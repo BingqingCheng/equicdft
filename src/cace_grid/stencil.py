@@ -136,7 +136,8 @@ def get_local_density(
     Parameters
     ----------
     rho
-        Scalar density field with shape ``[n_grid]``.
+        Density field with shape ``[n_grid, n_types]``. The component axis is
+        retained when ``n_types == 1``.
     grid_positions
         Zero-based integer coordinates with shape ``[n_grid, 3]``.
     grid_spacing
@@ -147,7 +148,7 @@ def get_local_density(
     Returns
     -------
     local_density
-        Density environments with shape ``[n_grid, n_neighbors]``.
+        Density environments with shape ``[n_grid, n_neighbors, n_types]``.
     local_density_positions
         Shared relative integer displacements with shape ``[n_neighbors, 3]``.
 
@@ -159,8 +160,8 @@ def get_local_density(
     grid_positions = np.asarray(grid_positions)
     spacing = np.asarray(grid_spacing, dtype=float).reshape(-1)
 
-    if rho.ndim != 1:
-        raise ValueError("rho must be a one-dimensional scalar field")
+    if rho.ndim != 2:
+        raise ValueError("rho must have shape [n_grid, n_types]")
     if grid_positions.shape != (rho.shape[0], 3):
         raise ValueError("grid_positions must have shape [n_grid, 3]")
     if spacing.size == 1:

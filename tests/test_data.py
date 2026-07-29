@@ -57,6 +57,28 @@ def _write_grid_with_custom_keys(path):
     write(path, atoms, format="extxyz")
 
 
+def _write_multitype_grid(path):
+    shape = (4, 4, 4)
+    spacing = 0.5
+    grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+    values = np.arange(len(grid_positions), dtype=float)
+
+    atoms = Atoms(
+        symbols=["X"] * len(grid_positions),
+        positions=grid_positions,
+        cell=np.diag(shape),
+        pbc=True,
+    )
+    atoms.arrays["density"] = np.column_stack((values, values + 100.0))
+    atoms.arrays["V_ext"] = np.column_stack((-values, -values - 10.0))
+    atoms.info["grid_size"] = np.asarray(shape)
+    atoms.info["grid_spacing"] = np.repeat(spacing, 3)
+    atoms.info["grid_indexing"] = "zero_based"
+    atoms.info["T"] = 1.5
+    atoms.info["mu"] = -1.0
+    write(path, atoms, format="extxyz")
+
+
 class TestGridData(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -74,6 +96,7 @@ class TestGridData(unittest.TestCase):
             {
                 "temperature",
                 "mu",
+                "n_types",
                 "grid_spacing",
                 "index",
                 "grid_positions",
@@ -83,15 +106,17 @@ class TestGridData(unittest.TestCase):
                 "local_density_positions",
             },
         )
-        self.assertEqual(data["rho"].shape, (64,))
-        self.assertEqual(data["local_density"].shape, (64, 7))
+        self.assertEqual(data["rho"].shape, (64, 1))
+        self.assertEqual(data["V_ext"].shape, (64, 1))
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertEqual(data["local_density"].shape, (64, 7, 1))
         self.assertEqual(data["local_density_positions"].shape, (7, 3))
         self.assertTrue(
             torch.equal(
                 data["local_density_positions"][0], torch.tensor([0, 0, 0])
             )
         )
-        self.assertTrue(torch.equal(data["local_density"][:, 0], data["rho"]))
+        self.assertTrue(torch.equal(data["local_density"][:, 0, :], data["rho"]))
         self.assertTrue(
             torch.equal(
                 data["grid_positions"][1], torch.tensor([0, 0, 1])
@@ -106,11 +131,11 @@ class TestGridData(unittest.TestCase):
         }
         minus_z = offset_lookup[(0, 0, -1)]
 
-        self.assertEqual(data["local_density"][0, minus_z].item(), 3.25)
+        self.assertEqual(data["local_density"][0, minus_z, 0].item(), 3.25)
 
         batch = next(iter(DataLoader([data, data], batch_size=2)))
-        self.assertEqual(batch["rho"].shape, (2, 64))
-        self.assertEqual(batch["local_density"].shape, (2, 64, 7))
+        self.assertEqual(batch["rho"].shape, (2, 64, 1))
+        self.assertEqual(batch["local_density"].shape, (2, 64, 7, 1))
 
     def test_custom_data_key_mapping(self):
         path = Path(self.temporary_directory.name) / "custom.extxyz"
@@ -132,7 +157,7 @@ class TestGridData(unittest.TestCase):
 
         self.assertEqual(data["temperature"].item(), 1.5)
         self.assertEqual(data["mu"].item(), -1.0)
-        self.assertTrue(torch.equal(data["local_density"][:, 0], data["rho"]))
+        self.assertTrue(torch.equal(data["local_density"][:, 0, :], data["rho"]))
         self.assertEqual(default_data_key["rho"], "density")
 
     def test_optional_local_average(self):
@@ -144,12 +169,13 @@ class TestGridData(unittest.TestCase):
 
         source = (np.arange(64, dtype=float) + 0.25).reshape(4, 4, 4)
         expected = source.reshape(2, 2, 2, 2, 2, 2).mean(axis=(1, 3, 5))
-        self.assertEqual(data["rho"].shape, (8,))
-        self.assertEqual(data["local_density"].shape, (8, 1))
+        self.assertEqual(data["rho"].shape, (8, 1))
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertEqual(data["local_density"].shape, (8, 1, 1))
         self.assertTrue(
             torch.allclose(
                 data["rho"],
-                torch.tensor(expected.reshape(-1), dtype=data["rho"].dtype),
+                torch.tensor(expected.reshape(-1, 1), dtype=data["rho"].dtype),
             )
         )
         self.assertTrue(
@@ -163,6 +189,27 @@ class TestGridData(unittest.TestCase):
                 torch.tensor([1.0, 1.0, 1.0], dtype=data["grid_spacing"].dtype),
             )
         )
+
+    def test_multitype_fields(self):
+        path = Path(self.temporary_directory.name) / "multitype.extxyz"
+        _write_multitype_grid(path)
+        data = GridData.from_xyz(path, cutoff=0.5)[0]
+
+        self.assertEqual(data["n_types"].item(), 2)
+        self.assertEqual(data["rho"].shape, (64, 2))
+        self.assertEqual(data["V_ext"].shape, (64, 2))
+        self.assertEqual(data["local_density"].shape, (64, 7, 2))
+        self.assertTrue(
+            torch.equal(data["local_density"][:, 0, :], data["rho"])
+        )
+
+        coarse = GridData.from_xyz(
+            path, cutoff=0.0, target_grid_spacing=1.0
+        )[0]
+        self.assertEqual(coarse["n_types"].item(), 2)
+        self.assertEqual(coarse["rho"].shape, (8, 2))
+        self.assertEqual(coarse["V_ext"].shape, (8, 2))
+        self.assertEqual(coarse["local_density"].shape, (8, 1, 2))
 
 
 if __name__ == "__main__":

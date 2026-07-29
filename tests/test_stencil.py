@@ -9,7 +9,7 @@ class TestGetLocalDensity(unittest.TestCase):
     def test_center_is_first_and_cutoff_two_has_257_positions(self):
         shape = (10, 10, 10)
         positions = np.indices(shape, dtype=int).reshape(3, -1).T
-        rho = np.arange(len(positions), dtype=float)
+        rho = np.arange(len(positions), dtype=float).reshape(-1, 1)
 
         local_density, local_positions = get_local_density(
             rho=rho,
@@ -18,10 +18,10 @@ class TestGetLocalDensity(unittest.TestCase):
             cutoff=2.0,
         )
 
-        self.assertEqual(local_density.shape, (1000, 257))
+        self.assertEqual(local_density.shape, (1000, 257, 1))
         self.assertEqual(local_positions.shape, (257, 3))
         self.assertTrue(np.array_equal(local_positions[0], (0, 0, 0)))
-        self.assertTrue(np.array_equal(local_density[:, 0], rho))
+        self.assertTrue(np.array_equal(local_density[:, 0, :], rho))
 
     def test_coarsen_grid_averages_all_fields(self):
         shape = (4, 4, 4)

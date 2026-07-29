@@ -37,12 +37,13 @@ class GridData(dict):
 
         temperature                 scalar
         mu                          scalar
+        n_types                     scalar
         grid_spacing                [3]
         index                       [n_grid]
         grid_positions              [n_grid, 3]
-        V_ext                       [n_grid]
-        rho                         [n_grid]
-        local_density               [n_grid, n_neighbors]
+        V_ext                       [n_grid, n_types]
+        rho                         [n_grid, n_types]
+        local_density               [n_grid, n_neighbors, n_types]
         local_density_positions     [n_neighbors, 3]
 
     ``local_density[m, k]`` is the density at relative integer displacement
@@ -205,6 +206,18 @@ def _process_atoms(
     V_ext = np.asarray(
         _required_source_value(atoms, data_key["V_ext"], "V_ext"), dtype=float
     )[order]
+    if rho.ndim not in (1, 2) or V_ext.ndim not in (1, 2):
+        raise ValueError(
+            "rho and V_ext must have shape [n_grid] or [n_grid, n_types]"
+        )
+    if rho.ndim == 1:
+        rho = rho[:, None]
+    if V_ext.ndim == 1:
+        V_ext = V_ext[:, None]
+    if rho.shape[1] != V_ext.shape[1]:
+        raise ValueError("rho and V_ext must contain the same number of columns")
+    n_types = rho.shape[1]
+
     grid_spacing = np.asarray(
         _required_source_value(
             atoms, data_key["grid_spacing"], "grid_spacing"
@@ -225,8 +238,8 @@ def _process_atoms(
             grid_spacing=grid_spacing,
             target_grid_spacing=target_grid_spacing,
         )
-        rho = fields[:, 0]
-        V_ext = fields[:, 1]
+        rho = fields[:, :n_types]
+        V_ext = fields[:, n_types:]
         n_grid = grid_positions.shape[0]
 
     # Construct all overlapping periodic environments. Row m is centered on
@@ -254,6 +267,7 @@ def _process_atoms(
             float(_required_source_value(atoms, data_key["mu"], "mu")),
             dtype=dtype,
         ),
+        "n_types": torch.tensor(n_types, dtype=torch.long),
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
