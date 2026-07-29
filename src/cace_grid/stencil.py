@@ -10,6 +10,113 @@ from typing import Sequence, Tuple, Union
 import numpy as np
 
 
+def coarsen_grid(
+    values: np.ndarray,
+    grid_positions: np.ndarray,
+    grid_spacing: Union[float, Sequence[float], np.ndarray],
+    target_grid_spacing: Union[float, Sequence[float], np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Block-average scalar fields onto a commensurate coarser grid.
+
+    Parameters
+    ----------
+    values
+        One or more fields with shape ``[n_grid]`` or ``[n_grid, n_fields]``.
+    grid_positions
+        Zero-based integer source-grid coordinates with shape ``[n_grid, 3]``.
+    grid_spacing
+        Physical source-grid spacing along the three axes.
+    target_grid_spacing
+        Requested physical spacing. Each target/source spacing ratio must be a
+        positive integer and must divide the corresponding grid size.
+
+    Returns
+    -------
+    coarse_values
+        Block-averaged fields in canonical C order.
+    coarse_positions
+        Zero-based integer coordinates of the coarse grid.
+    target_spacing
+        Normalized three-component target spacing.
+    """
+
+    values = np.asarray(values)
+    grid_positions = np.asarray(grid_positions)
+    source_spacing = np.asarray(grid_spacing, dtype=float).reshape(-1)
+    target_spacing = np.asarray(target_grid_spacing, dtype=float).reshape(-1)
+
+    scalar_field = values.ndim == 1
+    if scalar_field:
+        values = values[:, None]
+    if values.ndim != 2:
+        raise ValueError("values must have shape [n_grid] or [n_grid, n_fields]")
+    if grid_positions.shape != (values.shape[0], 3):
+        raise ValueError("grid_positions must have shape [n_grid, 3]")
+
+    if source_spacing.size == 1:
+        source_spacing = np.repeat(source_spacing, 3)
+    if target_spacing.size == 1:
+        target_spacing = np.repeat(target_spacing, 3)
+    if source_spacing.size != 3 or np.any(source_spacing <= 0.0):
+        raise ValueError("grid_spacing must contain three positive values")
+    if target_spacing.size != 3 or np.any(target_spacing <= 0.0):
+        raise ValueError("target_grid_spacing must contain three positive values")
+
+    rounded_positions = np.rint(grid_positions).astype(np.int64)
+    if not np.allclose(grid_positions, rounded_positions, atol=1.0e-8, rtol=0.0):
+        raise ValueError("grid_positions must be integer-valued")
+    if np.any(rounded_positions.min(axis=0) != 0):
+        raise ValueError("grid_positions must use zero-based indexing")
+
+    source_shape = rounded_positions.max(axis=0) + 1
+    n_grid = int(np.prod(source_shape))
+    if values.shape[0] != n_grid:
+        raise ValueError("grid_positions do not contain one complete regular grid")
+
+    flat_positions = np.ravel_multi_index(
+        rounded_positions.T, tuple(source_shape), order="C"
+    )
+    if np.unique(flat_positions).size != n_grid:
+        raise ValueError("grid_positions contain duplicate grid points")
+    order = np.argsort(flat_positions)
+    if not np.array_equal(flat_positions[order], np.arange(n_grid)):
+        raise ValueError("grid_positions do not cover the complete grid")
+
+    factor_float = target_spacing / source_spacing
+    factors = np.rint(factor_float).astype(np.int64)
+    if np.any(factors < 1) or not np.allclose(
+        factor_float, factors, atol=1.0e-10, rtol=1.0e-10
+    ):
+        raise ValueError(
+            "target_grid_spacing must be an integer multiple of grid_spacing"
+        )
+    if np.any(source_shape % factors != 0):
+        raise ValueError("coarsening factors must divide the source grid size")
+
+    coarse_shape = source_shape // factors
+    n_fields = values.shape[1]
+    values_grid = values[order].reshape(
+        source_shape[0], source_shape[1], source_shape[2], n_fields
+    )
+    blocked = values_grid.reshape(
+        coarse_shape[0],
+        factors[0],
+        coarse_shape[1],
+        factors[1],
+        coarse_shape[2],
+        factors[2],
+        n_fields,
+    )
+    coarse_values = blocked.mean(axis=(1, 3, 5)).reshape(-1, n_fields)
+    coarse_positions = np.indices(
+        tuple(coarse_shape), dtype=np.int64
+    ).reshape(3, -1).T
+
+    if scalar_field:
+        coarse_values = coarse_values[:, 0]
+    return coarse_values, coarse_positions, target_spacing
+
+
 def get_local_density(
     rho: np.ndarray,
     grid_positions: np.ndarray,
@@ -109,7 +216,7 @@ def get_local_density(
         offset, squared_distance = item
         x, y, z = offset
         return (
-            round(squared_distance, 14),
+            squared_distance,
             -abs(z),
             -z,
             -abs(y),

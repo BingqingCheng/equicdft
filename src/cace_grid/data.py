@@ -6,14 +6,14 @@ points rather than atoms, and their scalar node feature is the density ``rho``.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
 from ase import Atoms
 from ase.io import read
 
-from .stencil import get_local_density
+from .stencil import coarsen_grid, get_local_density
 
 
 # Canonical GridData field -> source field in the EXTXYZ/ASE Atoms object.
@@ -60,6 +60,9 @@ class GridData(dict):
         cutoff: float,
         index: str = ":",
         data_key: Optional[Dict[str, str]] = None,
+        target_grid_spacing: Optional[
+            Union[float, Sequence[float], np.ndarray]
+        ] = None,
     ) -> List["GridData"]:
         """Read EXTXYZ frames and convert each frame to one ``GridData``.
 
@@ -74,6 +77,9 @@ class GridData(dict):
         data_key
             Optional mapping from canonical GridData names to EXTXYZ field
             names. Supplied entries override :data:`default_data_key`.
+        target_grid_spacing
+            If provided, block-average ``rho`` and ``V_ext`` onto this
+            commensurate coarser spacing before constructing local environments.
 
         Returns
         -------
@@ -98,7 +104,15 @@ class GridData(dict):
         if not isinstance(configurations, list):
             configurations = [configurations]
         return [
-            cls(**_process_atoms(atoms, cutoff, keys)) for atoms in configurations
+            cls(
+                **_process_atoms(
+                    atoms,
+                    cutoff,
+                    keys,
+                    target_grid_spacing=target_grid_spacing,
+                )
+            )
+            for atoms in configurations
         ]
 
 
@@ -127,6 +141,9 @@ def _process_atoms(
     atoms: Atoms,
     cutoff: float,
     data_key: Dict[str, str],
+    target_grid_spacing: Optional[
+        Union[float, Sequence[float], np.ndarray]
+    ] = None,
 ) -> Dict[str, torch.Tensor]:
     """Convert one ASE frame to the tensor dictionary stored by GridData."""
 
@@ -198,6 +215,19 @@ def _process_atoms(
         grid_spacing = np.repeat(grid_spacing, 3)
     if grid_spacing.size != 3:
         raise ValueError("grid_spacing must contain one or three values")
+
+    # Optionally average both scalar fields over non-overlapping regular-grid
+    # blocks. The local environments are built only after this transformation.
+    if target_grid_spacing is not None:
+        fields, grid_positions, grid_spacing = coarsen_grid(
+            values=np.column_stack((rho, V_ext)),
+            grid_positions=grid_positions,
+            grid_spacing=grid_spacing,
+            target_grid_spacing=target_grid_spacing,
+        )
+        rho = fields[:, 0]
+        V_ext = fields[:, 1]
+        n_grid = grid_positions.shape[0]
 
     # Construct all overlapping periodic environments. Row m is centered on
     # grid_positions[m]; column k corresponds to one shared relative offset.

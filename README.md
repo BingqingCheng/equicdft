@@ -17,3 +17,14 @@ print(data["rho"].shape)
 print(data["local_density"].shape)
 print(data["local_density_positions"].shape)
 ```
+
+A fine regular grid can be block-averaged in memory before its local
+environments are constructed:
+
+```python
+dataset = GridData.from_xyz(
+    "density-grid-0.25.extxyz",
+    cutoff=2.0,
+    target_grid_spacing=0.5,
+)
+```

@@ -135,6 +135,35 @@ class TestGridData(unittest.TestCase):
         self.assertTrue(torch.equal(data["local_density"][:, 0], data["rho"]))
         self.assertEqual(default_data_key["rho"], "density")
 
+    def test_optional_local_average(self):
+        data = GridData.from_xyz(
+            self.path,
+            cutoff=0.0,
+            target_grid_spacing=1.0,
+        )[0]
+
+        source = (np.arange(64, dtype=float) + 0.25).reshape(4, 4, 4)
+        expected = source.reshape(2, 2, 2, 2, 2, 2).mean(axis=(1, 3, 5))
+        self.assertEqual(data["rho"].shape, (8,))
+        self.assertEqual(data["local_density"].shape, (8, 1))
+        self.assertTrue(
+            torch.allclose(
+                data["rho"],
+                torch.tensor(expected.reshape(-1), dtype=data["rho"].dtype),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                data["grid_positions"][1], torch.tensor([0, 0, 1])
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                data["grid_spacing"],
+                torch.tensor([1.0, 1.0, 1.0], dtype=data["grid_spacing"].dtype),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
