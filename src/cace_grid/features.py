@@ -211,3 +211,74 @@ class CartesianAFeatures(nn.Module):
         while cell_volume.ndim < features.ndim:
             cell_volume = cell_volume.unsqueeze(-1)
         return cell_volume * features
+
+
+class AChannelMixing(nn.Module):
+    """Mix physical component channels of ``A`` into latent channels.
+
+    For each grid point, radial channel, and Cartesian component, this module
+    applies the same learned linear map
+
+    ``A_mixed[..., q] = sum_t weight[q, t] * A[..., t]``.
+
+    Here ``t`` labels the physical components of the density field and ``q``
+    labels latent channels. Mixing only the final channel axis means that the
+    operation commutes with rotations and reflections of the Cartesian
+    component axis. Consequently, ``A_mixed`` can be passed directly to
+    :class:`cace_grid.symmetrize.CartesianBFeatures`.
+
+    Parameters
+    ----------
+    n_types
+        Number of physical density/component channels in ``A``.
+    n_channels
+        Number of latent channels produced by the learned mixing matrix.
+
+    Notes
+    -----
+    The map intentionally has no additive bias. A constant bias applied to
+    odd Cartesian components would not transform equivariantly under axis
+    reflections. For a one-component system this module is optional; the
+    original ``A`` tensor can be symmetrized directly.
+    """
+
+    def __init__(self, n_types: int, n_channels: int) -> None:
+        super().__init__()
+
+        for name, value in (
+            ("n_types", n_types),
+            ("n_channels", n_channels),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError("{} must be a positive integer".format(name))
+            if int(value) < 1:
+                raise ValueError("{} must be a positive integer".format(name))
+
+        self.n_types = int(n_types)
+        self.n_channels = int(n_channels)
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.n_channels,
+                self.n_types,
+                dtype=torch.get_default_dtype(),
+            )
+        )
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, A: torch.Tensor) -> torch.Tensor:
+        """Return ``A`` with its final physical-type axis linearly mixed."""
+
+        if A.ndim < 4:
+            raise ValueError(
+                "A must have shape "
+                "[..., n_grid, n_alphas, n_monomials, n_types]"
+            )
+        if A.shape[-1] != self.n_types:
+            raise ValueError(
+                "A has {} type channels but this module expects {}".format(
+                    A.shape[-1],
+                    self.n_types,
+                )
+            )
+
+        return torch.einsum("...t,qt->...q", A, self.weight)

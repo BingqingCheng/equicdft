@@ -4,7 +4,7 @@ import unittest
 import torch
 from torch import nn
 
-from cace_grid import CartesianAFeatures
+from cace_grid import AChannelMixing, CartesianAFeatures, CartesianBFeatures
 
 
 class TestCartesianAFeatures(unittest.TestCase):
@@ -149,6 +149,86 @@ class TestCartesianAFeatures(unittest.TestCase):
 
         self.assertIsNotNone(module.log_alphas.grad)
         self.assertTrue(torch.all(torch.isfinite(module.log_alphas.grad)))
+
+
+class TestAChannelMixing(unittest.TestCase):
+    def test_known_linear_map_and_shape(self):
+        module = AChannelMixing(n_types=2, n_channels=3)
+        with torch.no_grad():
+            module.weight.copy_(
+                torch.tensor(
+                    [[1.0, 0.0], [0.0, 1.0], [2.0, -1.0]],
+                    dtype=module.weight.dtype,
+                )
+            )
+
+        A = torch.tensor(
+            [[[[1.0, 3.0], [2.0, 5.0]]]],
+            dtype=module.weight.dtype,
+        )
+        mixed = module(A)
+
+        self.assertEqual(mixed.shape, (1, 1, 2, 3))
+        self.assertTrue(
+            torch.allclose(
+                mixed,
+                torch.tensor(
+                    [[[[1.0, 3.0, -1.0], [2.0, 5.0, -1.0]]]],
+                    dtype=mixed.dtype,
+                ),
+            )
+        )
+
+    def test_mixing_commutes_with_cubic_symmetry(self):
+        mixer = AChannelMixing(n_types=2, n_channels=4)
+        symmetrizer = CartesianBFeatures(max_power=2, max_nu=3)
+        A = torch.randn(2, 3, 10, 2, dtype=mixer.weight.dtype)
+
+        mixed = mixer(A)
+        reference = symmetrizer(mixed)
+        for index_map, sign_map in zip(
+            symmetrizer.component_indices,
+            symmetrizer.component_signs,
+        ):
+            sign_shape = [1] * A.ndim
+            sign_shape[-2] = sign_map.shape[0]
+            transformed = (
+                A.index_select(-2, index_map) * sign_map.view(sign_shape)
+            )
+
+            # Mixing physical channels commutes with the signed permutation of
+            # Cartesian components, and the subsequent B features are invariant.
+            transformed_mixed = mixer(transformed)
+            expected_mixed = (
+                mixed.index_select(-2, index_map) * sign_map.view(sign_shape)
+            )
+            self.assertTrue(
+                torch.allclose(transformed_mixed, expected_mixed, atol=1.0e-6)
+            )
+            self.assertTrue(
+                torch.allclose(
+                    symmetrizer(transformed_mixed),
+                    reference,
+                    atol=1.0e-6,
+                )
+            )
+
+    def test_inputs_and_weights_receive_gradients(self):
+        module = AChannelMixing(n_types=2, n_channels=3)
+        A = torch.randn(
+            2,
+            4,
+            10,
+            2,
+            dtype=module.weight.dtype,
+            requires_grad=True,
+        )
+        module(A).square().sum().backward()
+
+        self.assertIsNotNone(A.grad)
+        self.assertIsNotNone(module.weight.grad)
+        self.assertTrue(torch.all(torch.isfinite(A.grad)))
+        self.assertTrue(torch.all(torch.isfinite(module.weight.grad)))
 
 
 if __name__ == "__main__":
