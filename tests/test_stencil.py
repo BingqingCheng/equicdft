@@ -2,11 +2,11 @@ import unittest
 
 import numpy as np
 
-from cace_grid import coarsen_grid, get_local_density
+from cace_grid import coarsen_grid, get_local_density, make_stencil
 
 
 class TestGetLocalDensity(unittest.TestCase):
-    def test_center_is_first_and_cutoff_two_has_257_positions(self):
+    def test_default_stencil_has_canonical_123_positions(self):
         shape = (10, 10, 10)
         positions = np.indices(shape, dtype=int).reshape(3, -1).T
         rho = np.arange(len(positions), dtype=float).reshape(-1, 1)
@@ -14,12 +14,10 @@ class TestGetLocalDensity(unittest.TestCase):
         local_density, local_positions = get_local_density(
             rho=rho,
             grid_positions=positions,
-            grid_spacing=(0.5, 0.5, 0.5),
-            cutoff=2.0,
         )
 
-        self.assertEqual(local_density.shape, (1000, 257, 1))
-        self.assertEqual(local_positions.shape, (257, 3))
+        self.assertEqual(local_density.shape, (1000, 123, 1))
+        self.assertEqual(local_positions.shape, (123, 3))
         self.assertTrue(np.array_equal(local_positions[0], (0, 0, 0)))
         self.assertTrue(np.array_equal(local_density[:, 0, :], rho))
 
@@ -61,6 +59,14 @@ class TestGetLocalDensity(unittest.TestCase):
                 expected_first_shells,
             )
         )
+
+    def test_stencil_cutoff_is_inclusive(self):
+        positions = make_stencil(cutoff_grid=3)
+        squared_distances = np.sum(positions**2, axis=1)
+
+        self.assertTrue(np.all(squared_distances <= 9))
+        self.assertTrue(np.any(squared_distances == 9))
+        self.assertIn((0, 0, 3), map(tuple, positions))
 
     def test_coarsen_grid_averages_all_fields(self):
         shape = (4, 4, 4)

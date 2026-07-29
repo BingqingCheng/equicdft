@@ -89,7 +89,7 @@ class TestGridData(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_grid_data_dictionary(self):
-        data = GridData.from_xyz(self.path, cutoff=0.5)[0]
+        data = GridData.from_xyz(self.path, cutoff_grid=1)[0]
 
         self.assertEqual(
             set(data),
@@ -124,7 +124,7 @@ class TestGridData(unittest.TestCase):
         )
 
     def test_periodic_local_density_and_default_batching(self):
-        data = GridData.from_xyz(self.path, cutoff=0.5)[0]
+        data = GridData.from_xyz(self.path, cutoff_grid=1)[0]
         offset_lookup = {
             tuple(position.tolist()): index
             for index, position in enumerate(data["local_density_positions"])
@@ -142,7 +142,7 @@ class TestGridData(unittest.TestCase):
         _write_grid_with_custom_keys(path)
         data = GridData.from_xyz(
             path,
-            cutoff=0.5,
+            cutoff_grid=1,
             data_key={
                 "temperature": "temperature_value",
                 "mu": "chemical_potential",
@@ -163,7 +163,7 @@ class TestGridData(unittest.TestCase):
     def test_optional_local_average(self):
         data = GridData.from_xyz(
             self.path,
-            cutoff=0.0,
+            cutoff_grid=0,
             target_grid_spacing=1.0,
         )[0]
 
@@ -193,7 +193,7 @@ class TestGridData(unittest.TestCase):
     def test_multitype_fields(self):
         path = Path(self.temporary_directory.name) / "multitype.extxyz"
         _write_multitype_grid(path)
-        data = GridData.from_xyz(path, cutoff=0.5)[0]
+        data = GridData.from_xyz(path, cutoff_grid=1)[0]
 
         self.assertEqual(data["n_types"].item(), 2)
         self.assertEqual(data["rho"].shape, (64, 2))
@@ -204,7 +204,7 @@ class TestGridData(unittest.TestCase):
         )
 
         coarse = GridData.from_xyz(
-            path, cutoff=0.0, target_grid_spacing=1.0
+            path, cutoff_grid=0, target_grid_spacing=1.0
         )[0]
         self.assertEqual(coarse["n_types"].item(), 2)
         self.assertEqual(coarse["rho"].shape, (8, 2))

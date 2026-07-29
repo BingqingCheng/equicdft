@@ -58,7 +58,7 @@ class GridData(dict):
     def from_xyz(
         cls,
         path: Union[str, Path],
-        cutoff: float,
+        cutoff_grid: int = 3,
         index: str = ":",
         data_key: Optional[Dict[str, str]] = None,
         target_grid_spacing: Optional[
@@ -71,8 +71,9 @@ class GridData(dict):
         ----------
         path
             EXTXYZ file containing density and external-potential fields.
-        cutoff
-            Physical cutoff used to construct every local density environment.
+        cutoff_grid
+            Inclusive spherical cutoff in integer grid steps. The default is
+            three, so retained offsets satisfy ``x^2 + y^2 + z^2 <= 9``.
         index
             ASE frame selection. ``":"`` reads every frame.
         data_key
@@ -108,7 +109,7 @@ class GridData(dict):
             cls(
                 **_process_atoms(
                     atoms,
-                    cutoff,
+                    cutoff_grid,
                     keys,
                     target_grid_spacing=target_grid_spacing,
                 )
@@ -140,7 +141,7 @@ def _required_source_value(atoms: Atoms, source_key: str, field: str) -> Any:
 
 def _process_atoms(
     atoms: Atoms,
-    cutoff: float,
+    cutoff_grid: int,
     data_key: Dict[str, str],
     target_grid_spacing: Optional[
         Union[float, Sequence[float], np.ndarray]
@@ -247,8 +248,7 @@ def _process_atoms(
     local_density, local_density_positions = get_local_density(
         rho=rho,
         grid_positions=grid_positions,
-        grid_spacing=grid_spacing,
-        cutoff=cutoff,
+        cutoff_grid=cutoff_grid,
     )
 
     # Match CACE's AtomicData convention by honoring PyTorch's current default

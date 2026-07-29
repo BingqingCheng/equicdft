@@ -5,9 +5,67 @@ geometry operation used by the data class, while storing no dataset state.
 """
 
 from itertools import product
+from numbers import Integral
 from typing import Sequence, Tuple, Union
 
 import numpy as np
+
+
+def make_stencil(cutoff_grid: int = 3) -> np.ndarray:
+    """Return canonically ordered integer offsets inside a spherical cutoff.
+
+    The cutoff is measured in grid steps and is inclusive: an offset ``s`` is
+    retained when ``s[0]**2 + s[1]**2 + s[2]**2 <= cutoff_grid**2``. Offsets
+    related by axis permutations and independent sign flips are contiguous.
+
+    Parameters
+    ----------
+    cutoff_grid
+        Nonnegative integer cutoff in grid steps. The default is three.
+
+    Returns
+    -------
+    numpy.ndarray
+        Relative integer displacements with shape ``[n_neighbors, 3]``.
+    """
+
+    if isinstance(cutoff_grid, bool) or not isinstance(cutoff_grid, Integral):
+        raise TypeError("cutoff_grid must be a nonnegative integer")
+    cutoff_grid = int(cutoff_grid)
+    if cutoff_grid < 0:
+        raise ValueError("cutoff_grid must be a nonnegative integer")
+
+    squared_cutoff = cutoff_grid**2
+    offsets = [
+        offset
+        for offset in product(
+            range(-cutoff_grid, cutoff_grid + 1),
+            range(-cutoff_grid, cutoff_grid + 1),
+            range(-cutoff_grid, cutoff_grid + 1),
+        )
+        if sum(component**2 for component in offset) <= squared_cutoff
+    ]
+
+    def ordering(offset):
+        """Group offsets by cubic-symmetry orbit, then orient canonically."""
+
+        absolute_offset = tuple(abs(component) for component in offset)
+
+        # Signed permutations of an offset belong to the same cubic orbit and
+        # therefore share the sorted absolute-coordinate triple. Squared
+        # distance orders the shells; the orbit label additionally separates
+        # inequivalent offsets such as (3, 0, 0) and (2, 2, 1), which both have
+        # x^2 + y^2 + z^2 = 9.
+        squared_distance = sum(component**2 for component in offset)
+        orbit = tuple(sorted(absolute_offset))
+
+        # Lexicographic absolute coordinates produce z-, y-, then x-oriented
+        # axial vectors. Positive signs precede their mirrored counterparts.
+        signs = tuple(0 if component >= 0 else 1 for component in offset)
+        return squared_distance, orbit, absolute_offset, signs
+
+    offsets.sort(key=ordering)
+    return np.asarray(offsets, dtype=np.int64)
 
 
 def coarsen_grid(
@@ -120,8 +178,7 @@ def coarsen_grid(
 def get_local_density(
     rho: np.ndarray,
     grid_positions: np.ndarray,
-    grid_spacing: Union[float, Sequence[float], np.ndarray],
-    cutoff: float,
+    cutoff_grid: int = 3,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Gather one periodic local density environment around every grid point.
 
@@ -140,10 +197,9 @@ def get_local_density(
         retained when ``n_types == 1``.
     grid_positions
         Zero-based integer coordinates with shape ``[n_grid, 3]``.
-    grid_spacing
-        Physical spacing along the three grid axes.
-    cutoff
-        Physical radius of the local environment.
+    cutoff_grid
+        Inclusive spherical cutoff in integer grid steps. The default is
+        three, so retained offsets satisfy ``x^2 + y^2 + z^2 <= 9``.
 
     Returns
     -------
@@ -158,18 +214,13 @@ def get_local_density(
 
     rho = np.asarray(rho)
     grid_positions = np.asarray(grid_positions)
-    spacing = np.asarray(grid_spacing, dtype=float).reshape(-1)
 
     if rho.ndim != 2:
         raise ValueError("rho must have shape [n_grid, n_types]")
     if grid_positions.shape != (rho.shape[0], 3):
         raise ValueError("grid_positions must have shape [n_grid, 3]")
-    if spacing.size == 1:
-        spacing = np.repeat(spacing, 3)
-    if spacing.size != 3 or np.any(spacing <= 0.0):
-        raise ValueError("grid_spacing must contain three positive values")
-    if cutoff < 0.0:
-        raise ValueError("cutoff must be nonnegative")
+
+    local_density_positions = make_stencil(cutoff_grid)
 
     # Grid coordinates must be exact integer lattice points. Keeping them as
     # integer offsets avoids floating-point ambiguity in periodic wrapping.
@@ -192,50 +243,12 @@ def get_local_density(
     if np.unique(flat_positions).size != n_grid:
         raise ValueError("grid_positions contain duplicate grid points")
 
-    # Below half the shortest periodic box length, each relative offset selects
-    # one unique periodic image.
-    if cutoff >= 0.5 * np.min(grid_size * spacing):
-        raise ValueError("cutoff must be smaller than half the shortest box length")
-
-    # Enumerate a rectangular integer bounding box, then keep only offsets
-    # whose physical vectors lie inside the spherical cutoff.
-    maximum_offsets = np.ceil(cutoff / spacing).astype(int)
-    candidates = []
-    for offset in product(
-        range(-maximum_offsets[0], maximum_offsets[0] + 1),
-        range(-maximum_offsets[1], maximum_offsets[1] + 1),
-        range(-maximum_offsets[2], maximum_offsets[2] + 1),
-    ):
-        physical_vector = np.asarray(offset, dtype=float) * spacing
-        squared_distance = float(np.dot(physical_vector, physical_vector))
-        if squared_distance <= (cutoff + 1.0e-12) ** 2:
-            candidates.append((offset, squared_distance))
-
-    def ordering(item):
-        """Group offsets by cubic-symmetry orbit, then orient them canonically."""
-
-        offset, _ = item
-        absolute_offset = tuple(abs(component) for component in offset)
-
-        # Signed permutations of an offset belong to the same cubic orbit and
-        # therefore share the sorted absolute-coordinate triple. Squared
-        # integer distance orders the shells; the orbit label additionally
-        # distinguishes inequivalent offsets such as (3, 0, 0) and (2, 2, 1),
-        # which both have x^2 + y^2 + z^2 = 9.
-        squared_grid_distance = sum(component**2 for component in offset)
-        orbit = tuple(sorted(absolute_offset))
-
-        # Within an orbit, lexicographic absolute coordinates give the order
-        # requested for a cubic grid: z-axis, y-axis, x-axis for (0, 0, 1),
-        # followed by positive signs before negative signs.
-        signs = tuple(0 if component >= 0 else 1 for component in offset)
-        return squared_grid_distance, orbit, absolute_offset, signs
-
-    # Since the center has zero squared distance, it is guaranteed to be k=0.
-    candidates.sort(key=ordering)
-    local_density_positions = np.asarray(
-        [item[0] for item in candidates], dtype=np.int64
-    )
+    # Below half the shortest periodic grid length, every offset selects one
+    # unique periodic image.
+    if cutoff_grid >= 0.5 * np.min(grid_size):
+        raise ValueError(
+            "cutoff_grid must be smaller than half the shortest grid dimension"
+        )
 
     # Invert the canonical-index mapping: given a wrapped grid coordinate,
     # recover the row in the caller's rho array that stores its density.
