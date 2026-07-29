@@ -23,6 +23,45 @@ class TestGetLocalDensity(unittest.TestCase):
         self.assertTrue(np.array_equal(local_positions[0], (0, 0, 0)))
         self.assertTrue(np.array_equal(local_density[:, 0, :], rho))
 
+        expected_first_shells = np.asarray(
+            [
+                (0, 0, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+                (0, 1, 0),
+                (0, -1, 0),
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 1),
+                (0, 1, -1),
+                (0, -1, 1),
+                (0, -1, -1),
+                (1, 0, 1),
+                (1, 0, -1),
+                (-1, 0, 1),
+                (-1, 0, -1),
+                (1, 1, 0),
+                (1, -1, 0),
+                (-1, 1, 0),
+                (-1, -1, 0),
+                (1, 1, 1),
+                (1, 1, -1),
+                (1, -1, 1),
+                (1, -1, -1),
+                (-1, 1, 1),
+                (-1, 1, -1),
+                (-1, -1, 1),
+                (-1, -1, -1),
+            ],
+            dtype=np.int64,
+        )
+        self.assertTrue(
+            np.array_equal(
+                local_positions[: len(expected_first_shells)],
+                expected_first_shells,
+            )
+        )
+
     def test_coarsen_grid_averages_all_fields(self):
         shape = (4, 4, 4)
         positions = np.indices(shape, dtype=int).reshape(3, -1).T

@@ -212,19 +212,24 @@ def get_local_density(
             candidates.append((offset, squared_distance))
 
     def ordering(item):
-        """Put the center first and otherwise use a deterministic shell order."""
+        """Group offsets by cubic-symmetry orbit, then orient them canonically."""
 
-        offset, squared_distance = item
-        x, y, z = offset
-        return (
-            squared_distance,
-            -abs(z),
-            -z,
-            -abs(y),
-            -y,
-            -abs(x),
-            -x,
-        )
+        offset, _ = item
+        absolute_offset = tuple(abs(component) for component in offset)
+
+        # Signed permutations of an offset belong to the same cubic orbit and
+        # therefore share the sorted absolute-coordinate triple. Squared
+        # integer distance orders the shells; the orbit label additionally
+        # distinguishes inequivalent offsets such as (3, 0, 0) and (2, 2, 1),
+        # which both have x^2 + y^2 + z^2 = 9.
+        squared_grid_distance = sum(component**2 for component in offset)
+        orbit = tuple(sorted(absolute_offset))
+
+        # Within an orbit, lexicographic absolute coordinates give the order
+        # requested for a cubic grid: z-axis, y-axis, x-axis for (0, 0, 1),
+        # followed by positive signs before negative signs.
+        signs = tuple(0 if component >= 0 else 1 for component in offset)
+        return squared_grid_distance, orbit, absolute_offset, signs
 
     # Since the center has zero squared distance, it is guaranteed to be k=0.
     candidates.sort(key=ordering)
