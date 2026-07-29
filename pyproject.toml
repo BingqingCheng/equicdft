@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cace-grid"
+version = "0.0.1"
+description = "Cartesian atomic-cluster-expansion models for density fields on periodic grids"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "ase>=3.22",
+    "numpy>=1.20",
+    "torch>=1.12",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

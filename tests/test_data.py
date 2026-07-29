@@ -1,0 +1,140 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+import torch
+from ase import Atoms
+from ase.io import write
+from torch.utils.data import DataLoader
+
+from cace_grid import GridData, default_data_key
+
+
+def _write_grid(path):
+    shape = (4, 4, 4)
+    spacing = 0.5
+    grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+    values = np.arange(len(grid_positions), dtype=float)
+    order = np.random.default_rng(7).permutation(len(grid_positions))
+
+    atoms = Atoms(
+        symbols=["X"] * len(grid_positions),
+        positions=grid_positions[order],
+        cell=np.diag(shape),
+        pbc=True,
+    )
+    atoms.arrays["density"] = (values + 0.25)[order]
+    atoms.arrays["V_ext"] = (-values)[order]
+    atoms.info["grid_size"] = np.asarray(shape)
+    atoms.info["grid_spacing"] = np.repeat(spacing, 3)
+    atoms.info["grid_indexing"] = "zero_based"
+    atoms.info["T"] = 1.5
+    atoms.info["mu"] = -1.0
+    write(path, atoms, format="extxyz")
+
+
+def _write_grid_with_custom_keys(path):
+    shape = (4, 4, 4)
+    spacing = 0.5
+    grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+    values = np.arange(len(grid_positions), dtype=float)
+
+    atoms = Atoms(
+        symbols=["X"] * len(grid_positions),
+        positions=grid_positions,
+        cell=np.diag(shape),
+        pbc=True,
+    )
+    atoms.arrays["grid_coordinates"] = grid_positions
+    atoms.arrays["number_density"] = values + 0.25
+    atoms.arrays["external_field"] = -values
+    atoms.info["shape"] = np.asarray(shape)
+    atoms.info["spacing"] = np.repeat(spacing, 3)
+    atoms.info["indexing"] = "zero_based"
+    atoms.info["temperature_value"] = 1.5
+    atoms.info["chemical_potential"] = -1.0
+    write(path, atoms, format="extxyz")
+
+
+class TestGridData(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary_directory.name) / "grid.extxyz"
+        _write_grid(self.path)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_grid_data_dictionary(self):
+        data = GridData.from_xyz(self.path, cutoff=0.5)[0]
+
+        self.assertEqual(
+            set(data),
+            {
+                "temperature",
+                "mu",
+                "grid_spacing",
+                "index",
+                "grid_positions",
+                "V_ext",
+                "rho",
+                "local_density",
+                "local_density_positions",
+            },
+        )
+        self.assertEqual(data["rho"].shape, (64,))
+        self.assertEqual(data["local_density"].shape, (64, 7))
+        self.assertEqual(data["local_density_positions"].shape, (7, 3))
+        self.assertTrue(
+            torch.equal(
+                data["local_density_positions"][0], torch.tensor([0, 0, 0])
+            )
+        )
+        self.assertTrue(torch.equal(data["local_density"][:, 0], data["rho"]))
+        self.assertTrue(
+            torch.equal(
+                data["grid_positions"][1], torch.tensor([0, 0, 1])
+            )
+        )
+
+    def test_periodic_local_density_and_default_batching(self):
+        data = GridData.from_xyz(self.path, cutoff=0.5)[0]
+        offset_lookup = {
+            tuple(position.tolist()): index
+            for index, position in enumerate(data["local_density_positions"])
+        }
+        minus_z = offset_lookup[(0, 0, -1)]
+
+        self.assertEqual(data["local_density"][0, minus_z].item(), 3.25)
+
+        batch = next(iter(DataLoader([data, data], batch_size=2)))
+        self.assertEqual(batch["rho"].shape, (2, 64))
+        self.assertEqual(batch["local_density"].shape, (2, 64, 7))
+
+    def test_custom_data_key_mapping(self):
+        path = Path(self.temporary_directory.name) / "custom.extxyz"
+        _write_grid_with_custom_keys(path)
+        data = GridData.from_xyz(
+            path,
+            cutoff=0.5,
+            data_key={
+                "temperature": "temperature_value",
+                "mu": "chemical_potential",
+                "grid_spacing": "spacing",
+                "grid_size": "shape",
+                "grid_indexing": "indexing",
+                "grid_positions": "grid_coordinates",
+                "V_ext": "external_field",
+                "rho": "number_density",
+            },
+        )[0]
+
+        self.assertEqual(data["temperature"].item(), 1.5)
+        self.assertEqual(data["mu"].item(), -1.0)
+        self.assertTrue(torch.equal(data["local_density"][:, 0], data["rho"]))
+        self.assertEqual(default_data_key["rho"], "density")
+
+
+if __name__ == "__main__":
+    unittest.main()
