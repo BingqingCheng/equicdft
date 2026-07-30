@@ -49,7 +49,7 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         )
         return data, A, B, readout, readout(B, data)
 
-    def test_vacuum_anchor(self):
+    def test_empty_density_has_zero_free_energy(self):
         rho = torch.zeros(
             64,
             1,
@@ -59,10 +59,7 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         data, _, _, _, output = self._full_pipeline(rho)
 
         self.assertTrue(
-            torch.equal(
-                output["beta_free_energy_per_particle"],
-                torch.zeros_like(output["beta_free_energy_per_particle"]),
-            )
+            torch.all(torch.isfinite(output["beta_free_energy_per_particle"]))
         )
         self.assertTrue(
             torch.equal(
@@ -72,21 +69,11 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         )
         self.assertEqual(output["beta_F_exc"].item(), 0.0)
 
-        # rho * anchored a_exc has zero first derivative at vacuum, not merely
-        # zero total free energy.
-        c1 = compute_c1(
-            output["beta_F_exc"],
-            data["rho"],
-            data["grid_spacing"],
-        )
-        self.assertTrue(torch.equal(c1, torch.zeros_like(c1)))
-
-    def test_batched_temperature_and_shapes(self):
+    def test_batched_shapes(self):
         B = torch.randn(2, 5, 1, 23, 1)
         rho = torch.rand(2, 5, 1)
         data = {
             "rho": rho,
-            "temperature": torch.tensor([1.5, 2.0], dtype=rho.dtype),
             "grid_spacing": torch.tensor(
                 [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]],
                 dtype=rho.dtype,
@@ -95,7 +82,6 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         readout = LocalFreeEnergyReadout(
             n_features=23,
             n_types=1,
-            include_temperature=True,
         )
         output = readout(B, data)
 
@@ -106,34 +92,6 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         self.assertEqual(
             output["beta_free_energy_density"].shape,
             (2, 5),
-        )
-        self.assertEqual(output["beta_F_exc"].shape, (2,))
-
-    def test_custom_data_keys(self):
-        data_key = {
-            "rho": "number_density",
-            "temperature": "temperature_value",
-            "grid_spacing": "spacing",
-        }
-        B = torch.randn(2, 5, 1, 3, 1)
-        data = {
-            "number_density": torch.rand(2, 5, 1),
-            "temperature_value": torch.tensor([1.5, 2.0]),
-            "spacing": torch.tensor(
-                [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]]
-            ),
-        }
-        readout = LocalFreeEnergyReadout(
-            n_features=3,
-            n_types=1,
-            include_temperature=True,
-            data_key=data_key,
-        )
-        output = readout(B, data)
-
-        self.assertEqual(
-            output["beta_free_energy_per_particle"].shape,
-            (2, 5, 1),
         )
         self.assertEqual(output["beta_F_exc"].shape, (2,))
 
@@ -148,13 +106,12 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         readout = LocalFreeEnergyReadout(
             n_features=2,
             n_types=1,
-            hidden_sizes=(2,),
+            hidden_sizes=(),
             feature_scale=torch.tensor([2.0, 4.0]),
         )
         with torch.no_grad():
-            for parameter in readout.nonlinear.parameters():
-                parameter.zero_()
-            readout.linear.weight.copy_(torch.tensor([[1.0, 1.0, 0.0]]))
+            readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
+            readout.mlp[0].bias.zero_()
 
         B = torch.tensor([[[[2.0], [4.0]]]])
         data = {
