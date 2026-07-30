@@ -37,7 +37,11 @@ from cace_grid import (
     LocalFreeEnergyReadout,
 )
 
-dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
+dataset = GridData.from_xyz(
+    "density.extxyz",
+    cutoff_grid=3,
+    boltzmann_constant=1.0,  # reduced units; default is eV/K
+)
 data = dataset[0]
 n_types = int(data["n_types"].item())
 mean_density = 0.7  # precomputed from the training frames
@@ -65,6 +69,13 @@ outputs = model(data)
 beta_F_exc = outputs["beta_F_exc"]
 c1 = outputs["c1"]
 ```
+
+`GridData` stores `beta = 1 / (k_B T)` and constructs the equilibrium
+reference field `c1_plus_beta_mu = log(rho * thermal_wavelength**3) +
+beta * V_ext`. When `mu` is present, it also stores `c1 =
+c1_plus_beta_mu - beta * mu`. The default Boltzmann constant is
+`8.617333262e-5` eV/K and the default thermal wavelength is one. Pass
+`boltzmann_constant=1.0` for reduced-unit data.
 
 For a multicomponent density field, an optional learned, bias-free channel map
 can mix the physical component channels of `A` before symmetrization:

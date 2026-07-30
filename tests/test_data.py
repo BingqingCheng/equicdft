@@ -70,7 +70,9 @@ def _write_multitype_grid(path):
         cell=np.diag(shape),
         pbc=True,
     )
-    atoms.arrays["density"] = np.column_stack((values, values + 100.0))
+    atoms.arrays["density"] = np.column_stack(
+        (values + 0.25, values + 100.25)
+    )
     atoms.arrays["V_ext"] = np.column_stack((-values, -values - 10.0))
     atoms.info["grid_size"] = np.asarray(shape)
     atoms.info["grid_spacing"] = np.repeat(spacing, 3)
@@ -96,20 +98,46 @@ class TestGridData(unittest.TestCase):
             set(data),
             {
                 "temperature",
+                "beta",
                 "mu",
                 "n_types",
+                "thermal_wavelength",
                 "grid_spacing",
                 "index",
                 "grid_positions",
                 "V_ext",
                 "rho",
+                "c1_plus_beta_mu",
+                "c1",
                 "local_density_index",
                 "local_density_positions",
             },
         )
         self.assertEqual(data["rho"].shape, (64, 1))
         self.assertEqual(data["V_ext"].shape, (64, 1))
+        self.assertEqual(data["c1_plus_beta_mu"].shape, (64, 1))
+        self.assertEqual(data["c1"].shape, (64, 1))
         self.assertEqual(data["n_types"].item(), 1)
+        self.assertEqual(data["mu"].shape, (1,))
+        self.assertEqual(data["thermal_wavelength"].shape, (1,))
+        expected_beta = 1.0 / (8.617333262e-5 * 1.5)
+        self.assertTrue(
+            np.isclose(data["beta"].item(), expected_beta, rtol=1.0e-6)
+        )
+        self.assertTrue(
+            np.isclose(
+                data["c1_plus_beta_mu"][0, 0].item(),
+                np.log(0.25),
+                rtol=1.0e-6,
+            )
+        )
+        self.assertTrue(
+            np.isclose(
+                data["c1"][0, 0].item(),
+                np.log(0.25) + expected_beta,
+                rtol=1.0e-6,
+            )
+        )
         self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertEqual(data["local_density_positions"].shape, (7, 3))
         self.assertTrue(
@@ -132,8 +160,11 @@ class TestGridData(unittest.TestCase):
         data = GridData.from_xyz(path, cutoff_grid=1)[0]
 
         self.assertNotIn("mu", data)
+        self.assertNotIn("c1", data)
+        self.assertIn("c1_plus_beta_mu", data)
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertNotIn("mu", batch)
+        self.assertNotIn("c1", batch)
 
     def test_periodic_local_density_and_default_batching(self):
         data = GridData.from_xyz(self.path, cutoff_grid=1)[0]
@@ -236,27 +267,86 @@ class TestGridData(unittest.TestCase):
                 torch.tensor([1.0, 1.0, 1.0], dtype=data["grid_spacing"].dtype),
             )
         )
+        expected_c1 = (
+            torch.log(data["rho"])
+            + data["beta"]
+            * (data["V_ext"] - data["mu"].unsqueeze(0))
+        )
+        self.assertTrue(torch.allclose(data["c1"], expected_c1))
 
     def test_multitype_fields(self):
         path = Path(self.temporary_directory.name) / "multitype.extxyz"
         _write_multitype_grid(path)
-        data = GridData.from_xyz(path, cutoff_grid=1)[0]
+        data = GridData.from_xyz(
+            path,
+            cutoff_grid=1,
+            boltzmann_constant=1.0,
+            thermal_wavelength=[1.0, 2.0],
+        )[0]
 
         self.assertEqual(data["n_types"].item(), 2)
         self.assertEqual(data["rho"].shape, (64, 2))
         self.assertEqual(data["V_ext"].shape, (64, 2))
+        self.assertEqual(data["mu"].shape, (2,))
+        self.assertTrue(
+            torch.equal(
+                data["thermal_wavelength"],
+                torch.tensor([1.0, 2.0], dtype=data["rho"].dtype),
+            )
+        )
+        self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
+        expected_c1_plus_beta_mu = (
+            torch.log(
+                data["rho"]
+                * data["thermal_wavelength"].unsqueeze(0) ** 3
+            )
+            + data["beta"] * data["V_ext"]
+        )
+        self.assertTrue(
+            torch.allclose(
+                data["c1_plus_beta_mu"],
+                expected_c1_plus_beta_mu,
+                atol=5.0e-6,
+                rtol=1.0e-6,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                data["c1"],
+                expected_c1_plus_beta_mu
+                - data["beta"] * data["mu"].unsqueeze(0),
+                atol=5.0e-6,
+                rtol=1.0e-6,
+            )
+        )
         self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertTrue(
             torch.equal(data["local_density_index"][:, 0], data["index"])
         )
 
         coarse = GridData.from_xyz(
-            path, cutoff_grid=0, target_grid_spacing=1.0
+            path,
+            cutoff_grid=0,
+            target_grid_spacing=1.0,
+            boltzmann_constant=1.0,
+            thermal_wavelength=[1.0, 2.0],
         )[0]
         self.assertEqual(coarse["n_types"].item(), 2)
         self.assertEqual(coarse["rho"].shape, (8, 2))
         self.assertEqual(coarse["V_ext"].shape, (8, 2))
         self.assertEqual(coarse["local_density_index"].shape, (8, 1))
+
+    def test_thermodynamic_constants_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "boltzmann_constant"):
+            GridData.from_xyz(
+                self.path,
+                boltzmann_constant=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "thermal_wavelength"):
+            GridData.from_xyz(
+                self.path,
+                thermal_wavelength=0.0,
+            )
 
 
 if __name__ == "__main__":

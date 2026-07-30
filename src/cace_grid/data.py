@@ -16,6 +16,11 @@ from ase.io import read
 from .stencil import coarsen_grid, get_neighbor_indices
 
 
+# Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
+# datasets can recover beta = 1 / T by passing boltzmann_constant=1.0.
+DEFAULT_BOLTZMANN_CONSTANT = 8.617333262e-5
+
+
 # Canonical GridData field -> source field in the EXTXYZ/ASE Atoms object.
 # Callers can override any subset of source names through `data_key`.
 default_data_key = {
@@ -37,13 +42,17 @@ class GridData(dict):
     supplied by the source frame::
 
         temperature                 scalar
-        mu                          scalar (optional)
+        beta                        scalar
+        mu                          [n_types] (optional)
         n_types                     scalar
+        thermal_wavelength          [n_types]
         grid_spacing                [3]
         index                       [n_grid]
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types]
         rho                         [n_grid, n_types]
+        c1_plus_beta_mu             [n_grid, n_types]
+        c1                          [n_grid, n_types] (if mu is supplied)
         local_density_index         [n_grid, n_neighbors]
         local_density_positions     [n_neighbors, 3]
 
@@ -66,6 +75,10 @@ class GridData(dict):
         target_grid_spacing: Optional[
             Union[float, Sequence[float], np.ndarray]
         ] = None,
+        boltzmann_constant: float = DEFAULT_BOLTZMANN_CONSTANT,
+        thermal_wavelength: Union[
+            float, Sequence[float], np.ndarray
+        ] = 1.0,
     ) -> List["GridData"]:
         """Read EXTXYZ frames and convert each frame to one ``GridData``.
 
@@ -84,12 +97,25 @@ class GridData(dict):
         target_grid_spacing
             If provided, block-average ``rho`` and ``V_ext`` onto this
             commensurate coarser spacing before constructing local environments.
+        boltzmann_constant
+            Boltzmann constant in energy per temperature. The default is in
+            eV/K. Use ``1.0`` when temperature is already expressed in energy
+            units, as in reduced Lennard-Jones data.
+        thermal_wavelength
+            Thermal de Broglie wavelength in the length unit reciprocal to
+            that used by ``rho``. Supply one positive value or one value per
+            component. The default is one.
 
         Returns
         -------
         list of GridData
             One complete grid configuration per selected EXTXYZ frame.
         """
+
+        boltzmann_constant = _positive_scalar(
+            boltzmann_constant,
+            "boltzmann_constant",
+        )
 
         keys = default_data_key.copy()
         if data_key is not None:
@@ -114,6 +140,8 @@ class GridData(dict):
                     cutoff_grid,
                     keys,
                     target_grid_spacing=target_grid_spacing,
+                    boltzmann_constant=boltzmann_constant,
+                    thermal_wavelength=thermal_wavelength,
                 )
             )
             for atoms in configurations
@@ -148,6 +176,10 @@ def _process_atoms(
     target_grid_spacing: Optional[
         Union[float, Sequence[float], np.ndarray]
     ] = None,
+    boltzmann_constant: float = DEFAULT_BOLTZMANN_CONSTANT,
+    thermal_wavelength: Union[
+        float, Sequence[float], np.ndarray
+    ] = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """Convert one ASE frame to the tensor dictionary stored by GridData."""
 
@@ -221,6 +253,25 @@ def _process_atoms(
         raise ValueError("rho and V_ext must contain the same number of columns")
     n_types = rho.shape[1]
 
+    thermal_wavelength_values = np.asarray(
+        thermal_wavelength,
+        dtype=float,
+    ).reshape(-1)
+    if thermal_wavelength_values.size == 1:
+        thermal_wavelength_values = np.repeat(
+            thermal_wavelength_values,
+            n_types,
+        )
+    if thermal_wavelength_values.size != n_types:
+        raise ValueError(
+            "thermal_wavelength must contain one value or one value per type"
+        )
+    if (
+        not np.all(np.isfinite(thermal_wavelength_values))
+        or np.any(thermal_wavelength_values <= 0.0)
+    ):
+        raise ValueError("thermal_wavelength values must be finite and positive")
+
     grid_spacing = np.asarray(
         _required_source_value(
             atoms, data_key["grid_spacing"], "grid_spacing"
@@ -245,6 +296,27 @@ def _process_atoms(
         V_ext = fields[:, n_types:]
         n_grid = grid_positions.shape[0]
 
+    # The equilibrium one-body identity uses dimensionless beta-weighted
+    # energies. rho and the thermal wavelength must use reciprocal length
+    # units so rho * Lambda^3 is dimensionless.
+    temperature = _positive_scalar(
+        _required_source_value(
+            atoms,
+            data_key["temperature"],
+            "temperature",
+        ),
+        "temperature",
+    )
+    beta = 1.0 / (boltzmann_constant * temperature)
+    if np.any(rho <= 0.0):
+        raise ValueError(
+            "rho must be positive to construct logarithmic c1 targets"
+        )
+    c1_plus_beta_mu = (
+        np.log(rho * thermal_wavelength_values[None, :] ** 3)
+        + beta * V_ext
+    )
+
     # Store only the geometry needed to construct all overlapping periodic
     # environments. Model forwards use these indices to gather from live rho.
     local_density_index, local_density_positions = get_neighbor_indices(
@@ -256,20 +328,22 @@ def _process_atoms(
     # int64 tensors for indices and integer grid coordinates.
     dtype = torch.get_default_dtype()
     data = {
-        "temperature": torch.tensor(
-            float(
-                _required_source_value(
-                    atoms, data_key["temperature"], "temperature"
-                )
-            ),
+        "temperature": torch.tensor(temperature, dtype=dtype),
+        "beta": torch.tensor(beta, dtype=dtype),
+        "n_types": torch.tensor(n_types, dtype=torch.long),
+        "thermal_wavelength": torch.tensor(
+            thermal_wavelength_values,
             dtype=dtype,
         ),
-        "n_types": torch.tensor(n_types, dtype=torch.long),
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
         "V_ext": torch.tensor(V_ext, dtype=dtype),
         "rho": torch.tensor(rho, dtype=dtype),
+        "c1_plus_beta_mu": torch.tensor(
+            c1_plus_beta_mu,
+            dtype=dtype,
+        ),
         "local_density_index": torch.tensor(
             local_density_index, dtype=torch.long
         ),
@@ -283,5 +357,28 @@ def _process_atoms(
     # canonical simulations. Do not assign an artificial value when missing.
     mu = _get_source_value(atoms, data_key["mu"])
     if mu is not None:
-        data["mu"] = torch.tensor(float(mu), dtype=dtype)
+        mu_values = np.asarray(mu, dtype=float).reshape(-1)
+        if mu_values.size == 1:
+            mu_values = np.repeat(mu_values, n_types)
+        if mu_values.size != n_types:
+            raise ValueError("mu must contain one value or one value per type")
+        if not np.all(np.isfinite(mu_values)):
+            raise ValueError("mu values must be finite")
+        data["mu"] = torch.tensor(mu_values, dtype=dtype)
+        data["c1"] = torch.tensor(
+            c1_plus_beta_mu - beta * mu_values[None, :],
+            dtype=dtype,
+        )
     return data
+
+
+def _positive_scalar(value: Any, name: str) -> float:
+    """Return one finite positive scalar with a field-specific error."""
+
+    values = np.asarray(value, dtype=float).reshape(-1)
+    if values.size != 1:
+        raise ValueError("{} must be a scalar".format(name))
+    scalar = float(values[0])
+    if not np.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError("{} must be finite and positive".format(name))
+    return scalar
