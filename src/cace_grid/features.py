@@ -1,14 +1,12 @@
 """Cartesian moment features for density fields on fixed integer grids.
 
-The angular basis uses the dimensionless integer stencil coordinates
-``(x, y, z)`` rather than physical distances. Gaussian radial functions are
-also evaluated using the squared integer-grid distance. The physical grid
-spacing enters only through the cell-volume factor used to turn the neighbor
-sum into a discrete spatial integral.
+The angular basis uses integer stencil coordinates. Gaussian radial functions
+are evaluated using squared integer-grid distances without an additional
+kernel normalization.
 """
 
 from numbers import Integral
-from typing import Mapping
+from typing import Mapping, Union
 
 import torch
 from torch import nn
@@ -79,18 +77,18 @@ def _make_powers(max_power: int) -> torch.Tensor:
 
 
 class CartesianAFeatures(nn.Module):
-    """Compute density-weighted Cartesian ``A`` features on a fixed stencil.
+    """Compute normalized Cartesian ``A`` features on a fixed stencil.
 
     For central grid point ``g``, Gaussian channel ``n``, monomial
     ``k = (a, b, c)``, and component ``t``, the module computes
 
-    ``A[g, n, k, t] = cell_volume * sum_j rho[g, j, t]``
-    ``* exp(-alpha[n] * r_grid[j]^2) * x_j^a y_j^b z_j^c``.
+    ``A[g, n, k, t] = sum_j (rho[g, j, t] / mean_density)``
+    ``* w[n, j] * x_j^a * y_j^b * z_j^c``,
 
-    Here ``j`` runs over the canonically ordered integer stencil. The monomial
-    coordinates and ``r_grid^2 = x^2 + y^2 + z^2`` use integer grid units;
-    ``cell_volume = hx * hy * hz`` is the physical volume represented by one
-    density-grid point.
+    where ``j`` runs over the canonically ordered integer stencil and
+    ``w[n, j] = exp(-alpha[n] * r_grid[j]^2)``. Grid-volume quadrature is
+    deliberately left to the free-energy readout rather than included in
+    these local descriptors.
 
     Parameters
     ----------
@@ -101,12 +99,17 @@ class CartesianAFeatures(nn.Module):
         Maximum total Cartesian power ``a + b + c``.
     n_alphas
         Number of Gaussian radial channels. Their positive initial decay
-        coefficients are logarithmically spaced from 0.25 to 2.0 in inverse
+        coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
         squared grid units.
     trainable_alphas
         If ``True``, optimize the Gaussian decay coefficients. They are stored
         in logarithmic form so that the resulting ``alpha`` values stay
         positive. If ``False``, they remain fixed model buffers.
+    mean_density
+        Positive scalar used for scale-only density normalization. For fitting,
+        set this to the precomputed mean density of the training split. It is
+        stored as a fixed buffer; no mean is subtracted, so zero density
+        remains zero.
 
     Notes
     -----
@@ -118,6 +121,7 @@ class CartesianAFeatures(nn.Module):
     def __init__(
         self,
         max_power: int,
+        mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
         n_alphas: int = 4,
         trainable_alphas: bool = False,
@@ -131,6 +135,18 @@ class CartesianAFeatures(nn.Module):
             raise ValueError("n_alphas must be a positive integer")
         if not isinstance(trainable_alphas, bool):
             raise TypeError("trainable_alphas must be a boolean")
+
+        mean_density_tensor = torch.as_tensor(
+            mean_density,
+            dtype=torch.get_default_dtype(),
+        ).detach().clone()
+        if mean_density_tensor.numel() != 1:
+            raise ValueError("mean_density must be a positive scalar")
+        mean_density_tensor = mean_density_tensor.reshape(())
+        if not torch.isfinite(mean_density_tensor).item():
+            raise ValueError("mean_density must be finite")
+        if mean_density_tensor.item() <= 0.0:
+            raise ValueError("mean_density must be positive")
 
         # Both GridData and this module call make_stencil, so neighbor j in
         # local_density always corresponds to row j of the monomial table.
@@ -151,11 +167,12 @@ class CartesianAFeatures(nn.Module):
                 powers[None, :, axis]
             )
 
-        # A logarithmic sequence resolves both broad and center-dominated
-        # environments. For n_alphas=4 this gives [0.25, 0.5, 1.0, 2.0].
+        # Gaussian channel n uses the radial weight
+        # R_n(q) = exp(-alpha_n * |q|**2).
+        # For n_alphas=4, the alpha values are [0.5, 1.0, 2.0, 4.0].
         initial_alphas = 2.0 ** torch.linspace(
-            -2.0,
-            1.0,
+            -1.0,
+            2.0,
             steps=n_alphas,
             dtype=torch.get_default_dtype(),
         )
@@ -173,6 +190,7 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("squared_distances", squared_distances)
         self.register_buffer("powers", powers)
         self.register_buffer("monomial_values", monomial_values)
+        self.register_buffer("mean_density", mean_density_tensor)
 
     @property
     def alphas(self) -> torch.Tensor:
@@ -195,12 +213,6 @@ class CartesianAFeatures(nn.Module):
                 ``[..., n_grid, n_neighbors]``. Local environments are
                 gathered from ``rho`` inside this forward pass so that
                 automatic differentiation includes overlapping neighbors.
-            ``grid_spacing``
-                Physical grid spacing ``(hx, hy, hz)`` with shape ``[3]`` for
-                one configuration or ``[..., 3]`` for batched data. It is not
-                used to rescale the integer monomials. Its product supplies
-                the cell-volume quadrature weight.
-
         Returns
         -------
         torch.Tensor
@@ -234,22 +246,10 @@ class CartesianAFeatures(nn.Module):
         # separate.
         features = torch.einsum(
             "...gjt,jnk->...gnkt",
-            local_density,
+            local_density / self.mean_density,
             basis_values,
         )
-
-        # grid_spacing stores physical lengths, not grid dimensions. Its
-        # product is the volume dV represented by one grid point. For batched
-        # input this initially has only the batch dimensions; trailing
-        # singleton axes make it broadcast over grid, radial, monomial, and
-        # type dimensions.
-        grid_spacing = data["grid_spacing"]
-        if grid_spacing.shape[-1] != 3:
-            raise ValueError("grid_spacing must have shape [..., 3]")
-        cell_volume = torch.prod(grid_spacing, dim=-1)
-        while cell_volume.ndim < features.ndim:
-            cell_volume = cell_volume.unsqueeze(-1)
-        return cell_volume * features
+        return features
 
 
 class AChannelMixing(nn.Module):

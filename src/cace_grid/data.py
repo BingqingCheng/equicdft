@@ -1,8 +1,8 @@
-"""Convert EXTXYZ density fields into Grid-CACE input dictionaries.
+"""Convert EXTXYZ density fields into model input dictionaries.
 
-The role of :class:`GridData` is analogous to ``AtomicData`` in CACE: one
-object represents one complete configuration. Here the nodes are regular grid
-points rather than atoms, and their scalar node feature is the density ``rho``.
+One :class:`GridData` object represents one complete periodic density field.
+It stores field values on the regular grid together with indices for gathering
+the periodic neighborhood of every grid point.
 """
 
 from pathlib import Path
@@ -17,7 +17,7 @@ from .stencil import coarsen_grid, get_neighbor_indices
 
 
 # Canonical GridData field -> source field in the EXTXYZ/ASE Atoms object.
-# As in CACE AtomicData, callers can override any subset through `data_key`.
+# Callers can override any subset of source names through `data_key`.
 default_data_key = {
     "temperature": "T",
     "mu": "mu",
@@ -252,8 +252,8 @@ def _process_atoms(
         cutoff_grid=cutoff_grid,
     )
 
-    # Match CACE's AtomicData convention by honoring PyTorch's current default
-    # floating dtype and using int64 tensors for indices and grid coordinates.
+    # Use PyTorch's current default floating dtype for physical values and
+    # int64 tensors for indices and integer grid coordinates.
     dtype = torch.get_default_dtype()
     data = {
         "temperature": torch.tensor(

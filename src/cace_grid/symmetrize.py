@@ -232,9 +232,8 @@ class CartesianBFeatures(nn.Module):
             coefficients = getattr(self, "coefficients_{}".format(nu))
             output_indices = getattr(self, "output_indices_{}".format(nu))
 
-            # Explicit multiplication avoids torch.prod/cumprod, whose higher
-            # derivatives have caused problems on MPS in the reference CACE
-            # implementation. The term axis replaces the monomial axis.
+            # Explicit multiplication keeps higher derivatives reliable on
+            # MPS. The term axis replaces the monomial axis.
             products = A.index_select(-2, product_indices[:, 0])
             for factor in range(1, nu):
                 products = products * A.index_select(

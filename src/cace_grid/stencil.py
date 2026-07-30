@@ -1,8 +1,4 @@
-"""Periodic-neighborhood helper for regular density grids.
-
-This module plays the same role as ``cace.data.neighborhood``: it contains the
-geometry operation used by the data class, while storing no dataset state.
-"""
+"""Geometry helpers for periodic neighborhoods on regular density grids."""
 
 from itertools import product
 from numbers import Integral

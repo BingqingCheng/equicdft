@@ -1,11 +1,32 @@
 # cace_grid
 
-`cace_grid` develops Cartesian atomic-cluster-expansion models for classical
+`cace_grid` develops Cartesian symmetry-adapted models for classical
 density-functional theory on periodic three-dimensional grids.
 
-The initial data interface follows CACE's `AtomicData` pattern. One `GridData`
-object represents one complete density configuration and contains the grid
-fields together with a periodic local-density environment for every grid point.
+One `GridData` object represents one complete density configuration and
+contains the grid fields together with periodic neighborhood indices for every
+grid point.
+
+Compute one mean density per frame before constructing the model:
+
+```bash
+python scripts/mean_density.py density.extxyz
+```
+
+The script prints a JSON list. Select the training-frame entries and average
+them to obtain the scalar `mean_density` used below.
+
+The same calculation can be called from a training script:
+
+```python
+from scripts.mean_density import compute_mean_densities
+
+frame_mean_densities = compute_mean_densities(
+    "density.extxyz",
+    index="0:50",  # training frames only
+)
+mean_density = sum(frame_mean_densities) / len(frame_mean_densities)
+```
 
 ```python
 from cace_grid import (
@@ -14,13 +35,14 @@ from cace_grid import (
     GridData,
     LocalFreeEnergyReadout,
     compute_c1,
-    compute_rms_feature_scale,
 )
 
 dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
 data = dataset[0]
+mean_density = 0.7  # precomputed from the training frames
 
 a_features = CartesianAFeatures(
+    mean_density=mean_density,
     cutoff_grid=3,
     max_power=4,
     n_alphas=4,
@@ -37,8 +59,6 @@ B = b_features(A)
 readout = LocalFreeEnergyReadout(
     n_features=B.shape[-3] * B.shape[-2] * B.shape[-1],
     n_types=data["n_types"].item(),
-    # In fitting, compute this once from all B tensors in the training split.
-    feature_scale=compute_rms_feature_scale(B.detach()),
 )
 free_energy = readout(B, data)
 c1 = compute_c1(

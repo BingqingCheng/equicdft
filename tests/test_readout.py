@@ -8,7 +8,6 @@ from cace_grid import (
     CartesianBFeatures,
     LocalFreeEnergyReadout,
     compute_c1,
-    compute_rms_feature_scale,
     get_neighbor_indices,
 )
 
@@ -34,18 +33,17 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         }
 
         A = CartesianAFeatures(
+            mean_density=0.5,
             cutoff_grid=1,
             max_power=2,
             n_alphas=1,
         )(data)
         B_module = CartesianBFeatures(max_power=2, max_nu=3)
         B = B_module(A)
-        feature_scale = compute_rms_feature_scale(B)
         readout = LocalFreeEnergyReadout(
             n_features=B.shape[-3] * B.shape[-2] * B.shape[-1],
             n_types=1,
             hidden_sizes=(16, 8),
-            feature_scale=feature_scale,
         )
         return data, A, B, readout, readout(B, data)
 
@@ -95,19 +93,11 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         )
         self.assertEqual(output["beta_F_exc"].shape, (2,))
 
-    def test_fixed_rms_feature_scaling(self):
-        B_training = torch.arange(1.0, 25.0).reshape(2, 3, 1, 2, 2)
-        B_flat = B_training.flatten(start_dim=-3)
-        expected_scale = torch.sqrt(torch.mean(B_flat.square(), dim=(0, 1)))
-        scale = compute_rms_feature_scale(B_training)
-        self.assertTrue(torch.allclose(scale, expected_scale))
-        self.assertFalse(scale.requires_grad)
-
+    def test_readout_uses_B_features_directly(self):
         readout = LocalFreeEnergyReadout(
             n_features=2,
             n_types=1,
             hidden_sizes=(),
-            feature_scale=torch.tensor([2.0, 4.0]),
         )
         with torch.no_grad():
             readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
@@ -121,9 +111,9 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         output = readout(B, data)
         self.assertEqual(
             output["beta_free_energy_per_particle"].item(),
-            2.0,
+            6.0,
         )
-        self.assertEqual(output["beta_F_exc"].item(), 2.0)
+        self.assertEqual(output["beta_F_exc"].item(), 6.0)
 
     def test_full_autograd_and_finite_difference(self):
         torch.manual_seed(7)
@@ -165,6 +155,7 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
             perturbed_data = dict(data)
             perturbed_data["rho"] = perturbed_rho
             perturbed_A = CartesianAFeatures(
+                mean_density=0.5,
                 cutoff_grid=1,
                 max_power=2,
                 n_alphas=1,

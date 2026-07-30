@@ -154,6 +154,7 @@ class TestGridData(unittest.TestCase):
         # rho tensor, so its complete overlapping dependence is differentiable.
         batch["rho"].requires_grad_(True)
         features = CartesianAFeatures(
+            mean_density=1.0,
             cutoff_grid=1,
             max_power=0,
             n_alphas=1,

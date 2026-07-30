@@ -10,6 +10,7 @@ from cace_grid import AChannelMixing, CartesianAFeatures, CartesianBFeatures
 class TestCartesianAFeatures(unittest.TestCase):
     def test_fixed_monomials_and_density_contraction(self):
         module = CartesianAFeatures(
+            mean_density=2.0,
             cutoff_grid=1,
             max_power=2,
             n_alphas=4,
@@ -37,12 +38,13 @@ class TestCartesianAFeatures(unittest.TestCase):
             torch.allclose(
                 module.alphas,
                 torch.tensor(
-                    [0.25, 0.5, 1.0, 2.0],
+                    [0.5, 1.0, 2.0, 4.0],
                     dtype=module.alphas.dtype,
                 ),
             )
         )
         self.assertNotIsInstance(module.log_alphas, nn.Parameter)
+        self.assertEqual(module.mean_density.item(), 2.0)
         self.assertTrue(
             torch.equal(
                 module.monomial_values[0],
@@ -63,18 +65,14 @@ class TestCartesianAFeatures(unittest.TestCase):
             {
                 "rho": rho,
                 "local_density_index": local_density_index,
-                "grid_spacing": torch.tensor(
-                    [0.5, 0.5, 0.5],
-                    dtype=rho.dtype,
-                ),
             }
         )
 
         self.assertEqual(features.shape, (7, 4, 10, 1))
         for radial_index, alpha in enumerate(module.alphas.tolist()):
             radial_weight = math.exp(-alpha)
-            expected_scalar = 0.125 * (1.0 + 27.0 * radial_weight)
-            expected_vector = -0.125 * radial_weight
+            expected_scalar = (1.0 + 27.0 * radial_weight) / 2.0
+            expected_vector = -radial_weight / 2.0
             self.assertAlmostEqual(
                 features[0, radial_index, 0, 0].item(),
                 expected_scalar,
@@ -98,6 +96,7 @@ class TestCartesianAFeatures(unittest.TestCase):
 
     def test_batched_data(self):
         module = CartesianAFeatures(
+            mean_density=2.0,
             cutoff_grid=0,
             max_power=0,
             n_alphas=3,
@@ -111,10 +110,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             {
                 "rho": rho,
                 "local_density_index": local_density_index,
-                "grid_spacing": torch.tensor(
-                    [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]],
-                    dtype=rho.dtype,
-                ),
             }
         )
 
@@ -123,14 +118,67 @@ class TestCartesianAFeatures(unittest.TestCase):
             torch.allclose(
                 features[:, 0, :, 0, 0],
                 torch.tensor(
-                    [[0.25, 0.25, 0.25], [3.0, 3.0, 3.0]],
+                    [[1.0, 1.0, 1.0], [1.5, 1.5, 1.5]],
                     dtype=features.dtype,
                 ),
             )
         )
 
+    def test_raw_gaussians_and_raw_integer_monomials(self):
+        module = CartesianAFeatures(
+            mean_density=2.0,
+            cutoff_grid=2,
+            max_power=2,
+            n_alphas=2,
+        )
+
+        position_lookup = {
+            tuple(position): index
+            for index, position in enumerate(
+                module.local_density_positions.tolist()
+            )
+        }
+        plus_two_z = position_lookup[(0, 0, 2)]
+        self.assertEqual(module.monomial_values[plus_two_z, 3].item(), 2.0)
+        self.assertEqual(module.monomial_values[plus_two_z, 9].item(), 4.0)
+
+        n_neighbors = module.local_density_positions.shape[0]
+        rho = torch.full(
+            (n_neighbors, 1),
+            2.0,
+            dtype=module.monomial_values.dtype,
+        )
+        local_density_index = torch.arange(n_neighbors).repeat(
+            n_neighbors,
+            1,
+        )
+        features = module(
+            {
+                "rho": rho,
+                "local_density_index": local_density_index,
+            }
+        )
+        # For a uniform field equal to mean_density, A_000 is the unnormalized
+        # discrete mass of its Gaussian channel.
+        expected_mass = torch.exp(
+            -module.squared_distances[:, None] * module.alphas[None, :]
+        ).sum(dim=0)
+        self.assertTrue(
+            torch.allclose(
+                features[:, :, 0, 0],
+                expected_mass.expand(n_neighbors, -1),
+            )
+        )
+
+    def test_mean_density_must_be_positive_scalar(self):
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(max_power=0, mean_density=0.0)
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(max_power=0, mean_density=[1.0, 2.0])
+
     def test_trainable_alphas_receive_gradients(self):
         module = CartesianAFeatures(
+            mean_density=1.0,
             cutoff_grid=1,
             max_power=1,
             n_alphas=2,
@@ -148,7 +196,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             {
                 "rho": rho,
                 "local_density_index": local_density_index,
-                "grid_spacing": torch.ones(3, dtype=rho.dtype),
             }
         )
         features.sum().backward()

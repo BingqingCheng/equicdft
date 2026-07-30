@@ -1,9 +1,8 @@
-"""CACE models for periodic density grids."""
+"""Neural density-functional models for periodic Cartesian grids."""
 
 from .data import GridData, default_data_key
 from .derivatives import compute_c1
 from .features import AChannelMixing, CartesianAFeatures
-from .normalization import compute_rms_feature_scale
 from .readout import LocalFreeEnergyReadout
 from .stencil import (
     coarsen_grid,
@@ -20,7 +19,6 @@ __all__ = [
     "LocalFreeEnergyReadout",
     "coarsen_grid",
     "compute_c1",
-    "compute_rms_feature_scale",
     "default_data_key",
     "get_neighbor_indices",
     "make_stencil",
