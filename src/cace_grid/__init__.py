@@ -2,7 +2,8 @@
 
 from .data import GridData, default_data_key
 from .derivatives import compute_c1
-from .features import AChannelMixing, CartesianAFeatures
+from .features import CartesianAFeatures
+from .model import GridCACEModel
 from .readout import LocalFreeEnergyReadout
 from .stencil import (
     coarsen_grid,
@@ -12,10 +13,10 @@ from .stencil import (
 from .symmetrize import CartesianBFeatures
 
 __all__ = [
-    "AChannelMixing",
     "CartesianAFeatures",
     "CartesianBFeatures",
     "GridData",
+    "GridCACEModel",
     "LocalFreeEnergyReadout",
     "coarsen_grid",
     "compute_c1",

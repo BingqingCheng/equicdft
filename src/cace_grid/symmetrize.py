@@ -81,7 +81,7 @@ def _signed_orbit(
 
 def _make_product_recipes(
     n_components: int,
-    max_nu: int,
+    max_product_order: int,
     component_indices: torch.Tensor,
     component_signs: torch.Tensor,
 ) -> Dict[int, Dict[str, torch.Tensor]]:
@@ -91,7 +91,7 @@ def _make_product_recipes(
     sign_maps = component_signs.to(dtype=torch.long).tolist()
     recipes: Dict[int, Dict[str, torch.Tensor]] = {}
 
-    for nu in range(1, max_nu + 1):
+    for nu in range(1, max_product_order + 1):
         unseen = set(combinations_with_replacement(range(n_components), nu))
         product_indices: List[Tuple[int, ...]] = []
         coefficients: List[float] = []
@@ -138,7 +138,7 @@ class CartesianBFeatures(nn.Module):
     max_power
         Maximum total Cartesian power used by the corresponding
         :class:`cace_grid.features.CartesianAFeatures` module.
-    max_nu
+    max_product_order
         Maximum correlation order, meaning the largest number of ``A``
         factors in one invariant product. Only values one through three are
         currently supported.
@@ -149,31 +149,36 @@ class CartesianBFeatures(nn.Module):
     radial channels and density/type channels remain separate, so input and
     output shapes are
 
-    ``A: [..., n_grid, n_alphas, n_monomials, n_types]``
+    ``A: [..., n_grid, n_radial_channels, n_monomials, n_channels]``
 
-    ``B: [..., n_grid, n_alphas, n_B, n_types]``.
+    ``B: [..., n_grid, n_radial_channels, n_B, n_channels]``.
     """
 
-    def __init__(self, max_power: int, max_nu: int = 3) -> None:
+    def __init__(self, max_power: int, max_product_order: int = 3) -> None:
         super().__init__()
 
-        if isinstance(max_nu, bool) or not isinstance(max_nu, Integral):
-            raise TypeError("max_nu must be an integer between one and three")
-        max_nu = int(max_nu)
-        if max_nu < 1 or max_nu > 3:
-            raise ValueError("max_nu must be between one and three")
+        if isinstance(max_product_order, bool) or not isinstance(
+            max_product_order,
+            Integral,
+        ):
+            raise TypeError(
+                "max_product_order must be an integer between one and three"
+            )
+        max_product_order = int(max_product_order)
+        if max_product_order < 1 or max_product_order > 3:
+            raise ValueError("max_product_order must be between one and three")
 
         powers = _make_powers(max_power)
         component_indices, component_signs = _make_group_actions(powers)
         recipes = _make_product_recipes(
             n_components=powers.shape[0],
-            max_nu=max_nu,
+            max_product_order=max_product_order,
             component_indices=component_indices,
             component_signs=component_signs,
         )
 
         self.max_power = int(max_power)
-        self.max_nu = max_nu
+        self.max_product_order = max_product_order
         self.n_components = powers.shape[0]
         self.register_buffer("powers", powers)
         self.register_buffer("component_indices", component_indices)
@@ -181,7 +186,7 @@ class CartesianBFeatures(nn.Module):
 
         n_features_by_order = []
         correlation_orders = []
-        for nu in range(1, max_nu + 1):
+        for nu in range(1, max_product_order + 1):
             recipe = recipes[nu]
             self.register_buffer(
                 "product_indices_{}".format(nu),
@@ -212,12 +217,12 @@ class CartesianBFeatures(nn.Module):
         )
 
     def forward(self, A: torch.Tensor) -> torch.Tensor:
-        """Return signed-orbit averages of ``A`` through ``max_nu``."""
+        """Return signed-orbit averages through ``max_product_order``."""
 
         if A.ndim < 4:
             raise ValueError(
                 "A must have shape "
-                "[..., n_grid, n_alphas, n_monomials, n_types]"
+                "[..., n_grid, n_radial_channels, n_monomials, n_channels]"
             )
         if A.shape[-2] != self.n_components:
             raise ValueError(

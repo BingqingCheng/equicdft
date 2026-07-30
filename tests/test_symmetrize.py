@@ -7,7 +7,7 @@ from cace_grid import CartesianBFeatures
 
 class TestCartesianBFeatures(unittest.TestCase):
     def test_feature_counts_and_shape(self):
-        module = CartesianBFeatures(max_power=2, max_nu=3)
+        module = CartesianBFeatures(max_power=2, max_product_order=3)
         A = torch.randn(2, 3, 4, 10, 2)
         B = module(A)
 
@@ -22,7 +22,7 @@ class TestCartesianBFeatures(unittest.TestCase):
         )
 
     def test_first_order_scalar_features(self):
-        module = CartesianBFeatures(max_power=2, max_nu=1)
+        module = CartesianBFeatures(max_power=2, max_product_order=1)
         A = torch.arange(10, dtype=torch.get_default_dtype()).reshape(
             1, 1, 1, 10, 1
         )
@@ -50,7 +50,7 @@ class TestCartesianBFeatures(unittest.TestCase):
         )
 
     def test_invariant_under_all_signed_axis_permutations(self):
-        module = CartesianBFeatures(max_power=2, max_nu=3)
+        module = CartesianBFeatures(max_power=2, max_product_order=3)
         A = torch.randn(2, 3, 10, 2)
         reference = module(A)
 
@@ -66,7 +66,7 @@ class TestCartesianBFeatures(unittest.TestCase):
             )
 
     def test_gradients_and_maximum_order(self):
-        module = CartesianBFeatures(max_power=2, max_nu=3)
+        module = CartesianBFeatures(max_power=2, max_product_order=3)
         A = torch.randn(1, 2, 10, 1, requires_grad=True)
         loss = module(A).square().sum()
         loss.backward()
@@ -74,7 +74,7 @@ class TestCartesianBFeatures(unittest.TestCase):
         self.assertIsNotNone(A.grad)
         self.assertTrue(torch.all(torch.isfinite(A.grad)))
         with self.assertRaises(ValueError):
-            CartesianBFeatures(max_power=2, max_nu=4)
+            CartesianBFeatures(max_power=2, max_product_order=4)
 
 
 if __name__ == "__main__":

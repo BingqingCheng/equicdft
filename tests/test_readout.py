@@ -36,84 +36,39 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
             mean_density=0.5,
             cutoff_grid=1,
             max_power=2,
-            n_alphas=1,
+            n_radial_channels=1,
         )(data)
-        B_module = CartesianBFeatures(max_power=2, max_nu=3)
+        B_module = CartesianBFeatures(max_power=2, max_product_order=3)
         B = B_module(A)
         readout = LocalFreeEnergyReadout(
-            n_features=B.shape[-3] * B.shape[-2] * B.shape[-1],
             n_types=1,
             hidden_sizes=(16, 8),
         )
-        return data, A, B, readout, readout(B, data)
-
-    def test_empty_density_has_zero_free_energy(self):
-        rho = torch.zeros(
-            64,
-            1,
-            dtype=torch.get_default_dtype(),
-            requires_grad=True,
-        )
-        data, _, _, _, output = self._full_pipeline(rho)
-
-        self.assertTrue(
-            torch.all(torch.isfinite(output["beta_free_energy_per_particle"]))
-        )
-        self.assertTrue(
-            torch.equal(
-                output["beta_free_energy_density"],
-                torch.zeros_like(output["beta_free_energy_density"]),
-            )
-        )
-        self.assertEqual(output["beta_F_exc"].item(), 0.0)
+        return data, A, B, readout, readout(B)
 
     def test_batched_shapes(self):
         B = torch.randn(2, 5, 1, 23, 1)
-        rho = torch.rand(2, 5, 1)
-        data = {
-            "rho": rho,
-            "grid_spacing": torch.tensor(
-                [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]],
-                dtype=rho.dtype,
-            ),
-        }
         readout = LocalFreeEnergyReadout(
-            n_features=23,
             n_types=1,
         )
-        output = readout(B, data)
+        output = readout(B)
 
-        self.assertEqual(
-            output["beta_free_energy_per_particle"].shape,
-            (2, 5, 1),
-        )
-        self.assertEqual(
-            output["beta_free_energy_density"].shape,
-            (2, 5),
-        )
-        self.assertEqual(output["beta_F_exc"].shape, (2,))
+        self.assertEqual(output.shape, (2, 5, 1))
+        self.assertEqual(readout.mlp[0].in_features, 23)
 
     def test_readout_uses_B_features_directly(self):
         readout = LocalFreeEnergyReadout(
-            n_features=2,
             n_types=1,
             hidden_sizes=(),
+            n_features=2,
         )
+        B = torch.tensor([[[[2.0], [4.0]]]])
         with torch.no_grad():
             readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
             readout.mlp[0].bias.zero_()
 
-        B = torch.tensor([[[[2.0], [4.0]]]])
-        data = {
-            "rho": torch.ones(1, 1),
-            "grid_spacing": torch.ones(3),
-        }
-        output = readout(B, data)
-        self.assertEqual(
-            output["beta_free_energy_per_particle"].item(),
-            6.0,
-        )
-        self.assertEqual(output["beta_F_exc"].item(), 6.0)
+        output = readout(B)
+        self.assertEqual(output.item(), 6.0)
 
     def test_full_autograd_and_finite_difference(self):
         torch.manual_seed(7)
@@ -124,19 +79,28 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
             dtype=torch.get_default_dtype(),
         ).reshape(64, 1)
         rho.requires_grad_(True)
-        data, A, B, readout, output = self._full_pipeline(rho)
+        data, A, B, readout, beta_free_energy_per_particle = (
+            self._full_pipeline(rho)
+        )
+        beta_free_energy_density = torch.sum(
+            rho * beta_free_energy_per_particle,
+            dim=-1,
+        )
+        beta_F_exc = torch.prod(data["grid_spacing"]) * torch.sum(
+            beta_free_energy_density
+        )
 
         self.assertEqual(A.shape, (64, 1, 10, 1))
         self.assertEqual(B.shape, (64, 1, 23, 1))
         self.assertEqual(
-            output["beta_free_energy_per_particle"].shape,
+            beta_free_energy_per_particle.shape,
             (64, 1),
         )
-        self.assertEqual(output["beta_free_energy_density"].shape, (64,))
-        self.assertEqual(output["beta_F_exc"].shape, ())
+        self.assertEqual(beta_free_energy_density.shape, (64,))
+        self.assertEqual(beta_F_exc.shape, ())
 
         c1 = compute_c1(
-            output["beta_F_exc"],
+            beta_F_exc,
             rho,
             data["grid_spacing"],
             create_graph=True,
@@ -158,13 +122,17 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
                 mean_density=0.5,
                 cutoff_grid=1,
                 max_power=2,
-                n_alphas=1,
+                n_radial_channels=1,
             )(perturbed_data)
             perturbed_B = CartesianBFeatures(
                 max_power=2,
-                max_nu=3,
+                max_product_order=3,
             )(perturbed_A)
-            return readout(perturbed_B, perturbed_data)["beta_F_exc"]
+            per_particle = readout(perturbed_B)
+            density = torch.sum(perturbed_rho * per_particle, dim=-1)
+            return torch.prod(perturbed_data["grid_spacing"]) * torch.sum(
+                density
+            )
 
         rho_plus = rho.detach().clone()
         rho_minus = rho.detach().clone()

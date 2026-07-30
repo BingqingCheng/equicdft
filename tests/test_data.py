@@ -157,7 +157,7 @@ class TestGridData(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=1,
             max_power=0,
-            n_alphas=1,
+            n_radial_channels=1,
         )(batch)
         # Differentiate only the scalar environment centered at grid point 0.
         # Its gradient must reach all seven stencil densities and no others.

@@ -1,89 +1,91 @@
 """Local excess-free-energy readout."""
 
-from typing import Dict, Mapping, Sequence
+from numbers import Integral
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
 
 
 class LocalFreeEnergyReadout(nn.Module):
-    """Predict local excess free energies and integrate them over the grid.
+    """Predict a local excess free energy per particle and component.
 
     A shared MLP maps the invariant ``B`` features at grid point
     ``g`` to one dimensionless excess free energy per particle and component,
 
     ``beta_a_exc[g, i] = MLP(B[g])[i]``.
 
-    The density supplies the grid-point weight,
-
-    ``beta_f_exc[g] = sum_i rho[g, i] * beta_a_exc[g, i]``,
-
-    and the grid quadrature gives
-
-    ``beta_F_exc = cell_volume * sum_g beta_f_exc[g]``.
-
-    Thus an empty grid has zero excess free energy without imposing a separate
-    constraint on the MLP output at ``B = 0``.
+    Density weighting, grid integration, and functional differentiation are
+    handled by :class:`cace_grid.model.GridCACEModel`.
 
     Parameters
     ----------
     n_features
-        Flattened size of the radial, invariant, and channel axes of ``B``.
+        Flattened input width of ``B``. If supplied, the first layer is a
+        regular ``Linear`` module. If ``None``, a ``LazyLinear`` module infers
+        this width from the first forward pass.
     n_types
         Number of physical density components and per-particle outputs.
     hidden_sizes
         Width of each hidden layer. An empty sequence gives a linear readout.
     Notes
     -----
+    When ``n_features`` is ``None``, materialize the lazy input layer with one
+    representative batch before constructing an optimizer or saving its
+    initial state.
+
     Smooth SiLU activations keep higher functional derivatives well defined.
     """
 
     def __init__(
         self,
-        n_features: int,
         n_types: int = 1,
         hidden_sizes: Sequence[int] = (32, 16),
+        n_features: Optional[int] = None,
     ) -> None:
         super().__init__()
+
+        if n_features is not None:
+            if isinstance(n_features, bool) or not isinstance(
+                n_features,
+                Integral,
+            ):
+                raise TypeError("n_features must be a positive integer or None")
+            n_features = int(n_features)
+            if n_features < 1:
+                raise ValueError("n_features must be a positive integer or None")
 
         self.n_features = n_features
         self.n_types = n_types
 
         layers = []
-        n_in = n_features
-        for n_hidden in hidden_sizes:
-            layers.extend((nn.Linear(n_in, n_hidden), nn.SiLU()))
-            n_in = n_hidden
-        layers.append(nn.Linear(n_in, n_types))
+        for layer_index, n_hidden in enumerate(hidden_sizes):
+            if layer_index == 0:
+                linear = (
+                    nn.LazyLinear(n_hidden)
+                    if n_features is None
+                    else nn.Linear(n_features, n_hidden)
+                )
+            else:
+                linear = nn.Linear(hidden_sizes[layer_index - 1], n_hidden)
+            layers.extend((linear, nn.SiLU()))
+        if hidden_sizes:
+            layers.append(nn.Linear(hidden_sizes[-1], n_types))
+        else:
+            layers.append(
+                nn.LazyLinear(n_types)
+                if n_features is None
+                else nn.Linear(n_features, n_types)
+            )
         self.mlp = nn.Sequential(*layers)
 
     def forward(
         self,
         B: torch.Tensor,
-        data: Mapping[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """Return local per-particle, density, and integrated free energies."""
+    ) -> torch.Tensor:
+        """Return ``beta_a_exc`` with shape ``[..., n_grid, n_types]``."""
 
+        # Flatten the radial, invariant, and input-channel dimensions while
+        # retaining every leading configuration dimension and the grid axis.
         B_flat = B.flatten(start_dim=-3)
-        rho = data["rho"]
-        beta_free_energy_per_particle = self.mlp(B_flat)
-
-        beta_free_energy_density = torch.sum(
-            rho * beta_free_energy_per_particle,
-            dim=-1,
-        )
-
-        cell_volume = torch.prod(
-            data["grid_spacing"],
-            dim=-1,
-        )
-        beta_F_exc = cell_volume * torch.sum(
-            beta_free_energy_density,
-            dim=-1,
-        )
-
-        return {
-            "beta_free_energy_per_particle": beta_free_energy_per_particle,
-            "beta_free_energy_density": beta_free_energy_density,
-            "beta_F_exc": beta_F_exc,
-        }
+        return self.mlp(B_flat)

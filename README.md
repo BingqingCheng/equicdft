@@ -32,69 +32,59 @@ mean_density = sum(frame_mean_densities) / len(frame_mean_densities)
 from cace_grid import (
     CartesianAFeatures,
     CartesianBFeatures,
+    GridCACEModel,
     GridData,
     LocalFreeEnergyReadout,
-    compute_c1,
 )
 
 dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
 data = dataset[0]
+n_types = int(data["n_types"].item())
 mean_density = 0.7  # precomputed from the training frames
 
 a_features = CartesianAFeatures(
     mean_density=mean_density,
     cutoff_grid=3,
     max_power=4,
-    n_alphas=4,
-    trainable_alphas=False,
+    n_radial_channels=4,
+    trainable_radial_exponents=False,
+    n_types=n_types,
 )
-A = a_features(data)
-b_features = CartesianBFeatures(max_power=4, max_nu=3)
-B = b_features(A)
-
-data["rho"].requires_grad_(True)
-# Recompute after enabling rho derivatives so the complete graph is retained.
-A = a_features(data)
-B = b_features(A)
+b_features = CartesianBFeatures(max_power=4, max_product_order=3)
 readout = LocalFreeEnergyReadout(
-    n_features=B.shape[-3] * B.shape[-2] * B.shape[-1],
-    n_types=data["n_types"].item(),
+    n_types=n_types,
 )
-free_energy = readout(B, data)
-c1 = compute_c1(
-    free_energy["beta_F_exc"],
-    data["rho"],
-    data["grid_spacing"],
+model = GridCACEModel(
+    a_features=a_features,
+    b_features=b_features,
+    readout=readout,
+    compute_c1=True,
 )
 
-print(data["rho"].shape)
-print(data["local_density_index"].shape)
-print(data["local_density_positions"].shape)
-print(A.shape)
-print(B.shape)
-print(free_energy["beta_free_energy_per_particle"].shape)
-print(free_energy["beta_F_exc"].shape)
-print(c1.shape)
+outputs = model(data)
+beta_F_exc = outputs["beta_F_exc"]
+c1 = outputs["c1"]
 ```
 
 For a multicomponent density field, an optional learned, bias-free channel map
 can mix the physical component channels of `A` before symmetrization:
 
 ```python
-from cace_grid import AChannelMixing
-
-channel_mixing = AChannelMixing(
-    n_types=data["n_types"].item(),
+a_features = CartesianAFeatures(
+    mean_density=mean_density,
+    cutoff_grid=3,
+    max_power=4,
+    n_radial_channels=4,
+    n_types=n_types,
     n_channels=4,
 )
-A_mixed = channel_mixing(A)
-B = b_features(A_mixed)
 ```
 
-The same mixing matrix is shared over grid points, radial channels, and
-Cartesian components, so it commutes with cubic rotations and reflections.
-The nonlinear products in `B` then contain cross-component correlations. For a
-one-component system, pass `A` directly to `CartesianBFeatures` as above.
+`CartesianAFeatures` applies the same mixing matrix over all grid points,
+radial channels, and Cartesian components, so it commutes with cubic rotations
+and reflections. The nonlinear products in `B` then contain cross-component
+correlations. For a one-component field, leave `n_channels=None`; no mixing
+module or mixing parameters are created.
 
 A fine regular grid can be block-averaged in memory before its local
 environments are constructed:

@@ -6,7 +6,7 @@ kernel normalization.
 """
 
 from numbers import Integral
-from typing import Mapping, Union
+from typing import Mapping, Optional, Union
 
 import torch
 from torch import nn
@@ -97,14 +97,20 @@ class CartesianAFeatures(nn.Module):
         three, matching :class:`cace_grid.data.GridData`.
     max_power
         Maximum total Cartesian power ``a + b + c``.
-    n_alphas
+    n_radial_channels
         Number of Gaussian radial channels. Their positive initial decay
         coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
         squared grid units.
-    trainable_alphas
+    trainable_radial_exponents
         If ``True``, optimize the Gaussian decay coefficients. They are stored
         in logarithmic form so that the resulting ``alpha`` values stay
         positive. If ``False``, they remain fixed model buffers.
+    n_types
+        Number of physical density components in the input field.
+    n_channels
+        Number of latent output channels after learned component mixing.
+        ``None`` retains the physical component channels. Mixing is available
+        only when ``n_types`` is greater than one.
     mean_density
         Positive scalar used for scale-only density normalization. For fitting,
         set this to the precomputed mean density of the training split. It is
@@ -123,18 +129,42 @@ class CartesianAFeatures(nn.Module):
         max_power: int,
         mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
-        n_alphas: int = 4,
-        trainable_alphas: bool = False,
+        n_radial_channels: int = 4,
+        trainable_radial_exponents: bool = False,
+        n_types: int = 1,
+        n_channels: Optional[int] = None,
     ) -> None:
         super().__init__()
 
-        if isinstance(n_alphas, bool) or not isinstance(n_alphas, Integral):
-            raise TypeError("n_alphas must be a positive integer")
-        n_alphas = int(n_alphas)
-        if n_alphas < 1:
-            raise ValueError("n_alphas must be a positive integer")
-        if not isinstance(trainable_alphas, bool):
-            raise TypeError("trainable_alphas must be a boolean")
+        if isinstance(n_radial_channels, bool) or not isinstance(
+            n_radial_channels,
+            Integral,
+        ):
+            raise TypeError("n_radial_channels must be a positive integer")
+        n_radial_channels = int(n_radial_channels)
+        if n_radial_channels < 1:
+            raise ValueError("n_radial_channels must be a positive integer")
+        if not isinstance(trainable_radial_exponents, bool):
+            raise TypeError("trainable_radial_exponents must be a boolean")
+        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
+            raise TypeError("n_types must be a positive integer")
+        n_types = int(n_types)
+        if n_types < 1:
+            raise ValueError("n_types must be a positive integer")
+
+        if n_channels is not None:
+            if isinstance(n_channels, bool) or not isinstance(
+                n_channels,
+                Integral,
+            ):
+                raise TypeError("n_channels must be a positive integer or None")
+            n_channels = int(n_channels)
+            if n_channels < 1:
+                raise ValueError("n_channels must be a positive integer or None")
+            if n_types == 1:
+                raise ValueError(
+                    "channel mixing is disabled for one-component density fields"
+                )
 
         mean_density_tensor = torch.as_tensor(
             mean_density,
@@ -169,23 +199,37 @@ class CartesianAFeatures(nn.Module):
 
         # Gaussian channel n uses the radial weight
         # R_n(q) = exp(-alpha_n * |q|**2).
-        # For n_alphas=4, the alpha values are [0.5, 1.0, 2.0, 4.0].
-        initial_alphas = 2.0 ** torch.linspace(
+        # For four radial channels, the alpha values are [0.5, 1, 2, 4].
+        initial_radial_exponents = 2.0 ** torch.linspace(
             -1.0,
             2.0,
-            steps=n_alphas,
+            steps=n_radial_channels,
             dtype=torch.get_default_dtype(),
         )
-        log_alphas = torch.log(initial_alphas)
-        if trainable_alphas:
-            self.log_alphas = nn.Parameter(log_alphas)
+        log_radial_exponents = torch.log(initial_radial_exponents)
+        if trainable_radial_exponents:
+            self.log_radial_exponents = nn.Parameter(log_radial_exponents)
         else:
-            self.register_buffer("log_alphas", log_alphas)
+            self.register_buffer(
+                "log_radial_exponents",
+                log_radial_exponents,
+            )
 
         self.cutoff_grid = int(cutoff_grid)
         self.max_power = int(max_power)
-        self.n_alphas = n_alphas
-        self.trainable_alphas = trainable_alphas
+        self.n_radial_channels = n_radial_channels
+        self.trainable_radial_exponents = trainable_radial_exponents
+        self.n_types = n_types
+        self.n_channels = n_channels
+        self.n_output_channels = n_types if n_channels is None else n_channels
+        self.channel_mixing = (
+            None
+            if n_channels is None
+            else _AChannelMixing(
+                n_types=n_types,
+                n_channels=n_channels,
+            )
+        )
         self.register_buffer("local_density_positions", local_density_positions)
         self.register_buffer("squared_distances", squared_distances)
         self.register_buffer("powers", powers)
@@ -193,10 +237,10 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("mean_density", mean_density_tensor)
 
     @property
-    def alphas(self) -> torch.Tensor:
+    def radial_exponents(self) -> torch.Tensor:
         """Positive Gaussian decay coefficients in inverse grid units squared."""
 
-        return torch.exp(self.log_alphas)
+        return torch.exp(self.log_radial_exponents)
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
@@ -217,13 +261,22 @@ class CartesianAFeatures(nn.Module):
         -------
         torch.Tensor
             ``A`` with shape
-            ``[..., n_grid, n_alphas, n_monomials, n_types]``.
+            ``[..., n_grid, n_radial_channels, n_monomials, n_output_channels]``.
+            The final dimension equals ``n_types`` when mixing is disabled and
+            ``n_channels`` when mixing is enabled.
         """
 
         local_density = _gather_local_density(
             data["rho"],
             data["local_density_index"],
         )
+        if local_density.shape[-1] != self.n_types:
+            raise ValueError(
+                "rho has {} type channels but CartesianAFeatures expects {}".format(
+                    local_density.shape[-1],
+                    self.n_types,
+                )
+            )
         if local_density.shape[-2] != self.monomial_values.shape[0]:
             raise ValueError(
                 "local_density neighbor count does not match cutoff_grid={}".format(
@@ -235,7 +288,8 @@ class CartesianAFeatures(nn.Module):
         # alpha values may be trainable. Distances themselves are fixed model
         # geometry and are therefore stored once as a buffer.
         radial_values = torch.exp(
-            -self.squared_distances[:, None] * self.alphas[None, :]
+            -self.squared_distances[:, None]
+            * self.radial_exponents[None, :]
         )
         basis_values = (
             radial_values[:, :, None] * self.monomial_values[:, None, :]
@@ -249,11 +303,13 @@ class CartesianAFeatures(nn.Module):
             local_density / self.mean_density,
             basis_values,
         )
+        if self.channel_mixing is not None:
+            features = self.channel_mixing(features)
         return features
 
 
-class AChannelMixing(nn.Module):
-    """Mix physical component channels of ``A`` into latent channels.
+class _AChannelMixing(nn.Module):
+    """Internal learned map from physical A channels to latent channels.
 
     For each grid point, radial channel, and Cartesian component, this module
     applies the same learned linear map
@@ -266,19 +322,11 @@ class AChannelMixing(nn.Module):
     component axis. Consequently, ``A_mixed`` can be passed directly to
     :class:`cace_grid.symmetrize.CartesianBFeatures`.
 
-    Parameters
-    ----------
-    n_types
-        Number of physical density/component channels in ``A``.
-    n_channels
-        Number of latent channels produced by the learned mixing matrix.
-
     Notes
     -----
     The map intentionally has no additive bias. A constant bias applied to
     odd Cartesian components would not transform equivariantly under axis
-    reflections. For a one-component system this module is optional; the
-    original ``A`` tensor can be symmetrized directly.
+    reflections.
     """
 
     def __init__(self, n_types: int, n_channels: int) -> None:
@@ -310,7 +358,7 @@ class AChannelMixing(nn.Module):
         if A.ndim < 4:
             raise ValueError(
                 "A must have shape "
-                "[..., n_grid, n_alphas, n_monomials, n_types]"
+                "[..., n_grid, n_radial_channels, n_monomials, n_types]"
             )
         if A.shape[-1] != self.n_types:
             raise ValueError(
