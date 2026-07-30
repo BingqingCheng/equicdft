@@ -53,22 +53,24 @@ class TestCartesianAFeatures(unittest.TestCase):
             )
         )
 
-        local_density = torch.arange(
+        rho = torch.arange(
             1,
             8,
             dtype=module.monomial_values.dtype,
-        ).reshape(1, 7, 1)
+        ).reshape(7, 1)
+        local_density_index = torch.arange(7).repeat(7, 1)
         features = module(
             {
-                "local_density": local_density,
+                "rho": rho,
+                "local_density_index": local_density_index,
                 "grid_spacing": torch.tensor(
                     [0.5, 0.5, 0.5],
-                    dtype=local_density.dtype,
+                    dtype=rho.dtype,
                 ),
             }
         )
 
-        self.assertEqual(features.shape, (1, 4, 10, 1))
+        self.assertEqual(features.shape, (7, 4, 10, 1))
         for radial_index, alpha in enumerate(module.alphas.tolist()):
             radial_weight = math.exp(-alpha)
             expected_scalar = 0.125 * (1.0 + 27.0 * radial_weight)
@@ -100,16 +102,18 @@ class TestCartesianAFeatures(unittest.TestCase):
             max_power=0,
             n_alphas=3,
         )
-        local_density = torch.tensor(
-            [[[[2.0]]], [[[3.0]]]],
+        rho = torch.tensor(
+            [[[2.0]], [[3.0]]],
             dtype=module.monomial_values.dtype,
         )
+        local_density_index = torch.zeros((2, 1, 1), dtype=torch.long)
         features = module(
             {
-                "local_density": local_density,
+                "rho": rho,
+                "local_density_index": local_density_index,
                 "grid_spacing": torch.tensor(
                     [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]],
-                    dtype=local_density.dtype,
+                    dtype=rho.dtype,
                 ),
             }
         )
@@ -134,15 +138,17 @@ class TestCartesianAFeatures(unittest.TestCase):
         )
         self.assertIsInstance(module.log_alphas, nn.Parameter)
 
-        local_density = torch.arange(
+        rho = torch.arange(
             1,
             8,
             dtype=module.monomial_values.dtype,
-        ).reshape(1, 7, 1)
+        ).reshape(7, 1)
+        local_density_index = torch.arange(7).repeat(7, 1)
         features = module(
             {
-                "local_density": local_density,
-                "grid_spacing": torch.ones(3, dtype=local_density.dtype),
+                "rho": rho,
+                "local_density_index": local_density_index,
+                "grid_spacing": torch.ones(3, dtype=rho.dtype),
             }
         )
         features.sum().backward()

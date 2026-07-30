@@ -2,19 +2,19 @@ import unittest
 
 import numpy as np
 
-from cace_grid import coarsen_grid, get_local_density, make_stencil
+from cace_grid import coarsen_grid, get_neighbor_indices, make_stencil
 
 
-class TestGetLocalDensity(unittest.TestCase):
+class TestGridStencil(unittest.TestCase):
     def test_default_stencil_has_canonical_123_positions(self):
         shape = (10, 10, 10)
         positions = np.indices(shape, dtype=int).reshape(3, -1).T
         rho = np.arange(len(positions), dtype=float).reshape(-1, 1)
 
-        local_density, local_positions = get_local_density(
-            rho=rho,
+        neighbor_indices, local_positions = get_neighbor_indices(
             grid_positions=positions,
         )
+        local_density = rho[neighbor_indices]
 
         self.assertEqual(local_density.shape, (1000, 123, 1))
         self.assertEqual(local_positions.shape, (123, 3))

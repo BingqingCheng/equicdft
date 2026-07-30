@@ -16,6 +16,45 @@ from torch import nn
 from .stencil import make_stencil
 
 
+def _gather_local_density(
+    rho: torch.Tensor,
+    local_density_index: torch.Tensor,
+) -> torch.Tensor:
+    """Gather periodic environments from a live, possibly batched ``rho``."""
+
+    if rho.ndim < 2:
+        raise ValueError("rho must have shape [..., n_grid, n_types]")
+    if local_density_index.ndim != rho.ndim:
+        raise ValueError(
+            "local_density_index must have shape "
+            "[..., n_grid, n_neighbors]"
+        )
+    if local_density_index.shape[:-2] != rho.shape[:-2]:
+        raise ValueError("rho and local_density_index leading shapes must match")
+    if local_density_index.shape[-2] != rho.shape[-2]:
+        raise ValueError("rho and local_density_index grid sizes must match")
+    if local_density_index.dtype != torch.long:
+        raise TypeError("local_density_index must have dtype torch.long")
+
+    leading_shape = rho.shape[:-2]
+    n_grid = rho.shape[-2]
+    n_types = rho.shape[-1]
+    n_neighbors = local_density_index.shape[-1]
+
+    # Flatten only leading configuration/batch dimensions. torch.gather then
+    # selects the grid axis independently for every configuration and type.
+    rho_flat = rho.reshape(-1, n_grid, n_types)
+    index_flat = local_density_index.reshape(-1, n_grid * n_neighbors)
+    gather_index = index_flat.unsqueeze(-1).expand(-1, -1, n_types)
+    local_density = torch.gather(rho_flat, dim=1, index=gather_index)
+    return local_density.reshape(
+        *leading_shape,
+        n_grid,
+        n_neighbors,
+        n_types,
+    )
+
+
 def _make_powers(max_power: int) -> torch.Tensor:
     """Enumerate ``(a, b, c)`` by increasing total Cartesian power.
 
@@ -149,11 +188,13 @@ class CartesianAFeatures(nn.Module):
         data
             GridData-like mapping containing:
 
-            ``local_density``
-                Tensor with shape
-                ``[..., n_grid, n_neighbors, n_types]``. Any leading
-                dimensions, such as the training-batch dimension, are
-                preserved.
+            ``rho``
+                Live density tensor with shape ``[..., n_grid, n_types]``.
+            ``local_density_index``
+                Periodic neighbor rows with shape
+                ``[..., n_grid, n_neighbors]``. Local environments are
+                gathered from ``rho`` inside this forward pass so that
+                automatic differentiation includes overlapping neighbors.
             ``grid_spacing``
                 Physical grid spacing ``(hx, hy, hz)`` with shape ``[3]`` for
                 one configuration or ``[..., 3]`` for batched data. It is not
@@ -167,12 +208,10 @@ class CartesianAFeatures(nn.Module):
             ``[..., n_grid, n_alphas, n_monomials, n_types]``.
         """
 
-        local_density = data["local_density"]
-        if local_density.ndim < 3:
-            raise ValueError(
-                "local_density must have shape "
-                "[..., n_grid, n_neighbors, n_types]"
-            )
+        local_density = _gather_local_density(
+            data["rho"],
+            data["local_density_index"],
+        )
         if local_density.shape[-2] != self.monomial_values.shape[0]:
             raise ValueError(
                 "local_density neighbor count does not match cutoff_grid={}".format(

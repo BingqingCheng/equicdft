@@ -175,49 +175,27 @@ def coarsen_grid(
     return coarse_values, coarse_positions, target_spacing
 
 
-def get_local_density(
-    rho: np.ndarray,
+def get_neighbor_indices(
     grid_positions: np.ndarray,
     cutoff_grid: int = 3,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Gather one periodic local density environment around every grid point.
+    """Return periodic neighbor rows for every regular-grid point.
 
-    For central grid point ``m`` and local displacement ``k``, this function
-    constructs
-
-    ``local_density[m, k] = rho[(g_m + s_k) mod grid_size]``,
-
-    where ``g_m = grid_positions[m]`` and
-    ``s_k = local_density_positions[k]``.
-
-    Parameters
-    ----------
-    rho
-        Density field with shape ``[n_grid, n_types]``. The component axis is
-        retained when ``n_types == 1``.
-    grid_positions
-        Zero-based integer coordinates with shape ``[n_grid, 3]``.
-    cutoff_grid
-        Inclusive spherical cutoff in integer grid steps. The default is
-        three, so retained offsets satisfy ``x^2 + y^2 + z^2 <= 9``.
+    This helper stores only geometry. The returned integer matrix is placed in
+    :class:`cace_grid.data.GridData` and used to gather from the live PyTorch
+    ``rho`` tensor during a model forward pass. That keeps all overlapping
+    local environments connected to ``rho`` in the differentiation graph.
 
     Returns
     -------
-    local_density
-        Density environments with shape ``[n_grid, n_neighbors, n_types]``.
+    neighbor_indices
+        Row indices with shape ``[n_grid, n_neighbors]``.
     local_density_positions
         Shared relative integer displacements with shape ``[n_neighbors, 3]``.
-
-    The center is always the first entry in ``local_density_positions``.
-    Periodic wrapping is applied independently along all three grid axes.
     """
 
-    rho = np.asarray(rho)
     grid_positions = np.asarray(grid_positions)
-
-    if rho.ndim != 2:
-        raise ValueError("rho must have shape [n_grid, n_types]")
-    if grid_positions.shape != (rho.shape[0], 3):
+    if grid_positions.ndim != 2 or grid_positions.shape[1] != 3:
         raise ValueError("grid_positions must have shape [n_grid, 3]")
 
     local_density_positions = make_stencil(cutoff_grid)
@@ -232,7 +210,7 @@ def get_local_density(
 
     grid_size = rounded_positions.max(axis=0) + 1
     n_grid = int(np.prod(grid_size))
-    if rho.shape[0] != n_grid:
+    if rounded_positions.shape[0] != n_grid:
         raise ValueError("grid_positions do not contain one complete regular grid")
 
     # Map the input row order onto canonical C-order flat indices. The helper
@@ -251,7 +229,7 @@ def get_local_density(
         )
 
     # Invert the canonical-index mapping: given a wrapped grid coordinate,
-    # recover the row in the caller's rho array that stores its density.
+    # recover the row in the caller's density array that stores its value.
     row_from_flat_position = np.empty(n_grid, dtype=np.int64)
     row_from_flat_position[flat_positions] = np.arange(n_grid)
 
@@ -261,12 +239,9 @@ def get_local_density(
         rounded_positions[:, None, :] + local_density_positions[None, :, :],
         grid_size[None, None, :],
     )
-    # Convert wrapped neighbor coordinates to input row indices, then gather
-    # the complete [n_grid, n_neighbors] local-density matrix at once.
     neighbor_flat_positions = np.ravel_multi_index(
         neighbor_positions.reshape(-1, 3).T, tuple(grid_size), order="C"
     ).reshape(n_grid, -1)
-    neighbor_rows = row_from_flat_position[neighbor_flat_positions]
-    local_density = rho[neighbor_rows]
+    neighbor_indices = row_from_flat_position[neighbor_flat_positions]
 
-    return local_density, local_density_positions
+    return neighbor_indices, local_density_positions

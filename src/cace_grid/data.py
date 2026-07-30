@@ -13,7 +13,7 @@ import torch
 from ase import Atoms
 from ase.io import read
 
-from .stencil import coarsen_grid, get_local_density
+from .stencil import coarsen_grid, get_neighbor_indices
 
 
 # Canonical GridData field -> source field in the EXTXYZ/ASE Atoms object.
@@ -43,12 +43,13 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types]
         rho                         [n_grid, n_types]
-        local_density               [n_grid, n_neighbors, n_types]
+        local_density_index         [n_grid, n_neighbors]
         local_density_positions     [n_neighbors, 3]
 
-    ``local_density[m, k]`` is the density at relative integer displacement
-    ``local_density_positions[k]`` from central grid point ``m``. The first
-    displacement is always ``[0, 0, 0]``.
+    ``local_density_index[m, k]`` selects the density at relative integer
+    displacement ``local_density_positions[k]`` from central point ``m``. The
+    first displacement is always ``[0, 0, 0]``. Model forwards gather from the
+    live ``rho`` tensor so functional derivatives retain the full graph.
     """
 
     def __init__(self, **data: torch.Tensor) -> None:
@@ -243,10 +244,9 @@ def _process_atoms(
         V_ext = fields[:, n_types:]
         n_grid = grid_positions.shape[0]
 
-    # Construct all overlapping periodic environments. Row m is centered on
-    # grid_positions[m]; column k corresponds to one shared relative offset.
-    local_density, local_density_positions = get_local_density(
-        rho=rho,
+    # Store only the geometry needed to construct all overlapping periodic
+    # environments. Model forwards use these indices to gather from live rho.
+    local_density_index, local_density_positions = get_neighbor_indices(
         grid_positions=grid_positions,
         cutoff_grid=cutoff_grid,
     )
@@ -273,7 +273,9 @@ def _process_atoms(
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
         "V_ext": torch.tensor(V_ext, dtype=dtype),
         "rho": torch.tensor(rho, dtype=dtype),
-        "local_density": torch.tensor(local_density, dtype=dtype),
+        "local_density_index": torch.tensor(
+            local_density_index, dtype=torch.long
+        ),
         "local_density_positions": torch.tensor(
             local_density_positions, dtype=torch.long
         ),

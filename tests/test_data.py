@@ -8,7 +8,7 @@ from ase import Atoms
 from ase.io import write
 from torch.utils.data import DataLoader
 
-from cace_grid import GridData, default_data_key
+from cace_grid import CartesianAFeatures, GridData, default_data_key
 
 
 def _write_grid(path):
@@ -102,21 +102,23 @@ class TestGridData(unittest.TestCase):
                 "grid_positions",
                 "V_ext",
                 "rho",
-                "local_density",
+                "local_density_index",
                 "local_density_positions",
             },
         )
         self.assertEqual(data["rho"].shape, (64, 1))
         self.assertEqual(data["V_ext"].shape, (64, 1))
         self.assertEqual(data["n_types"].item(), 1)
-        self.assertEqual(data["local_density"].shape, (64, 7, 1))
+        self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertEqual(data["local_density_positions"].shape, (7, 3))
         self.assertTrue(
             torch.equal(
                 data["local_density_positions"][0], torch.tensor([0, 0, 0])
             )
         )
-        self.assertTrue(torch.equal(data["local_density"][:, 0, :], data["rho"]))
+        self.assertTrue(
+            torch.equal(data["local_density_index"][:, 0], data["index"])
+        )
         self.assertTrue(
             torch.equal(
                 data["grid_positions"][1], torch.tensor([0, 0, 1])
@@ -131,11 +133,43 @@ class TestGridData(unittest.TestCase):
         }
         minus_z = offset_lookup[(0, 0, -1)]
 
-        self.assertEqual(data["local_density"][0, minus_z, 0].item(), 3.25)
+        minus_z_index = data["local_density_index"][0, minus_z]
+        self.assertEqual(data["rho"][minus_z_index, 0].item(), 3.25)
 
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertEqual(batch["rho"].shape, (2, 64, 1))
-        self.assertEqual(batch["local_density"].shape, (2, 64, 7, 1))
+        self.assertEqual(batch["local_density_index"].shape, (2, 64, 7))
+
+        # The representation gathers neighborhoods from this exact batched
+        # rho tensor, so its complete overlapping dependence is differentiable.
+        batch["rho"].requires_grad_(True)
+        features = CartesianAFeatures(
+            cutoff_grid=1,
+            max_power=0,
+            n_alphas=1,
+        )(batch)
+        # Differentiate only the scalar environment centered at grid point 0.
+        # Its gradient must reach all seven stencil densities and no others.
+        selected_environment = features[:, 0, 0, 0, 0].sum()
+        gradient = torch.autograd.grad(
+            selected_environment,
+            batch["rho"],
+        )[0]
+        self.assertEqual(gradient.shape, batch["rho"].shape)
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertTrue(
+            torch.equal(
+                torch.count_nonzero(gradient[..., 0], dim=-1),
+                torch.tensor([7, 7]),
+            )
+        )
+        neighbor_indices = batch["local_density_index"][:, 0, :]
+        gathered_gradient = torch.gather(
+            gradient[..., 0],
+            dim=1,
+            index=neighbor_indices,
+        )
+        self.assertTrue(torch.all(gathered_gradient != 0.0))
 
     def test_custom_data_key_mapping(self):
         path = Path(self.temporary_directory.name) / "custom.extxyz"
@@ -157,7 +191,9 @@ class TestGridData(unittest.TestCase):
 
         self.assertEqual(data["temperature"].item(), 1.5)
         self.assertEqual(data["mu"].item(), -1.0)
-        self.assertTrue(torch.equal(data["local_density"][:, 0, :], data["rho"]))
+        self.assertTrue(
+            torch.equal(data["local_density_index"][:, 0], data["index"])
+        )
         self.assertEqual(default_data_key["rho"], "density")
 
     def test_optional_local_average(self):
@@ -171,7 +207,7 @@ class TestGridData(unittest.TestCase):
         expected = source.reshape(2, 2, 2, 2, 2, 2).mean(axis=(1, 3, 5))
         self.assertEqual(data["rho"].shape, (8, 1))
         self.assertEqual(data["n_types"].item(), 1)
-        self.assertEqual(data["local_density"].shape, (8, 1, 1))
+        self.assertEqual(data["local_density_index"].shape, (8, 1))
         self.assertTrue(
             torch.allclose(
                 data["rho"],
@@ -198,9 +234,9 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(data["n_types"].item(), 2)
         self.assertEqual(data["rho"].shape, (64, 2))
         self.assertEqual(data["V_ext"].shape, (64, 2))
-        self.assertEqual(data["local_density"].shape, (64, 7, 2))
+        self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertTrue(
-            torch.equal(data["local_density"][:, 0, :], data["rho"])
+            torch.equal(data["local_density_index"][:, 0], data["index"])
         )
 
         coarse = GridData.from_xyz(
@@ -209,7 +245,7 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(coarse["n_types"].item(), 2)
         self.assertEqual(coarse["rho"].shape, (8, 2))
         self.assertEqual(coarse["V_ext"].shape, (8, 2))
-        self.assertEqual(coarse["local_density"].shape, (8, 1, 2))
+        self.assertEqual(coarse["local_density_index"].shape, (8, 1))
 
 
 if __name__ == "__main__":
