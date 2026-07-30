@@ -109,6 +109,34 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         )
         self.assertEqual(output["beta_F_exc"].shape, (2,))
 
+    def test_custom_data_keys(self):
+        data_key = {
+            "rho": "number_density",
+            "temperature": "temperature_value",
+            "grid_spacing": "spacing",
+        }
+        B = torch.randn(2, 5, 1, 3, 1)
+        data = {
+            "number_density": torch.rand(2, 5, 1),
+            "temperature_value": torch.tensor([1.5, 2.0]),
+            "spacing": torch.tensor(
+                [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]]
+            ),
+        }
+        readout = LocalFreeEnergyReadout(
+            n_features=3,
+            n_types=1,
+            include_temperature=True,
+            data_key=data_key,
+        )
+        output = readout(B, data)
+
+        self.assertEqual(
+            output["beta_free_energy_per_particle"].shape,
+            (2, 5, 1),
+        )
+        self.assertEqual(output["beta_F_exc"].shape, (2,))
+
     def test_fixed_rms_feature_scaling(self):
         B_training = torch.arange(1.0, 25.0).reshape(2, 3, 1, 2, 2)
         B_flat = B_training.flatten(start_dim=-3)

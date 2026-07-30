@@ -33,10 +33,11 @@ default_data_key = {
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
-    Every object contains the following tensors::
+    Each object contains the following fields; ``mu`` is included only when
+    supplied by the source frame::
 
         temperature                 scalar
-        mu                          scalar
+        mu                          scalar (optional)
         n_types                     scalar
         grid_spacing                [3]
         index                       [n_grid]
@@ -254,17 +255,13 @@ def _process_atoms(
     # Match CACE's AtomicData convention by honoring PyTorch's current default
     # floating dtype and using int64 tensors for indices and grid coordinates.
     dtype = torch.get_default_dtype()
-    return {
+    data = {
         "temperature": torch.tensor(
             float(
                 _required_source_value(
                     atoms, data_key["temperature"], "temperature"
                 )
             ),
-            dtype=dtype,
-        ),
-        "mu": torch.tensor(
-            float(_required_source_value(atoms, data_key["mu"], "mu")),
             dtype=dtype,
         ),
         "n_types": torch.tensor(n_types, dtype=torch.long),
@@ -280,3 +277,11 @@ def _process_atoms(
             local_density_positions, dtype=torch.long
         ),
     }
+
+    # Chemical potential is useful metadata for grand-canonical frames but is
+    # not part of the density field itself and may be absent, for example for
+    # canonical simulations. Do not assign an artificial value when missing.
+    mu = _get_source_value(atoms, data_key["mu"])
+    if mu is not None:
+        data["mu"] = torch.tensor(float(mu), dtype=dtype)
+    return data

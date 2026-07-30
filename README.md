@@ -57,6 +57,21 @@ print(free_energy["beta_F_exc"].shape)
 print(c1.shape)
 ```
 
+The readout input names are constructor options rather than fixed lookups:
+
+```python
+readout_data_key = {
+    "rho": "number_density",
+    "grid_spacing": "spacing",
+    "temperature": "temperature_value",
+}
+
+readout = LocalFreeEnergyReadout(
+    n_features=n_features,
+    data_key=readout_data_key,
+)
+```
+
 For a multicomponent density field, an optional learned, bias-free channel map
 can mix the physical component channels of `A` before symmetrization:
 

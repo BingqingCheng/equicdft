@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from cace_grid import CartesianAFeatures, GridData, default_data_key
 
 
-def _write_grid(path):
+def _write_grid(path, include_mu=True):
     shape = (4, 4, 4)
     spacing = 0.5
     grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
@@ -30,7 +30,8 @@ def _write_grid(path):
     atoms.info["grid_spacing"] = np.repeat(spacing, 3)
     atoms.info["grid_indexing"] = "zero_based"
     atoms.info["T"] = 1.5
-    atoms.info["mu"] = -1.0
+    if include_mu:
+        atoms.info["mu"] = -1.0
     write(path, atoms, format="extxyz")
 
 
@@ -124,6 +125,15 @@ class TestGridData(unittest.TestCase):
                 data["grid_positions"][1], torch.tensor([0, 0, 1])
             )
         )
+
+    def test_mu_is_optional(self):
+        path = Path(self.temporary_directory.name) / "without-mu.extxyz"
+        _write_grid(path, include_mu=False)
+        data = GridData.from_xyz(path, cutoff_grid=1)[0]
+
+        self.assertNotIn("mu", data)
+        batch = next(iter(DataLoader([data, data], batch_size=2)))
+        self.assertNotIn("mu", batch)
 
     def test_periodic_local_density_and_default_batching(self):
         data = GridData.from_xyz(self.path, cutoff_grid=1)[0]

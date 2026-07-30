@@ -83,6 +83,9 @@ class LocalFreeEnergyReadout(nn.Module):
         Optional positive tensor with shape ``[n_features]``. ``B`` is divided
         by this fixed scale before entering the readout. Use
         :func:`compute_rms_feature_scale` on the training split to construct it.
+    data_key
+        Optional mapping from model field names to keys in the input data
+        dictionary. Any omitted entries use the canonical GridData names.
 
     Notes
     -----
@@ -99,6 +102,7 @@ class LocalFreeEnergyReadout(nn.Module):
         include_temperature: bool = False,
         add_linear: bool = True,
         feature_scale: Optional[torch.Tensor] = None,
+        data_key: Optional[Mapping[str, str]] = None,
     ) -> None:
         super().__init__()
 
@@ -119,6 +123,26 @@ class LocalFreeEnergyReadout(nn.Module):
         self.hidden_sizes = hidden_sizes
         self.include_temperature = include_temperature
         self.add_linear = add_linear
+        self.data_key = {
+            "rho": "rho",
+            "temperature": "temperature",
+            "grid_spacing": "grid_spacing",
+        }
+        if data_key is not None:
+            unknown_keys = set(data_key) - set(self.data_key)
+            if unknown_keys:
+                raise KeyError(
+                    "unknown readout data_key entries: {}".format(
+                        sorted(unknown_keys)
+                    )
+                )
+            for field, key in data_key.items():
+                if not isinstance(key, str) or not key:
+                    raise ValueError(
+                        "readout data_key value for '{}' must be a nonempty "
+                        "string".format(field)
+                    )
+                self.data_key[field] = key
         self.n_input = (
             self.n_features
             + self.n_types
@@ -216,7 +240,7 @@ class LocalFreeEnergyReadout(nn.Module):
                 )
             )
 
-        rho = data["rho"]
+        rho = data[self.data_key["rho"]]
         if rho.ndim < 2 or rho.shape[-1] != self.n_types:
             raise ValueError(
                 "rho must have shape [..., n_grid, {}]".format(self.n_types)
@@ -229,7 +253,7 @@ class LocalFreeEnergyReadout(nn.Module):
         vacuum_parts = [torch.zeros_like(B_flat), torch.zeros_like(rho)]
         if self.include_temperature:
             inverse_temperature = self._inverse_temperature(
-                data["temperature"],
+                data[self.data_key["temperature"]],
                 rho,
             )
             physical_parts.append(inverse_temperature)
@@ -246,7 +270,7 @@ class LocalFreeEnergyReadout(nn.Module):
             dim=-1,
         )
 
-        grid_spacing = data["grid_spacing"]
+        grid_spacing = data[self.data_key["grid_spacing"]]
         configuration_shape = rho.shape[:-2]
         if (
             grid_spacing.shape[-1] != 3
