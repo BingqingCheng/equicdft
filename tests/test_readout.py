@@ -6,13 +6,13 @@ import torch
 from cace_grid import (
     CartesianAFeatures,
     CartesianBFeatures,
-    LocalFreeEnergyReadout,
+    LocalReadout,
     compute_grid_derivative,
     get_neighbor_indices,
 )
 
 
-class TestLocalFreeEnergyReadout(unittest.TestCase):
+class TestLocalReadout(unittest.TestCase):
     def _full_pipeline(self, rho):
         shape = (4, 4, 4)
         grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
@@ -40,34 +40,35 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         )(data)
         B_module = CartesianBFeatures(max_power=2, max_product_order=3)
         B = B_module(A)
-        readout = LocalFreeEnergyReadout(
+        readout = LocalReadout(
             n_types=1,
             hidden_sizes=(16, 8),
         )
-        return data, A, B, readout, readout(B)
+        local_features = B.flatten(start_dim=-3)
+        return data, A, B, readout, readout(local_features)
 
     def test_batched_shapes(self):
-        B = torch.randn(2, 5, 1, 23, 1)
-        readout = LocalFreeEnergyReadout(
+        local_features = torch.randn(2, 5, 23)
+        readout = LocalReadout(
             n_types=1,
         )
-        output = readout(B)
+        output = readout(local_features)
 
         self.assertEqual(output.shape, (2, 5, 1))
         self.assertEqual(readout.mlp[0].in_features, 23)
 
-    def test_readout_uses_B_features_directly(self):
-        readout = LocalFreeEnergyReadout(
+    def test_readout_uses_local_features_directly(self):
+        readout = LocalReadout(
             n_types=1,
             hidden_sizes=(),
             n_features=2,
         )
-        B = torch.tensor([[[[2.0], [4.0]]]])
+        local_features = torch.tensor([[2.0, 4.0]])
         with torch.no_grad():
             readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
             readout.mlp[0].bias.zero_()
 
-        output = readout(B)
+        output = readout(local_features)
         self.assertEqual(output.item(), 6.0)
 
     def test_full_autograd_and_finite_difference(self):
@@ -127,7 +128,8 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
                 max_power=2,
                 max_product_order=3,
             )(perturbed_A)
-            per_particle = readout(perturbed_B)
+            local_features = perturbed_B.flatten(start_dim=-3)
+            per_particle = readout(local_features)
             density = torch.sum(perturbed_rho * per_particle, dim=-1)
             return torch.prod(perturbed_data["grid_spacing"]) * torch.sum(
                 density

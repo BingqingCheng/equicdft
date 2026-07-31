@@ -8,7 +8,7 @@ from torch import nn
 
 from .derivatives import compute_grid_derivative
 from .features import CartesianAFeatures
-from .readout import LocalFreeEnergyReadout
+from .readout import LocalReadout
 from .symmetrize import CartesianBFeatures
 
 
@@ -17,7 +17,7 @@ class GridCACEModel(nn.Module):
 
     The model applies the registered modules in the order
 
-    ``rho -> A -> B -> beta_F_exc -> c1``
+    ``rho -> A -> B -> (B, T) -> beta_F_exc -> c1``
 
     and returns the canonical physical outputs as one dictionary. Density is
     marked as differentiable before the representation is built so ``c1``
@@ -59,7 +59,8 @@ class GridCACEModel(nn.Module):
     b_features
         Module that contracts the Cartesian moments into invariant features.
     readout
-        Module that predicts the per-particle excess free energy from ``B``.
+        Module that predicts the per-particle excess free energy from the
+        flattened local ``B`` features and scalar temperature.
     compute_c1
         If ``True``, initialize density gradients and include ``c1`` in the
         collected outputs. Disable it for energy-only evaluation.
@@ -69,7 +70,7 @@ class GridCACEModel(nn.Module):
         self,
         a_features: CartesianAFeatures,
         b_features: CartesianBFeatures,
-        readout: LocalFreeEnergyReadout,
+        readout: LocalReadout,
         compute_c1: bool = True,
     ) -> None:
         super().__init__()
@@ -133,11 +134,34 @@ class GridCACEModel(nn.Module):
             # formed from the Cartesian components of A.
             B = self.b_features(A)
 
+            # Flatten the radial, invariant, and channel axes into one local
+            # feature vector [..., n_grid, n_B]. Temperature has shape [...]
+            # and is broadcast over the grid before being appended exactly
+            # once, giving [..., n_grid, n_B + 1].
+            B_flat = B.flatten(start_dim=-3)
+            temperature = data["temperature"].to(
+                device=B_flat.device,
+                dtype=B_flat.dtype,
+            )
+            if temperature.shape != B_flat.shape[:-2]:
+                raise ValueError(
+                    "temperature must be scalar for one field or have the "
+                    "same leading batch shape as B"
+                )
+            temperature_feature = temperature[..., None, None].expand(
+                *B_flat.shape[:-1],
+                1,
+            )
+            local_features = torch.cat(
+                (B_flat, temperature_feature),
+                dim=-1,
+            )
+
             # beta_free_energy_per_particle has shape
             #     [..., n_grid, n_types].
             # Entry [..., g, i] is the dimensionless excess free energy
             # assigned to one particle of type i at grid point g.
-            beta_free_energy_per_particle = self.readout(B)
+            beta_free_energy_per_particle = self.readout(local_features)
 
             # beta_free_energy_density has shape [..., n_grid]. Entry [..., g]
             # is beta*f_exc at grid point g. The density is still in physical

@@ -7,7 +7,7 @@ from .loader import make_dataloaders
 from .loss import Loss, TensorLoss
 from .metrics import Metrics, compute_metric
 from .model import GridCACEModel
-from .readout import LocalFreeEnergyReadout
+from .readout import LocalReadout
 from .stencil import (
     coarsen_grid,
     get_neighbor_indices,
@@ -21,7 +21,7 @@ __all__ = [
     "CartesianBFeatures",
     "GridData",
     "GridCACEModel",
-    "LocalFreeEnergyReadout",
+    "LocalReadout",
     "Loss",
     "Metrics",
     "TensorLoss",

@@ -8,7 +8,7 @@ from cace_grid import (
     CartesianAFeatures,
     CartesianBFeatures,
     GridCACEModel,
-    LocalFreeEnergyReadout,
+    LocalReadout,
     get_neighbor_indices,
 )
 
@@ -17,12 +17,19 @@ class _DensityFeatures(nn.Module):
     """Expose rho directly for an analytic model-integration test."""
 
     def forward(self, data):
-        return data["rho"]
+        return data["rho"].unsqueeze(-2).unsqueeze(-2)
 
 
 class _IdentityModule(nn.Module):
     def forward(self, values):
         return values
+
+
+class _FirstFeatureReadout(nn.Module):
+    """Return the density feature and ignore scalar conditioning inputs."""
+
+    def forward(self, local_features):
+        return local_features[..., :1]
 
 
 class TestGridCACEModel(unittest.TestCase):
@@ -40,6 +47,7 @@ class TestGridCACEModel(unittest.TestCase):
                 dtype=torch.long,
             ),
             "grid_spacing": torch.tensor([0.5, 0.5, 0.5]),
+            "temperature": torch.tensor(1.5),
         }
 
     def _make_model(self, compute_c1=True):
@@ -50,7 +58,7 @@ class TestGridCACEModel(unittest.TestCase):
             n_radial_channels=1,
         )
         b_features = CartesianBFeatures(max_power=2, max_product_order=3)
-        readout = LocalFreeEnergyReadout(
+        readout = LocalReadout(
             n_types=1,
             hidden_sizes=(8,),
         )
@@ -84,7 +92,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=_IdentityModule(),
+            readout=_FirstFeatureReadout(),
             compute_c1=True,
         )
         data = self._make_data()
@@ -97,6 +105,40 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(outputs["beta_F_exc"].shape, (2,))
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
+
+    def test_temperature_is_appended_once_to_each_local_feature_vector(self):
+        readout = LocalReadout(
+            n_types=1,
+            hidden_sizes=(),
+            n_features=2,
+        )
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(torch.tensor([[0.0, 1.0]]))
+            readout.mlp[0].bias.zero_()
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=readout,
+            compute_c1=False,
+        )
+
+        first = self._make_data()
+        second = self._make_data()
+        second["temperature"] = torch.tensor(2.0)
+        data = {
+            key: torch.stack((first[key], second[key]))
+            for key in first
+        }
+
+        outputs = model(data)
+
+        expected = data["temperature"][:, None, None].expand(2, 27, 1)
+        self.assertTrue(
+            torch.equal(
+                outputs["beta_free_energy_per_particle"],
+                expected,
+            )
+        )
 
     def test_empty_density_has_zero_integrated_free_energy(self):
         model = self._make_model()
@@ -168,7 +210,7 @@ class TestGridCACEModel(unittest.TestCase):
                     n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
-                LocalFreeEnergyReadout(n_types=1),
+                LocalReadout(n_types=1),
                 compute_c1=1,
             )
 
@@ -187,7 +229,7 @@ class TestGridCACEModel(unittest.TestCase):
             n_channels=3,
         )
         b_features = CartesianBFeatures(max_power=2, max_product_order=3)
-        readout = LocalFreeEnergyReadout(
+        readout = LocalReadout(
             n_types=2,
             hidden_sizes=(8,),
         )

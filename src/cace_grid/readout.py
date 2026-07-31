@@ -1,4 +1,4 @@
-"""Local excess-free-energy readout."""
+"""Local readout for invariant grid features."""
 
 from numbers import Integral
 from typing import Optional, Sequence
@@ -7,13 +7,15 @@ import torch
 from torch import nn
 
 
-class LocalFreeEnergyReadout(nn.Module):
-    """Predict a local excess free energy per particle and component.
+class LocalReadout(nn.Module):
+    """Map local invariant features to one output per physical component.
 
-    A shared MLP maps the invariant ``B`` features at grid point
-    ``g`` to one dimensionless excess free energy per particle and component,
-
-    ``beta_a_exc[g, i] = MLP(B[g])[i]``.
+    A shared MLP maps a local feature vector at each grid point to one output
+    per component. The readout itself is agnostic about the construction and
+    physical meaning of its inputs and outputs.
+    :class:`cace_grid.model.GridCACEModel` supplies flattened invariant B
+    features and temperature, and interprets the outputs as dimensionless
+    per-particle excess free energies.
 
     Density weighting, grid integration, and functional differentiation are
     handled by :class:`cace_grid.model.GridCACEModel`.
@@ -21,9 +23,9 @@ class LocalFreeEnergyReadout(nn.Module):
     Parameters
     ----------
     n_features
-        Flattened input width of ``B``. If supplied, the first layer is a
-        regular ``Linear`` module. If ``None``, a ``LazyLinear`` module infers
-        this width from the first forward pass.
+        Width of the complete local input vector. If supplied, the first layer
+        is a regular ``Linear`` module. If ``None``, a ``LazyLinear``
+        module infers this width from the first forward pass.
     n_types
         Number of physical density components and per-particle outputs.
     hidden_sizes
@@ -81,11 +83,8 @@ class LocalFreeEnergyReadout(nn.Module):
 
     def forward(
         self,
-        B: torch.Tensor,
+        local_features: torch.Tensor,
     ) -> torch.Tensor:
-        """Return ``beta_a_exc`` with shape ``[..., n_grid, n_types]``."""
+        """Return local outputs with shape ``[..., n_grid, n_types]``."""
 
-        # Flatten the radial, invariant, and input-channel dimensions while
-        # retaining every leading configuration dimension and the grid axis.
-        B_flat = B.flatten(start_dim=-3)
-        return self.mlp(B_flat)
+        return self.mlp(local_features)

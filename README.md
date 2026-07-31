@@ -136,7 +136,7 @@ from cace_grid import (
     CartesianBFeatures,
     GridCACEModel,
     GridData,
-    LocalFreeEnergyReadout,
+    LocalReadout,
 )
 
 dataset = GridData.from_xyz(
@@ -157,7 +157,7 @@ a_features = CartesianAFeatures(
     n_types=n_types,
 )
 b_features = CartesianBFeatures(max_power=4, max_product_order=3)
-readout = LocalFreeEnergyReadout(
+readout = LocalReadout(
     n_types=n_types,
 )
 model = GridCACEModel(
@@ -173,8 +173,10 @@ c1 = outputs["c1"]
 ```
 
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
-External potential and chemical potential are optional annotations rather than
-model inputs. When `V_ext` is available, `GridData` constructs
+`GridCACEModel` appends the scalar temperature once to the flattened local
+`B` feature vector at every grid point before applying `LocalReadout`.
+External potential and chemical potential are optional annotations rather
+than model inputs. When `V_ext` is available, `GridData` constructs
 `c1_plus_beta_mu = log(rho * thermal_wavelength**3) + beta * V_ext`; if `mu`
 is also present, it stores `c1 = c1_plus_beta_mu - beta * mu`. The default
 Boltzmann constant is `8.617333262e-5` eV/K and the default thermal wavelength
