@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from numbers import Real
-from typing import Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -194,6 +194,22 @@ class GridCACEModel(nn.Module):
         """Volume represented by one grid point."""
 
         return torch.prod(self.grid_spacing)
+
+    @property
+    def grid_info(self) -> Dict[str, Any]:
+        """Return the grid and thermodynamic metadata needed for inference."""
+
+        return {
+            "cutoff_grid": self.cutoff_grid,
+            "grid_spacing": self.grid_spacing.detach().cpu().tolist(),
+            "n_types": self.n_types,
+            "boltzmann_constant": (
+                self.boltzmann_constant.detach().cpu().item()
+            ),
+            "thermal_wavelength": (
+                self.thermal_wavelength.detach().cpu().tolist()
+            ),
+        }
 
     def _validate_grid_spacing(self, data: Dict[str, torch.Tensor]) -> None:
         """Reject grids inconsistent with the trained discretization."""

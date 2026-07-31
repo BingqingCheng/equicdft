@@ -100,6 +100,60 @@ class TestGridData(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    @staticmethod
+    def _grid_info():
+        return {
+            "cutoff_grid": 1,
+            "grid_spacing": [0.5, 0.5, 0.5],
+            "n_types": 1,
+            "boltzmann_constant": 1.0,
+            "thermal_wavelength": [1.0],
+        }
+
+    def test_grid_info_configures_xyz_and_validates_geometry(self):
+        data = GridData.from_xyz(
+            self.path,
+            grid_info=self._grid_info(),
+        )[0]
+
+        self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
+        self.assertEqual(data["local_density_index"].shape, (64, 7))
+
+        mismatched = self._grid_info()
+        mismatched["grid_spacing"] = [1.0, 1.0, 1.0]
+        with self.assertRaisesRegex(ValueError, "grid_spacing"):
+            GridData.from_xyz(self.path, grid_info=mismatched)
+
+    def test_grid_info_supplies_from_dict_model_metadata(self):
+        data = GridData.from_dict(
+            {
+                "grid_size": [3, 4, 5],
+                "temperature": 1.5,
+            },
+            grid_info=self._grid_info(),
+        )
+
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertTrue(
+            torch.equal(
+                data["grid_spacing"],
+                torch.tensor([0.5, 0.5, 0.5]),
+            )
+        )
+        self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
+        self.assertEqual(data["local_density_index"].shape, (60, 7))
+
+        conflicting_values = {
+            "grid_size": [3, 4, 5],
+            "grid_spacing": 1.0,
+            "temperature": 1.5,
+        }
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            GridData.from_dict(
+                conflicting_values,
+                grid_info=self._grid_info(),
+            )
+
     def test_from_dict_builds_grid_without_fields(self):
         data = GridData.from_dict(
             {

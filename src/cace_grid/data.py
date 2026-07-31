@@ -6,7 +6,7 @@ the periodic neighborhood of every grid point.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -32,6 +32,15 @@ default_data_key = {
     "grid_positions": "positions",
     "V_ext": "V_ext",
     "rho": "density",
+}
+
+
+GRID_INFO_KEYS = {
+    "cutoff_grid",
+    "grid_spacing",
+    "n_types",
+    "boltzmann_constant",
+    "thermal_wavelength",
 }
 
 
@@ -85,6 +94,7 @@ class GridData(dict):
         thermal_wavelength: Union[
             float, Sequence[float], np.ndarray
         ] = 1.0,
+        grid_info: Optional[Mapping[str, Any]] = None,
     ) -> List["GridData"]:
         """Read EXTXYZ frames and convert each frame to one ``GridData``.
 
@@ -116,12 +126,25 @@ class GridData(dict):
             component. It is stored when an external potential is available
             and is used both for equilibrium solving and direct-correlation
             references. The default is one.
+        grid_info
+            Optional model metadata dictionary containing ``cutoff_grid``,
+            ``grid_spacing``, ``n_types``, ``boltzmann_constant``, and
+            ``thermal_wavelength``. When supplied, it replaces the matching
+            individual arguments and validates every processed frame against
+            the trained grid spacing and component count.
 
         Returns
         -------
         list of GridData
             One complete grid configuration per selected EXTXYZ frame.
         """
+
+        resolved_grid_info = None
+        if grid_info is not None:
+            resolved_grid_info = _normalize_grid_info(grid_info)
+            cutoff_grid = resolved_grid_info["cutoff_grid"]
+            boltzmann_constant = resolved_grid_info["boltzmann_constant"]
+            thermal_wavelength = resolved_grid_info["thermal_wavelength"]
 
         boltzmann_constant = _positive_scalar(
             boltzmann_constant,
@@ -144,7 +167,7 @@ class GridData(dict):
         configurations = read(str(Path(path).expanduser()), index=index)
         if not isinstance(configurations, list):
             configurations = [configurations]
-        return [
+        data = [
             cls(
                 **_process_atoms(
                     atoms,
@@ -157,6 +180,10 @@ class GridData(dict):
             )
             for atoms in configurations
         ]
+        if resolved_grid_info is not None:
+            for frame in data:
+                _validate_frame_grid_info(frame, resolved_grid_info)
+        return data
 
     @classmethod
     def from_dict(
@@ -167,17 +194,57 @@ class GridData(dict):
         thermal_wavelength: Union[
             float, Sequence[float], np.ndarray
         ] = 1.0,
+        grid_info: Optional[Mapping[str, Any]] = None,
     ) -> "GridData":
         """Build one regular periodic grid without reading an EXTXYZ file.
 
-        ``values`` requires the three spatial dimensions in ``grid_size``, the
-        separate scalar ``n_types``, ``grid_spacing``, and either
-        ``temperature`` or ``T``. Density, external potential, and chemical
-        potential fields can be assigned to the returned dictionary afterward.
+        ``values`` requires the three spatial dimensions in ``grid_size`` and
+        either ``temperature`` or ``T``. It also requires the separate scalar
+        ``n_types`` and ``grid_spacing`` unless they are supplied through
+        ``grid_info``. Density, external potential, and chemical potential
+        fields can be assigned to the returned dictionary afterward.
         """
 
         if not isinstance(values, dict):
             raise TypeError("values must be a dictionary")
+        values = values.copy()
+        if grid_info is not None:
+            resolved_grid_info = _normalize_grid_info(grid_info)
+            if "grid_spacing" in values:
+                supplied_spacing = np.asarray(
+                    values["grid_spacing"],
+                    dtype=float,
+                ).reshape(-1)
+                if supplied_spacing.size == 1:
+                    supplied_spacing = np.repeat(supplied_spacing, 3)
+                if (
+                    supplied_spacing.shape != (3,)
+                    or not np.allclose(
+                        supplied_spacing,
+                        resolved_grid_info["grid_spacing"],
+                    )
+                ):
+                    raise ValueError(
+                        "values grid_spacing does not match grid_info"
+                    )
+            if "n_types" in values:
+                supplied_n_types = np.asarray(
+                    values["n_types"],
+                    dtype=float,
+                ).reshape(-1)
+                if (
+                    supplied_n_types.size != 1
+                    or not np.isclose(
+                        supplied_n_types[0],
+                        resolved_grid_info["n_types"],
+                    )
+                ):
+                    raise ValueError("values n_types does not match grid_info")
+            values["grid_spacing"] = resolved_grid_info["grid_spacing"]
+            values["n_types"] = resolved_grid_info["n_types"]
+            cutoff_grid = resolved_grid_info["cutoff_grid"]
+            boltzmann_constant = resolved_grid_info["boltzmann_constant"]
+            thermal_wavelength = resolved_grid_info["thermal_wavelength"]
         allowed_keys = {
             "grid_size",
             "grid_spacing",
@@ -299,6 +366,101 @@ class GridData(dict):
                 dtype=torch.long,
             ),
         )
+
+
+def _normalize_grid_info(grid_info: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate model grid metadata and return CPU-native values."""
+
+    if not isinstance(grid_info, Mapping):
+        raise TypeError("grid_info must be a mapping")
+    missing_keys = GRID_INFO_KEYS - set(grid_info)
+    if missing_keys:
+        raise KeyError(
+            "grid_info is missing required entries: {}".format(
+                sorted(missing_keys)
+            )
+        )
+    unknown_keys = set(grid_info) - GRID_INFO_KEYS
+    if unknown_keys:
+        raise KeyError(
+            "unknown grid_info entries: {}".format(sorted(unknown_keys))
+        )
+
+    raw_cutoff_grid = np.asarray(
+        grid_info["cutoff_grid"],
+        dtype=float,
+    ).reshape(-1)
+    if raw_cutoff_grid.size != 1:
+        raise ValueError("grid_info cutoff_grid must be a nonnegative integer")
+    cutoff_grid = int(np.rint(raw_cutoff_grid[0]))
+    if not np.isclose(raw_cutoff_grid[0], cutoff_grid) or cutoff_grid < 0:
+        raise ValueError("grid_info cutoff_grid must be a nonnegative integer")
+
+    grid_spacing = np.asarray(
+        grid_info["grid_spacing"],
+        dtype=float,
+    ).reshape(-1)
+    if grid_spacing.size == 1:
+        grid_spacing = np.repeat(grid_spacing, 3)
+    if (
+        grid_spacing.shape != (3,)
+        or not np.all(np.isfinite(grid_spacing))
+        or np.any(grid_spacing <= 0.0)
+    ):
+        raise ValueError(
+            "grid_info grid_spacing must contain three positive values"
+        )
+
+    raw_n_types = np.asarray(
+        grid_info["n_types"],
+        dtype=float,
+    ).reshape(-1)
+    if raw_n_types.size != 1:
+        raise ValueError("grid_info n_types must be a positive integer")
+    n_types = int(np.rint(raw_n_types[0]))
+    if not np.isclose(raw_n_types[0], n_types) or n_types < 1:
+        raise ValueError("grid_info n_types must be a positive integer")
+
+    boltzmann_constant = _positive_scalar(
+        grid_info["boltzmann_constant"],
+        "grid_info boltzmann_constant",
+    )
+    thermal_wavelength = np.asarray(
+        grid_info["thermal_wavelength"],
+        dtype=float,
+    ).reshape(-1)
+    if thermal_wavelength.size == 1:
+        thermal_wavelength = np.repeat(thermal_wavelength, n_types)
+    if (
+        thermal_wavelength.shape != (n_types,)
+        or not np.all(np.isfinite(thermal_wavelength))
+        or np.any(thermal_wavelength <= 0.0)
+    ):
+        raise ValueError(
+            "grid_info thermal_wavelength must contain one positive value "
+            "per type"
+        )
+
+    return {
+        "cutoff_grid": cutoff_grid,
+        "grid_spacing": grid_spacing.tolist(),
+        "n_types": n_types,
+        "boltzmann_constant": boltzmann_constant,
+        "thermal_wavelength": thermal_wavelength.tolist(),
+    }
+
+
+def _validate_frame_grid_info(
+    frame: "GridData",
+    grid_info: Mapping[str, Any],
+) -> None:
+    """Check that one processed EXTXYZ frame matches trained grid metadata."""
+
+    if int(frame["n_types"].item()) != grid_info["n_types"]:
+        raise ValueError("frame n_types does not match grid_info")
+    frame_spacing = frame["grid_spacing"].detach().cpu().numpy()
+    if not np.allclose(frame_spacing, grid_info["grid_spacing"]):
+        raise ValueError("frame grid_spacing does not match grid_info")
 
 
 def _get_source_value(atoms: Atoms, source_key: str) -> Optional[Any]:

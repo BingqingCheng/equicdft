@@ -181,7 +181,15 @@ Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
 The trained grid spacing and thermodynamic conventions are persistent model
 buffers. The stencil cutoff, number of components, and density scale are also
 available directly as `model.cutoff_grid`, `model.n_types`, and
-`model.mean_density`.
+`model.mean_density`. For inference, `model.grid_info` collects the grid and
+thermodynamic metadata in the native forms accepted by `GridData`:
+
+```python
+inference_data = GridData.from_xyz(
+    "density.extxyz",
+    grid_info=model.grid_info,
+)
+```
 External potential and chemical potential are optional annotations rather
 than model inputs. When `V_ext` is available, `GridData` constructs
 `c1_plus_beta_mu = log(rho * thermal_wavelength**3) + beta * V_ext`; if `mu`
@@ -201,20 +209,18 @@ import torch
 external_data = GridData.from_dict(
     {
         "grid_size": [10, 10, 10],
-        "n_types": 1,
-        "grid_spacing": 0.5,
         "temperature": 1.5,
     },
-    cutoff_grid=3,
-    boltzmann_constant=1.0,
+    grid_info=model.grid_info,
 )
 external_data["V_ext"] = V_ext.reshape(1000, 1)
 external_data["mu"] = torch.tensor([0.0])
 ```
 
-`grid_size` always contains only `[nx, ny, nz]`; `n_types` is a separate
-required scalar. Density, external-potential, and chemical-potential tensors
-are assigned afterward in their canonical flattened shapes.
+`grid_size` always contains only `[nx, ny, nz]`. Without `grid_info`,
+`n_types` and `grid_spacing` are separate required entries. Density,
+external-potential, and chemical-potential tensors are assigned afterward in
+their canonical flattened shapes.
 
 Use `GridSolver` for prescribed-density thermodynamics or equilibrium
 minimization:

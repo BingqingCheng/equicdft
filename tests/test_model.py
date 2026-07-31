@@ -96,6 +96,16 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertIn("grid_spacing", state)
         self.assertIn("boltzmann_constant", state)
         self.assertIn("thermal_wavelength", state)
+        self.assertEqual(
+            model.grid_info,
+            {
+                "cutoff_grid": 1,
+                "grid_spacing": [0.5, 0.5, 0.5],
+                "n_types": 1,
+                "boltzmann_constant": 1.0,
+                "thermal_wavelength": [1.0],
+            },
+        )
 
     def test_rejects_mismatched_input_grid_spacing(self):
         model = self._make_model()
