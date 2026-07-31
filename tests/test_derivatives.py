@@ -2,21 +2,22 @@ import unittest
 
 import torch
 
-from cace_grid import compute_c1
+from cace_grid import compute_grid_derivative
 
 
-class TestFunctionalDerivatives(unittest.TestCase):
-    def test_compute_c1(self):
-        rho = torch.tensor(
+class TestGridDerivatives(unittest.TestCase):
+    def test_compute_grid_derivative_has_no_physical_rescaling(self):
+        grid_field = torch.tensor(
             [[0.2], [0.5], [0.8]],
             requires_grad=True,
         )
-        grid_spacing = torch.tensor([0.5, 0.5, 0.5])
-        beta_F_exc = torch.prod(grid_spacing) * torch.sum(rho.square())
+        output = 0.125 * torch.sum(grid_field.square())
 
-        c1 = compute_c1(beta_F_exc, rho, grid_spacing)
+        derivative = compute_grid_derivative(output, grid_field)
 
-        self.assertTrue(torch.allclose(c1, -2.0 * rho))
+        self.assertTrue(
+            torch.allclose(derivative, 0.25 * grid_field)
+        )
 
 
 if __name__ == "__main__":

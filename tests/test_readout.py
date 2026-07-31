@@ -7,7 +7,7 @@ from cace_grid import (
     CartesianAFeatures,
     CartesianBFeatures,
     LocalFreeEnergyReadout,
-    compute_c1,
+    compute_grid_derivative,
     get_neighbor_indices,
 )
 
@@ -99,17 +99,16 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         self.assertEqual(beta_free_energy_density.shape, (64,))
         self.assertEqual(beta_F_exc.shape, ())
 
-        c1 = compute_c1(
+        beta_F_exc_derivative = compute_grid_derivative(
             beta_F_exc,
             rho,
-            data["grid_spacing"],
             create_graph=True,
         )
-        self.assertEqual(c1.shape, rho.shape)
-        self.assertTrue(torch.all(torch.isfinite(c1)))
+        self.assertEqual(beta_F_exc_derivative.shape, rho.shape)
+        self.assertTrue(torch.all(torch.isfinite(beta_F_exc_derivative)))
 
-        # Compare the continuum-normalized c1 with a numerical derivative of
-        # the complete rho -> A -> B -> F_exc pipeline.
+        # Compare the raw grid derivative with a numerical derivative of the
+        # complete rho -> A -> B -> F_exc pipeline.
         selected_index = 9
         # A 1e-2 central step is in the converged regime for the default
         # float32 test dtype; much smaller steps suffer subtractive cancellation.
@@ -141,20 +140,18 @@ class TestLocalFreeEnergyReadout(unittest.TestCase):
         finite_difference = (
             evaluate(rho_plus) - evaluate(rho_minus)
         ) / (2.0 * epsilon)
-        cell_volume = torch.prod(data["grid_spacing"])
-        expected_derivative = -cell_volume * c1[selected_index, 0].detach()
         self.assertTrue(
             torch.allclose(
                 finite_difference,
-                expected_derivative,
+                beta_F_exc_derivative[selected_index, 0].detach(),
                 atol=5.0e-6,
                 rtol=5.0e-4,
             )
         )
 
-        # A c1 loss requires second derivatives and must reach every readout
-        # parameter through torch.autograd.grad(create_graph=True).
-        c1.square().mean().backward()
+        # A loss on a response requires second derivatives and must reach every
+        # readout parameter through torch.autograd.grad(create_graph=True).
+        beta_F_exc_derivative.square().mean().backward()
         gradients = [
             parameter.grad
             for parameter in readout.parameters()

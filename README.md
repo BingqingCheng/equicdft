@@ -7,14 +7,116 @@ One `GridData` object represents one complete density configuration and
 contains the grid fields together with periodic neighborhood indices for every
 grid point.
 
-Compute one mean density per frame before constructing the model:
+Split complete fields and construct reproducible data loaders with:
+
+```python
+from cace_grid import GridData, make_dataloaders
+
+dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
+train_loader, valid_loader, test_loader, mean_density = make_dataloaders(
+    train_dataset=dataset,
+    valid_fraction=0.1,
+    test_dataset=None,
+    batch_size=2,
+    seed=1,
+    compute_mean_density=True,
+)
+```
+
+The random split acts on complete fields and does not inspect temperature or
+chemical potential. A test dataset should be constructed separately to probe
+the intended thermodynamic states. The optional `mean_density` is computed
+from train plus validation and excludes the test set.
+
+Compose named training objectives independently of the training loop:
+
+```python
+from torch import nn
+from cace_grid import Loss, TensorLoss
+
+loss_module = Loss(
+    terms=[
+        TensorLoss(
+            name="c1",
+            prediction_key="c1",
+            target_key="c1",
+            loss_fn=nn.MSELoss(),
+            weight=1.0,
+        ),
+    ]
+)
+loss_values = loss_module(outputs, batch)
+loss_values["total"].backward()
+```
+
+Each term returns a weighted scalar. `Loss` returns the named terms for
+logging and their sum as `total`. Predictions and targets must have exactly
+matching shapes; the loss code never reshapes grid fields implicitly.
+
+Record unweighted dataset-level prediction metrics across batches:
+
+```python
+from cace_grid import Metrics
+
+c1_metrics = Metrics(
+    target_key="c1",
+    prediction_key="c1",
+    metric_keys=("mae", "rmse", "rmse_percent", "pearson_r"),
+)
+for batch in train_loader:
+    outputs = model(batch)
+    c1_metrics.update_metrics("train", outputs, batch)
+
+epoch_metrics = c1_metrics.retrieve_metrics("train")
+```
+
+`retrieve_metrics` concatenates the recorded batches before evaluating each
+metric. Thus RMSE and Pearson correlation are computed over the complete
+subset rather than averaged from batch-level values. `rmse_percent` is
+`100 * RMSE / sigma(target)` using the population standard deviation of all
+recorded target values.
+
+Keep epoch orchestration outside the model and training script with
+`Trainer`:
+
+```python
+from cace_grid import Trainer
+
+trainer = Trainer(
+    model=model,
+    loss=loss_module,
+    metrics=[c1_metrics],
+    optimizer_cls=torch.optim.Adam,
+    optimizer_args={"lr": 1.0e-4},
+    scheduler_cls=None,
+    scheduler_args=None,
+    device="cpu",
+    checkpoint_dir=None,
+    checkpoint_interval=10,
+    save_best=True,
+)
+history = trainer.fit(
+    train_loader,
+    valid_loader,
+    epochs=1000,
+    print_interval=10,
+)
+```
+
+Set `scheduler_cls` and `scheduler_args` to use an epoch scheduler. A
+`ReduceLROnPlateau` scheduler receives validation loss automatically; other
+schedulers are stepped once per epoch. Setting `checkpoint_dir` writes
+periodic `checkpoint_epoch_XXXX.pt` files and updates `last.pt`; with
+`save_best=True`, it also maintains `best.pt`.
+
+For manual preprocessing, compute one mean density per frame with:
 
 ```bash
 python scripts/mean_density.py density.extxyz
 ```
 
-The script prints a JSON list. Select the training-frame entries and average
-them to obtain the scalar `mean_density` used below.
+The script prints a JSON list. Select the training-plus-validation entries and
+average them to obtain the scalar `mean_density` used below.
 
 The same calculation can be called from a training script:
 
@@ -70,12 +172,15 @@ beta_F_exc = outputs["beta_F_exc"]
 c1 = outputs["c1"]
 ```
 
-`GridData` stores `beta = 1 / (k_B T)` and constructs the equilibrium
-reference field `c1_plus_beta_mu = log(rho * thermal_wavelength**3) +
-beta * V_ext`. When `mu` is present, it also stores `c1 =
-c1_plus_beta_mu - beta * mu`. The default Boltzmann constant is
-`8.617333262e-5` eV/K and the default thermal wavelength is one. Pass
-`boltzmann_constant=1.0` for reduced-unit data.
+Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
+External potential and chemical potential are optional annotations rather than
+model inputs. When `V_ext` is available, `GridData` constructs
+`c1_plus_beta_mu = log(rho * thermal_wavelength**3) + beta * V_ext`; if `mu`
+is also present, it stores `c1 = c1_plus_beta_mu - beta * mu`. The default
+Boltzmann constant is `8.617333262e-5` eV/K and the default thermal wavelength
+is one. Pass `boltzmann_constant=1.0` for reduced-unit data. An inference
+EXTXYZ therefore requires density, temperature, and grid metadata, but no
+dummy external potential or chemical potential.
 
 For a multicomponent density field, an optional learned, bias-free channel map
 can mix the physical component channels of `A` before symmetrization:

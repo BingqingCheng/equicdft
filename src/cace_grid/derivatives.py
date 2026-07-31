@@ -1,20 +1,23 @@
-"""Functional derivatives of the learned excess free energy."""
+"""Generic derivatives of scalar outputs with respect to grid fields."""
 
 import torch
 
 
-def compute_c1(
-    beta_F_exc: torch.Tensor,
-    rho: torch.Tensor,
-    grid_spacing: torch.Tensor,
+def compute_grid_derivative(
+    scalar_output: torch.Tensor,
+    grid_field: torch.Tensor,
     create_graph: bool = False,
 ) -> torch.Tensor:
-    """Return ``c1 = -(1 / cell_volume) * d(beta_F_exc) / d(rho)``."""
+    """Differentiate a scalar output with respect to a grid field.
 
-    derivative = torch.autograd.grad(
-        beta_F_exc.sum(),
-        rho,
+    This function applies no physical sign or grid-volume convention. Such
+    transformations belong to the model output that gives the derivative its
+    physical meaning. ``scalar_output`` must already be a scalar; batch or
+    component reductions are the caller's responsibility.
+    """
+
+    return torch.autograd.grad(
+        scalar_output,
+        grid_field,
         create_graph=create_graph,
     )[0]
-    cell_volume = torch.prod(grid_spacing, dim=-1)
-    return -derivative / cell_volume[..., None, None]

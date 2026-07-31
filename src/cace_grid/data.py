@@ -38,21 +38,22 @@ default_data_key = {
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
-    Each object contains the following fields; ``mu`` is included only when
-    supplied by the source frame::
+    Every object contains the grid geometry, density, temperature, beta, and
+    neighborhood fields. External-potential, chemical-potential, and reference
+    fields are included only when their source quantities are available::
 
         temperature                 scalar
         beta                        scalar
         mu                          [n_types] (optional)
         n_types                     scalar
-        thermal_wavelength          [n_types]
+        thermal_wavelength          [n_types] (if a reference is constructed)
         grid_spacing                [3]
         index                       [n_grid]
         grid_positions              [n_grid, 3]
-        V_ext                       [n_grid, n_types]
+        V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types]
-        c1_plus_beta_mu             [n_grid, n_types]
-        c1                          [n_grid, n_types] (if mu is supplied)
+        c1_plus_beta_mu             [n_grid, n_types] (if V_ext exists)
+        c1                          [n_grid, n_types] (if mu also exists)
         local_density_index         [n_grid, n_neighbors]
         local_density_positions     [n_neighbors, 3]
 
@@ -85,7 +86,8 @@ class GridData(dict):
         Parameters
         ----------
         path
-            EXTXYZ file containing density and external-potential fields.
+            EXTXYZ file containing a regular density field and temperature.
+            External potential and chemical potential metadata are optional.
         cutoff_grid
             Inclusive spherical cutoff in integer grid steps. The default is
             three, so retained offsets satisfy ``x^2 + y^2 + z^2 <= 9``.
@@ -95,8 +97,9 @@ class GridData(dict):
             Optional mapping from canonical GridData names to EXTXYZ field
             names. Supplied entries override :data:`default_data_key`.
         target_grid_spacing
-            If provided, block-average ``rho`` and ``V_ext`` onto this
-            commensurate coarser spacing before constructing local environments.
+            If provided, block-average ``rho`` and any available ``V_ext``
+            onto this commensurate coarser spacing before constructing local
+            environments.
         boltzmann_constant
             Boltzmann constant in energy per temperature. The default is in
             eV/K. Use ``1.0`` when temperature is already expressed in energy
@@ -104,7 +107,8 @@ class GridData(dict):
         thermal_wavelength
             Thermal de Broglie wavelength in the length unit reciprocal to
             that used by ``rho``. Supply one positive value or one value per
-            component. The default is one.
+            component. It is used only when a direct-correlation reference can
+            be constructed. The default is one.
 
         Returns
         -------
@@ -232,45 +236,32 @@ def _process_atoms(
     if not np.array_equal(flat_positions[order], np.arange(n_grid)):
         raise ValueError("grid positions do not cover the complete grid")
 
-    # Apply exactly the same canonical permutation to the coordinates and both
-    # scalar fields.
+    # Apply exactly the same canonical permutation to the coordinates and all
+    # available grid fields.
     grid_positions = grid_positions[order]
     rho = np.asarray(
         _required_source_value(atoms, data_key["rho"], "rho"), dtype=float
     )[order]
-    V_ext = np.asarray(
-        _required_source_value(atoms, data_key["V_ext"], "V_ext"), dtype=float
-    )[order]
-    if rho.ndim not in (1, 2) or V_ext.ndim not in (1, 2):
-        raise ValueError(
-            "rho and V_ext must have shape [n_grid] or [n_grid, n_types]"
-        )
+    if rho.ndim not in (1, 2):
+        raise ValueError("rho must have shape [n_grid] or [n_grid, n_types]")
     if rho.ndim == 1:
         rho = rho[:, None]
-    if V_ext.ndim == 1:
-        V_ext = V_ext[:, None]
-    if rho.shape[1] != V_ext.shape[1]:
-        raise ValueError("rho and V_ext must contain the same number of columns")
     n_types = rho.shape[1]
 
-    thermal_wavelength_values = np.asarray(
-        thermal_wavelength,
-        dtype=float,
-    ).reshape(-1)
-    if thermal_wavelength_values.size == 1:
-        thermal_wavelength_values = np.repeat(
-            thermal_wavelength_values,
-            n_types,
-        )
-    if thermal_wavelength_values.size != n_types:
-        raise ValueError(
-            "thermal_wavelength must contain one value or one value per type"
-        )
-    if (
-        not np.all(np.isfinite(thermal_wavelength_values))
-        or np.any(thermal_wavelength_values <= 0.0)
-    ):
-        raise ValueError("thermal_wavelength values must be finite and positive")
+    V_ext_value = _get_source_value(atoms, data_key["V_ext"])
+    V_ext = None
+    if V_ext_value is not None:
+        V_ext = np.asarray(V_ext_value, dtype=float)[order]
+        if V_ext.ndim not in (1, 2):
+            raise ValueError(
+                "V_ext must have shape [n_grid] or [n_grid, n_types]"
+            )
+        if V_ext.ndim == 1:
+            V_ext = V_ext[:, None]
+        if rho.shape[1] != V_ext.shape[1]:
+            raise ValueError(
+                "rho and V_ext must contain the same number of columns"
+            )
 
     grid_spacing = np.asarray(
         _required_source_value(
@@ -283,22 +274,25 @@ def _process_atoms(
     if grid_spacing.size != 3:
         raise ValueError("grid_spacing must contain one or three values")
 
-    # Optionally average both scalar fields over non-overlapping regular-grid
+    # Optionally average all available fields over non-overlapping regular-grid
     # blocks. The local environments are built only after this transformation.
     if target_grid_spacing is not None:
+        fields_to_coarsen = [rho]
+        if V_ext is not None:
+            fields_to_coarsen.append(V_ext)
         fields, grid_positions, grid_spacing = coarsen_grid(
-            values=np.column_stack((rho, V_ext)),
+            values=np.column_stack(fields_to_coarsen),
             grid_positions=grid_positions,
             grid_spacing=grid_spacing,
             target_grid_spacing=target_grid_spacing,
         )
         rho = fields[:, :n_types]
-        V_ext = fields[:, n_types:]
+        if V_ext is not None:
+            V_ext = fields[:, n_types:]
         n_grid = grid_positions.shape[0]
 
-    # The equilibrium one-body identity uses dimensionless beta-weighted
-    # energies. rho and the thermal wavelength must use reciprocal length
-    # units so rho * Lambda^3 is dimensionless.
+    # Temperature is required even for an initial fixed-temperature fit so the
+    # data retain their thermodynamic state and unit conversion explicitly.
     temperature = _positive_scalar(
         _required_source_value(
             atoms,
@@ -308,14 +302,55 @@ def _process_atoms(
         "temperature",
     )
     beta = 1.0 / (boltzmann_constant * temperature)
-    if np.any(rho <= 0.0):
-        raise ValueError(
-            "rho must be positive to construct logarithmic c1 targets"
+
+    # Chemical potential is optional metadata. Normalize it to one value per
+    # physical density component even if the source stores a scalar.
+    mu_value = _get_source_value(atoms, data_key["mu"])
+    mu_values = None
+    if mu_value is not None:
+        mu_values = np.asarray(mu_value, dtype=float).reshape(-1)
+        if mu_values.size == 1:
+            mu_values = np.repeat(mu_values, n_types)
+        if mu_values.size != n_types:
+            raise ValueError("mu must contain one value or one value per type")
+        if not np.all(np.isfinite(mu_values)):
+            raise ValueError("mu values must be finite")
+
+    # A reference direct-correlation field additionally requires V_ext. rho and
+    # the thermal wavelength use reciprocal length units so rho*Lambda^3 is
+    # dimensionless. No reference fields are invented for inference-only
+    # inputs that omit the external field.
+    thermal_wavelength_values = None
+    c1_plus_beta_mu = None
+    if V_ext is not None:
+        thermal_wavelength_values = np.asarray(
+            thermal_wavelength,
+            dtype=float,
+        ).reshape(-1)
+        if thermal_wavelength_values.size == 1:
+            thermal_wavelength_values = np.repeat(
+                thermal_wavelength_values,
+                n_types,
+            )
+        if thermal_wavelength_values.size != n_types:
+            raise ValueError(
+                "thermal_wavelength must contain one value or one value per type"
+            )
+        if (
+            not np.all(np.isfinite(thermal_wavelength_values))
+            or np.any(thermal_wavelength_values <= 0.0)
+        ):
+            raise ValueError(
+                "thermal_wavelength values must be finite and positive"
+            )
+        if np.any(rho <= 0.0):
+            raise ValueError(
+                "rho must be positive to construct logarithmic c1 targets"
+            )
+        c1_plus_beta_mu = (
+            np.log(rho * thermal_wavelength_values[None, :] ** 3)
+            + beta * V_ext
         )
-    c1_plus_beta_mu = (
-        np.log(rho * thermal_wavelength_values[None, :] ** 3)
-        + beta * V_ext
-    )
 
     # Store only the geometry needed to construct all overlapping periodic
     # environments. Model forwards use these indices to gather from live rho.
@@ -331,19 +366,10 @@ def _process_atoms(
         "temperature": torch.tensor(temperature, dtype=dtype),
         "beta": torch.tensor(beta, dtype=dtype),
         "n_types": torch.tensor(n_types, dtype=torch.long),
-        "thermal_wavelength": torch.tensor(
-            thermal_wavelength_values,
-            dtype=dtype,
-        ),
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
-        "V_ext": torch.tensor(V_ext, dtype=dtype),
         "rho": torch.tensor(rho, dtype=dtype),
-        "c1_plus_beta_mu": torch.tensor(
-            c1_plus_beta_mu,
-            dtype=dtype,
-        ),
         "local_density_index": torch.tensor(
             local_density_index, dtype=torch.long
         ),
@@ -352,19 +378,20 @@ def _process_atoms(
         ),
     }
 
-    # Chemical potential is useful metadata for grand-canonical frames but is
-    # not part of the density field itself and may be absent, for example for
-    # canonical simulations. Do not assign an artificial value when missing.
-    mu = _get_source_value(atoms, data_key["mu"])
-    if mu is not None:
-        mu_values = np.asarray(mu, dtype=float).reshape(-1)
-        if mu_values.size == 1:
-            mu_values = np.repeat(mu_values, n_types)
-        if mu_values.size != n_types:
-            raise ValueError("mu must contain one value or one value per type")
-        if not np.all(np.isfinite(mu_values)):
-            raise ValueError("mu values must be finite")
+    if V_ext is not None:
+        data["V_ext"] = torch.tensor(V_ext, dtype=dtype)
+    if mu_values is not None:
         data["mu"] = torch.tensor(mu_values, dtype=dtype)
+    if c1_plus_beta_mu is not None:
+        data["thermal_wavelength"] = torch.tensor(
+            thermal_wavelength_values,
+            dtype=dtype,
+        )
+        data["c1_plus_beta_mu"] = torch.tensor(
+            c1_plus_beta_mu,
+            dtype=dtype,
+        )
+    if c1_plus_beta_mu is not None and mu_values is not None:
         data["c1"] = torch.tensor(
             c1_plus_beta_mu - beta * mu_values[None, :],
             dtype=dtype,

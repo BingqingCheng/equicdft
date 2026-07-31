@@ -11,7 +11,12 @@ from torch.utils.data import DataLoader
 from cace_grid import CartesianAFeatures, GridData, default_data_key
 
 
-def _write_grid(path, include_mu=True):
+def _write_grid(
+    path,
+    include_mu=True,
+    include_temperature=True,
+    include_v_ext=True,
+):
     shape = (4, 4, 4)
     spacing = 0.5
     grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
@@ -25,11 +30,13 @@ def _write_grid(path, include_mu=True):
         pbc=True,
     )
     atoms.arrays["density"] = (values + 0.25)[order]
-    atoms.arrays["V_ext"] = (-values)[order]
+    if include_v_ext:
+        atoms.arrays["V_ext"] = (-values)[order]
     atoms.info["grid_size"] = np.asarray(shape)
     atoms.info["grid_spacing"] = np.repeat(spacing, 3)
     atoms.info["grid_indexing"] = "zero_based"
-    atoms.info["T"] = 1.5
+    if include_temperature:
+        atoms.info["T"] = 1.5
     if include_mu:
         atoms.info["mu"] = -1.0
     write(path, atoms, format="extxyz")
@@ -165,6 +172,58 @@ class TestGridData(unittest.TestCase):
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertNotIn("mu", batch)
         self.assertNotIn("c1", batch)
+
+    def test_density_only_inference_data(self):
+        path = Path(self.temporary_directory.name) / "density-only.extxyz"
+        _write_grid(
+            path,
+            include_mu=False,
+            include_v_ext=False,
+        )
+        data = GridData.from_xyz(
+            path,
+            cutoff_grid=0,
+            target_grid_spacing=1.0,
+        )[0]
+
+        self.assertEqual(
+            set(data),
+            {
+                "temperature",
+                "beta",
+                "n_types",
+                "grid_spacing",
+                "index",
+                "grid_positions",
+                "rho",
+                "local_density_index",
+                "local_density_positions",
+            },
+        )
+        self.assertEqual(data["rho"].shape, (8, 1))
+        self.assertEqual(data["local_density_index"].shape, (8, 1))
+
+    def test_external_potential_is_optional(self):
+        no_external_path = (
+            Path(self.temporary_directory.name) / "without-external.extxyz"
+        )
+        _write_grid(no_external_path, include_v_ext=False)
+        no_external = GridData.from_xyz(no_external_path, cutoff_grid=1)[0]
+
+        self.assertIn("temperature", no_external)
+        self.assertIn("beta", no_external)
+        self.assertIn("mu", no_external)
+        self.assertNotIn("V_ext", no_external)
+        self.assertNotIn("thermal_wavelength", no_external)
+        self.assertNotIn("c1_plus_beta_mu", no_external)
+        self.assertNotIn("c1", no_external)
+
+    def test_temperature_is_required(self):
+        path = Path(self.temporary_directory.name) / "without-temperature.extxyz"
+        _write_grid(path, include_temperature=False)
+
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            GridData.from_xyz(path, cutoff_grid=1)
 
     def test_periodic_local_density_and_default_batching(self):
         data = GridData.from_xyz(self.path, cutoff_grid=1)[0]

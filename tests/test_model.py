@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 import torch
+from torch import nn
 
 from cace_grid import (
     CartesianAFeatures,
@@ -10,6 +11,18 @@ from cace_grid import (
     LocalFreeEnergyReadout,
     get_neighbor_indices,
 )
+
+
+class _DensityFeatures(nn.Module):
+    """Expose rho directly for an analytic model-integration test."""
+
+    def forward(self, data):
+        return data["rho"]
+
+
+class _IdentityModule(nn.Module):
+    def forward(self, values):
+        return values
 
 
 class TestGridCACEModel(unittest.TestCase):
@@ -63,6 +76,27 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(outputs["beta_free_energy_density"].shape, (27,))
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 1))
+
+    def test_model_applies_c1_sign_and_cell_volume(self):
+        # With per-particle free energy equal to rho,
+        # beta_F_exc = Delta V * sum_g rho_g^2. Its discrete derivative is
+        # 2*Delta V*rho, while the continuum c1 must be -2*rho.
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=_IdentityModule(),
+            compute_c1=True,
+        )
+        data = self._make_data()
+        data = {
+            key: torch.stack((value, value.clone()))
+            for key, value in data.items()
+        }
+
+        outputs = model(data)
+
+        self.assertEqual(outputs["beta_F_exc"].shape, (2,))
+        self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
 
     def test_empty_density_has_zero_integrated_free_energy(self):
         model = self._make_model()

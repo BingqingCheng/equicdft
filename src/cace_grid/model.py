@@ -6,7 +6,7 @@ from typing import Dict
 import torch
 from torch import nn
 
-from .derivatives import compute_c1
+from .derivatives import compute_grid_derivative
 from .features import CartesianAFeatures
 from .readout import LocalFreeEnergyReadout
 from .symmetrize import CartesianBFeatures
@@ -29,23 +29,28 @@ class GridCACEModel(nn.Module):
     the higher-order graph. Setting ``compute_c1=False`` omits the derivative
     output and leaves ``rho`` unchanged.
 
-    The returned dictionary contains:
+    In the shapes below, ``...`` denotes optional leading batch dimensions,
+    ``g`` runs over ``n_grid`` grid points, and ``i`` runs over ``n_types``
+    density components. The returned dictionary contains:
 
     ``beta_free_energy_per_particle``
-        Dimensionless per-particle excess free energies
+        Shape ``[..., n_grid, n_types]``. Dimensionless per-particle excess
+        free energies
         ``beta_a_exc[..., grid, type]`` predicted by the local readout.
     ``beta_free_energy_density``
-        Dimensionless excess free-energy density
+        Shape ``[..., n_grid]``. Dimensionless excess free-energy density
         ``sum_i rho[..., grid, i] * beta_a_exc[..., grid, i]`` at each grid
         point, before multiplication by the voxel volume.
     ``beta_F_exc``
-        Dimensionless excess free energy for each complete density field,
-        obtained by multiplying the grid sum of
+        Shape ``[...]`` (a scalar without batching). Dimensionless excess free
+        energy for each complete density field, obtained by multiplying the
+        grid sum of
         ``beta_free_energy_density`` by ``Delta V``.
     ``c1``
-        First direct correlation ``-delta(beta_F_exc) / delta(rho)`` in the
-        continuum functional-derivative convention. This key is present only
-        when ``compute_c1=True``.
+        Shape ``[..., n_grid, n_types]``. First direct correlation
+        ``-delta(beta_F_exc) / delta(rho)`` in the continuum
+        functional-derivative convention. This key is present only when
+        ``compute_c1=True``.
 
     Parameters
     ----------
@@ -128,20 +133,23 @@ class GridCACEModel(nn.Module):
             # formed from the Cartesian components of A.
             B = self.b_features(A)
 
-            # beta_free_energy_per_particle[..., g, i] is the dimensionless
-            # excess free energy assigned to one particle of type i at grid g.
+            # beta_free_energy_per_particle has shape
+            #     [..., n_grid, n_types].
+            # Entry [..., g, i] is the dimensionless excess free energy
+            # assigned to one particle of type i at grid point g.
             beta_free_energy_per_particle = self.readout(B)
 
-            # beta_free_energy_density[..., g] is beta*f_exc at grid g. The
-            # density is still in physical number-density units, and no voxel
-            # volume has been applied at this stage.
+            # beta_free_energy_density has shape [..., n_grid]. Entry [..., g]
+            # is beta*f_exc at grid point g. The density is still in physical
+            # number-density units, and no voxel volume has been applied.
             beta_free_energy_density = torch.sum(
                 data["rho"] * beta_free_energy_per_particle,
                 dim=-1,
             )
 
-            # beta_F_exc[...] is the scalar dimensionless excess free energy
-            # of each complete field. cell_volume is Delta V = hx*hy*hz.
+            # grid_spacing has shape [..., 3], so cell_volume has shape [...].
+            # beta_F_exc also has shape [...] (or scalar shape [] without a
+            # batch) and stores one dimensionless excess free energy per field.
             cell_volume = torch.prod(data["grid_spacing"], dim=-1)
             beta_F_exc = cell_volume * torch.sum(
                 beta_free_energy_density,
@@ -157,15 +165,22 @@ class GridCACEModel(nn.Module):
             }
 
             if self.compute_c1:
-                # c1[..., g, i] is the continuum-normalized first direct
-                # correlation. A later c2 branch should differentiate this
-                # field in derivatives.py and append another collected output
-                # here, without changing the local readout.
-                outputs["c1"] = compute_c1(
-                    beta_F_exc,
+                # beta_F_exc_derivative and c1 have the same shape as rho:
+                #     [..., n_grid, n_types].
+                # The generic helper returns the derivative with respect to a
+                # discrete rho value; the minus sign and division by Delta V
+                # produce the continuum-normalized first direct correlation.
+                # Summing independent batch outputs supplies the scalar that
+                # torch.autograd requires without embedding batch semantics in
+                # the derivative helper.
+                beta_F_exc_derivative = compute_grid_derivative(
+                    beta_F_exc.sum(),
                     data["rho"],
-                    data["grid_spacing"],
                     create_graph=self.training,
+                )
+                outputs["c1"] = (
+                    -beta_F_exc_derivative
+                    / cell_volume[..., None, None]
                 )
 
         return self.extract_outputs(outputs)
