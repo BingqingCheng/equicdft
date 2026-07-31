@@ -8,6 +8,7 @@ from .loss import Loss, TensorLoss
 from .metrics import Metrics, compute_metric
 from .model import GridCACEModel
 from .readout import LocalReadout
+from .solver import GridSolver
 from .stencil import (
     coarsen_grid,
     get_neighbor_indices,
@@ -21,6 +22,7 @@ __all__ = [
     "CartesianBFeatures",
     "GridData",
     "GridCACEModel",
+    "GridSolver",
     "LocalReadout",
     "Loss",
     "Metrics",

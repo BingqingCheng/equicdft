@@ -14,6 +14,7 @@ from cace_grid import CartesianAFeatures, GridData, default_data_key
 def _write_grid(
     path,
     include_mu=True,
+    include_rho=True,
     include_temperature=True,
     include_v_ext=True,
 ):
@@ -29,7 +30,8 @@ def _write_grid(
         cell=np.diag(shape),
         pbc=True,
     )
-    atoms.arrays["density"] = (values + 0.25)[order]
+    if include_rho:
+        atoms.arrays["density"] = (values + 0.25)[order]
     if include_v_ext:
         atoms.arrays["V_ext"] = (-values)[order]
     atoms.info["grid_size"] = np.asarray(shape)
@@ -97,6 +99,89 @@ class TestGridData(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_from_dict_builds_grid_without_fields(self):
+        data = GridData.from_dict(
+            {
+                "grid_size": [3, 4, 5],
+                "n_types": 1,
+                "grid_spacing": 0.5,
+                "T": 1.5,
+            },
+            cutoff_grid=1,
+            boltzmann_constant=1.0,
+        )
+
+        self.assertNotIn("rho", data)
+        self.assertNotIn("V_ext", data)
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertEqual(data["grid_positions"].shape, (60, 3))
+        self.assertTrue(
+            torch.equal(
+                data["grid_positions"][1],
+                torch.tensor([0, 0, 1]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                data["grid_spacing"],
+                torch.tensor([0.5, 0.5, 0.5]),
+            )
+        )
+        self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
+        self.assertEqual(data["local_density_index"].shape, (60, 7))
+
+    def test_from_dict_builds_multicomponent_metadata(self):
+        data = GridData.from_dict(
+            {
+                "grid_size": [2, 2, 2],
+                "grid_spacing": [0.5, 0.6, 0.7],
+                "temperature": 2.0,
+                "n_types": 2,
+            },
+            cutoff_grid=0,
+            boltzmann_constant=1.0,
+            thermal_wavelength=[1.0, 2.0],
+        )
+
+        self.assertEqual(data["n_types"].item(), 2)
+        self.assertEqual(data["thermal_wavelength"].shape, (2,))
+        self.assertNotIn("rho", data)
+        self.assertNotIn("V_ext", data)
+
+        data["V_ext"] = torch.zeros((8, 2))
+        self.assertTrue(
+            torch.equal(
+                data["V_ext"],
+                torch.zeros((8, 2)),
+            )
+        )
+
+    def test_from_dict_requires_grid_geometry_and_temperature(self):
+        with self.assertRaisesRegex(ValueError, "grid_size"):
+            GridData.from_dict(
+                {
+                    "n_types": 1,
+                    "grid_spacing": 0.5,
+                    "temperature": 1.5,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            GridData.from_dict(
+                {
+                    "grid_size": [2, 2, 2],
+                    "n_types": 1,
+                    "grid_spacing": 0.5,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "n_types"):
+            GridData.from_dict(
+                {
+                    "grid_size": [2, 2, 2],
+                    "grid_spacing": 0.5,
+                    "temperature": 1.5,
+                }
+            )
 
     def test_grid_data_dictionary(self):
         data = GridData.from_xyz(self.path, cutoff_grid=1)[0]
@@ -202,6 +287,34 @@ class TestGridData(unittest.TestCase):
         )
         self.assertEqual(data["rho"].shape, (8, 1))
         self.assertEqual(data["local_density_index"].shape, (8, 1))
+
+    def test_external_potential_only_inference_data(self):
+        path = Path(self.temporary_directory.name) / "external-only.extxyz"
+        _write_grid(path, include_rho=False)
+        data = GridData.from_xyz(
+            path,
+            cutoff_grid=0,
+            target_grid_spacing=1.0,
+        )[0]
+
+        self.assertNotIn("rho", data)
+        self.assertNotIn("c1_plus_beta_mu", data)
+        self.assertNotIn("c1", data)
+        self.assertEqual(data["V_ext"].shape, (8, 1))
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertEqual(data["thermal_wavelength"].shape, (1,))
+        self.assertEqual(data["local_density_index"].shape, (8, 1))
+
+    def test_density_or_external_potential_is_required(self):
+        path = Path(self.temporary_directory.name) / "geometry-only.extxyz"
+        _write_grid(
+            path,
+            include_rho=False,
+            include_v_ext=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "rho or V_ext"):
+            GridData.from_xyz(path, cutoff_grid=1)
 
     def test_external_potential_is_optional(self):
         no_external_path = (

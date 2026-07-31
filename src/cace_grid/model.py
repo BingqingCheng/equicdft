@@ -1,7 +1,8 @@
 """Collected grid-CACE density-functional model."""
 
 from contextlib import nullcontext
-from typing import Dict
+from numbers import Real
+from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -27,7 +28,8 @@ class GridCACEModel(nn.Module):
     derivative-level loss can be differentiated with respect to model
     parameters. In evaluation mode, ``c1`` is produced without constructing
     the higher-order graph. Setting ``compute_c1=False`` omits the derivative
-    output and leaves ``rho`` unchanged.
+    output and leaves ``rho`` unchanged. The constructor value is the default;
+    an individual forward call can override it without mutating the model.
 
     In the shapes below, ``...`` denotes optional leading batch dimensions,
     ``g`` runs over ``n_grid`` grid points, and ``i`` runs over ``n_types``
@@ -61,6 +63,15 @@ class GridCACEModel(nn.Module):
     readout
         Module that predicts the per-particle excess free energy from the
         flattened local ``B`` features and scalar temperature.
+    grid_spacing
+        One value for an isotropic grid or three Cartesian spacings. The
+        discretization is fixed by training and stored with the model.
+    boltzmann_constant
+        Boltzmann constant in the energy and temperature units used to train
+        the model. It is stored for inference thermodynamics.
+    thermal_wavelength
+        One positive value or one value per density component. It fixes the
+        ideal-gas convention used to reconstruct external potentials.
     compute_c1
         If ``True``, initialize density gradients and include ``c1`` in the
         collected outputs. Disable it for energy-only evaluation.
@@ -71,6 +82,13 @@ class GridCACEModel(nn.Module):
         a_features: CartesianAFeatures,
         b_features: CartesianBFeatures,
         readout: LocalReadout,
+        grid_spacing: Union[float, Sequence[float], torch.Tensor],
+        boltzmann_constant: float = 1.0,
+        thermal_wavelength: Union[
+            float,
+            Sequence[float],
+            torch.Tensor,
+        ] = 1.0,
         compute_c1: bool = True,
     ) -> None:
         super().__init__()
@@ -83,6 +101,67 @@ class GridCACEModel(nn.Module):
         self.readout = readout
         self.compute_c1 = compute_c1
 
+        grid_spacing_tensor = torch.as_tensor(
+            grid_spacing,
+            dtype=torch.get_default_dtype(),
+        ).detach().clone().reshape(-1)
+        if grid_spacing_tensor.numel() == 1:
+            grid_spacing_tensor = grid_spacing_tensor.repeat(3)
+        if grid_spacing_tensor.shape != (3,):
+            raise ValueError(
+                "grid_spacing must contain one or three values"
+            )
+        if (
+            not torch.all(torch.isfinite(grid_spacing_tensor)).item()
+            or torch.any(grid_spacing_tensor <= 0.0).item()
+        ):
+            raise ValueError("grid_spacing values must be finite and positive")
+
+        if isinstance(boltzmann_constant, bool) or not isinstance(
+            boltzmann_constant,
+            Real,
+        ):
+            raise TypeError("boltzmann_constant must be a positive scalar")
+        boltzmann_constant_tensor = torch.as_tensor(
+            boltzmann_constant,
+            dtype=torch.get_default_dtype(),
+        )
+        if (
+            not torch.isfinite(boltzmann_constant_tensor).item()
+            or boltzmann_constant_tensor.item() <= 0.0
+        ):
+            raise ValueError("boltzmann_constant must be finite and positive")
+
+        thermal_wavelength_tensor = torch.as_tensor(
+            thermal_wavelength,
+            dtype=torch.get_default_dtype(),
+        ).detach().clone().reshape(-1)
+        if thermal_wavelength_tensor.numel() == 1:
+            thermal_wavelength_tensor = thermal_wavelength_tensor.repeat(
+                self.n_types
+            )
+        if thermal_wavelength_tensor.shape != (self.n_types,):
+            raise ValueError(
+                "thermal_wavelength must contain one value or one per type"
+            )
+        if (
+            not torch.all(torch.isfinite(thermal_wavelength_tensor)).item()
+            or torch.any(thermal_wavelength_tensor <= 0.0).item()
+        ):
+            raise ValueError(
+                "thermal_wavelength values must be finite and positive"
+            )
+
+        self.register_buffer("grid_spacing", grid_spacing_tensor)
+        self.register_buffer(
+            "boltzmann_constant",
+            boltzmann_constant_tensor,
+        )
+        self.register_buffer(
+            "thermal_wavelength",
+            thermal_wavelength_tensor,
+        )
+
         self.required_derivatives = ["rho"] if compute_c1 else []
         self.model_outputs = [
             "beta_free_energy_per_particle",
@@ -92,38 +171,102 @@ class GridCACEModel(nn.Module):
         if compute_c1:
             self.model_outputs.append("c1")
 
+    @property
+    def cutoff_grid(self) -> int:
+        """Integer stencil cutoff used by the local representation."""
+
+        return self.a_features.cutoff_grid
+
+    @property
+    def n_types(self) -> int:
+        """Number of physical density components accepted by the model."""
+
+        return self.a_features.n_types
+
+    @property
+    def mean_density(self) -> torch.Tensor:
+        """Density scale fitted from the development data."""
+
+        return self.a_features.mean_density
+
+    @property
+    def cell_volume(self) -> torch.Tensor:
+        """Volume represented by one grid point."""
+
+        return torch.prod(self.grid_spacing)
+
+    def _validate_grid_spacing(self, data: Dict[str, torch.Tensor]) -> None:
+        """Reject grids inconsistent with the trained discretization."""
+
+        if "grid_spacing" not in data:
+            return
+        input_spacing = data["grid_spacing"]
+        if input_spacing.shape[-1:] != (3,):
+            raise ValueError(
+                "input grid_spacing must have three Cartesian values"
+            )
+        expected = self.grid_spacing.to(
+            device=input_spacing.device,
+            dtype=input_spacing.dtype,
+        ).expand_as(input_spacing)
+        if not torch.allclose(input_spacing, expected):
+            raise ValueError(
+                "input grid_spacing does not match the trained model"
+            )
+
     def initialize_derivatives(
         self,
         data: Dict[str, torch.Tensor],
+        compute_c1: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Enable gradients for the fields required by response outputs."""
 
-        for key in self.required_derivatives:
+        if compute_c1 is None:
+            compute_c1 = self.compute_c1
+        required_derivatives = ["rho"] if compute_c1 else []
+        for key in required_derivatives:
             data[key].requires_grad_(True)
         return data
 
     def extract_outputs(
         self,
         data: Dict[str, torch.Tensor],
+        compute_c1: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return only the canonical model outputs."""
 
-        return {key: data[key] for key in self.model_outputs}
+        if compute_c1 is None:
+            compute_c1 = self.compute_c1
+        model_outputs = [
+            "beta_free_energy_per_particle",
+            "beta_free_energy_density",
+            "beta_F_exc",
+        ]
+        if compute_c1:
+            model_outputs.append("c1")
+        return {key: data[key] for key in model_outputs}
 
     def forward(
         self,
         data: Dict[str, torch.Tensor],
+        compute_c1: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
+
+        if compute_c1 is None:
+            compute_c1 = self.compute_c1
+        if not isinstance(compute_c1, bool):
+            raise TypeError("compute_c1 must be a boolean or None")
 
         # A requested functional derivative requires gradient tracking even
         # when surrounding evaluation code uses torch.no_grad(). Energy-only
         # evaluation respects the caller's existing gradient context.
         gradient_context = (
-            torch.enable_grad() if self.compute_c1 else nullcontext()
+            torch.enable_grad() if compute_c1 else nullcontext()
         )
         with gradient_context:
-            data = self.initialize_derivatives(data)
+            self._validate_grid_spacing(data)
+            data = self.initialize_derivatives(data, compute_c1=compute_c1)
 
             # A[..., g, n, k, c] contains Cartesian density moment k in radial
             # channel n and descriptor channel c around grid point g. Channel
@@ -171,10 +314,14 @@ class GridCACEModel(nn.Module):
                 dim=-1,
             )
 
-            # grid_spacing has shape [..., 3], so cell_volume has shape [...].
-            # beta_F_exc also has shape [...] (or scalar shape [] without a
-            # batch) and stores one dimensionless excess free energy per field.
-            cell_volume = torch.prod(data["grid_spacing"], dim=-1)
+            # cell_volume is a scalar fixed by the training-grid
+            # discretization. beta_F_exc has shape [...] (or scalar shape []
+            # without a batch) and stores one dimensionless excess free energy
+            # per field.
+            cell_volume = self.cell_volume.to(
+                device=beta_free_energy_density.device,
+                dtype=beta_free_energy_density.dtype,
+            )
             beta_F_exc = cell_volume * torch.sum(
                 beta_free_energy_density,
                 dim=-1,
@@ -188,7 +335,7 @@ class GridCACEModel(nn.Module):
                 "beta_F_exc": beta_F_exc,
             }
 
-            if self.compute_c1:
+            if compute_c1:
                 # beta_F_exc_derivative and c1 have the same shape as rho:
                 #     [..., n_grid, n_types].
                 # The generic helper returns the derivative with respect to a
@@ -204,7 +351,7 @@ class GridCACEModel(nn.Module):
                 )
                 outputs["c1"] = (
                     -beta_F_exc_derivative
-                    / cell_volume[..., None, None]
+                    / cell_volume
                 )
 
-        return self.extract_outputs(outputs)
+        return self.extract_outputs(outputs, compute_c1=compute_c1)

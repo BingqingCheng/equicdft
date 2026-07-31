@@ -164,6 +164,9 @@ model = GridCACEModel(
     a_features=a_features,
     b_features=b_features,
     readout=readout,
+    grid_spacing=data["grid_spacing"],
+    boltzmann_constant=1.0,
+    thermal_wavelength=data["thermal_wavelength"],
     compute_c1=True,
 )
 
@@ -175,14 +178,66 @@ c1 = outputs["c1"]
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
 `GridCACEModel` appends the scalar temperature once to the flattened local
 `B` feature vector at every grid point before applying `LocalReadout`.
+The trained grid spacing and thermodynamic conventions are persistent model
+buffers. The stencil cutoff, number of components, and density scale are also
+available directly as `model.cutoff_grid`, `model.n_types`, and
+`model.mean_density`.
 External potential and chemical potential are optional annotations rather
 than model inputs. When `V_ext` is available, `GridData` constructs
 `c1_plus_beta_mu = log(rho * thermal_wavelength**3) + beta * V_ext`; if `mu`
 is also present, it stores `c1 = c1_plus_beta_mu - beta * mu`. The default
 Boltzmann constant is `8.617333262e-5` eV/K and the default thermal wavelength
 is one. Pass `boltzmann_constant=1.0` for reduced-unit data. An inference
-EXTXYZ therefore requires density, temperature, and grid metadata, but no
-dummy external potential or chemical potential.
+EXTXYZ requires temperature, grid metadata, and at least one of `rho` and
+`V_ext`. A density-only record can be evaluated directly; an external-field-
+only record supplies the geometry and thermodynamic controls needed to solve
+for an equilibrium density.
+
+For inference, the regular grid can instead be constructed directly:
+
+```python
+import torch
+
+external_data = GridData.from_dict(
+    {
+        "grid_size": [10, 10, 10],
+        "n_types": 1,
+        "grid_spacing": 0.5,
+        "temperature": 1.5,
+    },
+    cutoff_grid=3,
+    boltzmann_constant=1.0,
+)
+external_data["V_ext"] = V_ext.reshape(1000, 1)
+external_data["mu"] = torch.tensor([0.0])
+```
+
+`grid_size` always contains only `[nx, ny, nz]`; `n_types` is a separate
+required scalar. Density, external-potential, and chemical-potential tensors
+are assigned afterward in their canonical flattened shapes.
+
+Use `GridSolver` for prescribed-density thermodynamics or equilibrium
+minimization:
+
+```python
+from cace_grid import GridSolver
+
+solver = GridSolver(model, device="cuda")
+
+# data contains rho; V_ext and mu are optional.
+evaluated = solver.evaluate(data)
+
+# external_data contains V_ext and mu but need not contain rho.
+equilibrium = solver.solve(external_data)
+rho = equilibrium["rho"]
+
+# Alternatively impose one particle number per component.
+canonical = solver.solve(external_data, particle_numbers=[128.0])
+```
+
+The minimization uses energy-only model calls and evaluates `c1` after
+convergence. `GridCACEModel.forward(..., compute_c1=False)` can likewise be
+used directly when only `beta_F_exc` is needed.
 
 For a multicomponent density field, an optional learned, bias-free channel map
 can mix the physical component channels of `A` before symmetrization:

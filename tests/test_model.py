@@ -16,6 +16,12 @@ from cace_grid import (
 class _DensityFeatures(nn.Module):
     """Expose rho directly for an analytic model-integration test."""
 
+    def __init__(self):
+        super().__init__()
+        self.cutoff_grid = 0
+        self.n_types = 1
+        self.register_buffer("mean_density", torch.tensor(1.0))
+
     def forward(self, data):
         return data["rho"].unsqueeze(-2).unsqueeze(-2)
 
@@ -66,8 +72,47 @@ class TestGridCACEModel(unittest.TestCase):
             a_features,
             b_features,
             readout,
+            grid_spacing=0.5,
+            boltzmann_constant=1.0,
+            thermal_wavelength=1.0,
             compute_c1=compute_c1,
         )
+
+    def test_exposes_persistent_inference_metadata(self):
+        model = self._make_model()
+
+        self.assertEqual(model.cutoff_grid, 1)
+        self.assertEqual(model.n_types, 1)
+        self.assertEqual(model.mean_density.item(), 0.5)
+        self.assertTrue(
+            torch.equal(model.grid_spacing, torch.full((3,), 0.5))
+        )
+        self.assertEqual(model.cell_volume.item(), 0.125)
+        self.assertEqual(model.boltzmann_constant.item(), 1.0)
+        self.assertTrue(
+            torch.equal(model.thermal_wavelength, torch.ones(1))
+        )
+        state = model.state_dict()
+        self.assertIn("grid_spacing", state)
+        self.assertIn("boltzmann_constant", state)
+        self.assertIn("thermal_wavelength", state)
+
+    def test_rejects_mismatched_input_grid_spacing(self):
+        model = self._make_model()
+        data = self._make_data()
+        data["grid_spacing"] = torch.tensor([0.25, 0.25, 0.25])
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            model(data)
+
+    def test_grid_spacing_is_optional_in_forward_data(self):
+        model = self._make_model()
+        data = self._make_data()
+        data.pop("grid_spacing")
+
+        outputs = model(data)
+
+        self.assertEqual(outputs["beta_F_exc"].shape, ())
 
     def test_collects_outputs_and_initializes_density_gradient(self):
         model = self._make_model()
@@ -93,6 +138,7 @@ class TestGridCACEModel(unittest.TestCase):
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
             readout=_FirstFeatureReadout(),
+            grid_spacing=0.5,
             compute_c1=True,
         )
         data = self._make_data()
@@ -119,6 +165,7 @@ class TestGridCACEModel(unittest.TestCase):
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
             readout=readout,
+            grid_spacing=0.5,
             compute_c1=False,
         )
 
@@ -200,6 +247,26 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertFalse(data["rho"].requires_grad)
         self.assertFalse(outputs["beta_F_exc"].requires_grad)
 
+    def test_c1_can_be_selected_per_forward_call(self):
+        model = self._make_model(compute_c1=True)
+        data = self._make_data()
+        data["rho"].requires_grad_(True)
+
+        energy_outputs = model(data, compute_c1=False)
+        self.assertNotIn("c1", energy_outputs)
+        energy_gradient = torch.autograd.grad(
+            energy_outputs["beta_F_exc"],
+            data["rho"],
+        )[0]
+        self.assertTrue(torch.all(torch.isfinite(energy_gradient)))
+
+        energy_default_model = self._make_model(compute_c1=False)
+        response_outputs = energy_default_model(
+            self._make_data(),
+            compute_c1=True,
+        )
+        self.assertIn("c1", response_outputs)
+
     def test_compute_c1_must_be_boolean(self):
         with self.assertRaises(TypeError):
             GridCACEModel(
@@ -211,6 +278,7 @@ class TestGridCACEModel(unittest.TestCase):
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
                 LocalReadout(n_types=1),
+                grid_spacing=0.5,
                 compute_c1=1,
             )
 
@@ -233,7 +301,12 @@ class TestGridCACEModel(unittest.TestCase):
             n_types=2,
             hidden_sizes=(8,),
         )
-        model = GridCACEModel(a_features, b_features, readout)
+        model = GridCACEModel(
+            a_features,
+            b_features,
+            readout,
+            grid_spacing=0.5,
+        )
 
         outputs = model(data)
 
