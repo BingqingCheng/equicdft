@@ -55,6 +55,7 @@ class GridData(dict):
         temperature                 scalar
         beta                        scalar
         mu                          [n_types] (optional)
+        beta_mu                     [n_types] (if mu exists)
         n_types                     scalar
         thermal_wavelength          [n_types] (if V_ext exists or built directly)
         grid_spacing                [3]
@@ -62,8 +63,10 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
-        c1_plus_beta_mu             [n_grid, n_types] (if rho and V_ext exist)
-        c1                          [n_grid, n_types] (if rho, V_ext, and mu exist)
+        c1_plus_beta_mu             [n_grid, n_types] (if rho is positive and
+                                    V_ext exists)
+        c1                          [n_grid, n_types] (if rho is positive and
+                                    V_ext and mu exist)
         local_density_index         [n_grid, n_neighbors]
         local_density_positions     [n_neighbors, 3]
 
@@ -180,6 +183,14 @@ class GridData(dict):
             )
             for atoms in configurations
         ]
+        # Default PyTorch collation requires identical dictionary keys. If a
+        # selected frame contains an empty voxel, omit logarithmic pointwise
+        # targets from the complete selection; the masked local-chemical-
+        # potential loss uses rho and V_ext directly for every frame.
+        if any("c1_plus_beta_mu" not in frame for frame in data):
+            for frame in data:
+                frame.pop("c1_plus_beta_mu", None)
+                frame.pop("c1", None)
         if resolved_grid_info is not None:
             for frame in data:
                 _validate_frame_grid_info(frame, resolved_grid_info)
@@ -562,6 +573,10 @@ def _process_atoms(
             )
         if rho.ndim == 1:
             rho = rho[:, None]
+        if not np.all(np.isfinite(rho)):
+            raise ValueError("rho must contain only finite values")
+        if np.any(rho < 0.0):
+            raise ValueError("rho must contain only nonnegative values")
 
     V_ext_value = _get_source_value(atoms, data_key["V_ext"])
     V_ext = None
@@ -669,11 +684,14 @@ def _process_atoms(
             raise ValueError(
                 "thermal_wavelength values must be finite and positive"
             )
-    if rho is not None and V_ext is not None:
-        if np.any(rho <= 0.0):
-            raise ValueError(
-                "rho must be positive to construct logarithmic c1 targets"
-            )
+    # Precompute conventional pointwise targets only when the logarithm is
+    # defined everywhere. The model's chemical-potential weights mask empty
+    # voxels in weighted objectives, so zero-density records remain valid.
+    if (
+        rho is not None
+        and V_ext is not None
+        and np.all(rho > 0.0)
+    ):
         c1_plus_beta_mu = (
             np.log(rho * thermal_wavelength_values[None, :] ** 3)
             + beta * V_ext
@@ -710,6 +728,10 @@ def _process_atoms(
         data["V_ext"] = torch.tensor(V_ext, dtype=dtype)
     if mu_values is not None:
         data["mu"] = torch.tensor(mu_values, dtype=dtype)
+        # The local chemical potential produced by the model is dimensionless,
+        # so beta_mu is the directly compatible supervised target. Retain mu
+        # separately in its original energy units for thermodynamic use.
+        data["beta_mu"] = torch.tensor(beta * mu_values, dtype=dtype)
     if thermal_wavelength_values is not None:
         data["thermal_wavelength"] = torch.tensor(
             thermal_wavelength_values,

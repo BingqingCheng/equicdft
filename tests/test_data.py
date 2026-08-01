@@ -17,6 +17,7 @@ def _write_grid(
     include_rho=True,
     include_temperature=True,
     include_v_ext=True,
+    density_offset=0.25,
 ):
     shape = (4, 4, 4)
     spacing = 0.5
@@ -31,7 +32,7 @@ def _write_grid(
         pbc=True,
     )
     if include_rho:
-        atoms.arrays["density"] = (values + 0.25)[order]
+        atoms.arrays["density"] = (values + density_offset)[order]
     if include_v_ext:
         atoms.arrays["V_ext"] = (-values)[order]
     atoms.info["grid_size"] = np.asarray(shape)
@@ -246,6 +247,7 @@ class TestGridData(unittest.TestCase):
                 "temperature",
                 "beta",
                 "mu",
+                "beta_mu",
                 "n_types",
                 "thermal_wavelength",
                 "grid_spacing",
@@ -265,10 +267,14 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(data["c1"].shape, (64, 1))
         self.assertEqual(data["n_types"].item(), 1)
         self.assertEqual(data["mu"].shape, (1,))
+        self.assertEqual(data["beta_mu"].shape, (1,))
         self.assertEqual(data["thermal_wavelength"].shape, (1,))
         expected_beta = 1.0 / (8.617333262e-5 * 1.5)
         self.assertTrue(
             np.isclose(data["beta"].item(), expected_beta, rtol=1.0e-6)
+        )
+        self.assertTrue(
+            torch.allclose(data["beta_mu"], data["beta"] * data["mu"])
         )
         self.assertTrue(
             np.isclose(
@@ -306,11 +312,29 @@ class TestGridData(unittest.TestCase):
         data = GridData.from_xyz(path, cutoff_grid=1)[0]
 
         self.assertNotIn("mu", data)
+        self.assertNotIn("beta_mu", data)
         self.assertNotIn("c1", data)
         self.assertIn("c1_plus_beta_mu", data)
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertNotIn("mu", batch)
         self.assertNotIn("c1", batch)
+
+    def test_zero_density_is_retained_for_masked_losses(self):
+        path = Path(self.temporary_directory.name) / "zero-density.extxyz"
+        _write_grid(path, density_offset=0.0)
+
+        data = GridData.from_xyz(path, cutoff_grid=1)[0]
+
+        self.assertEqual(torch.count_nonzero(data["rho"] == 0.0).item(), 1)
+        self.assertNotIn("c1_plus_beta_mu", data)
+        self.assertNotIn("c1", data)
+
+    def test_negative_density_is_rejected(self):
+        path = Path(self.temporary_directory.name) / "negative-density.extxyz"
+        _write_grid(path, density_offset=-0.25)
+
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            GridData.from_xyz(path, cutoff_grid=1)
 
     def test_density_only_inference_data(self):
         path = Path(self.temporary_directory.name) / "density-only.extxyz"
@@ -514,6 +538,9 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(data["rho"].shape, (64, 2))
         self.assertEqual(data["V_ext"].shape, (64, 2))
         self.assertEqual(data["mu"].shape, (2,))
+        self.assertTrue(
+            torch.allclose(data["beta_mu"], data["beta"] * data["mu"])
+        )
         self.assertTrue(
             torch.equal(
                 data["thermal_wavelength"],

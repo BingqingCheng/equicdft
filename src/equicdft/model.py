@@ -1,5 +1,6 @@
 """Collected grid-CACE density-functional model."""
 
+import math
 from contextlib import nullcontext
 from numbers import Real
 from typing import Any, Dict, Optional, Sequence, Union
@@ -20,7 +21,11 @@ class GridCACEModel(nn.Module):
 
     ``rho -> A -> B -> (B, T) -> beta_F_exc -> c1``
 
-    and returns the canonical physical outputs as one dictionary. Density is
+    and, when an external field is supplied,
+
+    ``(rho, V_ext, T, c1) -> local_chemical_potential``.
+
+    It returns the canonical physical outputs as one dictionary. Density is
     marked as differentiable before the representation is built so ``c1``
     includes every overlapping local environment.
 
@@ -53,6 +58,18 @@ class GridCACEModel(nn.Module):
         ``-delta(beta_F_exc) / delta(rho)`` in the continuum
         functional-derivative convention. This key is present only when
         ``compute_c1=True``.
+    ``local_chemical_potential``
+        Shape ``[..., n_grid, n_types]``. Dimensionless local chemical
+        potential obtained from the Euler--Lagrange equation. This key is
+        returned when ``compute_local_mu=True``, ``compute_c1`` is enabled,
+        and the input contains ``V_ext``.
+    ``average_chemical_potential``
+        Shape ``[..., n_types]``. Hard-mask-weighted spatial average of
+        ``local_chemical_potential`` with weights ``rho > rho_min``. It is
+        returned together with the local field when ``compute_local_mu=True``.
+    ``chemical_potential_weights``
+        Shape ``[..., n_grid, n_types]``. Detached hard-mask weights used for
+        both the average and the local-chemical-potential loss.
 
     Parameters
     ----------
@@ -75,6 +92,13 @@ class GridCACEModel(nn.Module):
     compute_c1
         If ``True``, initialize density gradients and include ``c1`` in the
         collected outputs. Disable it for energy-only evaluation.
+    compute_local_mu
+        If ``True``, include both ``local_chemical_potential`` and its
+        hard-mask-weighted ``average_chemical_potential``. This requires
+        ``compute_c1=True``.
+    rho_min
+        Nonnegative density threshold defining the hard weights used by
+        :meth:`average_chemical_potential`.
     """
 
     def __init__(
@@ -90,16 +114,30 @@ class GridCACEModel(nn.Module):
             torch.Tensor,
         ] = 1.0,
         compute_c1: bool = True,
+        compute_local_mu: bool = False,
+        rho_min: float = 0.0,
     ) -> None:
         super().__init__()
 
         if not isinstance(compute_c1, bool):
             raise TypeError("compute_c1 must be a boolean")
+        if not isinstance(compute_local_mu, bool):
+            raise TypeError("compute_local_mu must be a boolean")
+        if compute_local_mu and not compute_c1:
+            raise ValueError("compute_local_mu requires compute_c1=True")
+        try:
+            rho_min = float(rho_min)
+        except (TypeError, ValueError):
+            raise ValueError("rho_min must be a finite nonnegative scalar")
+        if not math.isfinite(rho_min) or rho_min < 0.0:
+            raise ValueError("rho_min must be a finite nonnegative scalar")
 
         self.a_features = a_features
         self.b_features = b_features
         self.readout = readout
         self.compute_c1 = compute_c1
+        self.compute_local_mu = compute_local_mu
+        self.rho_min = rho_min
 
         grid_spacing_tensor = torch.as_tensor(
             grid_spacing,
@@ -170,6 +208,14 @@ class GridCACEModel(nn.Module):
         ]
         if compute_c1:
             self.model_outputs.append("c1")
+        if compute_local_mu:
+            self.model_outputs.extend(
+                (
+                    "local_chemical_potential",
+                    "average_chemical_potential",
+                    "chemical_potential_weights",
+                )
+            )
 
     @property
     def cutoff_grid(self) -> int:
@@ -210,6 +256,52 @@ class GridCACEModel(nn.Module):
                 self.thermal_wavelength.detach().cpu().tolist()
             ),
         }
+
+    def compute_local_chemical_potential(
+        self,
+        data: Dict[str, torch.Tensor],
+        c1: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``log(rho*Lambda**3) + beta*V_ext - c1``."""
+
+        rho = data["rho"].detach()
+        beta = data["beta"].detach().to(rho)
+        wavelength = self.thermal_wavelength.to(rho)
+        positive_density = rho > 0.0
+        safe_rho = torch.where(positive_density, rho, torch.ones_like(rho))
+        local_chemical_potential = (
+            torch.log(safe_rho * wavelength.pow(3))
+            + beta[..., None, None] * data["V_ext"].detach()
+            - c1
+        )
+        return torch.where(
+            positive_density,
+            local_chemical_potential,
+            torch.zeros_like(local_chemical_potential),
+        )
+
+    def weight_mask(self, rho: torch.Tensor) -> torch.Tensor:
+        """Return hard averaging weights from the physical density."""
+
+        return (rho.detach() > self.rho_min).to(dtype=rho.dtype)
+
+    def average_chemical_potential(
+        self,
+        local_chemical_potential: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the componentwise weighted average over grid points."""
+
+        weights = weights.detach().to(local_chemical_potential)
+        total_weight = weights.sum(dim=-2)
+        if torch.any(total_weight <= 0.0).item():
+            raise ValueError(
+                "every field and component must have positive total weight"
+            )
+        return (
+            (weights * local_chemical_potential).sum(dim=-2)
+            / total_weight
+        )
 
     def _validate_grid_spacing(self, data: Dict[str, torch.Tensor]) -> None:
         """Reject grids inconsistent with the trained discretization."""
@@ -253,14 +345,26 @@ class GridCACEModel(nn.Module):
 
         if compute_c1 is None:
             compute_c1 = self.compute_c1
-        model_outputs = [
+        requested_outputs = [
             "beta_free_energy_per_particle",
             "beta_free_energy_density",
             "beta_F_exc",
         ]
         if compute_c1:
-            model_outputs.append("c1")
-        return {key: data[key] for key in model_outputs}
+            requested_outputs.append("c1")
+            if self.compute_local_mu:
+                requested_outputs.extend(
+                    (
+                        "local_chemical_potential",
+                        "average_chemical_potential",
+                        "chemical_potential_weights",
+                    )
+                )
+        return {
+            key: data[key]
+            for key in requested_outputs
+            if key in data
+        }
 
     def forward(
         self,
@@ -369,5 +473,29 @@ class GridCACEModel(nn.Module):
                     -beta_F_exc_derivative
                     / cell_volume
                 )
+
+                # Chemical-potential response is controlled by one model flag.
+                # V_ext remains optional for intrinsic-functional evaluation.
+                if (
+                    self.compute_local_mu
+                    and "V_ext" in data
+                ):
+                    local_chemical_potential = (
+                        self.compute_local_chemical_potential(
+                            data=data,
+                            c1=outputs["c1"],
+                        )
+                    )
+                    outputs["local_chemical_potential"] = (
+                        local_chemical_potential
+                    )
+                    weights = self.weight_mask(data["rho"])
+                    outputs["chemical_potential_weights"] = weights
+                    outputs["average_chemical_potential"] = (
+                        self.average_chemical_potential(
+                            local_chemical_potential,
+                            weights,
+                        )
+                    )
 
         return self.extract_outputs(outputs, compute_c1=compute_c1)

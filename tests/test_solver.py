@@ -38,6 +38,7 @@ class TestGridSolver(unittest.TestCase):
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
             compute_c1=True,
+            compute_local_mu=True,
         )
 
     def _make_data(self, target_rho=None, include_mu=True):

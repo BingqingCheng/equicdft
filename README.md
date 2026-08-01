@@ -29,19 +29,23 @@ chemical potential. A test dataset should be constructed separately to probe
 the intended thermodynamic states. The optional `mean_density` is computed
 from train plus validation and excludes the test set.
 
-Compose named training objectives independently of the training loop:
+Choose the local-chemical-potential target in the training configuration. Use
+the dimensionless reservoir value `beta_mu` when it is known, or the model's
+masked spatial `average_chemical_potential` when it is latent:
 
 ```python
-from torch import nn
 from equicdft import Loss, TensorLoss
+
+chemical_potential_target_key = "average_chemical_potential"
+# chemical_potential_target_key = "beta_mu"  # known reservoir value
 
 loss_module = Loss(
     terms=[
         TensorLoss(
-            name="c1",
-            prediction_key="c1",
-            target_key="c1",
-            loss_fn=nn.MSELoss(),
+            name="local_chemical_potential",
+            prediction_key="local_chemical_potential",
+            target_key=chemical_potential_target_key,
+            weights_key="chemical_potential_weights",
             weight=1.0,
         ),
     ]
@@ -50,9 +54,17 @@ loss_values = loss_module(outputs, batch)
 loss_values["total"].backward()
 ```
 
-Each term returns a weighted scalar. `Loss` returns the named terms for
-logging and their sum as `total`. Predictions and targets must have exactly
-matching shapes; the loss code never reshapes grid fields implicitly.
+When `compute_local_mu=True` and `V_ext` is supplied, `GridCACEModel`
+constructs the dimensionless physical output
+`local_chemical_potential = log(rho * thermal_wavelength**3) + beta * V_ext - c1`.
+Its `average_chemical_potential` method returns the componentwise spatial
+average weighted by the hard mask `rho > rho_min`. The model also returns this
+mask as `chemical_potential_weights`. `GridData` stores `beta_mu = beta * mu`
+when reservoir chemical potentials are present. A weighted `TensorLoss`
+therefore handles either supervised or latent chemical potentials solely by
+changing `target_key`; the model does not select the target. In the latent
+case, the unknown chemical potential is the first masked spatial cumulant and
+the loss is its second central cumulant.
 
 Record unweighted dataset-level prediction metrics across batches:
 
@@ -169,14 +181,21 @@ model = GridCACEModel(
     boltzmann_constant=1.0,
     thermal_wavelength=data["thermal_wavelength"],
     compute_c1=True,
+    compute_local_mu=True,
+    rho_min=1.0e-3,
 )
 
 outputs = model(data)
 beta_F_exc = outputs["beta_F_exc"]
 c1 = outputs["c1"]
+local_chemical_potential = outputs.get("local_chemical_potential")
+average_chemical_potential = outputs.get("average_chemical_potential")
+chemical_potential_weights = outputs.get("chemical_potential_weights")
 ```
 
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
+Both `rho` and `beta` passed to `GridCACEModel` retain their physical values;
+density normalization is confined to `CartesianAFeatures`.
 `GridCACEModel` appends the scalar temperature once to the flattened local
 `B` feature vector at every grid point before applying `LocalReadout`.
 The trained grid spacing and thermodynamic conventions are persistent model
@@ -191,10 +210,15 @@ inference_data = GridData.from_xyz(
     grid_info=model.grid_info,
 )
 ```
-External potential and chemical potential are optional annotations rather
-than model inputs. When `V_ext` is available, `GridData` constructs
+External potential and chemical potential are optional fields rather than
+inputs to the learned intrinsic functional. When `V_ext` is available, the
+model additionally returns the requested local and averaged chemical
+potentials. `GridData` constructs
 `c1_plus_beta_mu = log(rho * thermal_wavelength**3) + beta * V_ext`; if `mu`
-is also present, it stores `c1 = c1_plus_beta_mu - beta * mu`. The default
+is also present, it stores `c1 = c1_plus_beta_mu - beta * mu`. These pointwise
+targets are stored only when every selected frame has strictly positive
+density values; zero-density voxels are retained for the model's
+`chemical_potential_weights` to mask. The default
 Boltzmann constant is `8.617333262e-5` eV/K and the default thermal wavelength
 is one. Pass `boltzmann_constant=1.0` for reduced-unit data. An inference
 EXTXYZ requires temperature, grid metadata, and at least one of `rho` and

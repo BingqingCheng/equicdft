@@ -3,7 +3,10 @@ import unittest
 import torch
 from torch import nn
 
-from equicdft import Loss, TensorLoss
+from equicdft import (
+    Loss,
+    TensorLoss,
+)
 
 
 class _PredictionPenalty(nn.Module):
@@ -83,6 +86,68 @@ class TestTensorLoss(unittest.TestCase):
             with self.subTest(weight=weight):
                 with self.assertRaisesRegex(ValueError, "weight"):
                     TensorLoss("c1", "c1", "c1", weight=weight)
+
+
+class TestWeightedTensorLoss(unittest.TestCase):
+    @staticmethod
+    def _example():
+        rho = torch.tensor([[[1.0], [2.0], [0.0], [4.0]]])
+
+        # On the three unmasked grid points, construct local values
+        # [1, 3, 5]. Their spatial mean is 3.
+        desired_local = torch.tensor([[[1.0], [3.0], [0.0], [5.0]]])
+        local_chemical_potential = desired_local.clone().requires_grad_(True)
+        average_chemical_potential = (
+            local_chemical_potential[:, [0, 1, 3], :].mean(dim=-2)
+        )
+        chemical_potential_weights = (rho > 0.5).to(rho.dtype)
+        batch = {}
+        outputs = {
+            "local_chemical_potential": local_chemical_potential,
+            "average_chemical_potential": average_chemical_potential,
+            "chemical_potential_weights": chemical_potential_weights,
+        }
+        return outputs, batch
+
+    @staticmethod
+    def _loss():
+        return TensorLoss(
+            name="local_chemical_potential",
+            prediction_key="local_chemical_potential",
+            target_key="average_chemical_potential",
+            weights_key="chemical_potential_weights",
+        )
+
+    def test_unknown_mu_is_masked_spatial_mean(self):
+        outputs, batch = self._example()
+
+        loss = self._loss()(outputs, batch)
+        self.assertAlmostEqual(loss.item(), 8.0 / 3.0, places=6)
+        loss.backward()
+        local = outputs["local_chemical_potential"]
+        self.assertTrue(torch.all(torch.isfinite(local.grad)))
+        self.assertEqual(local.grad[0, 2, 0].item(), 0.0)
+
+    def test_known_beta_mu_is_selected_from_batch(self):
+        outputs, _ = self._example()
+        batch = {"beta_mu": torch.tensor([[2.0]])}
+        loss = TensorLoss(
+            name="local_chemical_potential",
+            prediction_key="local_chemical_potential",
+            target_key="beta_mu",
+            weights_key="chemical_potential_weights",
+        )(outputs, batch)
+
+        # The known componentwise beta*mu is expanded over the grid axis;
+        # the empty voxel remains excluded by the same hard mask.
+        self.assertAlmostEqual(loss.item(), 11.0 / 3.0, places=6)
+
+    def test_zero_total_element_weight_is_rejected(self):
+        outputs, batch = self._example()
+        outputs["chemical_potential_weights"].zero_()
+
+        with self.assertRaisesRegex(ValueError, "positive sum"):
+            self._loss()(outputs, batch)
 
 
 class TestLossAggregation(unittest.TestCase):

@@ -94,12 +94,10 @@ class GridSolver:
             result["beta_Omega"] = (
                 result["beta_F"] + result["beta_V_ext"] - beta_mu_N
             )
-            if "c1" in result:
+            if "local_chemical_potential" in result:
                 result["euler_lagrange_residual"] = (
-                    log_density
-                    - result["c1"]
-                    + beta
-                    * (data["V_ext"] - data["mu"][..., None, :])
+                    result["local_chemical_potential"]
+                    - beta * data["mu"][..., None, :]
                 )
 
         return result
@@ -211,16 +209,9 @@ class GridSolver:
             self.model.train(was_training)
 
         if fixed_N is not None:
-            local_beta_mu = (
-                _log_dimensionless_density(
-                    result["rho"],
-                    thermal_wavelength,
-                )
-                - result["c1"]
-                + data["beta"] * V_ext
-            )
             result["euler_lagrange_residual"] = (
-                local_beta_mu - local_beta_mu.mean(dim=0, keepdim=True)
+                result["local_chemical_potential"]
+                - result["average_chemical_potential"][..., None, :]
             )
 
         state = optimizer.state[u]

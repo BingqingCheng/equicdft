@@ -54,9 +54,15 @@ class TestGridCACEModel(unittest.TestCase):
             ),
             "grid_spacing": torch.tensor([0.5, 0.5, 0.5]),
             "temperature": torch.tensor(1.5),
+            "beta": torch.tensor(1.0 / 1.5),
         }
 
-    def _make_model(self, compute_c1=True):
+    def _make_model(
+        self,
+        compute_c1=True,
+        compute_chemical_potential=False,
+        rho_min=0.0,
+    ):
         a_features = CartesianAFeatures(
             mean_density=0.5,
             cutoff_grid=1,
@@ -76,6 +82,8 @@ class TestGridCACEModel(unittest.TestCase):
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
             compute_c1=compute_c1,
+            compute_local_mu=compute_chemical_potential,
+            rho_min=rho_min,
         )
 
     def test_exposes_persistent_inference_metadata(self):
@@ -161,6 +169,70 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(outputs["beta_F_exc"].shape, (2,))
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
+
+    def test_collects_local_chemical_potential_with_external_field(self):
+        model = self._make_model(
+            compute_c1=True,
+            compute_chemical_potential=True,
+            rho_min=0.5,
+        )
+        data = self._make_data()
+        data["V_ext"] = torch.linspace(-1.0, 1.0, steps=27).reshape(27, 1)
+
+        outputs = model(data)
+
+        expected = (
+            torch.log(data["rho"].detach())
+            + data["V_ext"] / data["temperature"]
+            - outputs["c1"]
+        )
+        self.assertIn("local_chemical_potential", outputs)
+        self.assertTrue(
+            torch.allclose(outputs["local_chemical_potential"], expected)
+        )
+        weights = (data["rho"].detach() > 0.5).to(expected.dtype)
+        expected_average = (weights * expected).sum(dim=-2) / weights.sum(
+            dim=-2
+        )
+        self.assertTrue(
+            torch.allclose(
+                outputs["average_chemical_potential"],
+                expected_average,
+            )
+        )
+        self.assertTrue(
+            torch.equal(outputs["chemical_potential_weights"], weights)
+        )
+
+    def test_chemical_potential_is_activated_by_compute_local_mu(self):
+        model = self._make_model(compute_c1=True)
+        data = self._make_data()
+        data["V_ext"] = torch.zeros_like(data["rho"])
+
+        outputs = model(data)
+
+        self.assertNotIn("local_chemical_potential", outputs)
+        self.assertNotIn("average_chemical_potential", outputs)
+        self.assertNotIn("chemical_potential_weights", outputs)
+
+    def test_zero_density_local_chemical_potential_is_finite_sentinel(self):
+        model = self._make_model(
+            compute_c1=True,
+            compute_chemical_potential=True,
+        )
+        data = self._make_data()
+        data["rho"][0] = 0.0
+        data["V_ext"] = torch.zeros_like(data["rho"])
+
+        outputs = model(data)
+
+        self.assertEqual(
+            outputs["local_chemical_potential"][0, 0].item(),
+            0.0,
+        )
+        self.assertTrue(
+            torch.all(torch.isfinite(outputs["local_chemical_potential"]))
+        )
 
     def test_temperature_is_appended_once_to_each_local_feature_vector(self):
         readout = LocalReadout(
@@ -290,6 +362,35 @@ class TestGridCACEModel(unittest.TestCase):
                 LocalReadout(n_types=1),
                 grid_spacing=0.5,
                 compute_c1=1,
+            )
+
+        with self.assertRaises(TypeError):
+            GridCACEModel(
+                CartesianAFeatures(
+                    mean_density=0.5,
+                    cutoff_grid=1,
+                    max_power=2,
+                    n_radial_channels=1,
+                ),
+                CartesianBFeatures(max_power=2, max_product_order=3),
+                LocalReadout(n_types=1),
+                grid_spacing=0.5,
+                compute_local_mu=1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "requires compute_c1"):
+            GridCACEModel(
+                CartesianAFeatures(
+                    mean_density=0.5,
+                    cutoff_grid=1,
+                    max_power=2,
+                    n_radial_channels=1,
+                ),
+                CartesianBFeatures(max_power=2, max_product_order=3),
+                LocalReadout(n_types=1),
+                grid_spacing=0.5,
+                compute_c1=False,
+                compute_local_mu=True,
             )
 
     def test_multicomponent_latent_channels_feed_physical_readout(self):
