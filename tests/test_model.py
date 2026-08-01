@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from cace_grid import (
+from equicdft import (
     CartesianAFeatures,
     CartesianBFeatures,
     GridCACEModel,

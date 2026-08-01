@@ -178,7 +178,7 @@ def get_neighbor_indices(
     """Return periodic neighbor rows for every regular-grid point.
 
     This helper stores only geometry. The returned integer matrix is placed in
-    :class:`cace_grid.data.GridData` and used to gather from the live PyTorch
+    :class:`equicdft.data.GridData` and used to gather from the live PyTorch
     ``rho`` tensor during a model forward pass. That keeps all overlapping
     local environments connected to ``rho`` in the differentiation graph.
 

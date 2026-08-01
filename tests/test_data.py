@@ -8,7 +8,7 @@ from ase import Atoms
 from ase.io import write
 from torch.utils.data import DataLoader
 
-from cace_grid import CartesianAFeatures, GridData, default_data_key
+from equicdft import CartesianAFeatures, GridData, default_data_key
 
 
 def _write_grid(

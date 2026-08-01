@@ -3,8 +3,8 @@ import unittest
 
 import torch
 
-from cace_grid import Metrics, compute_metric
-from cace_grid.metrics import format_metric_value, metric_label
+from equicdft import Metrics, compute_metric
+from equicdft.metrics import format_metric_value, metric_label
 
 
 class TestComputeMetric(unittest.TestCase):

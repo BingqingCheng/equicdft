@@ -35,7 +35,7 @@ class Trainer(nn.Module):
     model
         Model mapping a batched grid dictionary to an output dictionary.
     loss
-        Aggregate :class:`cace_grid.loss.Loss` module.
+        Aggregate :class:`equicdft.loss.Loss` module.
     metrics
         Metric collections updated for every train and validation batch.
     optimizer_cls
@@ -77,7 +77,7 @@ class Trainer(nn.Module):
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
         if not isinstance(loss, Loss):
-            raise TypeError("loss must be a cace_grid.Loss")
+            raise TypeError("loss must be a equicdft.Loss")
         if (
             not isinstance(checkpoint_interval, int)
             or checkpoint_interval <= 0
@@ -88,7 +88,7 @@ class Trainer(nn.Module):
 
         metrics = list(metrics)
         if any(not isinstance(metric, Metrics) for metric in metrics):
-            raise TypeError("metrics must contain only cace_grid.Metrics")
+            raise TypeError("metrics must contain only equicdft.Metrics")
         metric_names = [metric.name for metric in metrics]
         if len(set(metric_names)) != len(metric_names):
             raise ValueError("metric collection names must be unique")

@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from cace_grid import compute_grid_derivative
+from equicdft import compute_grid_derivative
 
 
 class TestGridDerivatives(unittest.TestCase):

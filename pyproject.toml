@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cace-grid"
+name = "equicdft"
 version = "0.0.1"
-description = "Cartesian atomic-cluster-expansion models for density fields on periodic grids"
+description = "Equivariant learning of classical density functionals"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [

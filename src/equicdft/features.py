@@ -94,7 +94,7 @@ class CartesianAFeatures(nn.Module):
     ----------
     cutoff_grid
         Inclusive spherical cutoff in integer grid steps. The default is
-        three, matching :class:`cace_grid.data.GridData`.
+        three, matching :class:`equicdft.data.GridData`.
     max_power
         Maximum total Cartesian power ``a + b + c``.
     n_radial_channels
@@ -320,7 +320,7 @@ class _AChannelMixing(nn.Module):
     labels latent channels. Mixing only the final channel axis means that the
     operation commutes with rotations and reflections of the Cartesian
     component axis. Consequently, ``A_mixed`` can be passed directly to
-    :class:`cace_grid.symmetrize.CartesianBFeatures`.
+    :class:`equicdft.symmetrize.CartesianBFeatures`.
 
     Notes
     -----

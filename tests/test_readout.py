@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from cace_grid import (
+from equicdft import (
     CartesianAFeatures,
     CartesianBFeatures,
     LocalReadout,

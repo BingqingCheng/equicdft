@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch.utils.data import RandomSampler, SequentialSampler, Subset
 
-from cace_grid import make_dataloaders
+from equicdft import make_dataloaders
 
 
 def _dataset(values, n_grid=4):

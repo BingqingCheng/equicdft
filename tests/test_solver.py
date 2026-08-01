@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch import nn
 
-from cace_grid import GridCACEModel, GridData, GridSolver
+from equicdft import GridCACEModel, GridData, GridSolver
 
 
 class _DensityFeatures(nn.Module):

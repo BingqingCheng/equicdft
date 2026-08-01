@@ -4,7 +4,7 @@ import unittest
 import torch
 from torch import nn
 
-from cace_grid import CartesianAFeatures, CartesianBFeatures
+from equicdft import CartesianAFeatures, CartesianBFeatures
 
 
 class TestCartesianAFeatures(unittest.TestCase):

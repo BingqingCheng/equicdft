@@ -2,7 +2,7 @@
 
 The exact point symmetry used here consists of all axis permutations and
 independent axis reflections. These 48 signed permutations preserve the
-integer spherical stencil constructed by :func:`cace_grid.stencil.make_stencil`.
+integer spherical stencil constructed by :func:`equicdft.stencil.make_stencil`.
 """
 
 from itertools import combinations_with_replacement, permutations, product
@@ -137,7 +137,7 @@ class CartesianBFeatures(nn.Module):
     ----------
     max_power
         Maximum total Cartesian power used by the corresponding
-        :class:`cace_grid.features.CartesianAFeatures` module.
+        :class:`equicdft.features.CartesianAFeatures` module.
     max_product_order
         Maximum correlation order, meaning the largest number of ``A``
         factors in one invariant product. Only values one through three are

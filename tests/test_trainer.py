@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from cace_grid import Loss, Metrics, TensorLoss, Trainer
+from equicdft import Loss, Metrics, TensorLoss, Trainer
 
 
 class _LinearDictionaryModel(nn.Module):

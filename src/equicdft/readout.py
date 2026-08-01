@@ -13,12 +13,12 @@ class LocalReadout(nn.Module):
     A shared MLP maps a local feature vector at each grid point to one output
     per component. The readout itself is agnostic about the construction and
     physical meaning of its inputs and outputs.
-    :class:`cace_grid.model.GridCACEModel` supplies flattened invariant B
+    :class:`equicdft.model.GridCACEModel` supplies flattened invariant B
     features and temperature, and interprets the outputs as dimensionless
     per-particle excess free energies.
 
     Density weighting, grid integration, and functional differentiation are
-    handled by :class:`cace_grid.model.GridCACEModel`.
+    handled by :class:`equicdft.model.GridCACEModel`.
 
     Parameters
     ----------

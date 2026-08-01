@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch import nn
 
-from cace_grid import Loss, TensorLoss
+from equicdft import Loss, TensorLoss
 
 
 class _PredictionPenalty(nn.Module):

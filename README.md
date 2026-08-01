@@ -1,7 +1,8 @@
-# cace_grid
+# equicdft
 
-`cace_grid` develops Cartesian symmetry-adapted models for classical
-density-functional theory on periodic three-dimensional grids.
+`equicdft` develops equivariant neural models for learning classical density
+functionals. The current architecture uses Cartesian symmetry-adapted features
+for density fields on periodic three-dimensional grids.
 
 One `GridData` object represents one complete density configuration and
 contains the grid fields together with periodic neighborhood indices for every
@@ -10,7 +11,7 @@ grid point.
 Split complete fields and construct reproducible data loaders with:
 
 ```python
-from cace_grid import GridData, make_dataloaders
+from equicdft import GridData, make_dataloaders
 
 dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
 train_loader, valid_loader, test_loader, mean_density = make_dataloaders(
@@ -32,7 +33,7 @@ Compose named training objectives independently of the training loop:
 
 ```python
 from torch import nn
-from cace_grid import Loss, TensorLoss
+from equicdft import Loss, TensorLoss
 
 loss_module = Loss(
     terms=[
@@ -56,7 +57,7 @@ matching shapes; the loss code never reshapes grid fields implicitly.
 Record unweighted dataset-level prediction metrics across batches:
 
 ```python
-from cace_grid import Metrics
+from equicdft import Metrics
 
 c1_metrics = Metrics(
     target_key="c1",
@@ -80,7 +81,7 @@ Keep epoch orchestration outside the model and training script with
 `Trainer`:
 
 ```python
-from cace_grid import Trainer
+from equicdft import Trainer
 
 trainer = Trainer(
     model=model,
@@ -131,7 +132,7 @@ mean_density = sum(frame_mean_densities) / len(frame_mean_densities)
 ```
 
 ```python
-from cace_grid import (
+from equicdft import (
     CartesianAFeatures,
     CartesianBFeatures,
     GridCACEModel,
@@ -226,7 +227,7 @@ Use `GridSolver` for prescribed-density thermodynamics or equilibrium
 minimization:
 
 ```python
-from cace_grid import GridSolver
+from equicdft import GridSolver
 
 solver = GridSolver(model, device="cuda")
 
