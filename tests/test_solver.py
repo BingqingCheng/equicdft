@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from equicdft import GridCACEModel, GridData, GridSolver
+from equicdft.solver import _euler_residual
 
 
 class _DensityFeatures(nn.Module):
@@ -28,6 +29,13 @@ class _DensityReadout(nn.Module):
 
 
 class TestGridSolver(unittest.TestCase):
+    def assert_objective_histories_nonincreasing(self, histories):
+        """Check monotonic descent separately for every continued field."""
+
+        for history in histories:
+            for previous, current in zip(history, history[1:]):
+                self.assertLessEqual(current, previous + 1.0e-12)
+
     def _make_model(self):
         # beta_F_exc = sum_g rho_g^2 and c1 = -2 rho for unit voxels.
         return GridCACEModel(
@@ -97,8 +105,8 @@ class TestGridSolver(unittest.TestCase):
         result = GridSolver(self._make_model()).solve(
             self._make_data(target_rho),
             max_iter=200,
-            tolerance_grad=1.0e-9,
-            tolerance_change=1.0e-12,
+            continuation_steps=0,
+            tolerance_residual=1.0e-8,
         )
 
         self.assertTrue(
@@ -106,7 +114,13 @@ class TestGridSolver(unittest.TestCase):
         )
         self.assertLess(
             torch.max(torch.abs(result["euler_lagrange_residual"])).item(),
-            1.0e-5,
+            1.0e-7,
+        )
+        self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
+        self.assertEqual(result["solver_method"], "minimize")
+        self.assertEqual(result["line_search_failures"], 0)
+        self.assert_objective_histories_nonincreasing(
+            result["stage_objective_history"]
         )
 
     def test_fixed_particle_number_solve_enforces_constraint(self):
@@ -129,6 +143,123 @@ class TestGridSolver(unittest.TestCase):
             torch.max(torch.abs(result["euler_lagrange_residual"])).item(),
             1.0e-12,
         )
+        self.assertTrue(result["converged"])
+        self.assert_objective_histories_nonincreasing(
+            result["stage_objective_history"]
+        )
+
+    def test_fixed_particle_solver_recovers_from_concentrated_initial_density(
+        self,
+    ):
+        data = self._make_data(include_mu=False)
+        data["V_ext"].zero_()
+        initial_rho = torch.tensor(
+            [[1.9997], [0.0001], [0.0001], [0.0001]],
+            dtype=torch.float64,
+        )
+
+        result = GridSolver(self._make_model()).solve(
+            data,
+            initial_rho=initial_rho,
+            particle_numbers=[2.0],
+            max_iter=200,
+            continuation_steps=1,
+            tolerance_residual=1.0e-7,
+        )
+
+        expected_rho = torch.full(
+            (4, 1),
+            0.5,
+            dtype=torch.float64,
+        )
+        self.assertTrue(
+            torch.allclose(result["rho"], expected_rho, atol=1.0e-7)
+        )
+        self.assertTrue(result["converged"])
+        self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
+        self.assertTrue(
+            any(
+                history[-1] < history[0]
+                for history in result["stage_objective_history"]
+            )
+        )
+        self.assert_objective_histories_nonincreasing(
+            result["stage_objective_history"]
+        )
+
+    def test_euler_method_remains_available(self):
+        target_rho = torch.tensor(
+            [[0.2], [0.3], [0.4], [0.5]],
+            dtype=torch.float64,
+        )
+
+        result = GridSolver(self._make_model()).solve(
+            self._make_data(target_rho),
+            method="euler",
+            max_iter=200,
+            mixing=0.2,
+            tolerance_residual=1.0e-9,
+            tolerance_change=1.0e-12,
+        )
+
+        self.assertEqual(result["solver_method"], "euler")
+        self.assertTrue(result["converged"])
+        self.assertTrue(
+            torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
+        )
+
+    def test_fixed_particle_number_density_cap_is_enforced(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"] = torch.tensor(
+            [[-10.0], [0.0], [0.0], [0.0]],
+            dtype=torch.float64,
+        )
+
+        result = GridSolver(self._make_model()).solve(
+            data,
+            particle_numbers=[2.0],
+            maximum_density=0.6,
+            continuation_steps=0,
+            max_iter=500,
+            tolerance_residual=1.0e-7,
+        )
+
+        self.assertLessEqual(result["rho"].max().item(), 0.6 + 1.0e-12)
+        self.assertAlmostEqual(result["rho"].sum().item(), 2.0, places=12)
+        self.assertAlmostEqual(result["rho"][0, 0].item(), 0.6, places=10)
+        self.assertTrue(result["converged"])
+
+    def test_infeasible_fixed_particle_number_density_cap_is_rejected(self):
+        data = self._make_data(include_mu=False)
+
+        with self.assertRaisesRegex(ValueError, "infeasible"):
+            GridSolver(self._make_model()).solve(
+                data,
+                particle_numbers=[2.0],
+                maximum_density=0.4,
+            )
+
+    def test_solver_method_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "method"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                method="unknown",
+            )
+
+    def test_zero_density_is_included_in_default_physical_residual(self):
+        rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
+        residual, _, max_residual, _ = _euler_residual(
+            rho=rho,
+            c1=torch.zeros_like(rho),
+            V_ext=torch.zeros_like(rho),
+            beta=torch.tensor(1.0, dtype=rho.dtype),
+            thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
+            mu=None,
+            density_threshold=0.0,
+        )
+
+        self.assertTrue(torch.isfinite(residual).all())
+        self.assertGreater(max_residual, 100.0)
 
 
 if __name__ == "__main__":

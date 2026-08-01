@@ -4,7 +4,12 @@ from .data import GridData, default_data_key
 from .derivatives import compute_grid_derivative
 from .features import CartesianAFeatures
 from .loader import make_dataloaders
-from .loss import Loss, TensorLoss
+from .loss import (
+    DensityPerturbationStabilityLoss,
+    GlobalDensityStabilityLoss,
+    Loss,
+    TensorLoss,
+)
 from .metrics import Metrics, compute_metric
 from .model import GridCACEModel
 from .readout import LocalReadout
@@ -20,6 +25,8 @@ from .trainer import Trainer
 __all__ = [
     "CartesianAFeatures",
     "CartesianBFeatures",
+    "DensityPerturbationStabilityLoss",
+    "GlobalDensityStabilityLoss",
     "GridData",
     "GridCACEModel",
     "GridSolver",
