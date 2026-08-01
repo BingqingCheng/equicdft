@@ -1,16 +1,12 @@
 """Split complete density fields and construct PyTorch data loaders."""
 
-from typing import Optional, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
-LoaderTriple = Tuple[DataLoader, DataLoader, Optional[DataLoader]]
-LoaderResult = Union[
-    LoaderTriple,
-    Tuple[DataLoader, DataLoader, Optional[DataLoader], float],
-]
+LoaderResult = Dict[str, Union[DataLoader, float, None]]
 
 
 def make_dataloaders(
@@ -21,6 +17,7 @@ def make_dataloaders(
     batch_size: int = 2,
     seed: int = 1,
     compute_mean_density: bool = False,
+    compute_mean_temperature: bool = False,
     num_workers: int = 0,
 ) -> LoaderResult:
     """Build train, validation, and optional test loaders.
@@ -50,16 +47,19 @@ def make_dataloaders(
     compute_mean_density
         If true, append the scalar mean density over train and validation
         frames to the returned loaders. Test frames are always excluded.
+    compute_mean_temperature
+        If true, append the scalar mean temperature over train and validation
+        frames to the returned loaders. Test frames are always excluded.
     num_workers
         Number of worker processes used by each data loader.
 
     Returns
     -------
-    tuple
-        ``(train_loader, valid_loader, test_loader)``. When
-        ``compute_mean_density=True``, the scalar mean density is appended as
-        a fourth item. ``test_loader`` is ``None`` when no test dataset is
-        supplied.
+    dict
+        Always contains the ``train``, ``valid``, and ``test`` loaders, where
+        ``test`` is ``None`` when no test dataset is supplied. Requested
+        statistics are added under ``mean_density`` and
+        ``mean_temperature``.
 
     Notes
     -----
@@ -74,7 +74,7 @@ def make_dataloaders(
     _validate_loader_settings(batch_size, num_workers)
     _require_nonempty(train_dataset, "train_dataset")
 
-    density_datasets = [train_dataset]
+    statistics_datasets = [train_dataset]
     if valid_fraction is not None:
         train_data, valid_data = _random_split(
             train_dataset,
@@ -85,7 +85,7 @@ def make_dataloaders(
         _require_nonempty(valid_dataset, "valid_dataset")
         train_data = train_dataset
         valid_data = valid_dataset
-        density_datasets.append(valid_dataset)
+        statistics_datasets.append(valid_dataset)
 
     if test_dataset is not None:
         _require_nonempty(test_dataset, "test_dataset")
@@ -118,10 +118,16 @@ def make_dataloaders(
             num_workers=num_workers,
         )
 
-    loaders = (train_loader, valid_loader, test_loader)
-    if not compute_mean_density:
-        return loaders
-    return loaders + (_mean_density(density_datasets),)
+    result: LoaderResult = {
+        "train": train_loader,
+        "valid": valid_loader,
+        "test": test_loader,
+    }
+    if compute_mean_density:
+        result["mean_density"] = _mean_density(statistics_datasets)
+    if compute_mean_temperature:
+        result["mean_temperature"] = _mean_temperature(statistics_datasets)
+    return result
 
 
 def _random_split(
@@ -173,6 +179,31 @@ def _mean_density(datasets: Sequence[Dataset]) -> float:
                 raise ValueError("rho tensors must contain finite values")
             frame_means.append(frame_mean)
     return torch.stack(frame_means).mean().item()
+
+
+def _mean_temperature(datasets: Sequence[Dataset]) -> float:
+    """Average the scalar temperature of each selected frame."""
+
+    temperatures = []
+    for dataset in datasets:
+        for frame_index in range(len(dataset)):
+            frame = dataset[frame_index]
+            if "temperature" not in frame:
+                raise KeyError(
+                    "dataset frame is missing required field 'temperature'"
+                )
+            temperature = torch.as_tensor(frame["temperature"])
+            if temperature.numel() != 1:
+                raise ValueError(
+                    "temperature tensors must contain exactly one value"
+                )
+            temperature = temperature.detach().to(dtype=torch.float64).reshape(())
+            if not torch.isfinite(temperature).item():
+                raise ValueError("temperature tensors must contain finite values")
+            if temperature.item() <= 0.0:
+                raise ValueError("temperature values must be positive")
+            temperatures.append(temperature)
+    return torch.stack(temperatures).mean().item()
 
 
 def _require_nonempty(dataset: Optional[Dataset], name: str) -> None:

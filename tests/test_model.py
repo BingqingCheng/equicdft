@@ -62,6 +62,7 @@ class TestGridCACEModel(unittest.TestCase):
         compute_c1=True,
         compute_chemical_potential=False,
         rho_min=0.0,
+        mean_temperature=1.0,
     ):
         a_features = CartesianAFeatures(
             mean_density=0.5,
@@ -79,6 +80,7 @@ class TestGridCACEModel(unittest.TestCase):
             b_features,
             readout,
             grid_spacing=0.5,
+            mean_temperature=mean_temperature,
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
             compute_c1=compute_c1,
@@ -87,7 +89,7 @@ class TestGridCACEModel(unittest.TestCase):
         )
 
     def test_exposes_persistent_inference_metadata(self):
-        model = self._make_model()
+        model = self._make_model(mean_temperature=1.2)
 
         self.assertEqual(model.cutoff_grid, 1)
         self.assertEqual(model.n_types, 1)
@@ -97,11 +99,13 @@ class TestGridCACEModel(unittest.TestCase):
         )
         self.assertEqual(model.cell_volume.item(), 0.125)
         self.assertEqual(model.boltzmann_constant.item(), 1.0)
+        self.assertAlmostEqual(model.mean_temperature.item(), 1.2)
         self.assertTrue(
             torch.equal(model.thermal_wavelength, torch.ones(1))
         )
         state = model.state_dict()
         self.assertIn("grid_spacing", state)
+        self.assertIn("mean_temperature", state)
         self.assertIn("boltzmann_constant", state)
         self.assertIn("thermal_wavelength", state)
         self.assertEqual(
@@ -248,6 +252,7 @@ class TestGridCACEModel(unittest.TestCase):
             b_features=_IdentityModule(),
             readout=readout,
             grid_spacing=0.5,
+            mean_temperature=2.0,
             compute_c1=False,
         )
 
@@ -261,13 +266,21 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        expected = data["temperature"][:, None, None].expand(2, 27, 1)
+        expected = (
+            data["temperature"][:, None, None] / 2.0
+        ).expand(2, 27, 1)
         self.assertTrue(
             torch.equal(
                 outputs["beta_free_energy_per_particle"],
                 expected,
             )
         )
+
+    def test_mean_temperature_must_be_positive_scalar(self):
+        for value in (0.0, -1.0, float("nan"), [1.0, 2.0]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "mean_temperature"):
+                    self._make_model(mean_temperature=value)
 
     def test_empty_density_has_zero_integrated_free_energy(self):
         model = self._make_model()

@@ -14,20 +14,42 @@ Split complete fields and construct reproducible data loaders with:
 from equicdft import GridData, make_dataloaders
 
 dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
-train_loader, valid_loader, test_loader, mean_density = make_dataloaders(
+data = make_dataloaders(
     train_dataset=dataset,
     valid_fraction=0.1,
     test_dataset=None,
     batch_size=2,
     seed=1,
     compute_mean_density=True,
+    compute_mean_temperature=True,
 )
+
+train_loader = data["train"]
+valid_loader = data["valid"]
+test_loader = data["test"]
+mean_density = data["mean_density"]
+mean_temperature = data["mean_temperature"]
 ```
 
 The random split acts on complete fields and does not inspect temperature or
 chemical potential. A test dataset should be constructed separately to probe
-the intended thermodynamic states. The optional `mean_density` is computed
-from train plus validation and excludes the test set.
+the intended thermodynamic states. The optional `mean_density` and
+`mean_temperature` are computed from train plus validation and exclude the
+test set. They can be used as fixed input scales without leaking test-set
+statistics.
+
+Pass both scales into the representation/model. Density normalization is
+applied inside `CartesianAFeatures`, while the readout is conditioned on the
+scale-only normalized temperature `temperature / mean_temperature`:
+
+```python
+a_features = CartesianAFeatures(mean_density=mean_density, ...)
+model = GridCACEModel(
+    a_features=a_features,
+    ...,
+    mean_temperature=mean_temperature,
+)
+```
 
 Choose the local-chemical-potential target in the training configuration. Use
 the dimensionless reservoir value `beta_mu` when it is known, or the model's

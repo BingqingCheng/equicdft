@@ -6,16 +6,19 @@ from torch.utils.data import RandomSampler, SequentialSampler, Subset
 from equicdft import make_dataloaders
 
 
-def _dataset(values, n_grid=4):
+def _dataset(values, n_grid=4, temperatures=None):
     """Return minimal complete-field dictionaries for loader tests."""
 
-    return [
-        {
+    frames = []
+    for frame_id, value in enumerate(values):
+        frame = {
             "frame_id": torch.tensor(frame_id),
             "rho": torch.full((n_grid, 1), float(value)),
         }
-        for frame_id, value in enumerate(values)
-    ]
+        if temperatures is not None:
+            frame["temperature"] = torch.tensor(float(temperatures[frame_id]))
+        frames.append(frame)
+    return frames
 
 
 class TestMakeDataloaders(unittest.TestCase):
@@ -33,9 +36,14 @@ class TestMakeDataloaders(unittest.TestCase):
             batch_size=2,
             seed=17,
         )
-        train_a, valid_a, test_a = loaders_a
-        train_b, valid_b, test_b = loaders_b
+        train_a = loaders_a["train"]
+        valid_a = loaders_a["valid"]
+        test_a = loaders_a["test"]
+        train_b = loaders_b["train"]
+        valid_b = loaders_b["valid"]
+        test_b = loaders_b["test"]
 
+        self.assertEqual(set(loaders_a), {"train", "valid", "test"})
         self.assertIsInstance(train_a.dataset, Subset)
         self.assertIsInstance(valid_a.dataset, Subset)
         self.assertEqual(train_a.dataset.indices, train_b.dataset.indices)
@@ -64,12 +72,15 @@ class TestMakeDataloaders(unittest.TestCase):
         valid_dataset = _dataset([5.0, 6.0])
         test_dataset = _dataset([100.0, 200.0])
 
-        train_loader, valid_loader, test_loader = make_dataloaders(
+        loaders = make_dataloaders(
             train_dataset,
             valid_dataset=valid_dataset,
             test_dataset=test_dataset,
             batch_size=3,
         )
+        train_loader = loaders["train"]
+        valid_loader = loaders["valid"]
+        test_loader = loaders["test"]
 
         self.assertIs(train_loader.dataset, train_dataset)
         self.assertIs(valid_loader.dataset, valid_dataset)
@@ -93,20 +104,71 @@ class TestMakeDataloaders(unittest.TestCase):
             compute_mean_density=True,
         )
 
-        self.assertEqual(len(result), 4)
-        self.assertAlmostEqual(result[3], 3.0)
+        self.assertEqual(
+            set(result),
+            {"train", "valid", "test", "mean_density"},
+        )
+        self.assertAlmostEqual(result["mean_density"], 3.0)
 
     def test_fractional_mean_density_uses_complete_input_pool(self):
         dataset = _dataset([1.0, 3.0, 5.0, 7.0])
 
-        _, _, _, mean_density = make_dataloaders(
+        result = make_dataloaders(
             dataset,
             valid_fraction=0.5,
             seed=8,
             compute_mean_density=True,
         )
 
-        self.assertAlmostEqual(mean_density, 4.0)
+        self.assertAlmostEqual(result["mean_density"], 4.0)
+
+    def test_mean_temperature_uses_train_and_validation_but_not_test(self):
+        train_dataset = _dataset(
+            [1.0, 3.0],
+            temperatures=[0.6, 0.9],
+        )
+        valid_dataset = _dataset([5.0], temperatures=[1.2])
+        test_dataset = _dataset([100.0], temperatures=[100.0])
+
+        result = make_dataloaders(
+            train_dataset,
+            valid_dataset=valid_dataset,
+            test_dataset=test_dataset,
+            compute_mean_density=True,
+            compute_mean_temperature=True,
+        )
+
+        self.assertEqual(
+            set(result),
+            {
+                "train",
+                "valid",
+                "test",
+                "mean_density",
+                "mean_temperature",
+            },
+        )
+        self.assertAlmostEqual(result["mean_density"], 3.0)
+        self.assertAlmostEqual(result["mean_temperature"], 0.9)
+
+    def test_mean_temperature_can_be_returned_without_mean_density(self):
+        dataset = _dataset(
+            [1.0, 3.0, 5.0, 7.0],
+            temperatures=[0.6, 0.9, 1.2, 1.5],
+        )
+
+        result = make_dataloaders(
+            dataset,
+            valid_fraction=0.5,
+            seed=8,
+            compute_mean_temperature=True,
+        )
+
+        self.assertEqual(
+            set(result),
+            {"train", "valid", "test", "mean_temperature"},
+        )
+        self.assertAlmostEqual(result["mean_temperature"], 1.05)
 
     def test_requires_exactly_one_validation_source(self):
         dataset = _dataset([1.0, 2.0])
@@ -166,6 +228,25 @@ class TestMakeDataloaders(unittest.TestCase):
                 valid_dataset=_dataset([1.0]),
                 compute_mean_density=True,
             )
+
+    def test_mean_temperature_validates_temperature(self):
+        with self.assertRaisesRegex(KeyError, "temperature"):
+            make_dataloaders(
+                _dataset([1.0]),
+                valid_dataset=_dataset([2.0]),
+                compute_mean_temperature=True,
+            )
+
+        invalid_values = (float("nan"), 0.0, -1.0)
+        for value in invalid_values:
+            with self.subTest(value=value):
+                invalid = _dataset([1.0], temperatures=[value])
+                with self.assertRaisesRegex(ValueError, "finite|positive"):
+                    make_dataloaders(
+                        invalid,
+                        valid_dataset=_dataset([2.0], temperatures=[1.0]),
+                        compute_mean_temperature=True,
+                    )
 
 
 if __name__ == "__main__":

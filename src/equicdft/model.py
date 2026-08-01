@@ -79,10 +79,14 @@ class GridCACEModel(nn.Module):
         Module that contracts the Cartesian moments into invariant features.
     readout
         Module that predicts the per-particle excess free energy from the
-        flattened local ``B`` features and scalar temperature.
+        flattened local ``B`` features and normalized scalar temperature.
     grid_spacing
         One value for an isotropic grid or three Cartesian spacings. The
         discretization is fixed by training and stored with the model.
+    mean_temperature
+        Positive temperature scale computed from the development data. The
+        readout receives ``temperature / mean_temperature``; physical
+        thermodynamic expressions continue to use the unscaled temperature.
     boltzmann_constant
         Boltzmann constant in the energy and temperature units used to train
         the model. It is stored for inference thermodynamics.
@@ -107,6 +111,7 @@ class GridCACEModel(nn.Module):
         b_features: CartesianBFeatures,
         readout: LocalReadout,
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
+        mean_temperature: Union[float, torch.Tensor] = 1.0,
         boltzmann_constant: float = 1.0,
         thermal_wavelength: Union[
             float,
@@ -155,6 +160,19 @@ class GridCACEModel(nn.Module):
         ):
             raise ValueError("grid_spacing values must be finite and positive")
 
+        mean_temperature_tensor = torch.as_tensor(
+            mean_temperature,
+            dtype=torch.get_default_dtype(),
+        ).detach().clone().reshape(-1)
+        if mean_temperature_tensor.numel() != 1:
+            raise ValueError("mean_temperature must be a positive scalar")
+        mean_temperature_tensor = mean_temperature_tensor.reshape(())
+        if (
+            not torch.isfinite(mean_temperature_tensor).item()
+            or mean_temperature_tensor.item() <= 0.0
+        ):
+            raise ValueError("mean_temperature must be a positive scalar")
+
         if isinstance(boltzmann_constant, bool) or not isinstance(
             boltzmann_constant,
             Real,
@@ -191,6 +209,7 @@ class GridCACEModel(nn.Module):
             )
 
         self.register_buffer("grid_spacing", grid_spacing_tensor)
+        self.register_buffer("mean_temperature", mean_temperature_tensor)
         self.register_buffer(
             "boltzmann_constant",
             boltzmann_constant_tensor,
@@ -398,9 +417,9 @@ class GridCACEModel(nn.Module):
             B = self.b_features(A)
 
             # Flatten the radial, invariant, and channel axes into one local
-            # feature vector [..., n_grid, n_B]. Temperature has shape [...]
-            # and is broadcast over the grid before being appended exactly
-            # once, giving [..., n_grid, n_B + 1].
+            # feature vector [..., n_grid, n_B]. The scale-only normalized
+            # temperature T/<T> has shape [...] and is broadcast over the
+            # grid before being appended once, giving [..., n_grid, n_B + 1].
             B_flat = B.flatten(start_dim=-3)
             temperature = data["temperature"].to(
                 device=B_flat.device,
@@ -411,7 +430,13 @@ class GridCACEModel(nn.Module):
                     "temperature must be scalar for one field or have the "
                     "same leading batch shape as B"
                 )
-            temperature_feature = temperature[..., None, None].expand(
+            normalized_temperature = temperature / self.mean_temperature.to(
+                device=B_flat.device,
+                dtype=B_flat.dtype,
+            )
+            temperature_feature = normalized_temperature[
+                ..., None, None
+            ].expand(
                 *B_flat.shape[:-1],
                 1,
             )
