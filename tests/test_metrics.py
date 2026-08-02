@@ -123,6 +123,47 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(metrics.logs["valid"]["prediction"], [])
         self.assertEqual(metrics.logs["valid"]["target"], [])
 
+    def test_output_target_is_expanded_and_hard_masked(self):
+        metrics = Metrics(
+            target_key="average_mu",
+            prediction_key="local_mu",
+            metric_keys=("mae", "rmse"),
+            mask_key="rho_mask",
+        )
+        outputs = {
+            "local_mu": torch.tensor(
+                [
+                    [[1.0], [3.0], [100.0]],
+                    [[4.0], [6.0], [8.0]],
+                ]
+            ),
+            "average_mu": torch.tensor([[2.0], [6.0]]),
+            "rho_mask": torch.tensor(
+                [
+                    [[1.0], [1.0], [0.0]],
+                    [[1.0], [1.0], [1.0]],
+                ]
+            ),
+        }
+
+        values = metrics(outputs, {})
+
+        self.assertAlmostEqual(values["mae"].item(), 1.2)
+        self.assertAlmostEqual(values["rmse"].item(), math.sqrt(2.0))
+
+    def test_missing_and_empty_metric_masks_are_reported(self):
+        metrics = Metrics("target", prediction_key="prediction", mask_key="mask")
+        outputs = {"prediction": torch.ones(2)}
+        batch = {"target": torch.ones(2)}
+
+        with self.assertRaisesRegex(KeyError, "mask"):
+            metrics(outputs, batch)
+        with self.assertRaisesRegex(ValueError, "retain"):
+            metrics(
+                {"prediction": torch.ones(2), "mask": torch.zeros(2)},
+                batch,
+            )
+
     def test_detaches_recorded_tensors(self):
         metrics = Metrics("c1")
         prediction = torch.tensor([1.0], requires_grad=True)

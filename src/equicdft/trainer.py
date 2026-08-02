@@ -1,6 +1,7 @@
 """Training orchestration for grid density-functional models."""
 
 import math
+import os
 from pathlib import Path
 from typing import (
     Any,
@@ -113,6 +114,7 @@ class Trainer(nn.Module):
         self.scheduler = None
         self.history = []
         self.best_valid_loss = math.inf
+        self._train_loader_generator = None
         self.to(self.device)
 
     def fit(
@@ -132,6 +134,7 @@ class Trainer(nn.Module):
         if not isinstance(print_interval, int) or print_interval <= 0:
             raise ValueError("print_interval must be a positive integer")
 
+        self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization(train_loader)
         start_epoch = len(self.history) + 1
 
@@ -173,6 +176,7 @@ class Trainer(nn.Module):
         """Write model, optimization, scheduler, and history state."""
 
         checkpoint = {
+            "checkpoint_version": 1,
             "epoch": record["epoch"],
             "model_state_dict": self.model.state_dict(),
             "loss_state_dict": self.loss.state_dict(),
@@ -182,8 +186,128 @@ class Trainer(nn.Module):
             ),
             "record": record,
             "history": self.history,
+            "best_valid_loss": self.best_valid_loss,
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "train_loader_generator_state": (
+                self._train_loader_generator.get_state()
+                if self._train_loader_generator is not None
+                else None
+            ),
         }
-        torch.save(checkpoint, str(Path(path).expanduser()))
+        checkpoint_path = Path(path).expanduser()
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = checkpoint_path.with_name(
+            ".{}.tmp".format(checkpoint_path.name)
+        )
+        try:
+            torch.save(checkpoint, str(temporary_path))
+            os.replace(str(temporary_path), str(checkpoint_path))
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    def load_checkpoint(
+        self,
+        path: Union[str, Path],
+        train_loader: Iterable[Dict[str, torch.Tensor]],
+    ) -> int:
+        """Restore a complete training state and return its completed epoch.
+
+        Lazy parameters are first materialized from ``train_loader`` so that
+        model, optimizer, and scheduler state dictionaries can be restored in
+        their normal order. Random states are restored last, undoing any draws
+        made while constructing the replacement process.
+        """
+
+        checkpoint_path = Path(path).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                "checkpoint does not exist: {}".format(checkpoint_path)
+            )
+
+        self._train_loader_generator = getattr(train_loader, "generator", None)
+        self._initialize_optimization(train_loader)
+        checkpoint = torch.load(
+            str(checkpoint_path),
+            map_location=self.device,
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint must contain a dictionary")
+
+        required_keys = {
+            "epoch",
+            "model_state_dict",
+            "loss_state_dict",
+            "optimizer_state_dict",
+            "scheduler_state_dict",
+            "history",
+        }
+        missing_keys = required_keys - set(checkpoint)
+        if missing_keys:
+            raise ValueError(
+                "checkpoint is missing keys: {}".format(
+                    sorted(missing_keys)
+                )
+            )
+
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self._move_optimizer_state_to_device()
+
+        scheduler_state = checkpoint["scheduler_state_dict"]
+        if self.scheduler is None and scheduler_state is not None:
+            raise ValueError(
+                "checkpoint contains scheduler state but no scheduler is configured"
+            )
+        if self.scheduler is not None and scheduler_state is None:
+            raise ValueError(
+                "checkpoint has no scheduler state but a scheduler is configured"
+            )
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(scheduler_state)
+
+        epoch = checkpoint["epoch"]
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise ValueError("checkpoint epoch must be a positive integer")
+        history = checkpoint["history"]
+        if not isinstance(history, list) or len(history) != epoch:
+            raise ValueError(
+                "checkpoint history length must equal its completed epoch"
+            )
+        self.history = history
+
+        if "best_valid_loss" in checkpoint:
+            self.best_valid_loss = float(checkpoint["best_valid_loss"])
+        else:
+            self.best_valid_loss = min(
+                record["valid_losses"]["total"] for record in history
+            )
+
+        if checkpoint.get("torch_rng_state") is not None:
+            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+        cuda_states = checkpoint.get("cuda_rng_state_all")
+        if cuda_states is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
+        loader_state = checkpoint.get("train_loader_generator_state")
+        if loader_state is not None:
+            if self._train_loader_generator is None:
+                raise ValueError(
+                    "checkpoint contains a train-loader random state, but the "
+                    "current loader has no generator"
+                )
+            self._train_loader_generator.set_state(loader_state.cpu())
+
+        for metric in self.metrics:
+            for subset in metric.logs:
+                metric.clear_metrics(subset)
+        return epoch
 
     def _initialize_optimization(
         self,
@@ -286,21 +410,32 @@ class Trainer(nn.Module):
     def _write_epoch_checkpoints(self, record: Dict[str, Any]) -> None:
         """Write configured periodic, best, and last checkpoints."""
 
+        epoch = record["epoch"]
+        valid_loss = record["valid_losses"]["total"]
+        improved = valid_loss < self.best_valid_loss
+        if improved:
+            self.best_valid_loss = valid_loss
         if self.checkpoint_dir is None:
             return
 
-        epoch = record["epoch"]
-        valid_loss = record["valid_losses"]["total"]
+        is_best = self.save_best and improved
         if epoch % self.checkpoint_interval == 0:
             self.save_checkpoint(
                 self.checkpoint_dir
                 / "checkpoint_epoch_{:04d}.pt".format(epoch),
                 record,
             )
-        if self.save_best and valid_loss < self.best_valid_loss:
-            self.best_valid_loss = valid_loss
+        if is_best:
             self.save_checkpoint(self.checkpoint_dir / "best.pt", record)
         self.save_checkpoint(self.checkpoint_dir / "last.pt", record)
+
+    def _move_optimizer_state_to_device(self) -> None:
+        """Move restored optimizer tensors onto the configured device."""
+
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(self.device)
 
     def _move_batch(
         self,

@@ -135,7 +135,84 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("loss_state_dict", checkpoint)
         self.assertIn("optimizer_state_dict", checkpoint)
         self.assertIn("scheduler_state_dict", checkpoint)
+        self.assertIn("best_valid_loss", checkpoint)
+        self.assertIn("torch_rng_state", checkpoint)
+        self.assertIn("train_loader_generator_state", checkpoint)
         self.assertEqual(len(checkpoint["history"]), 2)
+
+    def test_checkpoint_resume_restores_complete_training_state(self):
+        train_values = [1, 2, 3, 4]
+        valid_loader = DataLoader(_dataset([5, 6]), batch_size=2)
+
+        continuous = self._make_trainer(scheduler=True)
+        continuous_loader = DataLoader(
+            _dataset(train_values),
+            batch_size=2,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(7),
+        )
+        continuous.fit(
+            continuous_loader,
+            valid_loader,
+            epochs=4,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            partial = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                scheduler=True,
+            )
+            partial_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(7),
+            )
+            partial.fit(
+                partial_loader,
+                valid_loader,
+                epochs=2,
+                verbose=False,
+            )
+
+            resumed = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                scheduler=True,
+            )
+            resumed_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(7),
+            )
+            completed_epoch = resumed.load_checkpoint(
+                Path(temporary_directory) / "last.pt",
+                train_loader=resumed_loader,
+            )
+            resumed.fit(
+                resumed_loader,
+                valid_loader,
+                epochs=2,
+                verbose=False,
+            )
+
+        self.assertEqual(completed_epoch, 2)
+        self.assertEqual(
+            [record["epoch"] for record in resumed.history],
+            [1, 2, 3, 4],
+        )
+        self.assertTrue(
+            torch.equal(resumed.model.weight, continuous.model.weight)
+        )
+        self.assertEqual(
+            resumed.optimizer.param_groups[0]["lr"],
+            continuous.optimizer.param_groups[0]["lr"],
+        )
+        self.assertEqual(
+            resumed.best_valid_loss,
+            continuous.best_valid_loss,
+        )
 
     def test_configuration_and_empty_loaders_are_validated(self):
         with self.assertRaisesRegex(ValueError, "checkpoint_interval"):

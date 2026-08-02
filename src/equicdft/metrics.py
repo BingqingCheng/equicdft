@@ -99,7 +99,9 @@ class Metrics(nn.Module):
     Parameters
     ----------
     target_key
-        Key selecting the reference tensor from the batch.
+        Key selecting the reference tensor. The batch is checked first,
+        followed by the model outputs. A componentwise target without the
+        prediction's grid axis is expanded over that axis.
     prediction_key
         Key selecting the predicted tensor from the model outputs. Defaults to
         ``target_key``.
@@ -114,6 +116,10 @@ class Metrics(nn.Module):
     subsets
         Independent accumulation buffers to create. The defaults are
         ``train``, ``valid``, and ``test``.
+    mask_key
+        Optional key selecting a hard mask from the model outputs or batch.
+        Positive entries are retained. The mask must have the same shape as
+        the prediction.
     """
 
     def __init__(
@@ -128,6 +134,7 @@ class Metrics(nn.Module):
             "pearson_r",
         ),
         subsets: Sequence[str] = ("train", "valid", "test"),
+        mask_key: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -139,6 +146,11 @@ class Metrics(nn.Module):
         self.name = _nonempty_string(
             target_key if name is None else name,
             "name",
+        )
+        self.mask_key = (
+            None
+            if mask_key is None
+            else _nonempty_string(mask_key, "mask_key")
         )
         self.metric_keys = _unique_strings(metric_keys, "metric_keys")
         unknown_metrics = set(self.metric_keys) - set(SUPPORTED_METRICS)
@@ -220,24 +232,54 @@ class Metrics(nn.Module):
                     self.prediction_key
                 )
             )
-        if self.target_key not in batch:
+        if self.target_key in batch:
+            target = batch[self.target_key]
+        elif self.target_key in outputs:
+            target = outputs[self.target_key]
+        else:
             raise KeyError(
-                "training batch is missing target '{}'".format(
+                "batch and model outputs are missing target '{}'".format(
                     self.target_key
                 )
             )
 
         prediction = outputs[self.prediction_key]
-        target = batch[self.target_key]
         if prediction.shape != target.shape:
-            raise ValueError(
-                "prediction '{}' has shape {}, but target '{}' has shape {}".format(
-                    self.prediction_key,
-                    tuple(prediction.shape),
-                    self.target_key,
-                    tuple(target.shape),
-                )
+            component_target_shape = (
+                prediction.shape[:-2] + prediction.shape[-1:]
             )
+            if target.shape == component_target_shape:
+                target = target.unsqueeze(-2).expand_as(prediction)
+            else:
+                raise ValueError(
+                    "prediction '{}' has shape {}, but target '{}' has shape "
+                    "{}".format(
+                        self.prediction_key,
+                        tuple(prediction.shape),
+                        self.target_key,
+                        tuple(target.shape),
+                    )
+                )
+
+        if self.mask_key is not None:
+            if self.mask_key in outputs:
+                mask = outputs[self.mask_key]
+            elif self.mask_key in batch:
+                mask = batch[self.mask_key]
+            else:
+                raise KeyError(
+                    "batch and model outputs are missing mask '{}'".format(
+                        self.mask_key
+                    )
+                )
+            if mask.shape != prediction.shape:
+                raise ValueError("mask and prediction must have same shape")
+            mask = mask.detach().to(dtype=torch.bool)
+            prediction = prediction[mask]
+            target = target[mask]
+            if prediction.numel() == 0:
+                raise ValueError("metric mask must retain at least one value")
+
         if prediction.ndim == 0:
             prediction = prediction.unsqueeze(0)
             target = target.unsqueeze(0)
