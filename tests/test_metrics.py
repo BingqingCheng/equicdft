@@ -70,6 +70,14 @@ class TestMetricFormatting(unittest.TestCase):
 
 
 class TestMetrics(unittest.TestCase):
+    def test_default_metrics_use_r2(self):
+        metrics = Metrics("c1")
+
+        self.assertEqual(
+            metrics.metric_keys,
+            ("mae", "rmse", "rmse_percent", "r2"),
+        )
+
     def test_forward_computes_unweighted_batch_metrics(self):
         metrics = Metrics(
             target_key="target_c1",

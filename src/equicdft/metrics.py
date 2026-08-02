@@ -93,7 +93,7 @@ class Metrics(nn.Module):
     The interface follows the CACE metric workflow: call
     :meth:`update_metrics` for every batch, then :meth:`retrieve_metrics` once
     at the end of an epoch. Metrics are evaluated after concatenating all
-    batches, so RMSE and Pearson correlation are true dataset-level values
+    batches, so RMSE and R2 are true dataset-level values
     rather than averages of per-batch values.
 
     Parameters
@@ -131,7 +131,7 @@ class Metrics(nn.Module):
             "mae",
             "rmse",
             "rmse_percent",
-            "pearson_r",
+            "r2",
         ),
         subsets: Sequence[str] = ("train", "valid", "test"),
         mask_key: Optional[str] = None,
