@@ -44,6 +44,32 @@ GRID_INFO_KEYS = {
 }
 
 
+def _normalize_xyz_paths(
+    path: Union[
+        str,
+        Path,
+        Sequence[Union[str, Path]],
+    ],
+) -> List[Path]:
+    """Return a validated nonempty list of expanded EXTXYZ paths."""
+
+    if isinstance(path, (str, Path)):
+        return [Path(path).expanduser()]
+    if not isinstance(path, Sequence):
+        raise TypeError(
+            "path must be a path-like value or a sequence of path-like values"
+        )
+
+    values = list(path)
+    if not values:
+        raise ValueError("path sequence must not be empty")
+    if any(not isinstance(value, (str, Path)) for value in values):
+        raise TypeError(
+            "every item in path must be a string or pathlib.Path"
+        )
+    return [Path(value).expanduser() for value in values]
+
+
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
@@ -86,7 +112,11 @@ class GridData(dict):
     @classmethod
     def from_xyz(
         cls,
-        path: Union[str, Path],
+        path: Union[
+            str,
+            Path,
+            Sequence[Union[str, Path]],
+        ],
         cutoff_grid: int = 3,
         index: str = ":",
         data_key: Optional[Dict[str, str]] = None,
@@ -104,9 +134,11 @@ class GridData(dict):
         Parameters
         ----------
         path
-            EXTXYZ file containing a regular grid, temperature, and at least
-            one of density or external potential. Chemical potential metadata
-            is optional.
+            One EXTXYZ path, or an ordered sequence of EXTXYZ paths. Every
+            file must contain a regular grid, temperature, and at least one of
+            density or external potential. Chemical-potential metadata is
+            optional. With multiple paths, frames are returned in path order
+            and then in frame order within each file.
         cutoff_grid
             Inclusive spherical cutoff in integer grid steps. The default is
             three, so retained offsets satisfy ``x^2 + y^2 + z^2 <= 9``.
@@ -165,11 +197,18 @@ class GridData(dict):
                 )
             keys.update(data_key)
 
+        paths = _normalize_xyz_paths(path)
+
         # ASE returns either one Atoms object or a list, depending on `index`.
-        # Normalize both cases to a list so this method has one return type.
-        configurations = read(str(Path(path).expanduser()), index=index)
-        if not isinstance(configurations, list):
-            configurations = [configurations]
+        # Normalize each read and append it in supplied path order. The same
+        # frame selection is applied independently to every file.
+        configurations: List[Atoms] = []
+        for xyz_path in paths:
+            selected = read(str(xyz_path), index=index)
+            if isinstance(selected, list):
+                configurations.extend(selected)
+            else:
+                configurations.append(selected)
         data = [
             cls(
                 **_process_atoms(
@@ -653,7 +692,11 @@ def _process_atoms(
             mu_values = np.repeat(mu_values, n_types)
         if mu_values.size != n_types:
             raise ValueError("mu must contain one value or one value per type")
-        if not np.all(np.isfinite(mu_values)):
+        if np.all(np.isnan(mu_values)):
+            # EXTXYZ writers commonly use mu=nan as an explicit placeholder
+            # for canonical data. Treat this exactly like absent optional mu.
+            mu_values = None
+        elif not np.all(np.isfinite(mu_values)):
             raise ValueError("mu values must be finite")
 
     # The thermal wavelength is required when an external field defines an

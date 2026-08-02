@@ -18,6 +18,7 @@ def _write_grid(
     include_temperature=True,
     include_v_ext=True,
     density_offset=0.25,
+    mu_value=-1.0,
 ):
     shape = (4, 4, 4)
     spacing = 0.5
@@ -41,7 +42,7 @@ def _write_grid(
     if include_temperature:
         atoms.info["T"] = 1.5
     if include_mu:
-        atoms.info["mu"] = -1.0
+        atoms.info["mu"] = mu_value
     write(path, atoms, format="extxyz")
 
 
@@ -124,6 +125,26 @@ class TestGridData(unittest.TestCase):
         mismatched["grid_spacing"] = [1.0, 1.0, 1.0]
         with self.assertRaisesRegex(ValueError, "grid_spacing"):
             GridData.from_xyz(self.path, grid_info=mismatched)
+
+    def test_from_xyz_accepts_ordered_path_sequence(self):
+        second_path = Path(self.temporary_directory.name) / "grid-second.extxyz"
+        _write_grid(second_path, density_offset=100.25)
+
+        for paths in ([second_path, self.path], (second_path, self.path)):
+            with self.subTest(container=type(paths).__name__):
+                data = GridData.from_xyz(paths, cutoff_grid=1)
+
+                self.assertEqual(len(data), 2)
+                self.assertAlmostEqual(data[0]["rho"][0, 0].item(), 100.25)
+                self.assertAlmostEqual(data[1]["rho"][0, 0].item(), 0.25)
+
+    def test_from_xyz_rejects_empty_path_sequence(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            GridData.from_xyz([], cutoff_grid=1)
+
+    def test_from_xyz_rejects_non_path_sequence_item(self):
+        with self.assertRaisesRegex(TypeError, "every item"):
+            GridData.from_xyz([self.path, 3], cutoff_grid=1)
 
     def test_grid_info_supplies_from_dict_model_metadata(self):
         data = GridData.from_dict(
@@ -318,6 +339,16 @@ class TestGridData(unittest.TestCase):
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertNotIn("mu", batch)
         self.assertNotIn("c1", batch)
+
+    def test_nan_mu_placeholder_is_treated_as_absent(self):
+        path = Path(self.temporary_directory.name) / "nan-mu.extxyz"
+        _write_grid(path, mu_value=float("nan"))
+        data = GridData.from_xyz(path, cutoff_grid=1)[0]
+
+        self.assertNotIn("mu", data)
+        self.assertNotIn("beta_mu", data)
+        self.assertNotIn("c1", data)
+        self.assertIn("c1_plus_beta_mu", data)
 
     def test_zero_density_is_retained_for_masked_losses(self):
         path = Path(self.temporary_directory.name) / "zero-density.extxyz"
