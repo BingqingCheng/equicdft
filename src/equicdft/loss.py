@@ -410,17 +410,24 @@ class DensityPerturbationStabilityLoss(nn.Module):
             target_sums,
             density_cap,
         )
+        accumulation_dtype = _accumulation_dtype(rho_reference.dtype)
         particle_number_error = torch.maximum(
             torch.amax(
                 torch.abs(
-                    torch.sum(rho_plus, dim=-2)
-                    - target_sums[:, None, :]
+                    torch.sum(
+                        rho_plus.to(accumulation_dtype),
+                        dim=-2,
+                    )
+                    - target_sums[:, None, :].to(accumulation_dtype)
                 )
             ),
             torch.amax(
                 torch.abs(
-                    torch.sum(rho_minus, dim=-2)
-                    - target_sums[:, None, :]
+                    torch.sum(
+                        rho_minus.to(accumulation_dtype),
+                        dim=-2,
+                    )
+                    - target_sums[:, None, :].to(accumulation_dtype)
                 )
             ),
         )
@@ -751,10 +758,14 @@ class GlobalDensityStabilityLoss(nn.Module):
             target_sums,
             density_cap,
         )
+        accumulation_dtype = _accumulation_dtype(rho_reference.dtype)
         particle_number_error = torch.amax(
             torch.abs(
-                torch.sum(candidate_density, dim=-2)
-                - target_sums[:, None, :]
+                torch.sum(
+                    candidate_density.to(accumulation_dtype),
+                    dim=-2,
+                )
+                - target_sums[:, None, :].to(accumulation_dtype)
             )
         )
         if particle_number_error.item() > 1.0e-4:
@@ -942,8 +953,11 @@ def _correct_component_grid_sums(
 ) -> torch.Tensor:
     """Correct float summation error without violating positivity or the cap."""
 
-    current_sums = torch.sum(rho, dim=-2)
-    correction = target_sums[:, None, :] - current_sums
+    accumulation_dtype = _accumulation_dtype(rho.dtype)
+    current_sums = torch.sum(rho.to(accumulation_dtype), dim=-2)
+    correction = (
+        target_sums[:, None, :].to(accumulation_dtype) - current_sums
+    ).to(rho.dtype)
     addition_index = torch.argmax(
         maximum_density[None, None, None, :] - rho,
         dim=-2,
@@ -960,3 +974,11 @@ def _correct_component_grid_sums(
         index=correction_index,
         src=correction[:, :, None, :],
     )
+
+
+def _accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Use double precision for reductions of low-precision grid fields."""
+
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return torch.float64
+    return dtype

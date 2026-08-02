@@ -1,5 +1,7 @@
 """Training orchestration for grid density-functional models."""
 
+import csv
+from datetime import datetime
 import math
 import os
 from pathlib import Path
@@ -57,6 +59,10 @@ class Trainer(nn.Module):
     save_best
         When checkpointing is enabled, update ``best.pt`` whenever validation
         loss improves. ``last.pt`` is updated after every epoch regardless.
+    log_dir
+        Optional directory for ``history.csv`` and ``training.log``.
+        ``history.csv`` is atomically reconstructed from the complete trainer
+        history after every epoch and after loading a checkpoint.
     """
 
     def __init__(
@@ -72,6 +78,7 @@ class Trainer(nn.Module):
         checkpoint_dir: Optional[Union[str, Path]] = None,
         checkpoint_interval: int = 1,
         save_best: bool = True,
+        log_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
 
@@ -109,6 +116,15 @@ class Trainer(nn.Module):
         if checkpoint_dir is not None:
             self.checkpoint_dir = Path(checkpoint_dir).expanduser()
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_dir = None
+        self.history_path = None
+        self.training_log_path = None
+        if log_dir is not None:
+            self.log_dir = Path(log_dir).expanduser()
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.history_path = self.log_dir / "history.csv"
+            self.training_log_path = self.log_dir / "training.log"
 
         self.optimizer = None
         self.scheduler = None
@@ -163,8 +179,9 @@ class Trainer(nn.Module):
 
             self._step_scheduler(valid_losses["total"])
             self._write_epoch_checkpoints(record)
+            self._write_history_csv()
             if verbose and epoch % print_interval == 0:
-                print(self._format_record(record))
+                self.log_message(self._format_record(record))
 
         return self.history
 
@@ -307,7 +324,25 @@ class Trainer(nn.Module):
         for metric in self.metrics:
             for subset in metric.logs:
                 metric.clear_metrics(subset)
+        self._write_history_csv()
         return epoch
+
+    def log_message(self, message: str, display: bool = True) -> None:
+        """Print a message and append it to the human-readable training log."""
+
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        if not isinstance(display, bool):
+            raise TypeError("display must be a boolean")
+        if display:
+            print(message)
+        if self.training_log_path is not None:
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            with self.training_log_path.open(
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("[{}]\n{}\n\n".format(timestamp, message))
 
     def _initialize_optimization(
         self,
@@ -436,6 +471,82 @@ class Trainer(nn.Module):
             for key, value in state.items():
                 if torch.is_tensor(value):
                     state[key] = value.to(self.device)
+
+    def _write_history_csv(self) -> None:
+        """Atomically write one flattened numerical row per completed epoch."""
+
+        if self.history_path is None or not self.history:
+            return
+
+        rows = [self._flatten_history_record(record) for record in self.history]
+        fieldnames = ["epoch", "learning_rate"]
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        temporary_path = self.history_path.with_name(
+            ".{}.tmp".format(self.history_path.name)
+        )
+        try:
+            with temporary_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(str(temporary_path), str(self.history_path))
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    @staticmethod
+    def _flatten_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten one nested epoch record into stable CSV column names."""
+
+        row = {
+            "epoch": record["epoch"],
+            "learning_rate": record["learning_rate"],
+        }
+        for loss_name in record["train_losses"]:
+            column_name = Trainer._log_column_name(loss_name)
+            for subset in ("train", "valid"):
+                row["{}_loss_{}".format(subset, column_name)] = record[
+                    "{}_losses".format(subset)
+                ][loss_name]
+
+        for collection_name, train_values in record["train_metrics"].items():
+            collection_column = Trainer._log_column_name(collection_name)
+            for metric_name in train_values:
+                metric_column = Trainer._log_column_name(metric_name)
+                for subset in ("train", "valid"):
+                    row[
+                        "{}_{}_{}".format(
+                            subset,
+                            collection_column,
+                            metric_column,
+                        )
+                    ] = record["{}_metrics".format(subset)][
+                        collection_name
+                    ][metric_name]
+        return row
+
+    @staticmethod
+    def _log_column_name(name: str) -> str:
+        """Return a lowercase underscore-separated CSV column fragment."""
+
+        characters = []
+        previous_was_separator = False
+        for character in name.strip().lower():
+            if character.isalnum():
+                characters.append(character)
+                previous_was_separator = False
+            elif not previous_was_separator:
+                characters.append("_")
+                previous_was_separator = True
+        return "".join(characters).strip("_")
 
     def _move_batch(
         self,

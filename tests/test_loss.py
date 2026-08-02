@@ -243,6 +243,48 @@ class TestDensityPerturbationStabilityLoss(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds"):
             term(outputs, batch, model=model)
 
+    def test_large_float32_grid_preserves_particle_number(self):
+        n_grid = 16**3
+        linear_index = torch.arange(n_grid)
+        batch = {
+            "rho": torch.linspace(0.001, 1.7, n_grid).reshape(1, n_grid, 1),
+            "V_ext": torch.zeros(1, n_grid, 1),
+            "beta": torch.ones(1),
+            "temperature": torch.ones(1),
+            "grid_spacing": torch.full((1, 3), 0.5),
+            "grid_positions": torch.stack(
+                (
+                    linear_index % 16,
+                    (linear_index // 16) % 16,
+                    linear_index // 16**2,
+                ),
+                dim=-1,
+            ).unsqueeze(0),
+            "local_density_index": linear_index.reshape(1, n_grid, 1),
+        }
+        model = _UnstableQuadraticFunctional()
+        outputs = model(batch)
+        term = DensityPerturbationStabilityLoss(
+            maximum_density=1.8,
+            relative_amplitudes=(0.05,),
+        )
+
+        value = term(outputs, batch, model=model)
+
+        self.assertTrue(torch.isfinite(value).item())
+        perturbed_sums = torch.sum(model.last_rho.double(), dim=-2)
+        # The fixed-N target is the sum represented by the float32 training
+        # batch; only the correction and verification reductions use float64.
+        reference_sums = torch.sum(batch["rho"], dim=-2).double()
+        self.assertTrue(
+            torch.allclose(
+                perturbed_sums,
+                reference_sums[:, None, :],
+                atol=1.0e-4,
+                rtol=0.0,
+            )
+        )
+
 
 class TestGlobalDensityStabilityLoss(unittest.TestCase):
     @staticmethod

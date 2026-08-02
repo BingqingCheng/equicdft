@@ -112,12 +112,18 @@ class GridSolver:
         method: str = "minimize",
         max_iter: int = 200,
         tolerance_residual: float = 1.0e-4,
+        tolerance_rms_residual: Optional[float] = None,
         tolerance_change: float = 1.0e-7,
         step_size: float = 1.0,
         minimum_step_size: float = 1.0e-8,
         line_search_factor: float = 0.5,
         armijo_factor: float = 1.0e-4,
-        mixing: float = 0.02,
+        mixing: float = 0.05,
+        adaptive_mixing: bool = True,
+        minimum_mixing: float = 0.005,
+        maximum_mixing: float = 0.2,
+        mixing_growth: float = 1.1,
+        mixing_backtrack_factor: float = 0.5,
         continuation_steps: int = 5,
         max_log_density_change: float = 2.0,
         residual_density_threshold: Optional[float] = None,
@@ -140,10 +146,18 @@ class GridSolver:
         condition: a capped grid point may have a negative unconstrained
         residual because increasing its density is forbidden.
 
-        ``method="euler"`` retains the damped Euler--Lagrange fixed-point
-        iteration as an optional alternative. Both methods can introduce the
-        external field by continuation and use the physical projected
-        functional gradient only as a convergence diagnostic.
+        ``method="euler"`` uses a damped Euler--Lagrange fixed-point
+        iteration. By default, its mixing is increased after an improving
+        density-weighted RMS residual and backtracked after a worsening
+        trial. Set ``adaptive_mixing=False`` to use a fixed mixing value.
+        Both methods can introduce the external field by continuation and
+        use the physical projected functional gradient as a convergence
+        diagnostic.
+
+        ``tolerance_residual`` bounds the largest active-grid residual. When
+        ``tolerance_rms_residual`` is supplied, its density-weighted RMS bound
+        must also be satisfied. ``residual_density_threshold`` excludes
+        statistically unresolved low-density voxels from both diagnostics.
         """
 
         if method not in ("minimize", "euler"):
@@ -158,15 +172,26 @@ class GridSolver:
                 "continuation_steps must be a nonnegative integer"
             )
         tolerance_residual = float(tolerance_residual)
+        if tolerance_rms_residual is not None:
+            tolerance_rms_residual = float(tolerance_rms_residual)
         tolerance_change = float(tolerance_change)
         step_size = float(step_size)
         minimum_step_size = float(minimum_step_size)
         line_search_factor = float(line_search_factor)
         armijo_factor = float(armijo_factor)
         mixing = float(mixing)
+        minimum_mixing = float(minimum_mixing)
+        maximum_mixing = float(maximum_mixing)
+        mixing_growth = float(mixing_growth)
+        mixing_backtrack_factor = float(mixing_backtrack_factor)
         max_log_density_change = float(max_log_density_change)
         if tolerance_residual <= 0.0:
             raise ValueError("tolerance_residual must be positive")
+        if (
+            tolerance_rms_residual is not None
+            and tolerance_rms_residual <= 0.0
+        ):
+            raise ValueError("tolerance_rms_residual must be positive")
         if tolerance_change <= 0.0:
             raise ValueError("tolerance_change must be positive")
         if step_size <= 0.0:
@@ -184,6 +209,23 @@ class GridSolver:
             raise ValueError("armijo_factor must be in the interval [0, 1)")
         if not 0.0 < mixing <= 1.0:
             raise ValueError("mixing must be in the interval (0, 1]")
+        if not isinstance(adaptive_mixing, bool):
+            raise TypeError("adaptive_mixing must be a boolean")
+        if adaptive_mixing:
+            if not 0.0 < minimum_mixing <= mixing:
+                raise ValueError(
+                    "minimum_mixing must be positive and no larger than mixing"
+                )
+            if not mixing <= maximum_mixing <= 1.0:
+                raise ValueError(
+                    "maximum_mixing must be at least mixing and no larger than one"
+                )
+            if mixing_growth < 1.0:
+                raise ValueError("mixing_growth must be at least one")
+            if not 0.0 < mixing_backtrack_factor < 1.0:
+                raise ValueError(
+                    "mixing_backtrack_factor must lie in the interval (0, 1)"
+                )
         if max_log_density_change <= 0.0:
             raise ValueError("max_log_density_change must be positive")
 
@@ -292,6 +334,7 @@ class GridSolver:
                     cell_volume=cell_volume,
                     max_iter=max_iter,
                     tolerance_residual=tolerance_residual,
+                    tolerance_rms_residual=tolerance_rms_residual,
                     step_size=step_size,
                     minimum_step_size=minimum_step_size,
                     line_search_factor=line_search_factor,
@@ -312,8 +355,14 @@ class GridSolver:
                     cell_volume=cell_volume,
                     max_iter=max_iter,
                     tolerance_residual=tolerance_residual,
+                    tolerance_rms_residual=tolerance_rms_residual,
                     tolerance_change=tolerance_change,
                     mixing=mixing,
+                    adaptive_mixing=adaptive_mixing,
+                    minimum_mixing=minimum_mixing,
+                    maximum_mixing=maximum_mixing,
+                    mixing_growth=mixing_growth,
+                    mixing_backtrack_factor=mixing_backtrack_factor,
                     continuation_steps=continuation_steps,
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
@@ -342,7 +391,12 @@ class GridSolver:
         result["equilibrium_chemical_potential"] = chemical_potential
         result["max_euler_lagrange_residual"] = max_residual
         result["rms_euler_lagrange_residual"] = rms_residual
-        result["converged"] = bool(max_residual <= tolerance_residual)
+        result["converged"] = _residuals_converged(
+            max_residual,
+            rms_residual,
+            tolerance_residual,
+            tolerance_rms_residual,
+        )
         result["solver_method"] = method
         result["n_iter"] = state["n_iter"]
         result["n_evaluations"] = state["n_evaluations"]
@@ -354,6 +408,8 @@ class GridSolver:
             "final_relative_density_change"
         ]
         result["line_search_failures"] = state["line_search_failures"]
+        result["mixing_backtracks"] = state.get("mixing_backtracks", 0)
+        result["final_mixing"] = state.get("final_mixing")
         return result
 
     def _minimize(
@@ -367,6 +423,7 @@ class GridSolver:
         cell_volume: torch.Tensor,
         max_iter: int,
         tolerance_residual: float,
+        tolerance_rms_residual: Optional[float],
         step_size: float,
         minimum_step_size: float,
         line_search_factor: float,
@@ -407,7 +464,12 @@ class GridSolver:
                 if not stage_history:
                     stage_history.append(objective.item())
 
-                residual, chemical_potential, max_residual, _ = _euler_residual(
+                (
+                    residual,
+                    chemical_potential,
+                    max_residual,
+                    rms_residual,
+                ) = _euler_residual(
                     rho,
                     evaluation["c1"].detach(),
                     stage_V_ext,
@@ -417,7 +479,12 @@ class GridSolver:
                     residual_density_threshold,
                     maximum_density,
                 )
-                if max_residual <= tolerance_residual:
+                if _residuals_converged(
+                    max_residual,
+                    rms_residual,
+                    tolerance_residual,
+                    tolerance_rms_residual,
+                ):
                     break
 
                 # Armijo needs the true objective derivative, whereas the
@@ -518,38 +585,45 @@ class GridSolver:
         cell_volume: torch.Tensor,
         max_iter: int,
         tolerance_residual: float,
+        tolerance_rms_residual: Optional[float],
         tolerance_change: float,
         mixing: float,
+        adaptive_mixing: bool,
+        minimum_mixing: float,
+        maximum_mixing: float,
+        mixing_growth: float,
+        mixing_backtrack_factor: float,
         continuation_steps: int,
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
-        """Retain the damped Euler--Lagrange fixed-point iteration."""
+        """Solve the Euler fixed point with optional residual backtracking."""
 
         stage_histories = []
         n_iter = 0
         n_evaluations = 0
+        mixing_backtracks = 0
         final_relative_change = float("inf")
+        current_mixing = mixing
 
         for stage_V_ext in _continued_fields(V_ext, continuation_steps):
-            stage_history = []
-            for _ in range(max_iter):
-                trial_data = dict(data)
-                trial_data["rho"] = rho.detach().clone()
-                trial_data["V_ext"] = stage_V_ext
-                evaluation = self.evaluate(trial_data, compute_c1=True)
-                n_evaluations += 1
-                c1 = evaluation["c1"].detach()
-                objective = _thermodynamic_objective(
-                    evaluation,
-                    fixed_N is not None,
-                    cell_volume,
-                    thermal_wavelength,
-                )
-                stage_history.append(objective.detach().item())
+            current_data = dict(data)
+            current_data["rho"] = rho.detach().clone()
+            current_data["V_ext"] = stage_V_ext
+            evaluation = self.evaluate(current_data, compute_c1=True)
+            n_evaluations += 1
+            objective = _thermodynamic_objective(
+                evaluation,
+                fixed_N is not None,
+                cell_volume,
+                thermal_wavelength,
+            )
+            stage_history = [objective.detach().item()]
 
-                _, _, max_residual, _ = _euler_residual(
+            for _ in range(max_iter):
+                c1 = evaluation["c1"].detach()
+                _, _, max_residual, rms_residual = _euler_residual(
                     rho,
                     c1,
                     stage_V_ext,
@@ -559,7 +633,12 @@ class GridSolver:
                     residual_density_threshold,
                     maximum_density,
                 )
-                if max_residual <= tolerance_residual:
+                if _residuals_converged(
+                    max_residual,
+                    rms_residual,
+                    tolerance_residual,
+                    tolerance_rms_residual,
+                ):
                     break
 
                 if fixed_N is None:
@@ -595,23 +674,76 @@ class GridSolver:
                         / cell_volume
                     )
 
-                next_rho = (1.0 - mixing) * rho + mixing * target_rho
-                if fixed_N is not None:
-                    next_rho = _normalize_particle_numbers(
-                        next_rho,
-                        fixed_N,
-                        cell_volume,
-                        maximum_density=maximum_density,
+                trial_mixing = current_mixing
+                while True:
+                    next_rho = (
+                        (1.0 - trial_mixing) * rho
+                        + trial_mixing * target_rho
                     )
-                elif maximum_density is not None:
-                    next_rho = torch.minimum(
-                        next_rho,
-                        maximum_density[None, :],
+                    if fixed_N is not None:
+                        next_rho = _normalize_particle_numbers(
+                            next_rho,
+                            fixed_N,
+                            cell_volume,
+                            maximum_density=maximum_density,
+                        )
+                    elif maximum_density is not None:
+                        next_rho = torch.minimum(
+                            next_rho,
+                            maximum_density[None, :],
+                        )
+
+                    trial_data = dict(data)
+                    trial_data["rho"] = next_rho.detach().clone()
+                    trial_data["V_ext"] = stage_V_ext
+                    trial_evaluation = self.evaluate(
+                        trial_data,
+                        compute_c1=True,
                     )
+                    n_evaluations += 1
+                    _, _, _, trial_rms_residual = _euler_residual(
+                        next_rho,
+                        trial_evaluation["c1"].detach(),
+                        stage_V_ext,
+                        data["beta"],
+                        thermal_wavelength,
+                        mu,
+                        residual_density_threshold,
+                        maximum_density,
+                    )
+
+                    if (
+                        not adaptive_mixing
+                        or trial_rms_residual <= rms_residual
+                        or trial_mixing <= minimum_mixing
+                    ):
+                        break
+                    trial_mixing = max(
+                        minimum_mixing,
+                        trial_mixing * mixing_backtrack_factor,
+                    )
+                    mixing_backtracks += 1
+
                 relative_change = _maximum_relative_change(rho, next_rho)
                 rho = next_rho.detach()
+                evaluation = trial_evaluation
                 n_iter += 1
                 final_relative_change = relative_change
+                objective = _thermodynamic_objective(
+                    evaluation,
+                    fixed_N is not None,
+                    cell_volume,
+                    thermal_wavelength,
+                )
+                stage_history.append(objective.detach().item())
+
+                if adaptive_mixing:
+                    current_mixing = min(
+                        maximum_mixing,
+                        trial_mixing * mixing_growth,
+                    )
+                else:
+                    current_mixing = mixing
                 if relative_change <= tolerance_change:
                     break
 
@@ -624,6 +756,8 @@ class GridSolver:
             "stage_objective_history": stage_histories,
             "final_relative_density_change": final_relative_change,
             "line_search_failures": 0,
+            "mixing_backtracks": mixing_backtracks,
+            "final_mixing": current_mixing,
         }
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -938,12 +1072,32 @@ def _euler_residual(
         max_residual = torch.max(
             torch.abs(constrained_residual[active])
         ).item()
+        rms_weights = rho * active.to(rho.dtype)
+        rms_residual = torch.sqrt(
+            torch.sum(rms_weights * constrained_residual.square())
+            / torch.sum(rms_weights)
+        ).item()
     else:
         max_residual = float("inf")
-    rms_residual = torch.sqrt(
-        torch.sum(rho * constrained_residual.square()) / torch.sum(rho)
-    ).item()
+        rms_residual = float("inf")
     return constrained_residual, chemical_potential, max_residual, rms_residual
+
+
+def _residuals_converged(
+    max_residual: float,
+    rms_residual: float,
+    tolerance_residual: float,
+    tolerance_rms_residual: Optional[float],
+) -> bool:
+    """Return whether the configured maximum and RMS bounds are satisfied."""
+
+    return bool(
+        max_residual <= tolerance_residual
+        and (
+            tolerance_rms_residual is None
+            or rms_residual <= tolerance_rms_residual
+        )
+    )
 
 
 def _module_device(module: nn.Module) -> torch.device:

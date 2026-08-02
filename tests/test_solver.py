@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from equicdft import GridCACEModel, GridData, GridSolver
-from equicdft.solver import _euler_residual
+from equicdft.solver import _euler_residual, _residuals_converged
 
 
 class _DensityFeatures(nn.Module):
@@ -198,12 +198,40 @@ class TestGridSolver(unittest.TestCase):
             method="euler",
             max_iter=200,
             mixing=0.2,
+            adaptive_mixing=False,
             tolerance_residual=1.0e-9,
             tolerance_change=1.0e-12,
         )
 
         self.assertEqual(result["solver_method"], "euler")
         self.assertTrue(result["converged"])
+        self.assertTrue(
+            torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
+        )
+
+    def test_default_adaptive_euler_mixing_is_bounded_and_converges(self):
+        target_rho = torch.tensor(
+            [[0.2], [0.3], [0.4], [0.5]],
+            dtype=torch.float64,
+        )
+
+        result = GridSolver(self._make_model()).solve(
+            self._make_data(target_rho),
+            method="euler",
+            max_iter=200,
+            mixing=0.05,
+            minimum_mixing=0.01,
+            maximum_mixing=0.4,
+            mixing_growth=1.2,
+            tolerance_residual=1.0e-8,
+            tolerance_rms_residual=1.0e-8,
+            tolerance_change=1.0e-12,
+        )
+
+        self.assertTrue(result["converged"])
+        self.assertGreaterEqual(result["final_mixing"], 0.01)
+        self.assertLessEqual(result["final_mixing"], 0.4)
+        self.assertGreaterEqual(result["mixing_backtracks"], 0)
         self.assertTrue(
             torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
         )
@@ -260,6 +288,28 @@ class TestGridSolver(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(residual).all())
         self.assertGreater(max_residual, 100.0)
+
+    def test_density_threshold_excludes_unresolved_voxels_from_diagnostics(
+        self,
+    ):
+        rho = torch.tensor([[1.0], [1.0e-8]], dtype=torch.float64)
+        _, _, max_residual, rms_residual = _euler_residual(
+            rho=rho,
+            c1=torch.zeros_like(rho),
+            V_ext=torch.zeros_like(rho),
+            beta=torch.tensor(1.0, dtype=rho.dtype),
+            thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
+            mu=None,
+            density_threshold=1.0e-3,
+        )
+
+        self.assertLess(max_residual, 1.0e-5)
+        self.assertLess(rms_residual, 1.0e-5)
+
+    def test_maximum_and_rms_residual_tolerances_are_both_required(self):
+        self.assertTrue(_residuals_converged(0.02, 0.005, 0.03, 0.01))
+        self.assertFalse(_residuals_converged(0.04, 0.005, 0.03, 0.01))
+        self.assertFalse(_residuals_converged(0.02, 0.02, 0.03, 0.01))
 
 
 if __name__ == "__main__":

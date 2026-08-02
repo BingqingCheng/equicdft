@@ -1,3 +1,6 @@
+import csv
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,7 +33,12 @@ def _dataset(values):
 
 
 class TestTrainer(unittest.TestCase):
-    def _make_trainer(self, checkpoint_dir=None, scheduler=False):
+    def _make_trainer(
+        self,
+        checkpoint_dir=None,
+        scheduler=False,
+        log_dir=None,
+    ):
         loss = Loss(
             [
                 TensorLoss(
@@ -59,6 +67,7 @@ class TestTrainer(unittest.TestCase):
             checkpoint_dir=checkpoint_dir,
             checkpoint_interval=1,
             save_best=True,
+            log_dir=log_dir,
         )
 
     def test_fit_updates_model_and_returns_history(self):
@@ -213,6 +222,66 @@ class TestTrainer(unittest.TestCase):
             resumed.best_valid_loss,
             continuous.best_valid_loss,
         )
+
+    def test_csv_history_and_text_log_are_written(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log_dir = Path(temporary_directory) / "logs"
+            trainer = self._make_trainer(log_dir=log_dir)
+            trainer.log_message("Starting test fit", display=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                trainer.fit(
+                    DataLoader(_dataset([1, 2]), batch_size=2),
+                    DataLoader(_dataset([3, 4]), batch_size=2),
+                    epochs=2,
+                    print_interval=1,
+                )
+
+            with (log_dir / "history.csv").open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            training_log = (log_dir / "training.log").read_text()
+
+        self.assertEqual([row["epoch"] for row in rows], ["1", "2"])
+        self.assertIn("train_loss_total", rows[0])
+        self.assertIn("valid_loss_target", rows[0])
+        self.assertIn("train_target_rmse", rows[0])
+        self.assertIn("Starting test fit", training_log)
+        self.assertIn("Epoch    1", training_log)
+
+    def test_resume_reconstructs_csv_without_duplicate_epochs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_dir = Path(temporary_directory) / "checkpoints"
+            log_dir = Path(temporary_directory) / "logs"
+            partial = self._make_trainer(
+                checkpoint_dir=checkpoint_dir,
+                log_dir=log_dir,
+            )
+            partial.fit(
+                DataLoader(_dataset([1, 2]), batch_size=2),
+                DataLoader(_dataset([3, 4]), batch_size=2),
+                epochs=2,
+                verbose=False,
+            )
+
+            resumed = self._make_trainer(
+                checkpoint_dir=checkpoint_dir,
+                log_dir=log_dir,
+            )
+            train_loader = DataLoader(_dataset([1, 2]), batch_size=2)
+            resumed.load_checkpoint(
+                checkpoint_dir / "last.pt",
+                train_loader=train_loader,
+            )
+            resumed.fit(
+                train_loader,
+                DataLoader(_dataset([3, 4]), batch_size=2),
+                epochs=1,
+                verbose=False,
+            )
+
+            with (log_dir / "history.csv").open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual([row["epoch"] for row in rows], ["1", "2", "3"])
 
     def test_configuration_and_empty_loaders_are_validated(self):
         with self.assertRaisesRegex(ValueError, "checkpoint_interval"):
