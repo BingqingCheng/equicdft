@@ -400,6 +400,7 @@ class GridData(dict):
                 dtype=dtype,
             ),
             n_types=torch.tensor(n_types, dtype=torch.long),
+            grid_size=torch.tensor(grid_size, dtype=torch.long),
             thermal_wavelength=torch.tensor(
                 thermal_wavelength_values,
                 dtype=dtype,
@@ -669,6 +670,7 @@ def _process_atoms(
         if V_ext is not None:
             V_ext = fields[:, field_start : field_start + n_types]
         n_grid = grid_positions.shape[0]
+        grid_size = grid_positions.max(axis=0) + 1
 
     # Temperature is required even for an initial fixed-temperature fit so the
     # data retain their thermodynamic state and unit conversion explicitly.
@@ -754,6 +756,7 @@ def _process_atoms(
         "temperature": torch.tensor(temperature, dtype=dtype),
         "beta": torch.tensor(beta, dtype=dtype),
         "n_types": torch.tensor(n_types, dtype=torch.long),
+        "grid_size": torch.tensor(grid_size, dtype=torch.long),
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),

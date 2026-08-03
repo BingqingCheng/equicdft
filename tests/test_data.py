@@ -157,6 +157,9 @@ class TestGridData(unittest.TestCase):
 
         self.assertEqual(data["n_types"].item(), 1)
         self.assertTrue(
+            torch.equal(data["grid_size"], torch.tensor([3, 4, 5]))
+        )
+        self.assertTrue(
             torch.equal(
                 data["grid_spacing"],
                 torch.tensor([0.5, 0.5, 0.5]),
@@ -191,6 +194,9 @@ class TestGridData(unittest.TestCase):
         self.assertNotIn("rho", data)
         self.assertNotIn("V_ext", data)
         self.assertEqual(data["n_types"].item(), 1)
+        self.assertTrue(
+            torch.equal(data["grid_size"], torch.tensor([3, 4, 5]))
+        )
         self.assertEqual(data["grid_positions"].shape, (60, 3))
         self.assertTrue(
             torch.equal(
@@ -221,6 +227,9 @@ class TestGridData(unittest.TestCase):
         )
 
         self.assertEqual(data["n_types"].item(), 2)
+        self.assertTrue(
+            torch.equal(data["grid_size"], torch.tensor([2, 2, 2]))
+        )
         self.assertEqual(data["thermal_wavelength"].shape, (2,))
         self.assertNotIn("rho", data)
         self.assertNotIn("V_ext", data)
@@ -270,6 +279,7 @@ class TestGridData(unittest.TestCase):
                 "mu",
                 "beta_mu",
                 "n_types",
+                "grid_size",
                 "thermal_wavelength",
                 "grid_spacing",
                 "index",
@@ -386,6 +396,7 @@ class TestGridData(unittest.TestCase):
                 "temperature",
                 "beta",
                 "n_types",
+                "grid_size",
                 "grid_spacing",
                 "index",
                 "grid_positions",
@@ -395,6 +406,9 @@ class TestGridData(unittest.TestCase):
             },
         )
         self.assertEqual(data["rho"].shape, (8, 1))
+        self.assertTrue(
+            torch.equal(data["grid_size"], torch.tensor([2, 2, 2]))
+        )
         self.assertEqual(data["local_density_index"].shape, (8, 1))
 
     def test_external_potential_only_inference_data(self):

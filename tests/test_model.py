@@ -9,6 +9,8 @@ from equicdft import (
     CartesianBFeatures,
     GridCACEModel,
     LocalReadout,
+    LongRangeReadout,
+    ReciprocalFeatures,
     get_neighbor_indices,
 )
 
@@ -64,6 +66,7 @@ class TestGridCACEModel(unittest.TestCase):
                 dtype=torch.long,
             ),
             "grid_spacing": torch.tensor([0.5, 0.5, 0.5]),
+            "grid_size": torch.tensor(shape),
             "temperature": torch.tensor(1.5),
             "beta": torch.tensor(1.0 / 1.5),
         }
@@ -75,6 +78,7 @@ class TestGridCACEModel(unittest.TestCase):
         compute_chemical_potential=False,
         rho_min=0.0,
         mean_temperature=1.0,
+        with_long_range=False,
     ):
         a_features = CartesianAFeatures(
             mean_density=0.5,
@@ -87,6 +91,18 @@ class TestGridCACEModel(unittest.TestCase):
             n_types=1,
             hidden_sizes=(8,),
         )
+        long_range_features = None
+        long_range_readout = None
+        if with_long_range:
+            long_range_features = ReciprocalFeatures(
+                radial_exponents=(0.25, 0.5),
+                n_types=1,
+            )
+            long_range_readout = LongRangeReadout(
+                n_kernels=2,
+                n_types=1,
+                hidden_sizes=(4,),
+            )
         return GridCACEModel(
             a_features,
             b_features,
@@ -95,11 +111,45 @@ class TestGridCACEModel(unittest.TestCase):
             mean_temperature=mean_temperature,
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
+            long_range_features=long_range_features,
+            long_range_readout=long_range_readout,
             compute_c1=compute_c1,
             compute_c2=compute_c2,
             compute_local_mu=compute_chemical_potential,
             rho_min=rho_min,
         )
+
+    def test_long_range_energy_is_combined_before_local_mu_derivative(self):
+        model = self._make_model(
+            compute_c1=True,
+            compute_chemical_potential=True,
+            with_long_range=True,
+        )
+        with torch.no_grad():
+            model.long_range_readout.mlp[-1].bias.fill_(0.2)
+        data = self._make_data()
+        data["V_ext"] = torch.zeros_like(data["rho"])
+
+        outputs = model(data)
+        centered_local_mu = (
+            outputs["local_chemical_potential"]
+            - outputs["average_chemical_potential"].unsqueeze(-2)
+        )
+        centered_local_mu.square().mean().backward()
+
+        self.assertEqual(outputs["beta_F_exc_local"].shape, ())
+        self.assertEqual(outputs["beta_F_exc_long_range"].shape, ())
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"],
+                outputs["beta_F_exc_local"]
+                + outputs["beta_F_exc_long_range"],
+            )
+        )
+        final_gradient = model.long_range_readout.mlp[-1].bias.grad
+        self.assertIsNotNone(final_gradient)
+        self.assertTrue(torch.all(torch.isfinite(final_gradient)))
+        self.assertGreater(torch.linalg.vector_norm(final_gradient).item(), 0.0)
 
     def test_exposes_persistent_inference_metadata(self):
         model = self._make_model(mean_temperature=1.2)

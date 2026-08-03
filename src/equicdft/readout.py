@@ -88,3 +88,111 @@ class LocalReadout(nn.Module):
         """Return local outputs with shape ``[..., n_grid, n_types]``."""
 
         return self.mlp(local_features)
+
+
+class LongRangeReadout(nn.Module):
+    """Map thermodynamic state to a reciprocal quadratic kernel.
+
+    The readout predicts one coefficient for every fixed reciprocal kernel and
+    unique density-component pair. Its output energy is a linear contraction
+    with the reciprocal features, preserving their quadratic density
+    dependence and extensive scaling.
+
+    Parameters
+    ----------
+    n_kernels
+        Number of fixed radial kernels in the reciprocal representation.
+    n_types
+        Number of physical density components. The state vector contains
+        normalized temperature followed by one mean density per component.
+    hidden_sizes
+        Width of each state-network hidden layer. An empty sequence gives a
+        linear state dependence.
+    zero_init
+        If true, initialize the final coefficient layer to zero. This makes an
+        attached long-range branch leave a pretrained local model unchanged.
+    """
+
+    def __init__(
+        self,
+        n_kernels: int,
+        n_types: int = 1,
+        hidden_sizes: Sequence[int] = (16, 16),
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+
+        for value, name in ((n_kernels, "n_kernels"), (n_types, "n_types")):
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError("{} must be a positive integer".format(name))
+            if int(value) < 1:
+                raise ValueError("{} must be a positive integer".format(name))
+        if not isinstance(zero_init, bool):
+            raise TypeError("zero_init must be a boolean")
+
+        self.n_kernels = int(n_kernels)
+        self.n_types = int(n_types)
+        self.n_type_pairs = self.n_types * (self.n_types + 1) // 2
+        self.n_state_features = 1 + self.n_types
+
+        layers = []
+        input_width = self.n_state_features
+        for hidden_width in hidden_sizes:
+            if isinstance(hidden_width, bool) or not isinstance(
+                hidden_width,
+                Integral,
+            ):
+                raise TypeError("hidden_sizes must contain positive integers")
+            hidden_width = int(hidden_width)
+            if hidden_width < 1:
+                raise ValueError(
+                    "hidden_sizes must contain positive integers"
+                )
+            layers.extend((nn.Linear(input_width, hidden_width), nn.SiLU()))
+            input_width = hidden_width
+
+        output_width = self.n_kernels * self.n_type_pairs
+        final_layer = nn.Linear(input_width, output_width)
+        if zero_init:
+            nn.init.zeros_(final_layer.weight)
+            nn.init.zeros_(final_layer.bias)
+        layers.append(final_layer)
+        self.mlp = nn.Sequential(*layers)
+
+    def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
+        """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""
+
+        if state_features.shape[-1] != self.n_state_features:
+            raise ValueError(
+                "state_features must end with normalized temperature and "
+                "one mean density per type"
+            )
+        return self.mlp(state_features).reshape(
+            *state_features.shape[:-1],
+            self.n_kernels,
+            self.n_type_pairs,
+        )
+
+    def forward(
+        self,
+        reciprocal_features: torch.Tensor,
+        state_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return one dimensionless long-range free energy per field."""
+
+        expected_trailing_shape = (self.n_kernels, self.n_type_pairs)
+        if reciprocal_features.shape[-2:] != expected_trailing_shape:
+            raise ValueError(
+                "reciprocal_features must end with shape {}".format(
+                    expected_trailing_shape
+                )
+            )
+        if reciprocal_features.shape[:-2] != state_features.shape[:-1]:
+            raise ValueError(
+                "reciprocal and state features must have matching leading shapes"
+            )
+        coefficients = self.coefficients(state_features)
+        return torch.sum(
+            coefficients * reciprocal_features,
+            dim=(-2, -1),
+        )

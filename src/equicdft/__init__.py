@@ -12,7 +12,8 @@ from .loss import (
 )
 from .metrics import Metrics, compute_metric
 from .model import GridCACEModel
-from .readout import LocalReadout
+from .readout import LocalReadout, LongRangeReadout
+from .reciprocal import ReciprocalFeatures
 from .solver import GridSolver
 from .stencil import (
     coarsen_grid,
@@ -31,8 +32,10 @@ __all__ = [
     "GridCACEModel",
     "GridSolver",
     "LocalReadout",
+    "LongRangeReadout",
     "Loss",
     "Metrics",
+    "ReciprocalFeatures",
     "TensorLoss",
     "Trainer",
     "coarsen_grid",
