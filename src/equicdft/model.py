@@ -2,8 +2,8 @@
 
 import math
 from contextlib import nullcontext
-from numbers import Real
-from typing import Any, Dict, Optional, Sequence, Union
+from numbers import Integral, Real
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -19,7 +19,7 @@ class GridCACEModel(nn.Module):
 
     The model applies the registered modules in the order
 
-    ``rho -> A -> B -> (B, T) -> beta_F_exc -> c1``
+    ``rho -> A -> B -> (B, T) -> beta_F_exc -> c1 -> c2``
 
     and, when an external field is supplied,
 
@@ -29,12 +29,13 @@ class GridCACEModel(nn.Module):
     marked as differentiable before the representation is built so ``c1``
     includes every overlapping local environment.
 
-    During training, the graph used to construct ``c1`` is retained so a
-    derivative-level loss can be differentiated with respect to model
-    parameters. In evaluation mode, ``c1`` is produced without constructing
-    the higher-order graph. Setting ``compute_c1=False`` omits the derivative
-    output and leaves ``rho`` unchanged. The constructor value is the default;
-    an individual forward call can override it without mutating the model.
+    During training, the graph used to construct response outputs is retained
+    so a derivative-level loss can be differentiated with respect to model
+    parameters. A requested ``c2`` row also retains the ``c1`` graph long
+    enough to take the second density derivative. In evaluation mode, a
+    ``c1``-only calculation avoids this higher-order graph. Setting both
+    response flags to ``False`` leaves ``rho`` unchanged. Constructor values
+    are defaults that an individual forward call can override.
 
     In the shapes below, ``...`` denotes optional leading batch dimensions,
     ``g`` runs over ``n_grid`` grid points, and ``i`` runs over ``n_types``
@@ -58,6 +59,13 @@ class GridCACEModel(nn.Module):
         ``-delta(beta_F_exc) / delta(rho)`` in the continuum
         functional-derivative convention. This key is present only when
         ``compute_c1=True``.
+    ``c2``
+        Shape ``[..., n_grid, n_types]``. One row of the second direct
+        correlation, obtained by differentiating the selected
+        ``c1[..., reference_grid, reference_type]`` with respect to the
+        complete density field. This key is present only when
+        ``compute_c2=True``. For a homogeneous fluid, translational symmetry
+        makes this row a function of relative grid displacement.
     ``local_chemical_potential``
         Shape ``[..., n_grid, n_types]``. Dimensionless local chemical
         potential obtained from the Euler--Lagrange equation. This key is
@@ -96,10 +104,15 @@ class GridCACEModel(nn.Module):
     compute_c1
         If ``True``, initialize density gradients and include ``c1`` in the
         collected outputs. Disable it for energy-only evaluation.
+    compute_c2
+        If ``True``, include one selected row of ``c2`` in the collected
+        outputs. Computing ``c2`` requires ``c1`` and therefore enables it
+        automatically. The reference grid and component may be selected on
+        each forward call.
     compute_local_mu
         If ``True``, include both ``local_chemical_potential`` and its
         hard-mask-weighted ``average_chemical_potential``. This requires
-        ``compute_c1=True``.
+        ``c1``, enabled by either response flag.
     rho_min
         Nonnegative density threshold defining the hard weights used by
         :meth:`average_chemical_potential`.
@@ -119,6 +132,7 @@ class GridCACEModel(nn.Module):
             torch.Tensor,
         ] = 1.0,
         compute_c1: bool = True,
+        compute_c2: bool = False,
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
     ) -> None:
@@ -126,9 +140,11 @@ class GridCACEModel(nn.Module):
 
         if not isinstance(compute_c1, bool):
             raise TypeError("compute_c1 must be a boolean")
+        if not isinstance(compute_c2, bool):
+            raise TypeError("compute_c2 must be a boolean")
         if not isinstance(compute_local_mu, bool):
             raise TypeError("compute_local_mu must be a boolean")
-        if compute_local_mu and not compute_c1:
+        if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
         try:
             rho_min = float(rho_min)
@@ -140,7 +156,8 @@ class GridCACEModel(nn.Module):
         self.a_features = a_features
         self.b_features = b_features
         self.readout = readout
-        self.compute_c1 = compute_c1
+        self.compute_c1 = compute_c1 or compute_c2
+        self.compute_c2 = compute_c2
         self.compute_local_mu = compute_local_mu
         self.rho_min = rho_min
 
@@ -219,14 +236,16 @@ class GridCACEModel(nn.Module):
             thermal_wavelength_tensor,
         )
 
-        self.required_derivatives = ["rho"] if compute_c1 else []
+        self.required_derivatives = ["rho"] if self.compute_c1 else []
         self.model_outputs = [
             "beta_free_energy_per_particle",
             "beta_free_energy_density",
             "beta_F_exc",
         ]
-        if compute_c1:
+        if self.compute_c1:
             self.model_outputs.append("c1")
+        if compute_c2:
+            self.model_outputs.append("c2")
         if compute_local_mu:
             self.model_outputs.extend(
                 (
@@ -341,6 +360,30 @@ class GridCACEModel(nn.Module):
                 "input grid_spacing does not match the trained model"
             )
 
+    def _validate_c2_reference(
+        self,
+        c2_reference: Tuple[int, int],
+        rho: torch.Tensor,
+    ) -> Tuple[int, int]:
+        """Validate and return ``(reference_grid, reference_type)``."""
+
+        if not isinstance(c2_reference, (tuple, list)) or len(c2_reference) != 2:
+            raise TypeError(
+                "c2_reference must contain (grid_index, type_index)"
+            )
+        if any(
+            isinstance(index, bool) or not isinstance(index, Integral)
+            for index in c2_reference
+        ):
+            raise TypeError("c2_reference indices must be integers")
+
+        reference_grid, reference_type = map(int, c2_reference)
+        if not 0 <= reference_grid < rho.shape[-2]:
+            raise IndexError("c2 reference grid index is out of bounds")
+        if not 0 <= reference_type < rho.shape[-1]:
+            raise IndexError("c2 reference type index is out of bounds")
+        return reference_grid, reference_type
+
     def initialize_derivatives(
         self,
         data: Dict[str, torch.Tensor],
@@ -359,11 +402,15 @@ class GridCACEModel(nn.Module):
         self,
         data: Dict[str, torch.Tensor],
         compute_c1: Optional[bool] = None,
+        compute_c2: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return only the canonical model outputs."""
 
+        if compute_c2 is None:
+            compute_c2 = self.compute_c2
         if compute_c1 is None:
             compute_c1 = self.compute_c1
+        compute_c1 = compute_c1 or compute_c2
         requested_outputs = [
             "beta_free_energy_per_particle",
             "beta_free_energy_density",
@@ -371,6 +418,8 @@ class GridCACEModel(nn.Module):
         ]
         if compute_c1:
             requested_outputs.append("c1")
+            if compute_c2:
+                requested_outputs.append("c2")
             if self.compute_local_mu:
                 requested_outputs.extend(
                     (
@@ -389,13 +438,20 @@ class GridCACEModel(nn.Module):
         self,
         data: Dict[str, torch.Tensor],
         compute_c1: Optional[bool] = None,
+        compute_c2: Optional[bool] = None,
+        c2_reference: Tuple[int, int] = (0, 0),
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
+        if compute_c2 is None:
+            compute_c2 = self.compute_c2
+        if not isinstance(compute_c2, bool):
+            raise TypeError("compute_c2 must be a boolean or None")
         if compute_c1 is None:
             compute_c1 = self.compute_c1
         if not isinstance(compute_c1, bool):
             raise TypeError("compute_c1 must be a boolean or None")
+        compute_c1 = compute_c1 or compute_c2
 
         # A requested functional derivative requires gradient tracking even
         # when surrounding evaluation code uses torch.no_grad(). Energy-only
@@ -492,12 +548,42 @@ class GridCACEModel(nn.Module):
                 beta_F_exc_derivative = compute_grid_derivative(
                     beta_F_exc.sum(),
                     data["rho"],
-                    create_graph=self.training,
+                    create_graph=(self.training or compute_c2),
                 )
                 outputs["c1"] = (
                     -beta_F_exc_derivative
                     / cell_volume
                 )
+
+                if compute_c2:
+                    reference_grid, reference_type = (
+                        self._validate_c2_reference(
+                            c2_reference,
+                            data["rho"],
+                        )
+                    )
+                    # Selecting one c1 value and differentiating it with
+                    # respect to the complete density produces one row of the
+                    # second direct-correlation matrix. The sum only reduces
+                    # independent leading batch entries to the scalar required
+                    # by compute_grid_derivative. Dividing by Delta V converts
+                    # the discrete derivative to the continuum convention;
+                    # there is no additional minus sign because
+                    # c2 = delta(c1) / delta(rho).
+                    selected_c1 = outputs["c1"][
+                        ..., reference_grid, reference_type
+                    ].sum()
+                    outputs["c2"] = compute_grid_derivative(
+                        selected_c1,
+                        data["rho"],
+                        create_graph=self.training,
+                        allow_unused=True,
+                    ) / cell_volume
+                    if not self.training:
+                        # The c1 graph was needed only as an intermediate for
+                        # c2. Match the graph-free evaluation semantics of a
+                        # c1-only forward call before returning it.
+                        outputs["c1"] = outputs["c1"].detach()
 
                 # Chemical-potential response is controlled by one model flag.
                 # V_ext remains optional for intrinsic-functional evaluation.
@@ -523,4 +609,8 @@ class GridCACEModel(nn.Module):
                         )
                     )
 
-        return self.extract_outputs(outputs, compute_c1=compute_c1)
+        return self.extract_outputs(
+            outputs,
+            compute_c1=compute_c1,
+            compute_c2=compute_c2,
+        )

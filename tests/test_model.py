@@ -38,6 +38,17 @@ class _FirstFeatureReadout(nn.Module):
         return local_features[..., :1]
 
 
+class _ConstantPerParticleReadout(nn.Module):
+    """Return a trainable constant, making the functional linear in rho."""
+
+    def __init__(self):
+        super().__init__()
+        self.value = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, local_features):
+        return self.value.expand(*local_features.shape[:-1], 1)
+
+
 class TestGridCACEModel(unittest.TestCase):
     def _make_data(self):
         shape = (3, 3, 3)
@@ -60,6 +71,7 @@ class TestGridCACEModel(unittest.TestCase):
     def _make_model(
         self,
         compute_c1=True,
+        compute_c2=False,
         compute_chemical_potential=False,
         rho_min=0.0,
         mean_temperature=1.0,
@@ -84,6 +96,7 @@ class TestGridCACEModel(unittest.TestCase):
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
             compute_c1=compute_c1,
+            compute_c2=compute_c2,
             compute_local_mu=compute_chemical_potential,
             rho_min=rho_min,
         )
@@ -173,6 +186,30 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(outputs["beta_F_exc"].shape, (2,))
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
+
+    def test_model_applies_c2_sign_and_cell_volume_to_one_row(self):
+        # Continuing the analytic quadratic functional above,
+        # c2(g0, g) = -2 delta(g0, g) / Delta V. Only one Hessian row is
+        # evaluated and returned for each independent batch entry.
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=_FirstFeatureReadout(),
+            grid_spacing=0.5,
+            compute_c2=True,
+        )
+        data = self._make_data()
+        data = {
+            key: torch.stack((value, value.clone()))
+            for key, value in data.items()
+        }
+
+        outputs = model(data, c2_reference=(5, 0))
+
+        expected = torch.zeros_like(data["rho"])
+        expected[:, 5, 0] = -2.0 / model.cell_volume
+        self.assertEqual(outputs["c2"].shape, (2, 27, 1))
+        self.assertTrue(torch.equal(outputs["c2"], expected))
 
     def test_collects_local_chemical_potential_with_external_field(self):
         model = self._make_model(
@@ -322,6 +359,53 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertFalse(outputs["c1"].requires_grad)
 
+    def test_c2_evaluation_works_inside_no_grad(self):
+        model = self._make_model(compute_c2=True)
+        model.eval()
+
+        with torch.no_grad():
+            outputs = model(self._make_data(), c2_reference=(3, 0))
+
+        self.assertEqual(outputs["c2"].shape, (27, 1))
+        self.assertFalse(outputs["c1"].requires_grad)
+        self.assertFalse(outputs["c2"].requires_grad)
+
+    def test_linear_functional_has_zero_c2_with_trainable_graph(self):
+        readout = _ConstantPerParticleReadout()
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=readout,
+            grid_spacing=0.5,
+            compute_c2=True,
+        )
+
+        outputs = model(self._make_data(), c2_reference=(0, 0))
+        outputs["c2"].square().sum().backward()
+
+        self.assertTrue(
+            torch.equal(outputs["c2"], torch.zeros_like(outputs["c2"]))
+        )
+        self.assertIsNotNone(readout.value.grad)
+        self.assertEqual(readout.value.grad.item(), 0.0)
+
+    def test_training_c2_loss_reaches_readout_parameters(self):
+        model = self._make_model(compute_c2=True)
+        model.train()
+
+        outputs = model(self._make_data(), c2_reference=(4, 0))
+        outputs["c2"].square().mean().backward()
+
+        gradients = [
+            parameter.grad
+            for parameter in model.readout.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertTrue(gradients)
+        self.assertTrue(
+            all(torch.all(torch.isfinite(gradient)) for gradient in gradients)
+        )
+
     def test_c1_is_optional(self):
         model = self._make_model(compute_c1=False)
         model.eval()
@@ -362,6 +446,40 @@ class TestGridCACEModel(unittest.TestCase):
         )
         self.assertIn("c1", response_outputs)
 
+    def test_c2_can_be_selected_per_forward_call_and_implies_c1(self):
+        model = self._make_model(compute_c1=False)
+        data = self._make_data()
+
+        outputs = model(
+            data,
+            compute_c1=False,
+            compute_c2=True,
+            c2_reference=(2, 0),
+        )
+
+        self.assertIn("c1", outputs)
+        self.assertIn("c2", outputs)
+        self.assertTrue(data["rho"].requires_grad)
+
+    def test_c2_reference_is_validated(self):
+        model = self._make_model(compute_c2=True)
+
+        invalid_references = (
+            ((0,), TypeError),
+            ((0, 0, 0), TypeError),
+            ((0.0, 0), TypeError),
+            ((27, 0), IndexError),
+            ((0, 1), IndexError),
+            ((-1, 0), IndexError),
+        )
+        for reference, error_type in invalid_references:
+            with self.subTest(reference=reference):
+                with self.assertRaises(error_type):
+                    model(
+                        self._make_data(),
+                        c2_reference=reference,
+                    )
+
     def test_compute_c1_must_be_boolean(self):
         with self.assertRaises(TypeError):
             GridCACEModel(
@@ -375,6 +493,20 @@ class TestGridCACEModel(unittest.TestCase):
                 LocalReadout(n_types=1),
                 grid_spacing=0.5,
                 compute_c1=1,
+            )
+
+        with self.assertRaises(TypeError):
+            GridCACEModel(
+                CartesianAFeatures(
+                    mean_density=0.5,
+                    cutoff_grid=1,
+                    max_power=2,
+                    n_radial_channels=1,
+                ),
+                CartesianBFeatures(max_power=2, max_product_order=3),
+                LocalReadout(n_types=1),
+                grid_spacing=0.5,
+                compute_c2=1,
             )
 
         with self.assertRaises(TypeError):

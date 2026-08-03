@@ -19,6 +19,21 @@ class TestGridDerivatives(unittest.TestCase):
             torch.allclose(derivative, 0.25 * grid_field)
         )
 
+    def test_unused_grid_field_can_return_differentiable_zero(self):
+        grid_field = torch.ones(3, requires_grad=True)
+        parameter = torch.tensor(2.0, requires_grad=True)
+
+        derivative = compute_grid_derivative(
+            parameter.square(),
+            grid_field,
+            create_graph=True,
+            allow_unused=True,
+        )
+        derivative.sum().backward()
+
+        self.assertTrue(torch.equal(derivative, torch.zeros_like(grid_field)))
+        self.assertEqual(parameter.grad.item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
