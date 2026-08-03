@@ -124,7 +124,13 @@ class GridSolver:
         maximum_mixing: float = 0.2,
         mixing_growth: float = 1.1,
         mixing_backtrack_factor: float = 0.5,
+        anderson_depth: int = 0,
+        anderson_mixing: float = 0.2,
+        anderson_regularization: float = 1.0e-8,
+        anderson_rejection_limit: int = 3,
         continuation_steps: int = 5,
+        adaptive_continuation: bool = False,
+        continuation_probe_iterations: int = 5,
         max_log_density_change: float = 2.0,
         residual_density_threshold: Optional[float] = None,
         maximum_density: Optional[
@@ -150,6 +156,16 @@ class GridSolver:
         iteration. By default, its mixing is increased after an improving
         density-weighted RMS residual and backtracked after a worsening
         trial. Set ``adaptive_mixing=False`` to use a fixed mixing value.
+        A positive ``anderson_depth`` additionally constructs a multisecant
+        extrapolation from recent log-density fixed-point residuals. Each
+        accelerated proposal is accepted only when it lowers the physical RMS
+        residual; otherwise the ordinary safeguarded mixing step is used.
+
+        With ``adaptive_continuation=True``, the Euler solver first attempts
+        the complete external field from the corresponding ideal-gas density
+        when no explicit initial density is supplied. If that short probe does
+        not converge, it restarts from the ordinary initial density and uses
+        the requested fixed continuation schedule.
         Both methods can introduce the external field by continuation and
         use the physical projected functional gradient as a convergence
         diagnostic.
@@ -171,6 +187,35 @@ class GridSolver:
             raise ValueError(
                 "continuation_steps must be a nonnegative integer"
             )
+        if isinstance(anderson_depth, bool) or not isinstance(
+            anderson_depth, int
+        ):
+            raise ValueError("anderson_depth must be a nonnegative integer")
+        if anderson_depth < 0:
+            raise ValueError("anderson_depth must be a nonnegative integer")
+        if (
+            isinstance(anderson_rejection_limit, bool)
+            or not isinstance(anderson_rejection_limit, int)
+            or anderson_rejection_limit <= 0
+        ):
+            raise ValueError(
+                "anderson_rejection_limit must be a positive integer"
+            )
+        if not isinstance(adaptive_continuation, bool):
+            raise TypeError("adaptive_continuation must be a boolean")
+        if (
+            isinstance(continuation_probe_iterations, bool)
+            or not isinstance(continuation_probe_iterations, int)
+            or continuation_probe_iterations <= 0
+        ):
+            raise ValueError(
+                "continuation_probe_iterations must be a positive integer"
+            )
+        if adaptive_continuation and method != "euler":
+            raise ValueError(
+                "adaptive_continuation is currently available only for "
+                "method='euler'"
+            )
         tolerance_residual = float(tolerance_residual)
         if tolerance_rms_residual is not None:
             tolerance_rms_residual = float(tolerance_rms_residual)
@@ -184,6 +229,8 @@ class GridSolver:
         maximum_mixing = float(maximum_mixing)
         mixing_growth = float(mixing_growth)
         mixing_backtrack_factor = float(mixing_backtrack_factor)
+        anderson_mixing = float(anderson_mixing)
+        anderson_regularization = float(anderson_regularization)
         max_log_density_change = float(max_log_density_change)
         if tolerance_residual <= 0.0:
             raise ValueError("tolerance_residual must be positive")
@@ -228,6 +275,10 @@ class GridSolver:
                 )
         if max_log_density_change <= 0.0:
             raise ValueError("max_log_density_change must be positive")
+        if not 0.0 < anderson_mixing <= 1.0:
+            raise ValueError("anderson_mixing must be in the interval (0, 1]")
+        if anderson_regularization <= 0.0:
+            raise ValueError("anderson_regularization must be positive")
 
         data = self._move_data(data)
         V_ext = data["V_ext"]
@@ -292,6 +343,7 @@ class GridSolver:
 
         if initial_rho is None:
             initial_rho = data.get("rho")
+        initial_rho_was_supplied = initial_rho is not None
         if initial_rho is not None:
             initial_rho = torch.as_tensor(
                 initial_rho,
@@ -320,8 +372,24 @@ class GridSolver:
         elif density_cap is not None:
             rho = torch.minimum(rho, density_cap[None, :])
 
+        fallback_rho = rho.detach().clone()
+        if adaptive_continuation and not initial_rho_was_supplied:
+            probe_rho = _ideal_gas_initial_density(
+                V_ext=V_ext,
+                beta=data["beta"],
+                thermal_wavelength=thermal_wavelength,
+                mu=mu,
+                particle_numbers=fixed_N,
+                cell_volume=cell_volume,
+                maximum_density=density_cap,
+            )
+        else:
+            probe_rho = fallback_rho
+
         was_training = self.model.training
         self.model.eval()
+        adaptive_probe_attempted = False
+        adaptive_fallback_used = False
         try:
             if method == "minimize":
                 state = self._minimize(
@@ -345,29 +413,65 @@ class GridSolver:
                     maximum_density=density_cap,
                 )
             else:
-                state = self._solve_euler(
-                    data=data,
-                    rho=rho,
-                    V_ext=V_ext,
-                    thermal_wavelength=thermal_wavelength,
-                    mu=mu,
-                    fixed_N=fixed_N,
-                    cell_volume=cell_volume,
-                    max_iter=max_iter,
-                    tolerance_residual=tolerance_residual,
-                    tolerance_rms_residual=tolerance_rms_residual,
-                    tolerance_change=tolerance_change,
-                    mixing=mixing,
-                    adaptive_mixing=adaptive_mixing,
-                    minimum_mixing=minimum_mixing,
-                    maximum_mixing=maximum_mixing,
-                    mixing_growth=mixing_growth,
-                    mixing_backtrack_factor=mixing_backtrack_factor,
-                    continuation_steps=continuation_steps,
-                    max_log_density_change=max_log_density_change,
-                    residual_density_threshold=residual_density_threshold,
-                    maximum_density=density_cap,
-                )
+                def run_euler(
+                    starting_rho: torch.Tensor,
+                    iterations: int,
+                    continued_steps: int,
+                ) -> Dict[str, Any]:
+                    return self._solve_euler(
+                        data=data,
+                        rho=starting_rho,
+                        V_ext=V_ext,
+                        thermal_wavelength=thermal_wavelength,
+                        mu=mu,
+                        fixed_N=fixed_N,
+                        cell_volume=cell_volume,
+                        max_iter=iterations,
+                        tolerance_residual=tolerance_residual,
+                        tolerance_rms_residual=tolerance_rms_residual,
+                        tolerance_change=tolerance_change,
+                        mixing=mixing,
+                        adaptive_mixing=adaptive_mixing,
+                        minimum_mixing=minimum_mixing,
+                        maximum_mixing=maximum_mixing,
+                        mixing_growth=mixing_growth,
+                        mixing_backtrack_factor=mixing_backtrack_factor,
+                        anderson_depth=anderson_depth,
+                        anderson_mixing=anderson_mixing,
+                        anderson_regularization=anderson_regularization,
+                        anderson_rejection_limit=anderson_rejection_limit,
+                        continuation_steps=continued_steps,
+                        max_log_density_change=max_log_density_change,
+                        residual_density_threshold=residual_density_threshold,
+                        maximum_density=density_cap,
+                    )
+
+                if adaptive_continuation and continuation_steps > 0:
+                    adaptive_probe_attempted = True
+                    probe_state = run_euler(
+                        probe_rho,
+                        min(max_iter, continuation_probe_iterations),
+                        0,
+                    )
+                    if probe_state["converged"]:
+                        state = probe_state
+                    else:
+                        adaptive_fallback_used = True
+                        fallback_state = run_euler(
+                            fallback_rho,
+                            max_iter,
+                            continuation_steps,
+                        )
+                        state = _merge_euler_states(
+                            probe_state,
+                            fallback_state,
+                        )
+                else:
+                    state = run_euler(
+                        probe_rho,
+                        max_iter,
+                        continuation_steps,
+                    )
 
             final_data = dict(data)
             final_data["rho"] = state["rho"].detach().clone()
@@ -410,6 +514,12 @@ class GridSolver:
         result["line_search_failures"] = state["line_search_failures"]
         result["mixing_backtracks"] = state.get("mixing_backtracks", 0)
         result["final_mixing"] = state.get("final_mixing")
+        result["anderson_steps"] = state.get("anderson_steps", 0)
+        result["anderson_rejections"] = state.get(
+            "anderson_rejections", 0
+        )
+        result["adaptive_continuation_probe"] = adaptive_probe_attempted
+        result["adaptive_continuation_fallback"] = adaptive_fallback_used
         return result
 
     def _minimize(
@@ -593,6 +703,10 @@ class GridSolver:
         maximum_mixing: float,
         mixing_growth: float,
         mixing_backtrack_factor: float,
+        anderson_depth: int,
+        anderson_mixing: float,
+        anderson_regularization: float,
+        anderson_rejection_limit: int,
         continuation_steps: int,
         max_log_density_change: float,
         residual_density_threshold: float,
@@ -604,10 +718,25 @@ class GridSolver:
         n_iter = 0
         n_evaluations = 0
         mixing_backtracks = 0
+        anderson_steps = 0
+        anderson_rejections = 0
         final_relative_change = float("inf")
         current_mixing = mixing
+        final_stage_converged = False
 
-        for stage_V_ext in _continued_fields(V_ext, continuation_steps):
+        continued_fields = _continued_fields(V_ext, continuation_steps)
+        for stage_index, stage_V_ext in enumerate(continued_fields):
+            anderson_inputs = []
+            anderson_outputs = []
+            # Intermediate continuation fields are normally inexpensive and
+            # already well initialized by the preceding stage. Reserve the
+            # extrapolation and its safeguard evaluation for the full physical
+            # field, where slow fixed-point convergence is most consequential.
+            stage_anderson_enabled = (
+                anderson_depth > 0
+                and stage_index == len(continued_fields) - 1
+            )
+            consecutive_anderson_rejections = 0
             current_data = dict(data)
             current_data["rho"] = rho.detach().clone()
             current_data["V_ext"] = stage_V_ext
@@ -620,6 +749,7 @@ class GridSolver:
                 thermal_wavelength,
             )
             stage_history = [objective.detach().item()]
+            stage_converged = False
 
             for _ in range(max_iter):
                 c1 = evaluation["c1"].detach()
@@ -639,15 +769,16 @@ class GridSolver:
                     tolerance_residual,
                     tolerance_rms_residual,
                 ):
+                    stage_converged = True
                     break
 
-                if fixed_N is None:
-                    current_log_density = torch.log(
-                        torch.clamp(
-                            rho,
-                            min=torch.finfo(rho.dtype).tiny,
-                        )
+                current_log_density = torch.log(
+                    torch.clamp(
+                        rho,
+                        min=torch.finfo(rho.dtype).tiny,
                     )
+                )
+                if fixed_N is None:
                     target_log_density = (
                         data["beta"] * (mu[None, :] - stage_V_ext)
                         + c1
@@ -674,8 +805,70 @@ class GridSolver:
                         / cell_volume
                     )
 
+                target_log_density = torch.log(
+                    torch.clamp(
+                        target_rho,
+                        min=torch.finfo(target_rho.dtype).tiny,
+                    )
+                )
+                if stage_anderson_enabled:
+                    anderson_inputs.append(current_log_density.detach())
+                    anderson_outputs.append(target_log_density.detach())
+                    if len(anderson_inputs) > anderson_depth:
+                        anderson_inputs.pop(0)
+                        anderson_outputs.pop(0)
+
                 trial_mixing = current_mixing
-                while True:
+                anderson_accepted = False
+                if stage_anderson_enabled and len(anderson_inputs) >= 2:
+                    accelerated_rho = _anderson_density_candidate(
+                        log_inputs=anderson_inputs,
+                        log_outputs=anderson_outputs,
+                        current_log_density=current_log_density,
+                        mixing=anderson_mixing,
+                        regularization=anderson_regularization,
+                        max_log_density_change=max_log_density_change,
+                        particle_numbers=fixed_N,
+                        cell_volume=cell_volume,
+                        maximum_density=maximum_density,
+                    )
+                    if accelerated_rho is not None:
+                        trial_data = dict(data)
+                        trial_data["rho"] = accelerated_rho.detach().clone()
+                        trial_data["V_ext"] = stage_V_ext
+                        accelerated_evaluation = self.evaluate(
+                            trial_data,
+                            compute_c1=True,
+                        )
+                        n_evaluations += 1
+                        _, _, _, accelerated_rms_residual = _euler_residual(
+                            accelerated_rho,
+                            accelerated_evaluation["c1"].detach(),
+                            stage_V_ext,
+                            data["beta"],
+                            thermal_wavelength,
+                            mu,
+                            residual_density_threshold,
+                            maximum_density,
+                        )
+                        if accelerated_rms_residual <= rms_residual:
+                            next_rho = accelerated_rho
+                            trial_evaluation = accelerated_evaluation
+                            anderson_accepted = True
+                            anderson_steps += 1
+                            consecutive_anderson_rejections = 0
+                        else:
+                            anderson_rejections += 1
+                            consecutive_anderson_rejections += 1
+                            anderson_inputs.clear()
+                            anderson_outputs.clear()
+                            if (
+                                consecutive_anderson_rejections
+                                >= anderson_rejection_limit
+                            ):
+                                stage_anderson_enabled = False
+
+                while not anderson_accepted:
                     next_rho = (
                         (1.0 - trial_mixing) * rho
                         + trial_mixing * target_rho
@@ -738,16 +931,40 @@ class GridSolver:
                 stage_history.append(objective.detach().item())
 
                 if adaptive_mixing:
-                    current_mixing = min(
-                        maximum_mixing,
-                        trial_mixing * mixing_growth,
-                    )
+                    if anderson_accepted:
+                        current_mixing = min(
+                            maximum_mixing,
+                            current_mixing * mixing_growth,
+                        )
+                    else:
+                        current_mixing = min(
+                            maximum_mixing,
+                            trial_mixing * mixing_growth,
+                        )
                 else:
                     current_mixing = mixing
                 if relative_change <= tolerance_change:
                     break
 
             stage_histories.append(stage_history)
+            final_c1 = evaluation["c1"].detach()
+            _, _, final_max_residual, final_rms_residual = _euler_residual(
+                rho,
+                final_c1,
+                stage_V_ext,
+                data["beta"],
+                thermal_wavelength,
+                mu,
+                residual_density_threshold,
+                maximum_density,
+            )
+            stage_converged = stage_converged or _residuals_converged(
+                final_max_residual,
+                final_rms_residual,
+                tolerance_residual,
+                tolerance_rms_residual,
+            )
+            final_stage_converged = stage_converged
 
         return {
             "rho": rho,
@@ -758,6 +975,9 @@ class GridSolver:
             "line_search_failures": 0,
             "mixing_backtracks": mixing_backtracks,
             "final_mixing": current_mixing,
+            "anderson_steps": anderson_steps,
+            "anderson_rejections": anderson_rejections,
+            "converged": final_stage_converged,
         }
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -812,6 +1032,172 @@ def _continued_fields(
         device=V_ext.device,
     )
     return tuple(fraction * V_ext for fraction in fractions)
+
+
+def _ideal_gas_initial_density(
+    V_ext: torch.Tensor,
+    beta: torch.Tensor,
+    thermal_wavelength: torch.Tensor,
+    mu: Optional[torch.Tensor],
+    particle_numbers: Optional[torch.Tensor],
+    cell_volume: torch.Tensor,
+    maximum_density: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Return the external-field ideal-gas density for a direct solve probe."""
+
+    if particle_numbers is not None:
+        logits = -beta * V_ext
+        rho = (
+            particle_numbers[None, :]
+            * torch.softmax(logits, dim=0)
+            / cell_volume
+        )
+        return _normalize_particle_numbers(
+            rho,
+            particle_numbers,
+            cell_volume,
+            maximum_density=maximum_density,
+        )
+
+    log_density = (
+        beta * (mu[None, :] - V_ext)
+        - 3.0 * torch.log(thermal_wavelength)[None, :]
+    )
+    finfo = torch.finfo(V_ext.dtype)
+    log_density = torch.clamp(
+        log_density,
+        min=torch.log(log_density.new_tensor(finfo.tiny)),
+        max=torch.log(log_density.new_tensor(finfo.max)),
+    )
+    rho = torch.exp(log_density)
+    if maximum_density is not None:
+        rho = torch.minimum(rho, maximum_density[None, :])
+    return rho
+
+
+def _anderson_density_candidate(
+    log_inputs: Sequence[torch.Tensor],
+    log_outputs: Sequence[torch.Tensor],
+    current_log_density: torch.Tensor,
+    mixing: float,
+    regularization: float,
+    max_log_density_change: float,
+    particle_numbers: Optional[torch.Tensor],
+    cell_volume: torch.Tensor,
+    maximum_density: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Construct a constrained Anderson proposal in log-density space.
+
+    Coefficients minimize the norm of a linear combination of recent
+    fixed-point residuals subject to summing to one. Log-density extrapolation
+    preserves positivity; fixed particle numbers and optional upper bounds are
+    imposed afterward by the same projection used by ordinary Euler mixing.
+    """
+
+    residual_matrix = torch.stack(
+        [
+            (output - input_value).reshape(-1)
+            for input_value, output in zip(log_inputs, log_outputs)
+        ],
+        dim=1,
+    )
+    solve_dtype = (
+        torch.float64
+        if residual_matrix.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
+        else residual_matrix.dtype
+    )
+    residual_matrix = residual_matrix.to(solve_dtype)
+    history_size = residual_matrix.shape[1]
+    gram = residual_matrix.transpose(0, 1) @ residual_matrix
+    gram = gram / max(1, residual_matrix.shape[0])
+    scale = torch.clamp(
+        torch.trace(gram) / history_size,
+        min=torch.finfo(solve_dtype).eps,
+    )
+    gram = gram + regularization * scale * torch.eye(
+        history_size,
+        dtype=solve_dtype,
+        device=gram.device,
+    )
+    system = torch.zeros(
+        (history_size + 1, history_size + 1),
+        dtype=solve_dtype,
+        device=gram.device,
+    )
+    system[:history_size, :history_size] = gram
+    system[:history_size, history_size] = 1.0
+    system[history_size, :history_size] = 1.0
+    right_hand_side = torch.zeros(
+        history_size + 1,
+        dtype=solve_dtype,
+        device=gram.device,
+    )
+    right_hand_side[history_size] = 1.0
+    try:
+        coefficients = torch.linalg.solve(
+            system,
+            right_hand_side,
+        )[:history_size]
+    except RuntimeError:
+        return None
+    if not torch.all(torch.isfinite(coefficients)).item():
+        return None
+    coefficients = coefficients.to(current_log_density.dtype)
+    coefficient_shape = (history_size,) + (1,) * current_log_density.ndim
+    coefficients = coefficients.reshape(coefficient_shape)
+    input_stack = torch.stack(log_inputs, dim=0)
+    output_stack = torch.stack(log_outputs, dim=0)
+    combined_input = torch.sum(coefficients * input_stack, dim=0)
+    combined_output = torch.sum(coefficients * output_stack, dim=0)
+    proposed_log_density = (
+        (1.0 - mixing) * combined_input
+        + mixing * combined_output
+    )
+    log_change = torch.clamp(
+        proposed_log_density - current_log_density,
+        min=-max_log_density_change,
+        max=max_log_density_change,
+    )
+    rho = torch.exp(current_log_density + log_change)
+    if not torch.all(torch.isfinite(rho)).item():
+        return None
+    if particle_numbers is not None:
+        rho = _normalize_particle_numbers(
+            rho,
+            particle_numbers,
+            cell_volume,
+            maximum_density=maximum_density,
+        )
+    elif maximum_density is not None:
+        rho = torch.minimum(rho, maximum_density[None, :])
+    return rho
+
+
+def _merge_euler_states(
+    probe: Dict[str, Any],
+    fallback: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Combine the cost accounting of a failed direct probe and fallback."""
+
+    merged = dict(fallback)
+    for key in (
+        "n_iter",
+        "n_evaluations",
+        "line_search_failures",
+        "mixing_backtracks",
+        "anderson_steps",
+        "anderson_rejections",
+    ):
+        merged[key] = probe.get(key, 0) + fallback.get(key, 0)
+    merged["stage_objective_history"] = [
+        *probe["stage_objective_history"],
+        *fallback["stage_objective_history"],
+    ]
+    return merged
 
 
 def _thermodynamic_objective(

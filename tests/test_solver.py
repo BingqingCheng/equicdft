@@ -236,6 +236,71 @@ class TestGridSolver(unittest.TestCase):
             torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
         )
 
+    def test_anderson_acceleration_reduces_fixed_point_evaluations(self):
+        target_rho = torch.tensor(
+            [[0.2], [0.3], [0.4], [0.5]],
+            dtype=torch.float64,
+        )
+        settings = {
+            "method": "euler",
+            "max_iter": 200,
+            "mixing": 0.05,
+            "continuation_steps": 0,
+            "tolerance_residual": 1.0e-8,
+            "tolerance_rms_residual": 1.0e-8,
+            "tolerance_change": 1.0e-12,
+        }
+
+        baseline = GridSolver(self._make_model()).solve(
+            self._make_data(target_rho),
+            **settings,
+        )
+        accelerated = GridSolver(self._make_model()).solve(
+            self._make_data(target_rho),
+            anderson_depth=4,
+            **settings,
+        )
+
+        self.assertTrue(accelerated["converged"])
+        self.assertGreater(accelerated["anderson_steps"], 0)
+        self.assertLess(
+            accelerated["n_evaluations"], baseline["n_evaluations"]
+        )
+        self.assertTrue(
+            torch.allclose(
+                accelerated["rho"],
+                target_rho,
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_adaptive_continuation_accepts_direct_ideal_gas_probe(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"].zero_()
+
+        result = GridSolver(self._make_model()).solve(
+            data,
+            particle_numbers=[2.0],
+            method="euler",
+            adaptive_continuation=True,
+            continuation_probe_iterations=5,
+            continuation_steps=5,
+            tolerance_residual=1.0e-8,
+            tolerance_rms_residual=1.0e-8,
+        )
+
+        self.assertTrue(result["converged"])
+        self.assertTrue(result["adaptive_continuation_probe"])
+        self.assertFalse(result["adaptive_continuation_fallback"])
+        self.assertEqual(result["n_evaluations"], 1)
+        self.assertTrue(
+            torch.allclose(
+                result["rho"],
+                torch.full((4, 1), 0.5, dtype=torch.float64),
+            )
+        )
+
     def test_fixed_particle_number_density_cap_is_enforced(self):
         data = self._make_data(include_mu=False)
         data["V_ext"] = torch.tensor(
