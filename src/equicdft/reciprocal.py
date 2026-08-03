@@ -41,12 +41,18 @@ class ReciprocalFeatures(nn.Module):
         ``"gaussian"`` gives ``exp(-alpha_n k^2)``. The
         ``"screened_inverse_laplacian"`` option gives
         ``exp(-alpha_n k^2) / (k^2 + kappa_n^2)``. Setting ``kappa_n=0``
-        recovers the nonzero-mode inverse-Laplacian form.
+        recovers the nonzero-mode inverse-Laplacian form. ``"coulomb"``
+        gives ``4 pi exp(-alpha_n k^2) / k^2`` for nonzero modes, matching
+        the Gaussian-damped Coulomb convention used in Ewald-type methods.
     n_types
         Number of density components.
     """
 
-    _KERNELS = ("gaussian", "screened_inverse_laplacian")
+    _KERNELS = (
+        "gaussian",
+        "screened_inverse_laplacian",
+        "coulomb",
+    )
 
     def __init__(
         self,
@@ -203,7 +209,7 @@ class ReciprocalFeatures(nn.Module):
 
         if self.kernel == "gaussian":
             values = gaussian
-        else:
+        elif self.kernel == "screened_inverse_laplacian":
             screening = self.screening.to(device=device, dtype=dtype)
             denominator = (
                 squared_wavevector[None, ...]
@@ -215,6 +221,18 @@ class ReciprocalFeatures(nn.Module):
                 torch.ones_like(denominator),
             )
             values = gaussian / safe_denominator
+        else:
+            safe_squared_wavevector = torch.where(
+                squared_wavevector > 0.0,
+                squared_wavevector,
+                torch.ones_like(squared_wavevector),
+            )
+            values = (
+                4.0
+                * math.pi
+                * gaussian
+                / safe_squared_wavevector[None, ...]
+            )
 
         # The homogeneous mode belongs to the bulk/local functional. Removing
         # it also makes the inverse-Laplacian kernel finite when kappa is zero.

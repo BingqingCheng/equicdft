@@ -14,7 +14,11 @@ class TestReciprocalFeatures(unittest.TestCase):
 
     def test_homogeneous_density_has_zero_features(self):
         rho = torch.full((4 * 4 * 4, 1), 0.7)
-        for kernel in ("gaussian", "screened_inverse_laplacian"):
+        for kernel in (
+            "gaussian",
+            "screened_inverse_laplacian",
+            "coulomb",
+        ):
             with self.subTest(kernel=kernel):
                 features = ReciprocalFeatures(
                     radial_exponents=(0.5, 1.0),
@@ -26,6 +30,43 @@ class TestReciprocalFeatures(unittest.TestCase):
                     grid_spacing=torch.tensor([0.5, 0.5, 0.5]),
                 )
                 self.assertTrue(torch.equal(features, torch.zeros_like(features)))
+
+    def test_kernel_flag_selects_expected_radial_function(self):
+        shape = (4, 4, 4)
+        spacing = torch.ones(3)
+        alpha = 0.5
+        k = 2.0 * math.pi / shape[0]
+        gaussian = math.exp(-alpha * k**2)
+        expected = {
+            "gaussian": gaussian,
+            "screened_inverse_laplacian": gaussian / (k**2 + 0.25**2),
+            "coulomb": 4.0 * math.pi * gaussian / k**2,
+        }
+
+        for kernel, expected_value in expected.items():
+            with self.subTest(kernel=kernel):
+                module = ReciprocalFeatures(
+                    radial_exponents=(alpha,),
+                    screening=0.25,
+                    kernel=kernel,
+                )
+                values = module._kernel_values(
+                    grid_size=shape,
+                    grid_spacing=spacing,
+                    device=spacing.device,
+                    dtype=spacing.dtype,
+                )
+
+                self.assertEqual(values[0, 0, 0, 0].item(), 0.0)
+                self.assertAlmostEqual(
+                    values[0, 1, 0, 0].item(),
+                    expected_value,
+                    places=6,
+                )
+
+    def test_unknown_kernel_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "kernel must be one of"):
+            ReciprocalFeatures(kernel="unknown")
 
     def test_features_are_translation_invariant(self):
         shape = (4, 4, 4)
