@@ -1,10 +1,38 @@
 import math
 import unittest
 
+import numpy as np
 import torch
 from torch import nn
 
-from equicdft import CartesianAFeatures, CartesianBFeatures
+from equicdft import (
+    CartesianAFeatures,
+    CartesianBFeatures,
+    get_neighbor_indices,
+)
+
+
+def _gather_reference(module, rho, grid_size):
+    """Evaluate the former gather/einsum definition for regression tests."""
+
+    positions = np.indices(grid_size, dtype=np.int64).reshape(3, -1).T
+    neighbor_indices, _ = get_neighbor_indices(
+        positions,
+        cutoff_grid=module.cutoff_grid,
+    )
+    local_density = rho[torch.as_tensor(neighbor_indices)]
+    radial_values = torch.exp(
+        -module.squared_distances[:, None]
+        * module.radial_exponents[None, :]
+    )
+    basis_values = (
+        radial_values[:, :, None] * module.monomial_values[:, None, :]
+    )
+    return torch.einsum(
+        "gjt,jnk->gnkt",
+        local_density / module.mean_density,
+        basis_values,
+    )
 
 
 class TestCartesianAFeatures(unittest.TestCase):
@@ -55,46 +83,22 @@ class TestCartesianAFeatures(unittest.TestCase):
             )
         )
 
+        grid_size = (3, 3, 3)
         rho = torch.arange(
             1,
-            8,
+            math.prod(grid_size) + 1,
             dtype=module.monomial_values.dtype,
-        ).reshape(7, 1)
-        local_density_index = torch.arange(7).repeat(7, 1)
+        ).reshape(-1, 1)
         features = module(
             {
                 "rho": rho,
-                "local_density_index": local_density_index,
+                "grid_size": torch.tensor(grid_size),
             }
         )
 
-        self.assertEqual(features.shape, (7, 4, 10, 1))
-        for radial_index, alpha in enumerate(
-            module.radial_exponents.tolist()
-        ):
-            radial_weight = math.exp(-alpha)
-            expected_scalar = (1.0 + 27.0 * radial_weight) / 2.0
-            expected_vector = -radial_weight / 2.0
-            self.assertAlmostEqual(
-                features[0, radial_index, 0, 0].item(),
-                expected_scalar,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 1, 0].item(),
-                expected_vector,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 2, 0].item(),
-                expected_vector,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 3, 0].item(),
-                expected_vector,
-                places=6,
-            )
+        reference = _gather_reference(module, rho, grid_size)
+        self.assertEqual(features.shape, (27, 4, 10, 1))
+        self.assertTrue(torch.allclose(features, reference, atol=1.0e-6))
 
     def test_batched_data(self):
         module = CartesianAFeatures(
@@ -107,11 +111,10 @@ class TestCartesianAFeatures(unittest.TestCase):
             [[[2.0]], [[3.0]]],
             dtype=module.monomial_values.dtype,
         )
-        local_density_index = torch.zeros((2, 1, 1), dtype=torch.long)
         features = module(
             {
                 "rho": rho,
-                "local_density_index": local_density_index,
+                "grid_size": torch.ones((2, 3), dtype=torch.long),
             }
         )
 
@@ -144,20 +147,17 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertEqual(module.monomial_values[plus_two_z, 3].item(), 2.0)
         self.assertEqual(module.monomial_values[plus_two_z, 9].item(), 4.0)
 
-        n_neighbors = module.local_density_positions.shape[0]
+        grid_size = (3, 4, 5)
+        n_grid = math.prod(grid_size)
         rho = torch.full(
-            (n_neighbors, 1),
+            (n_grid, 1),
             2.0,
             dtype=module.monomial_values.dtype,
-        )
-        local_density_index = torch.arange(n_neighbors).repeat(
-            n_neighbors,
-            1,
         )
         features = module(
             {
                 "rho": rho,
-                "local_density_index": local_density_index,
+                "grid_size": torch.tensor(grid_size),
             }
         )
         # For a uniform field equal to mean_density, A_000 is the unnormalized
@@ -169,7 +169,7 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertTrue(
             torch.allclose(
                 features[:, :, 0, 0],
-                expected_mass.expand(n_neighbors, -1),
+                expected_mass.expand(n_grid, -1),
             )
         )
 
@@ -189,16 +189,16 @@ class TestCartesianAFeatures(unittest.TestCase):
         )
         self.assertIsInstance(module.log_radial_exponents, nn.Parameter)
 
+        grid_size = (3, 3, 3)
         rho = torch.arange(
             1,
-            8,
+            math.prod(grid_size) + 1,
             dtype=module.monomial_values.dtype,
-        ).reshape(7, 1)
-        local_density_index = torch.arange(7).repeat(7, 1)
+        ).reshape(-1, 1)
         features = module(
             {
                 "rho": rho,
-                "local_density_index": local_density_index,
+                "grid_size": torch.tensor(grid_size),
             }
         )
         features.sum().backward()
@@ -207,6 +207,124 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertTrue(
             torch.all(torch.isfinite(module.log_radial_exponents.grad))
         )
+
+    def test_fixed_kernel_is_cached_but_trainable_kernel_is_live(self):
+        fixed = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=2,
+            n_radial_channels=2,
+        )
+        self.assertIs(
+            fixed._convolution_kernel(),
+            fixed.fixed_convolution_kernel,
+        )
+
+        trainable = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=2,
+            n_radial_channels=2,
+            trainable_radial_exponents=True,
+        )
+        before = trainable._convolution_kernel().detach().clone()
+        with torch.no_grad():
+            trainable.log_radial_exponents.add_(0.2)
+        after = trainable._convolution_kernel().detach()
+        self.assertIsNone(trainable.fixed_convolution_kernel)
+        self.assertFalse(torch.equal(before, after))
+
+    def test_matches_gather_values_and_density_gradients(self):
+        cases = (
+            ((4, 5, 6), 2),
+            # cutoff > a box dimension exercises repeated periodic images.
+            ((2, 3, 2), 3),
+        )
+        for grid_size, cutoff in cases:
+            with self.subTest(grid_size=grid_size, cutoff=cutoff):
+                torch.manual_seed(7)
+                module = CartesianAFeatures(
+                    mean_density=0.73,
+                    cutoff_grid=cutoff,
+                    max_power=3,
+                    n_radial_channels=3,
+                    n_types=2,
+                ).double()
+                rho = torch.randn(
+                    math.prod(grid_size),
+                    2,
+                    dtype=torch.float64,
+                    requires_grad=True,
+                )
+                actual = module(
+                    {
+                        "rho": rho,
+                        "grid_size": torch.tensor(grid_size),
+                    }
+                )
+                reference = _gather_reference(module, rho, grid_size)
+                self.assertTrue(
+                    torch.allclose(actual, reference, atol=1.0e-12, rtol=1.0e-12)
+                )
+
+                weights = torch.randn_like(actual)
+                actual_gradient = torch.autograd.grad(
+                    torch.sum(actual * weights),
+                    rho,
+                    retain_graph=True,
+                )[0]
+                reference_gradient = torch.autograd.grad(
+                    torch.sum(reference * weights),
+                    rho,
+                )[0]
+                self.assertTrue(
+                    torch.allclose(
+                        actual_gradient,
+                        reference_gradient,
+                        atol=1.0e-11,
+                        rtol=1.0e-11,
+                    )
+                )
+
+    def test_periodic_boundary_preserves_odd_monomial_sign(self):
+        grid_size = (5, 4, 3)
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            n_radial_channels=1,
+        )
+        rho = torch.zeros(math.prod(grid_size), 1)
+        plus_x = np.ravel_multi_index((1, 0, 0), grid_size, order="C")
+        minus_x = np.ravel_multi_index((4, 0, 0), grid_size, order="C")
+
+        rho[plus_x] = 1.0
+        plus_feature = module(
+            {"rho": rho, "grid_size": torch.tensor(grid_size)}
+        )[0, 0, 1, 0]
+        rho.zero_()
+        rho[minus_x] = 1.0
+        minus_feature = module(
+            {"rho": rho, "grid_size": torch.tensor(grid_size)}
+        )[0, 0, 1, 0]
+
+        expected = math.exp(-module.radial_exponents[0].item())
+        self.assertAlmostEqual(plus_feature.item(), expected, places=6)
+        self.assertAlmostEqual(minus_feature.item(), -expected, places=6)
+
+    def test_rejects_mixed_grid_sizes_inside_one_dense_batch(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=0,
+            max_power=0,
+        )
+        with self.assertRaisesRegex(ValueError, "share grid_size"):
+            module(
+                {
+                    "rho": torch.ones(2, 8, 1),
+                    "grid_size": torch.tensor([[2, 2, 2], [1, 2, 4]]),
+                }
+            )
 
 
 class TestCartesianAFeatureChannelMixing(unittest.TestCase):
@@ -234,10 +352,7 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
         mixed = module(
             {
                 "rho": rho,
-                "local_density_index": torch.zeros(
-                    (1, 1),
-                    dtype=torch.long,
-                ),
+                "grid_size": torch.ones(3, dtype=torch.long),
             }
         )
 

@@ -1,12 +1,71 @@
-"""Split complete density fields and construct PyTorch data loaders."""
+"""Split complete density fields and construct shape-compatible data loaders."""
 
-from typing import Dict, Optional, Sequence, Tuple, Union
+import math
+from collections import defaultdict
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 
 LoaderResult = Dict[str, Union[DataLoader, float, None]]
+
+
+class GridSizeBatchSampler(Sampler):
+    """Yield batches whose complete fields share one regular-grid shape.
+
+    Dense tensors with different numbers of grid points cannot be stacked by a
+    PyTorch ``DataLoader``. Bucketing by ``grid_size`` permits one dataset to
+    contain arbitrary rectangular boxes without padding them to a global size.
+    Component count is included in the bucket key to give malformed mixed-type
+    datasets a clear boundary as well.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        shuffle: bool,
+        seed: int = 1,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.generator = torch.Generator().manual_seed(int(seed))
+        self.drop_last = False
+
+        buckets = defaultdict(list)
+        for index in range(len(dataset)):
+            buckets[_grid_bucket_key(dataset[index])].append(index)
+        self.buckets = list(buckets.values())
+
+    def __iter__(self) -> Iterator[List[int]]:
+        batches = []
+        for bucket in self.buckets:
+            indices = list(bucket)
+            if self.shuffle and len(indices) > 1:
+                order = torch.randperm(
+                    len(indices),
+                    generator=self.generator,
+                ).tolist()
+                indices = [indices[position] for position in order]
+            batches.extend(
+                indices[start : start + self.batch_size]
+                for start in range(0, len(indices), self.batch_size)
+            )
+        if self.shuffle and len(batches) > 1:
+            order = torch.randperm(
+                len(batches),
+                generator=self.generator,
+            ).tolist()
+            batches = [batches[position] for position in order]
+        yield from batches
+
+    def __len__(self) -> int:
+        return sum(
+            math.ceil(len(bucket) / self.batch_size)
+            for bucket in self.buckets
+        )
 
 
 def make_dataloaders(
@@ -61,10 +120,10 @@ def make_dataloaders(
         statistics are added under ``mean_density`` and
         ``mean_temperature``.
 
-    Notes
-    -----
-    PyTorch's default collation is used. Fields within each dataset must
-    therefore have matching tensor shapes and dictionary keys.
+    Fields may use different ``grid_size`` values. The loaders automatically
+    group equally shaped fields into dense batches; an uncommon shape simply
+    produces a smaller batch. Dictionary keys must still agree within each
+    dataset.
     """
 
     if (valid_dataset is None) == (valid_fraction is None):
@@ -90,31 +149,36 @@ def make_dataloaders(
     if test_dataset is not None:
         _require_nonempty(test_dataset, "test_dataset")
 
-    # Keep splitting and epoch shuffling reproducible but independent: drawing
-    # a split must not advance the training sampler's random-number stream.
-    shuffle_generator = torch.Generator().manual_seed(int(seed))
     train_loader = DataLoader(
         train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
+        batch_sampler=GridSizeBatchSampler(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed,
+        ),
         num_workers=num_workers,
-        generator=shuffle_generator,
     )
     valid_loader = DataLoader(
         valid_data,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
+        batch_sampler=GridSizeBatchSampler(
+            valid_data,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=seed,
+        ),
         num_workers=num_workers,
     )
     test_loader = None
     if test_dataset is not None:
         test_loader = DataLoader(
             test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
+            batch_sampler=GridSizeBatchSampler(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                seed=seed,
+            ),
             num_workers=num_workers,
         )
 
@@ -160,6 +224,42 @@ def _random_split(
     valid_indices = permutation[:n_valid]
     train_indices = permutation[n_valid:]
     return Subset(dataset, train_indices), Subset(dataset, valid_indices)
+
+
+def _grid_bucket_key(frame: Dict[str, torch.Tensor]) -> Tuple[int, int, int, int]:
+    """Return ``(nx, ny, nz, n_types)`` for shape-compatible collation."""
+
+    if "grid_size" not in frame:
+        raise KeyError("dataset frame is missing required field 'grid_size'")
+    raw_size = torch.as_tensor(frame["grid_size"]).detach().reshape(-1)
+    if raw_size.numel() != 3:
+        raise ValueError("grid_size must contain three values")
+    grid_size = torch.round(raw_size).to(dtype=torch.long)
+    if not torch.allclose(
+        raw_size.to(dtype=torch.float64),
+        grid_size.to(dtype=torch.float64),
+    ) or torch.any(grid_size <= 0).item():
+        raise ValueError("grid_size values must be positive integers")
+
+    if "n_types" in frame:
+        raw_n_types = torch.as_tensor(frame["n_types"]).detach().reshape(-1)
+        if raw_n_types.numel() != 1:
+            raise ValueError("n_types must be a positive integer")
+        n_types = int(torch.round(raw_n_types[0]).item())
+        if not torch.isclose(
+            raw_n_types[0].to(dtype=torch.float64),
+            torch.tensor(float(n_types), dtype=torch.float64),
+        ).item() or n_types < 1:
+            raise ValueError("n_types must be a positive integer")
+    else:
+        field = frame.get("rho", frame.get("V_ext"))
+        if field is None or torch.as_tensor(field).ndim != 2:
+            raise KeyError(
+                "dataset frame needs n_types or a rank-two rho/V_ext field"
+            )
+        n_types = int(torch.as_tensor(field).shape[-1])
+
+    return (*[int(value) for value in grid_size.cpu().tolist()], n_types)
 
 
 def _mean_density(datasets: Sequence[Dataset]) -> float:

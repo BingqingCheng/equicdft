@@ -1,56 +1,67 @@
-"""Cartesian moment features for density fields on fixed integer grids.
+"""Cartesian moment features for density fields on regular periodic grids.
 
 The angular basis uses integer stencil coordinates. Gaussian radial functions
 are evaluated using squared integer-grid distances without an additional
 kernel normalization.
 """
 
+import math
 from numbers import Integral
 from typing import Mapping, Optional, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .stencil import make_stencil
 
 
-def _gather_local_density(
-    rho: torch.Tensor,
-    local_density_index: torch.Tensor,
+def _common_grid_size(
+    grid_size: torch.Tensor,
+    leading_shape: torch.Size,
+) -> tuple:
+    """Return the single regular-grid shape shared by one dense batch."""
+
+    sizes = torch.as_tensor(grid_size).detach().reshape(-1, 3)
+    n_fields = math.prod(leading_shape) if leading_shape else 1
+    if sizes.shape[0] not in (1, n_fields):
+        raise ValueError("grid_size leading shape must match rho")
+    rounded = torch.round(sizes).to(dtype=torch.long)
+    if not torch.allclose(
+        sizes.to(dtype=torch.float64),
+        rounded.to(dtype=torch.float64),
+    ):
+        raise ValueError("grid_size values must be integers")
+    if torch.any(rounded <= 0).item():
+        raise ValueError("grid_size values must be positive")
+    if not torch.all(rounded == rounded[0]).item():
+        raise ValueError("all fields in one batch must share grid_size")
+    return tuple(int(value) for value in rounded[0].cpu().tolist())
+
+
+def _periodic_extend_3d(
+    values: torch.Tensor,
+    padding: int,
 ) -> torch.Tensor:
-    """Gather periodic environments from a live, possibly batched ``rho``."""
+    """Periodically extend ``[batch, channels, nx, ny, nz]`` on every axis.
 
-    if rho.ndim < 2:
-        raise ValueError("rho must have shape [..., n_grid, n_types]")
-    if local_density_index.ndim != rho.ndim:
-        raise ValueError(
-            "local_density_index must have shape "
-            "[..., n_grid, n_neighbors]"
-        )
-    if local_density_index.shape[:-2] != rho.shape[:-2]:
-        raise ValueError("rho and local_density_index leading shapes must match")
-    if local_density_index.shape[-2] != rho.shape[-2]:
-        raise ValueError("rho and local_density_index grid sizes must match")
-    if local_density_index.dtype != torch.long:
-        raise TypeError("local_density_index must have dtype torch.long")
+    Explicit modular indices, rather than ``F.pad(mode='circular')``, retain
+    the repeated-image stencil semantics when ``padding`` is as large as a box
+    dimension.
+    """
 
-    leading_shape = rho.shape[:-2]
-    n_grid = rho.shape[-2]
-    n_types = rho.shape[-1]
-    n_neighbors = local_density_index.shape[-1]
-
-    # Flatten only leading configuration/batch dimensions. torch.gather then
-    # selects the grid axis independently for every configuration and type.
-    rho_flat = rho.reshape(-1, n_grid, n_types)
-    index_flat = local_density_index.reshape(-1, n_grid * n_neighbors)
-    gather_index = index_flat.unsqueeze(-1).expand(-1, -1, n_types)
-    local_density = torch.gather(rho_flat, dim=1, index=gather_index)
-    return local_density.reshape(
-        *leading_shape,
-        n_grid,
-        n_neighbors,
-        n_types,
-    )
+    if padding == 0:
+        return values
+    extended = values
+    for dimension in range(2, 5):
+        size = values.shape[dimension]
+        index = torch.arange(
+            -padding,
+            size + padding,
+            device=values.device,
+        ).remainder(size)
+        extended = extended.index_select(dimension, index)
+    return extended
 
 
 def _make_powers(max_power: int) -> torch.Tensor:
@@ -77,7 +88,7 @@ def _make_powers(max_power: int) -> torch.Tensor:
 
 
 class CartesianAFeatures(nn.Module):
-    """Compute normalized Cartesian ``A`` features on a fixed stencil.
+    """Compute normalized Cartesian ``A`` features by periodic convolution.
 
     For central grid point ``g``, Gaussian channel ``n``, monomial
     ``k = (a, b, c)``, and component ``t``, the module computes
@@ -117,11 +128,9 @@ class CartesianAFeatures(nn.Module):
         stored as a fixed buffer; no mean is subtracted, so zero density
         remains zero.
 
-    Notes
-    -----
-    The stencil and all monomials are model constants. They are constructed
-    once using the same canonical ordering as ``GridData`` and registered as
-    buffers, so they follow the module across devices without being optimized.
+    The input grid may have any positive rectangular shape. All fields in one
+    dense batch must share that shape, while different batches may use
+    different shapes.
     """
 
     def __init__(
@@ -178,8 +187,8 @@ class CartesianAFeatures(nn.Module):
         if mean_density_tensor.item() <= 0.0:
             raise ValueError("mean_density must be positive")
 
-        # Both GridData and this module call make_stencil, so neighbor j in
-        # local_density always corresponds to row j of the monomial table.
+        # The ordered stencil is retained as compact model geometry and is also
+        # useful for inspecting the exact basis represented by the convolution.
         local_density_positions = torch.from_numpy(make_stencil(cutoff_grid))
         powers = _make_powers(max_power)
 
@@ -236,11 +245,102 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("monomial_values", monomial_values)
         self.register_buffer("mean_density", mean_density_tensor)
 
+        # Build dense cubic coordinate tables once. Values outside the spherical
+        # cutoff are masked to zero when constructing each convolution kernel.
+        # PyTorch conv3d is a cross-correlation, so kernel coordinate q directly
+        # multiplies rho(r + q) after symmetric periodic extension.
+        coordinate = torch.arange(
+            -self.cutoff_grid,
+            self.cutoff_grid + 1,
+            dtype=torch.get_default_dtype(),
+        )
+        qx, qy, qz = torch.meshgrid(
+            coordinate,
+            coordinate,
+            coordinate,
+            indexing="ij",
+        )
+        kernel_positions = torch.stack((qx, qy, qz), dim=-1)
+        kernel_squared_distances = torch.sum(kernel_positions**2, dim=-1)
+        kernel_monomials = torch.ones(
+            (*kernel_squared_distances.shape, powers.shape[0]),
+            dtype=torch.get_default_dtype(),
+        )
+        for axis in range(3):
+            kernel_monomials = kernel_monomials * kernel_positions[
+                ..., axis, None
+            ].pow(powers[None, None, None, :, axis])
+        kernel_mask = kernel_squared_distances <= self.cutoff_grid**2
+        self.register_buffer(
+            "kernel_squared_distances",
+            kernel_squared_distances,
+        )
+        self.register_buffer("kernel_monomials", kernel_monomials)
+        self.register_buffer("kernel_mask", kernel_mask)
+        if self.trainable_radial_exponents:
+            self.register_buffer(
+                "fixed_convolution_kernel",
+                None,
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "fixed_convolution_kernel",
+                self._build_convolution_kernel(),
+                persistent=False,
+            )
+
     @property
     def radial_exponents(self) -> torch.Tensor:
         """Positive Gaussian decay coefficients in inverse grid units squared."""
 
         return torch.exp(self.log_radial_exponents)
+
+    def _apply(self, function):
+        """Move/cast buffers and regenerate a fixed kernel at full precision."""
+
+        result = super()._apply(function)
+        if not self.trainable_radial_exponents:
+            self.fixed_convolution_kernel = self._build_convolution_kernel()
+        return result
+
+    def _build_convolution_kernel(self) -> torch.Tensor:
+        """Construct grouped-convolution weights for all basis terms."""
+
+        radial_values = torch.exp(
+            -self.radial_exponents[:, None, None, None]
+            * self.kernel_squared_distances[None, ...]
+        )
+        basis_values = (
+            radial_values[..., None]
+            * self.kernel_monomials[None, ...]
+            * self.kernel_mask[None, ..., None]
+        )
+        # [n_radial, n_monomial, kx, ky, kz]
+        basis_values = basis_values.permute(0, 4, 1, 2, 3)
+        # Group t owns one identical bank of radial/monomial output filters and
+        # reads only input density channel t.
+        return basis_values.unsqueeze(0).expand(
+            self.n_types,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        ).reshape(
+            self.n_types
+            * self.n_radial_channels
+            * self.powers.shape[0],
+            1,
+            *basis_values.shape[-3:],
+        )
+
+    def _convolution_kernel(self) -> torch.Tensor:
+        """Return cached fixed weights or rebuild trainable radial weights."""
+
+        if self.fixed_convolution_kernel is not None:
+            return self.fixed_convolution_kernel
+        return self._build_convolution_kernel()
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
@@ -252,11 +352,10 @@ class CartesianAFeatures(nn.Module):
 
             ``rho``
                 Live density tensor with shape ``[..., n_grid, n_types]``.
-            ``local_density_index``
-                Periodic neighbor rows with shape
-                ``[..., n_grid, n_neighbors]``. Local environments are
-                gathered from ``rho`` inside this forward pass so that
-                automatic differentiation includes overlapping neighbors.
+            ``grid_size``
+                Three grid dimensions with shape ``[3]`` or
+                ``[..., 3]``. Every field in one dense batch must have the same
+                dimensions.
         Returns
         -------
         torch.Tensor
@@ -266,42 +365,55 @@ class CartesianAFeatures(nn.Module):
             ``n_channels`` when mixing is enabled.
         """
 
-        local_density = _gather_local_density(
-            data["rho"],
-            data["local_density_index"],
-        )
-        if local_density.shape[-1] != self.n_types:
+        if "rho" not in data:
+            raise KeyError("data is missing required field 'rho'")
+        if "grid_size" not in data:
+            raise KeyError("data is missing required field 'grid_size'")
+        rho = data["rho"]
+        if rho.ndim < 2:
+            raise ValueError("rho must have shape [..., n_grid, n_types]")
+        if rho.shape[-1] != self.n_types:
             raise ValueError(
                 "rho has {} type channels but CartesianAFeatures expects {}".format(
-                    local_density.shape[-1],
+                    rho.shape[-1],
                     self.n_types,
                 )
             )
-        if local_density.shape[-2] != self.monomial_values.shape[0]:
+        leading_shape = rho.shape[:-2]
+        grid_size = _common_grid_size(data["grid_size"], leading_shape)
+        n_grid = math.prod(grid_size)
+        if rho.shape[-2] != n_grid:
             raise ValueError(
-                "local_density neighbor count does not match cutoff_grid={}".format(
-                    self.cutoff_grid
-                )
+                "grid_size product does not match rho n_grid"
             )
 
-        # The radial values are recomputed on every forward pass because the
-        # alpha values may be trainable. Distances themselves are fixed model
-        # geometry and are therefore stored once as a buffer.
-        radial_values = torch.exp(
-            -self.squared_distances[:, None]
-            * self.radial_exponents[None, :]
+        rho_3d = rho.reshape(-1, *grid_size, self.n_types).permute(
+            0,
+            4,
+            1,
+            2,
+            3,
         )
-        basis_values = (
-            radial_values[:, :, None] * self.monomial_values[:, None, :]
+        rho_3d = _periodic_extend_3d(rho_3d, self.cutoff_grid)
+        features = F.conv3d(
+            rho_3d / self.mean_density,
+            self._convolution_kernel(),
+            groups=self.n_types,
         )
-
-        # Contract only the neighbor axis. Grid points, radial channels,
-        # monomials, component channels, and leading batch dimensions remain
-        # separate.
-        features = torch.einsum(
-            "...gjt,jnk->...gnkt",
-            local_density / self.mean_density,
-            basis_values,
+        n_monomials = self.powers.shape[0]
+        features = features.reshape(
+            -1,
+            self.n_types,
+            self.n_radial_channels,
+            n_monomials,
+            *grid_size,
+        ).permute(0, 4, 5, 6, 2, 3, 1)
+        features = features.reshape(
+            *leading_shape,
+            n_grid,
+            self.n_radial_channels,
+            n_monomials,
+            self.n_types,
         )
         if self.channel_mixing is not None:
             features = self.channel_mixing(features)

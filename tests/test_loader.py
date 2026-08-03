@@ -1,19 +1,28 @@
+import math
 import unittest
 
 import torch
-from torch.utils.data import RandomSampler, SequentialSampler, Subset
+from torch.utils.data import Subset
 
-from equicdft import make_dataloaders
+from equicdft import CartesianAFeatures, make_dataloaders
+from equicdft.loader import GridSizeBatchSampler
 
 
-def _dataset(values, n_grid=4, temperatures=None):
+def _dataset(values, n_grid=4, temperatures=None, grid_sizes=None):
     """Return minimal complete-field dictionaries for loader tests."""
 
     frames = []
     for frame_id, value in enumerate(values):
+        grid_size = (
+            (n_grid, 1, 1)
+            if grid_sizes is None
+            else tuple(grid_sizes[frame_id])
+        )
         frame = {
             "frame_id": torch.tensor(frame_id),
-            "rho": torch.full((n_grid, 1), float(value)),
+            "rho": torch.full((math.prod(grid_size), 1), float(value)),
+            "grid_size": torch.tensor(grid_size),
+            "n_types": torch.tensor(1),
         }
         if temperatures is not None:
             frame["temperature"] = torch.tensor(float(temperatures[frame_id]))
@@ -85,12 +94,101 @@ class TestMakeDataloaders(unittest.TestCase):
         self.assertIs(train_loader.dataset, train_dataset)
         self.assertIs(valid_loader.dataset, valid_dataset)
         self.assertIs(test_loader.dataset, test_dataset)
-        self.assertIsInstance(train_loader.sampler, RandomSampler)
-        self.assertIsInstance(valid_loader.sampler, SequentialSampler)
-        self.assertIsInstance(test_loader.sampler, SequentialSampler)
+        self.assertIsInstance(train_loader.batch_sampler, GridSizeBatchSampler)
+        self.assertIsInstance(valid_loader.batch_sampler, GridSizeBatchSampler)
+        self.assertIsInstance(test_loader.batch_sampler, GridSizeBatchSampler)
         self.assertFalse(train_loader.drop_last)
         self.assertEqual(next(iter(train_loader))["rho"].shape, (3, 4, 1))
         self.assertEqual(next(iter(valid_loader))["rho"].shape, (2, 4, 1))
+
+    def test_different_grid_sizes_are_bucketed_without_padding(self):
+        grid_sizes = [
+            (2, 2, 2),
+            (3, 2, 2),
+            (2, 2, 2),
+            (4, 2, 1),
+            (3, 2, 2),
+        ]
+        train_dataset = _dataset(
+            range(len(grid_sizes)),
+            grid_sizes=grid_sizes,
+        )
+        valid_dataset = _dataset(
+            [10.0, 11.0],
+            grid_sizes=[(2, 3, 2), (3, 3, 1)],
+        )
+        loaders = make_dataloaders(
+            train_dataset,
+            valid_dataset=valid_dataset,
+            batch_size=2,
+            seed=9,
+        )
+
+        visited = []
+        observed_batch_sizes = []
+        features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            n_radial_channels=2,
+        )
+        for batch in loaders["train"]:
+            sizes = batch["grid_size"]
+            self.assertTrue(torch.all(sizes == sizes[0]))
+            self.assertEqual(
+                batch["rho"].shape[1],
+                int(torch.prod(sizes[0]).item()),
+            )
+            visited.extend(batch["frame_id"].tolist())
+            observed_batch_sizes.append(len(batch["frame_id"]))
+            A = features(batch)
+            self.assertEqual(A.shape[:2], batch["rho"].shape[:2])
+
+        self.assertEqual(sorted(visited), list(range(len(grid_sizes))))
+        self.assertEqual(sorted(observed_batch_sizes), [1, 2, 2])
+        valid_batches = list(loaders["valid"])
+        self.assertEqual(len(valid_batches), 2)
+        self.assertEqual([len(batch["frame_id"]) for batch in valid_batches], [1, 1])
+
+    def test_shape_bucketing_requires_valid_grid_size(self):
+        missing = [{"rho": torch.ones(4, 1)}]
+        with self.assertRaisesRegex(KeyError, "grid_size"):
+            make_dataloaders(
+                missing,
+                valid_dataset=_dataset([1.0]),
+            )
+
+    def test_fractional_split_and_shape_bucketing_compose(self):
+        grid_sizes = [
+            (2, 2, 2),
+            (3, 2, 2),
+            (2, 2, 2),
+            (3, 2, 2),
+            (4, 2, 1),
+            (4, 2, 1),
+        ]
+        loaders = make_dataloaders(
+            _dataset(range(6), grid_sizes=grid_sizes),
+            valid_fraction=1.0 / 3.0,
+            batch_size=2,
+            seed=4,
+        )
+
+        identifiers = {}
+        for subset in ("train", "valid"):
+            identifiers[subset] = []
+            for batch in loaders[subset]:
+                self.assertTrue(
+                    torch.all(batch["grid_size"] == batch["grid_size"][0])
+                )
+                identifiers[subset].extend(batch["frame_id"].tolist())
+        self.assertTrue(
+            set(identifiers["train"]).isdisjoint(identifiers["valid"])
+        )
+        self.assertEqual(
+            sorted(identifiers["train"] + identifiers["valid"]),
+            list(range(6)),
+        )
 
     def test_mean_density_uses_train_and_validation_but_not_test(self):
         train_dataset = _dataset([1.0, 3.0])
@@ -215,7 +313,13 @@ class TestMakeDataloaders(unittest.TestCase):
     def test_mean_density_validates_rho(self):
         with self.assertRaisesRegex(KeyError, "rho"):
             make_dataloaders(
-                [{"frame_id": torch.tensor(0)}],
+                [
+                    {
+                        "frame_id": torch.tensor(0),
+                        "grid_size": torch.tensor([1, 1, 1]),
+                        "n_types": torch.tensor(1),
+                    }
+                ],
                 valid_dataset=_dataset([1.0]),
                 compute_mean_density=True,
             )

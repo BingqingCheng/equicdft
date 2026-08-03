@@ -1,6 +1,5 @@
 import unittest
 
-import numpy as np
 import torch
 
 from equicdft import (
@@ -8,24 +7,15 @@ from equicdft import (
     CartesianBFeatures,
     LocalReadout,
     compute_grid_derivative,
-    get_neighbor_indices,
 )
 
 
 class TestLocalReadout(unittest.TestCase):
     def _full_pipeline(self, rho):
         shape = (4, 4, 4)
-        grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
-        neighbor_indices, _ = get_neighbor_indices(
-            grid_positions,
-            cutoff_grid=1,
-        )
         data = {
             "rho": rho,
-            "local_density_index": torch.tensor(
-                neighbor_indices,
-                dtype=torch.long,
-            ),
+            "grid_size": torch.tensor(shape),
             "grid_spacing": torch.tensor(
                 [0.5, 0.5, 0.5],
                 dtype=rho.dtype,

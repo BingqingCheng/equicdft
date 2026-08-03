@@ -181,7 +181,7 @@ class TestDensityPerturbationStabilityLoss(unittest.TestCase):
             "grid_positions": torch.tensor(
                 [[[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]]
             ),
-            "local_density_index": torch.arange(4).reshape(1, 4, 1),
+            "grid_size": torch.tensor([[4, 1, 1]]),
         }
 
     def test_penalizes_lower_concentrated_objective_and_backpropagates(self):
@@ -260,7 +260,7 @@ class TestDensityPerturbationStabilityLoss(unittest.TestCase):
                 ),
                 dim=-1,
             ).unsqueeze(0),
-            "local_density_index": linear_index.reshape(1, n_grid, 1),
+            "grid_size": torch.tensor([[16, 16, 16]]),
         }
         model = _UnstableQuadraticFunctional()
         outputs = model(batch)

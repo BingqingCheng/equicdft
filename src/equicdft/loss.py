@@ -266,7 +266,7 @@ class DensityPerturbationStabilityLoss(nn.Module):
             "temperature",
             "grid_spacing",
             "grid_positions",
-            "local_density_index",
+            "grid_size",
         )
         missing = [key for key in required_batch if key not in batch]
         if missing:
@@ -442,10 +442,10 @@ class DensityPerturbationStabilityLoss(nn.Module):
         # the fields needed by the energy-only representation/readout pass.
         perturbed_data = {
             "rho": rho_perturbed,
-            "local_density_index": batch["local_density_index"]
+            "grid_size": batch["grid_size"]
             .detach()
             .unsqueeze(1)
-            .expand(-1, n_perturbations, -1, -1),
+            .expand(-1, n_perturbations, -1),
             "temperature": batch["temperature"]
             .detach()
             .unsqueeze(1)
@@ -650,7 +650,7 @@ class GlobalDensityStabilityLoss(nn.Module):
             "temperature",
             "grid_spacing",
             "grid_positions",
-            "local_density_index",
+            "grid_size",
         )
         missing = [key for key in required_batch if key not in batch]
         if missing:
@@ -775,10 +775,10 @@ class GlobalDensityStabilityLoss(nn.Module):
 
         candidate_data = {
             "rho": candidate_density,
-            "local_density_index": batch["local_density_index"]
+            "grid_size": batch["grid_size"]
             .detach()
             .unsqueeze(1)
-            .expand(-1, n_candidates, -1, -1),
+            .expand(-1, n_candidates, -1),
             "temperature": batch["temperature"]
             .detach()
             .unsqueeze(1)

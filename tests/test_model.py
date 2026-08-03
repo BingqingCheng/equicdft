@@ -1,6 +1,5 @@
 import unittest
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -11,7 +10,6 @@ from equicdft import (
     LocalReadout,
     LongRangeReadout,
     ReciprocalFeatures,
-    get_neighbor_indices,
 )
 
 
@@ -54,17 +52,8 @@ class _ConstantPerParticleReadout(nn.Module):
 class TestGridCACEModel(unittest.TestCase):
     def _make_data(self):
         shape = (3, 3, 3)
-        grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
-        neighbor_indices, _ = get_neighbor_indices(
-            grid_positions,
-            cutoff_grid=1,
-        )
         return {
             "rho": torch.linspace(0.2, 0.8, steps=27).reshape(27, 1),
-            "local_density_index": torch.tensor(
-                neighbor_indices,
-                dtype=torch.long,
-            ),
             "grid_spacing": torch.tensor([0.5, 0.5, 0.5]),
             "grid_size": torch.tensor(shape),
             "temperature": torch.tensor(1.5),

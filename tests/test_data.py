@@ -19,12 +19,17 @@ def _write_grid(
     include_v_ext=True,
     density_offset=0.25,
     mu_value=-1.0,
+    shuffle_rows=True,
 ):
     shape = (4, 4, 4)
     spacing = 0.5
     grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
     values = np.arange(len(grid_positions), dtype=float)
-    order = np.random.default_rng(7).permutation(len(grid_positions))
+    order = (
+        np.random.default_rng(7).permutation(len(grid_positions))
+        if shuffle_rows
+        else np.arange(len(grid_positions))
+    )
 
     atoms = Atoms(
         symbols=["X"] * len(grid_positions),
@@ -119,7 +124,7 @@ class TestGridData(unittest.TestCase):
         )[0]
 
         self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
-        self.assertEqual(data["local_density_index"].shape, (64, 7))
+        self.assertNotIn("local_density_index", data)
 
         mismatched = self._grid_info()
         mismatched["grid_spacing"] = [1.0, 1.0, 1.0]
@@ -137,6 +142,31 @@ class TestGridData(unittest.TestCase):
                 self.assertEqual(len(data), 2)
                 self.assertAlmostEqual(data[0]["rho"][0, 0].item(), 100.25)
                 self.assertAlmostEqual(data[1]["rho"][0, 0].item(), 0.25)
+
+    def test_shuffled_rows_are_canonicalized_before_convolution(self):
+        canonical_path = (
+            Path(self.temporary_directory.name) / "grid-canonical.extxyz"
+        )
+        _write_grid(canonical_path, shuffle_rows=False)
+        shuffled = GridData.from_xyz(self.path, cutoff_grid=1)[0]
+        canonical = GridData.from_xyz(canonical_path, cutoff_grid=1)[0]
+
+        for key in ("grid_positions", "rho", "V_ext"):
+            self.assertTrue(torch.equal(shuffled[key], canonical[key]))
+        expected_positions = torch.from_numpy(
+            np.indices((4, 4, 4), dtype=np.int64).reshape(3, -1).T
+        )
+        self.assertTrue(
+            torch.equal(shuffled["grid_positions"], expected_positions)
+        )
+
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=2,
+            n_radial_channels=2,
+        )
+        self.assertTrue(torch.equal(module(shuffled), module(canonical)))
 
     def test_from_xyz_rejects_empty_path_sequence(self):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
@@ -166,7 +196,6 @@ class TestGridData(unittest.TestCase):
             )
         )
         self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
-        self.assertEqual(data["local_density_index"].shape, (60, 7))
 
         conflicting_values = {
             "grid_size": [3, 4, 5],
@@ -211,7 +240,6 @@ class TestGridData(unittest.TestCase):
             )
         )
         self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
-        self.assertEqual(data["local_density_index"].shape, (60, 7))
 
     def test_from_dict_builds_multicomponent_metadata(self):
         data = GridData.from_dict(
@@ -288,8 +316,6 @@ class TestGridData(unittest.TestCase):
                 "rho",
                 "c1_plus_beta_mu",
                 "c1",
-                "local_density_index",
-                "local_density_positions",
             },
         )
         self.assertEqual(data["rho"].shape, (64, 1))
@@ -320,16 +346,6 @@ class TestGridData(unittest.TestCase):
                 np.log(0.25) + expected_beta,
                 rtol=1.0e-6,
             )
-        )
-        self.assertEqual(data["local_density_index"].shape, (64, 7))
-        self.assertEqual(data["local_density_positions"].shape, (7, 3))
-        self.assertTrue(
-            torch.equal(
-                data["local_density_positions"][0], torch.tensor([0, 0, 0])
-            )
-        )
-        self.assertTrue(
-            torch.equal(data["local_density_index"][:, 0], data["index"])
         )
         self.assertTrue(
             torch.equal(
@@ -401,15 +417,12 @@ class TestGridData(unittest.TestCase):
                 "index",
                 "grid_positions",
                 "rho",
-                "local_density_index",
-                "local_density_positions",
             },
         )
         self.assertEqual(data["rho"].shape, (8, 1))
         self.assertTrue(
             torch.equal(data["grid_size"], torch.tensor([2, 2, 2]))
         )
-        self.assertEqual(data["local_density_index"].shape, (8, 1))
 
     def test_external_potential_only_inference_data(self):
         path = Path(self.temporary_directory.name) / "external-only.extxyz"
@@ -426,7 +439,6 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(data["V_ext"].shape, (8, 1))
         self.assertEqual(data["n_types"].item(), 1)
         self.assertEqual(data["thermal_wavelength"].shape, (1,))
-        self.assertEqual(data["local_density_index"].shape, (8, 1))
 
     def test_density_or_external_potential_is_required(self):
         path = Path(self.temporary_directory.name) / "geometry-only.extxyz"
@@ -461,23 +473,14 @@ class TestGridData(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "temperature"):
             GridData.from_xyz(path, cutoff_grid=1)
 
-    def test_periodic_local_density_and_default_batching(self):
+    def test_periodic_model_input_and_default_batching(self):
         data = GridData.from_xyz(self.path, cutoff_grid=1)[0]
-        offset_lookup = {
-            tuple(position.tolist()): index
-            for index, position in enumerate(data["local_density_positions"])
-        }
-        minus_z = offset_lookup[(0, 0, -1)]
-
-        minus_z_index = data["local_density_index"][0, minus_z]
-        self.assertEqual(data["rho"][minus_z_index, 0].item(), 3.25)
 
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertEqual(batch["rho"].shape, (2, 64, 1))
-        self.assertEqual(batch["local_density_index"].shape, (2, 64, 7))
 
-        # The representation gathers neighborhoods from this exact batched
-        # rho tensor, so its complete overlapping dependence is differentiable.
+        # Periodic convolution acts on this exact live tensor, so overlapping
+        # neighborhoods remain connected to rho for functional derivatives.
         batch["rho"].requires_grad_(True)
         features = CartesianAFeatures(
             mean_density=1.0,
@@ -500,13 +503,8 @@ class TestGridData(unittest.TestCase):
                 torch.tensor([7, 7]),
             )
         )
-        neighbor_indices = batch["local_density_index"][:, 0, :]
-        gathered_gradient = torch.gather(
-            gradient[..., 0],
-            dim=1,
-            index=neighbor_indices,
-        )
-        self.assertTrue(torch.all(gathered_gradient != 0.0))
+        minus_z = np.ravel_multi_index((0, 0, 3), (4, 4, 4), order="C")
+        self.assertTrue(torch.all(gradient[:, minus_z, 0] != 0.0))
 
     def test_custom_data_key_mapping(self):
         path = Path(self.temporary_directory.name) / "custom.extxyz"
@@ -528,9 +526,6 @@ class TestGridData(unittest.TestCase):
 
         self.assertEqual(data["temperature"].item(), 1.5)
         self.assertEqual(data["mu"].item(), -1.0)
-        self.assertTrue(
-            torch.equal(data["local_density_index"][:, 0], data["index"])
-        )
         self.assertEqual(default_data_key["rho"], "density")
 
     def test_optional_local_average(self):
@@ -544,7 +539,6 @@ class TestGridData(unittest.TestCase):
         expected = source.reshape(2, 2, 2, 2, 2, 2).mean(axis=(1, 3, 5))
         self.assertEqual(data["rho"].shape, (8, 1))
         self.assertEqual(data["n_types"].item(), 1)
-        self.assertEqual(data["local_density_index"].shape, (8, 1))
         self.assertTrue(
             torch.allclose(
                 data["rho"],
@@ -617,11 +611,6 @@ class TestGridData(unittest.TestCase):
                 rtol=1.0e-6,
             )
         )
-        self.assertEqual(data["local_density_index"].shape, (64, 7))
-        self.assertTrue(
-            torch.equal(data["local_density_index"][:, 0], data["index"])
-        )
-
         coarse = GridData.from_xyz(
             path,
             cutoff_grid=0,
@@ -632,7 +621,6 @@ class TestGridData(unittest.TestCase):
         self.assertEqual(coarse["n_types"].item(), 2)
         self.assertEqual(coarse["rho"].shape, (8, 2))
         self.assertEqual(coarse["V_ext"].shape, (8, 2))
-        self.assertEqual(coarse["local_density_index"].shape, (8, 1))
 
     def test_thermodynamic_constants_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "boltzmann_constant"):
@@ -645,6 +633,13 @@ class TestGridData(unittest.TestCase):
                 self.path,
                 thermal_wavelength=0.0,
             )
+
+    def test_frames_do_not_store_redundant_neighborhood_geometry(self):
+        data = GridData.from_xyz([self.path, self.path], cutoff_grid=1)
+
+        for frame in data:
+            self.assertNotIn("local_density_index", frame)
+            self.assertNotIn("local_density_positions", frame)
 
 
 if __name__ == "__main__":

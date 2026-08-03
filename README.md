@@ -5,15 +5,16 @@ functionals. The current architecture uses Cartesian symmetry-adapted features
 for density fields on periodic three-dimensional grids.
 
 One `GridData` object represents one complete density configuration and
-contains the grid fields together with periodic neighborhood indices for every
-grid point.
+contains its fields in canonical C-order (`z` fastest) together with its
+regular-grid shape. Cartesian neighborhoods are evaluated inside the model by
+periodic three-dimensional convolution rather than stored per frame.
 
 Split complete fields and construct reproducible data loaders with:
 
 ```python
 from equicdft import GridData, make_dataloaders
 
-dataset = GridData.from_xyz("density.extxyz", cutoff_grid=3)
+dataset = GridData.from_xyz("density.extxyz")
 data = make_dataloaders(
     train_dataset=dataset,
     valid_fraction=0.1,
@@ -33,10 +34,13 @@ mean_temperature = data["mean_temperature"]
 
 The random split acts on complete fields and does not inspect temperature or
 chemical potential. A test dataset should be constructed separately to probe
-the intended thermodynamic states. The optional `mean_density` and
-`mean_temperature` are computed from train plus validation and exclude the
-test set. They can be used as fixed input scales without leaking test-set
-statistics.
+the intended held-out thermodynamic states. Frames may have different
+rectangular grid sizes: the loaders automatically bucket equal shapes into
+dense batches, and an uncommon shape produces a smaller batch without global
+padding.
+The optional `mean_density` and `mean_temperature` are computed from train plus
+validation and exclude the test set. They can be used as fixed input scales
+without leaking test-set statistics.
 
 Pass both scales into the representation/model. Density normalization is
 applied inside `CartesianAFeatures`, while the readout is conditioned on the
@@ -176,7 +180,6 @@ from equicdft import (
 
 dataset = GridData.from_xyz(
     "density.extxyz",
-    cutoff_grid=3,
     boltzmann_constant=1.0,  # reduced units; default is eV/K
 )
 data = dataset[0]
@@ -313,12 +316,11 @@ correlations. For a one-component field, leave `n_channels=None`; no mixing
 module or mixing parameters are created.
 
 A fine regular grid can be block-averaged in memory before its local
-environments are constructed:
+fields are passed to the model:
 
 ```python
 dataset = GridData.from_xyz(
     "density-grid-0.25.extxyz",
-    cutoff_grid=3,
     target_grid_spacing=0.5,
 )
 ```

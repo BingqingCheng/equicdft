@@ -1,8 +1,7 @@
 """Convert EXTXYZ density fields into model input dictionaries.
 
 One :class:`GridData` object represents one complete periodic density field.
-It stores field values on the regular grid together with indices for gathering
-the periodic neighborhood of every grid point.
+It stores physical fields and the regular-grid geometry needed by the model.
 """
 
 from pathlib import Path
@@ -13,7 +12,7 @@ import torch
 from ase import Atoms
 from ase.io import read
 
-from .stencil import coarsen_grid, get_neighbor_indices
+from .stencil import coarsen_grid
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -73,10 +72,9 @@ def _normalize_xyz_paths(
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
-    Every object contains the grid geometry, temperature, beta, and
-    neighborhood fields. Density, external-potential, chemical-potential, and
-    reference fields are included only when their source quantities are
-    available::
+    Every object contains the grid geometry, temperature, and beta. Density,
+    external-potential, chemical-potential, and reference fields are included
+    only when their source quantities are available::
 
         temperature                 scalar
         beta                        scalar
@@ -93,17 +91,13 @@ class GridData(dict):
                                     V_ext exists)
         c1                          [n_grid, n_types] (if rho is positive and
                                     V_ext and mu exist)
-        local_density_index         [n_grid, n_neighbors]
-        local_density_positions     [n_neighbors, 3]
 
     EXTXYZ records require at least one of ``rho`` and ``V_ext``. A grid built
     directly with :meth:`from_dict` may initially contain neither so that an
     external field can be assigned afterward.
 
-    ``local_density_index[m, k]`` selects the density at relative integer
-    displacement ``local_density_positions[k]`` from central point ``m``. The
-    first displacement is always ``[0, 0, 0]``. Model forwards gather from the
-    live ``rho`` tensor so functional derivatives retain the full graph.
+    Density neighborhoods are evaluated inside the model by periodic 3D
+    convolution. They are therefore not materialized or stored per frame.
     """
 
     def __init__(self, **data: torch.Tensor) -> None:
@@ -387,10 +381,6 @@ class GridData(dict):
             tuple(grid_size),
             dtype=np.int64,
         ).reshape(3, -1).T
-        local_density_index, local_density_positions = get_neighbor_indices(
-            grid_positions=grid_positions,
-            cutoff_grid=cutoff_grid,
-        )
         n_grid = grid_positions.shape[0]
         dtype = torch.get_default_dtype()
         return cls(
@@ -408,14 +398,6 @@ class GridData(dict):
             grid_spacing=torch.tensor(grid_spacing, dtype=dtype),
             index=torch.arange(n_grid, dtype=torch.long),
             grid_positions=torch.tensor(grid_positions, dtype=torch.long),
-            local_density_index=torch.tensor(
-                local_density_index,
-                dtype=torch.long,
-            ),
-            local_density_positions=torch.tensor(
-                local_density_positions,
-                dtype=torch.long,
-            ),
         )
 
 
@@ -742,13 +724,6 @@ def _process_atoms(
             + beta * V_ext
         )
 
-    # Store only the geometry needed to construct all overlapping periodic
-    # environments. Model forwards use these indices to gather from live rho.
-    local_density_index, local_density_positions = get_neighbor_indices(
-        grid_positions=grid_positions,
-        cutoff_grid=cutoff_grid,
-    )
-
     # Use PyTorch's current default floating dtype for physical values and
     # int64 tensors for indices and integer grid coordinates.
     dtype = torch.get_default_dtype()
@@ -760,12 +735,6 @@ def _process_atoms(
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
-        "local_density_index": torch.tensor(
-            local_density_index, dtype=torch.long
-        ),
-        "local_density_positions": torch.tensor(
-            local_density_positions, dtype=torch.long
-        ),
     }
 
     if rho is not None:
