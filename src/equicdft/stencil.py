@@ -182,6 +182,12 @@ def get_neighbor_indices(
     ``rho`` tensor during a model forward pass. That keeps all overlapping
     local environments connected to ``rho`` in the differentiation graph.
 
+    The stencil lives on the infinitely repeated periodic lattice. Therefore,
+    when the cutoff exceeds half a box length, distinct relative offsets may
+    wrap onto the same stored voxel. They remain separate stencil entries
+    because they represent different periodic images at different relative
+    positions and consequently carry different Cartesian/radial weights.
+
     Returns
     -------
     neighbor_indices
@@ -216,13 +222,6 @@ def get_neighbor_indices(
     )
     if np.unique(flat_positions).size != n_grid:
         raise ValueError("grid_positions contain duplicate grid points")
-
-    # Below half the shortest periodic grid length, every offset selects one
-    # unique periodic image.
-    if cutoff_grid >= 0.5 * np.min(grid_size):
-        raise ValueError(
-            "cutoff_grid must be smaller than half the shortest grid dimension"
-        )
 
     # Invert the canonical-index mapping: given a wrapped grid coordinate,
     # recover the row in the caller's density array that stores its value.

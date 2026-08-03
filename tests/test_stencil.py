@@ -68,6 +68,30 @@ class TestGridStencil(unittest.TestCase):
         self.assertTrue(np.any(squared_distances == 9))
         self.assertIn((0, 0, 3), map(tuple, positions))
 
+    def test_cutoff_can_include_multiple_periodic_images(self):
+        shape = (4, 4, 4)
+        grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+
+        neighbor_indices, local_positions = get_neighbor_indices(
+            grid_positions=grid_positions,
+            cutoff_grid=3,
+        )
+
+        position_to_column = {
+            tuple(position): column
+            for column, position in enumerate(local_positions)
+        }
+        positive_image = position_to_column[(0, 0, 1)]
+        negative_image = position_to_column[(0, 0, -3)]
+
+        # Both offsets wrap to the same stored voxel around the origin, but
+        # remain distinct environment entries with distinct relative vectors.
+        self.assertEqual(
+            neighbor_indices[0, positive_image],
+            neighbor_indices[0, negative_image],
+        )
+        self.assertNotEqual(positive_image, negative_image)
+
     def test_coarsen_grid_averages_all_fields(self):
         shape = (4, 4, 4)
         positions = np.indices(shape, dtype=int).reshape(3, -1).T

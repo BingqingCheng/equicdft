@@ -209,6 +209,10 @@ class GridData(dict):
                 configurations.extend(selected)
             else:
                 configurations.append(selected)
+        # Complete fields in one dataset normally share the same regular-grid
+        # geometry. Reuse its immutable neighborhood tensors rather than
+        # storing an identical, potentially very large index matrix per frame.
+        geometry_cache = {}
         data = [
             cls(
                 **_process_atoms(
@@ -218,6 +222,7 @@ class GridData(dict):
                     target_grid_spacing=target_grid_spacing,
                     boltzmann_constant=boltzmann_constant,
                     thermal_wavelength=thermal_wavelength,
+                    geometry_cache=geometry_cache,
                 )
             )
             for atoms in configurations
@@ -546,6 +551,7 @@ def _process_atoms(
     thermal_wavelength: Union[
         float, Sequence[float], np.ndarray
     ] = 1.0,
+    geometry_cache: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Convert one ASE frame to the tensor dictionary stored by GridData."""
 
@@ -744,10 +750,30 @@ def _process_atoms(
 
     # Store only the geometry needed to construct all overlapping periodic
     # environments. Model forwards use these indices to gather from live rho.
-    local_density_index, local_density_positions = get_neighbor_indices(
-        grid_positions=grid_positions,
-        cutoff_grid=cutoff_grid,
+    geometry_key = (cutoff_grid,) + tuple(int(value) for value in grid_size)
+    cached_geometry = (
+        None if geometry_cache is None else geometry_cache.get(geometry_key)
     )
+    if cached_geometry is None:
+        local_density_index, local_density_positions = get_neighbor_indices(
+            grid_positions=grid_positions,
+            cutoff_grid=cutoff_grid,
+        )
+        local_density_index = torch.tensor(
+            local_density_index,
+            dtype=torch.long,
+        )
+        local_density_positions = torch.tensor(
+            local_density_positions,
+            dtype=torch.long,
+        )
+        if geometry_cache is not None:
+            geometry_cache[geometry_key] = (
+                local_density_index,
+                local_density_positions,
+            )
+    else:
+        local_density_index, local_density_positions = cached_geometry
 
     # Use PyTorch's current default floating dtype for physical values and
     # int64 tensors for indices and integer grid coordinates.
@@ -760,12 +786,8 @@ def _process_atoms(
         "grid_spacing": torch.tensor(grid_spacing, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(grid_positions, dtype=torch.long),
-        "local_density_index": torch.tensor(
-            local_density_index, dtype=torch.long
-        ),
-        "local_density_positions": torch.tensor(
-            local_density_positions, dtype=torch.long
-        ),
+        "local_density_index": local_density_index,
+        "local_density_positions": local_density_positions,
     }
 
     if rho is not None:

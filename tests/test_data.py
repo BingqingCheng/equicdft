@@ -646,6 +646,18 @@ class TestGridData(unittest.TestCase):
                 thermal_wavelength=0.0,
             )
 
+    def test_frames_with_the_same_grid_share_neighborhood_geometry(self):
+        data = GridData.from_xyz([self.path, self.path], cutoff_grid=1)
+
+        self.assertIs(
+            data[0]["local_density_index"],
+            data[1]["local_density_index"],
+        )
+        self.assertIs(
+            data[0]["local_density_positions"],
+            data[1]["local_density_positions"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
