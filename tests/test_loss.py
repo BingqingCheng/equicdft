@@ -37,6 +37,16 @@ class _UnstableQuadraticFunctional(nn.Module):
         return {"beta_F_exc": beta_F_exc}
 
 
+class _GridSizeRequiringFunctional(_UnstableQuadraticFunctional):
+    """Energy model emulating the reciprocal branch input requirement."""
+
+    def forward(self, data, compute_c1=False):
+        if "grid_size" not in data:
+            raise KeyError("grid_size")
+        self.last_grid_size = data["grid_size"].detach().clone()
+        return super().forward(data, compute_c1=compute_c1)
+
+
 class TestTensorLoss(unittest.TestCase):
     def test_weighted_loss_and_gradient(self):
         prediction = torch.tensor([1.0, 3.0], requires_grad=True)
@@ -335,6 +345,141 @@ class TestDensityPerturbationStabilityLoss(unittest.TestCase):
                 rtol=0.0,
             )
         )
+
+    def test_fourier_strategy_penalizes_each_mode_and_backpropagates(self):
+        model = _UnstableQuadraticFunctional()
+        batch = self._batch()
+        outputs = model(batch)
+        term = DensityPerturbationStabilityLoss(
+            maximum_density=1.0,
+            relative_amplitudes=(0.05,),
+            perturbation_strategy="fourier",
+            fourier_modes=((1, 0, 0), (2, 0, 0)),
+        )
+
+        value = term(outputs, batch, model=model)
+        value.backward()
+
+        self.assertGreater(value.item(), 0.0)
+        self.assertGreater(model.scale.grad.item(), 0.0)
+        # Two modes, one amplitude, and two perturbation signs are evaluated.
+        self.assertEqual(model.last_rho.shape, (1, 4, 4, 1))
+        perturbed_sums = torch.sum(model.last_rho, dim=-2)
+        self.assertTrue(
+            torch.allclose(
+                perturbed_sums,
+                torch.full_like(perturbed_sums, 2.0),
+            )
+        )
+        self.assertGreaterEqual(model.last_rho.min().item(), 0.0)
+        self.assertLessEqual(model.last_rho.max().item(), 1.0)
+
+    def test_perturbed_model_call_forwards_grid_size(self):
+        batch = self._batch()
+        batch["grid_size"] = torch.tensor([[4, 1, 1]])
+        model = _GridSizeRequiringFunctional()
+        outputs = model(batch)
+        term = DensityPerturbationStabilityLoss(
+            maximum_density=1.0,
+            relative_amplitudes=(0.05,),
+            perturbation_strategy="fourier",
+            fourier_modes=((1, 0, 0), (2, 0, 0)),
+        )
+
+        value = term(outputs, batch, model=model)
+
+        self.assertTrue(torch.isfinite(value).item())
+        self.assertEqual(model.last_grid_size.shape, (1, 4, 3))
+        self.assertTrue(
+            torch.equal(
+                model.last_grid_size,
+                torch.tensor([[[4, 1, 1]] * 4]),
+            )
+        )
+
+    def test_fourier_strategy_applies_all_modes_to_all_fields(self):
+        x, y = torch.meshgrid(torch.arange(4), torch.arange(2), indexing="ij")
+        positions = torch.stack(
+            (x.reshape(-1), y.reshape(-1), torch.zeros(8, dtype=torch.long)),
+            dim=-1,
+        )
+        batch = {
+            "rho": torch.stack(
+                (torch.full((8, 1), 0.4), torch.full((8, 1), 0.6))
+            ),
+            "V_ext": torch.zeros(2, 8, 1),
+            "beta": torch.ones(2),
+            "temperature": torch.ones(2),
+            "grid_spacing": torch.ones(2, 3),
+            "grid_positions": positions.unsqueeze(0).expand(2, -1, -1),
+            "local_density_index": torch.arange(8)
+            .reshape(1, 8, 1)
+            .expand(2, -1, -1),
+        }
+        model = _UnstableQuadraticFunctional()
+        outputs = model(batch)
+        term = DensityPerturbationStabilityLoss(
+            maximum_density=1.0,
+            relative_amplitudes=(0.05,),
+            perturbation_strategy="fourier",
+            fourier_modes=((1, 0, 0), (0, 1, 0)),
+        )
+
+        value = term(outputs, batch, model=model)
+
+        self.assertTrue(torch.isfinite(value).item())
+        self.assertEqual(model.last_rho.shape, (2, 4, 8, 1))
+        expected_sums = torch.tensor([3.2, 4.8]).reshape(2, 1, 1)
+        self.assertTrue(
+            torch.allclose(
+                torch.sum(model.last_rho, dim=-2),
+                expected_sums.expand(-1, 4, -1),
+                atol=1.0e-6,
+            )
+        )
+
+    def test_homogeneous_ideal_fluid_has_unit_fourier_curvature(self):
+        model = _UnstableQuadraticFunctional()
+        model.scale.data.zero_()
+        batch = self._batch()
+        outputs = model(batch)
+
+        below_unit = DensityPerturbationStabilityLoss(
+            maximum_density=1.0,
+            relative_amplitudes=(0.01,),
+            perturbation_strategy="fourier",
+            fourier_modes=((1, 0, 0),),
+            minimum_normalized_curvature=0.9,
+        )(outputs, batch, model=model)
+        above_unit = DensityPerturbationStabilityLoss(
+            maximum_density=1.0,
+            relative_amplitudes=(0.01,),
+            perturbation_strategy="fourier",
+            fourier_modes=((1, 0, 0),),
+            minimum_normalized_curvature=1.1,
+        )(outputs, batch, model=model)
+
+        self.assertEqual(below_unit.item(), 0.0)
+        self.assertGreater(above_unit.item(), 0.0)
+
+    def test_validates_fourier_configuration(self):
+        with self.assertRaisesRegex(ValueError, "perturbation_strategy"):
+            DensityPerturbationStabilityLoss(
+                maximum_density=1.0,
+                perturbation_strategy="unknown",
+            )
+        with self.assertRaisesRegex(ValueError, "zero mode"):
+            DensityPerturbationStabilityLoss(
+                maximum_density=1.0,
+                perturbation_strategy="fourier",
+                fourier_modes=((0, 0, 0),),
+            )
+        with self.assertRaisesRegex(ValueError, "integers"):
+            DensityPerturbationStabilityLoss(
+                maximum_density=1.0,
+                perturbation_strategy="fourier",
+                fourier_modes=((0.5, 0, 0),),
+            )
 
 
 class TestGlobalDensityStabilityLoss(unittest.TestCase):

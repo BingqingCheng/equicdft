@@ -132,10 +132,12 @@ class TensorLoss(nn.Module):
 
 
 class DensityPerturbationStabilityLoss(nn.Module):
-    """Penalize negative curvature around equilibrium fixed-N fields.
+    """Penalize unstable curvature around equilibrium fixed-N fields.
 
-    For every equilibrium field, this term draws a bounded multiplicative
-    random direction tangent to each component particle-number constraint. It
+    For every equilibrium field, this term constructs bounded multiplicative
+    directions tangent to each component particle-number constraint. The
+    default strategy draws one random direction. The ``"fourier"`` strategy
+    instead constructs every requested lattice-commensurate cosine mode. It
     evaluates small symmetric perturbations ``rho +/- delta_rho`` and compares
     their mean
     dimensionless thermodynamic objective with the reference,
@@ -144,9 +146,9 @@ class DensityPerturbationStabilityLoss(nn.Module):
 
     The symmetric second difference cancels the first-order contribution and
     is negative only when the learned functional has negative curvature along
-    the sampled direction. It is divided by particle number and squared
-    relative amplitude so its scale remains comparable between fields and
-    perturbation sizes.
+    the sampled direction. The random strategy scales this difference by
+    particle number and squared relative amplitude. The Fourier strategy
+    instead normalizes it as a projected dimensionless Hessian eigenvalue.
 
     Each component particle number is unchanged, so the reservoir contribution
     cancels exactly: ``Delta(beta*Omega) = Delta(beta*Phi) - sum_i
@@ -163,6 +165,20 @@ class DensityPerturbationStabilityLoss(nn.Module):
     relative_amplitudes
         Small positive relative density amplitudes. A value of 0.05 gives
         changes of order five percent before particle-number projection.
+    perturbation_strategy
+        ``"random"`` for the original random direction or ``"fourier"`` for
+        all directions listed in ``fourier_modes``.
+    fourier_modes
+        Nonzero integer reciprocal-grid indices ``(nx, ny, nz)``. They define
+        ``cos(2*pi*(nx*x/Nx + ny*y/Ny + nz*z/Nz))`` on each periodic grid and
+        are used only by the Fourier strategy. Each cosine is density weighted
+        and centered separately for every field and component, preserving all
+        component particle numbers even for inhomogeneous reference fields.
+    minimum_normalized_curvature
+        Minimum dimensionless projected curvature for Fourier perturbations.
+        For a homogeneous one-component fluid this curvature is the finite-
+        difference estimate of ``S(k)^-1``. The hinge is applied separately
+        to every field, mode, and amplitude before averaging.
     curvature_tolerance
         Allowed negative symmetric curvature per particle before the hinge
         activates.
@@ -184,6 +200,14 @@ class DensityPerturbationStabilityLoss(nn.Module):
             torch.Tensor,
         ],
         relative_amplitudes: Sequence[float] = (0.01, 0.02, 0.05),
+        perturbation_strategy: str = "random",
+        fourier_modes: Sequence[Sequence[int]] = (
+            (1, 0, 0),
+            (1, 1, 0),
+            (1, 1, 1),
+            (2, 0, 0),
+        ),
+        minimum_normalized_curvature: float = 0.0,
         curvature_tolerance: float = 0.0,
         weight: float = 1.0,
         random_seed: int = 17,
@@ -227,15 +251,42 @@ class DensityPerturbationStabilityLoss(nn.Module):
             curvature_tolerance,
             "curvature_tolerance",
         )
+        minimum_normalized_curvature = _finite_nonnegative_scalar(
+            minimum_normalized_curvature,
+            "minimum_normalized_curvature",
+        )
+        if perturbation_strategy not in ("random", "fourier"):
+            raise ValueError(
+                "perturbation_strategy must be 'random' or 'fourier'"
+            )
+        modes_tensor = torch.as_tensor(fourier_modes)
+        if (
+            modes_tensor.ndim != 2
+            or modes_tensor.shape[-1] != 3
+            or modes_tensor.shape[0] == 0
+        ):
+            raise ValueError(
+                "fourier_modes must have shape [n_modes, 3]"
+            )
+        modes_long = modes_tensor.to(torch.long)
+        if not torch.equal(modes_tensor, modes_long.to(modes_tensor.dtype)):
+            raise ValueError("fourier_modes must contain integers")
+        if torch.any(torch.all(modes_long == 0, dim=-1)).item():
+            raise ValueError("fourier_modes must not contain the zero mode")
+        if torch.unique(modes_long, dim=0).shape[0] != modes_long.shape[0]:
+            raise ValueError("fourier_modes must not contain duplicates")
         weight = _finite_nonnegative_scalar(weight, "weight")
         if isinstance(random_seed, bool) or not isinstance(random_seed, int):
             raise TypeError("random_seed must be an integer")
 
         self.weight = weight
         self.curvature_tolerance = curvature_tolerance
+        self.minimum_normalized_curvature = minimum_normalized_curvature
+        self.perturbation_strategy = perturbation_strategy
         self.random_seed = random_seed
         self.register_buffer("maximum_density", density_cap)
         self.register_buffer("relative_amplitudes", amplitudes_tensor)
+        self.register_buffer("fourier_modes", modes_long)
 
     def forward(
         self,
@@ -304,8 +355,24 @@ class DensityPerturbationStabilityLoss(nn.Module):
             raise ValueError(
                 "grid_positions must have shape [n_fields, n_grid, 3]"
             )
-        if self.training:
-            random_field = 2.0 * torch.rand_like(rho_reference) - 1.0
+        if self.perturbation_strategy == "fourier":
+            grid_size = torch.max(grid_positions, dim=1).values + 1
+            phases = 2.0 * torch.pi * torch.sum(
+                grid_positions[:, None, :, :].to(rho_reference.dtype)
+                * self.fourier_modes.to(rho_reference)[None, :, None, :]
+                / grid_size[:, None, None, :].to(rho_reference.dtype),
+                dim=-1,
+            )
+            raw_directions = torch.cos(phases)[..., None].expand(
+                -1,
+                -1,
+                -1,
+                n_types,
+            )
+        elif self.training:
+            raw_directions = (
+                2.0 * torch.rand_like(rho_reference) - 1.0
+            )[:, None, :, :]
         else:
             grid_size = torch.max(grid_positions, dim=1).values + 1
             linear_index = (
@@ -332,36 +399,39 @@ class DensityPerturbationStabilityLoss(nn.Module):
                 / 1073741823.5
                 - 1.0
             )
+            raw_directions = random_field[:, None, :, :]
 
-        # Center the dimensionless random field using rho as its measure. Thus
-        # sum_grid direction = 0 independently for every field and component.
+        # Center every dimensionless field using rho as its measure. Thus
+        # sum_grid direction = 0 independently for every field, direction,
+        # and component.
         # Multiplication by rho prevents a dilute voxel from setting the scale
         # of the complete perturbation. The final normalization makes eps the
         # maximum pointwise fractional density change.
         density_weighted_mean = torch.sum(
-            rho_reference * random_field,
+            rho_reference[:, None, :, :] * raw_directions,
             dim=-2,
-        ) / torch.clamp(target_sums, min=1.0e-12)
+        ) / torch.clamp(target_sums[:, None, :], min=1.0e-12)
         relative_direction = (
-            random_field - density_weighted_mean[:, None, :]
+            raw_directions - density_weighted_mean[:, :, None, :]
         )
         relative_norm = torch.amax(
             torch.abs(relative_direction),
             dim=-2,
         )
         relative_direction = relative_direction / torch.clamp(
-            relative_norm[:, None, :],
+            relative_norm[:, :, None, :],
             min=1.0e-12,
         )
-        direction = rho_reference * relative_direction
+        direction = rho_reference[:, None, :, :] * relative_direction
 
         # Shorten a requested relative amplitude only when needed to keep both
         # signs positive and below maximum_density.
         absolute_direction = torch.abs(direction)
         available_change = torch.clamp(
             torch.minimum(
-                rho_reference,
-                density_cap[None, None, :] - rho_reference,
+                rho_reference[:, None, :, :],
+                density_cap[None, None, None, :]
+                - rho_reference[:, None, :, :],
             ),
             min=0.0,
         )
@@ -373,12 +443,25 @@ class DensityPerturbationStabilityLoss(nn.Module):
         amplitude_limits = 0.95 * torch.amin(amplitude_limits, dim=-2)
         requested_amplitudes = self.relative_amplitudes.to(rho_reference)
         n_amplitudes = requested_amplitudes.numel()
+        n_directions = direction.shape[1]
         actual_amplitudes = torch.minimum(
-            requested_amplitudes[None, :, None],
-            amplitude_limits[:, None, :],
+            requested_amplitudes[None, None, :, None],
+            amplitude_limits[:, :, None, :],
         )
         delta_rho = (
-            actual_amplitudes[:, :, None, :] * direction[:, None, :, :]
+            actual_amplitudes[:, :, :, None, :]
+            * direction[:, :, None, :, :]
+        )
+        delta_rho = delta_rho.reshape(
+            n_fields,
+            n_directions * n_amplitudes,
+            n_grid,
+            n_types,
+        )
+        actual_amplitudes = actual_amplitudes.reshape(
+            n_fields,
+            n_directions * n_amplitudes,
+            n_types,
         )
         rho_plus = rho_reference[:, None, :, :] + delta_rho
         rho_minus = rho_reference[:, None, :, :] - delta_rho
@@ -426,7 +509,8 @@ class DensityPerturbationStabilityLoss(nn.Module):
                 "density perturbations failed to preserve particle numbers"
             )
         rho_perturbed = torch.cat((rho_plus, rho_minus), dim=1)
-        n_perturbations = 2 * n_amplitudes
+        n_candidates = n_directions * n_amplitudes
+        n_perturbations = 2 * n_candidates
 
         # The model supports arbitrary leading batch dimensions. Expand only
         # the fields needed by the energy-only representation/readout pass.
@@ -445,6 +529,13 @@ class DensityPerturbationStabilityLoss(nn.Module):
             .unsqueeze(1)
             .expand(-1, n_perturbations, -1),
         }
+        if "grid_size" in batch:
+            perturbed_data["grid_size"] = (
+                batch["grid_size"]
+                .detach()
+                .unsqueeze(1)
+                .expand(-1, n_perturbations, -1)
+            )
         perturbed_outputs = model(perturbed_data, compute_c1=False)
 
         cell_volume = torch.prod(
@@ -492,11 +583,41 @@ class DensityPerturbationStabilityLoss(nn.Module):
         total_particles = (
             cell_volume * torch.sum(rho_reference, dim=(-2, -1))
         )
-        plus_objective = perturbed_objective[:, :n_amplitudes]
-        minus_objective = perturbed_objective[:, n_amplitudes:]
+        plus_objective = perturbed_objective[:, :n_candidates]
+        minus_objective = perturbed_objective[:, n_candidates:]
         symmetric_objective = 0.5 * (
             plus_objective + minus_objective
         )
+        if self.perturbation_strategy == "fourier":
+            # Delta2(beta*Phi) is the full symmetric second difference. The
+            # external and fixed-N reservoir terms cancel. For a homogeneous
+            # one-component field, rho_bar*Delta2/PerturbationNorm equals the
+            # finite-difference estimate of S(k)^-1. For an inhomogeneous
+            # field it is the corresponding dimensionless projected Hessian.
+            second_difference = 2.0 * (
+                symmetric_objective - reference_objective[:, None]
+            )
+            perturbation_norm = cell_volume[:, None] * torch.sum(
+                delta_rho.square(),
+                dim=(-2, -1),
+            )
+            volume = cell_volume * n_grid
+            mean_total_density = total_particles / volume
+            normalized_curvature = (
+                mean_total_density[:, None] * second_difference
+                / torch.clamp(perturbation_norm, min=1.0e-12)
+            )
+            valid_scale = perturbation_norm > 1.0e-12
+            hinge = torch.where(
+                valid_scale,
+                torch.relu(
+                    self.minimum_normalized_curvature
+                    - normalized_curvature
+                ).square(),
+                torch.zeros_like(normalized_curvature),
+            )
+            return self.weight * torch.mean(hinge)
+
         component_grid_sums = target_sums
         squared_relative_amplitude = torch.sum(
             component_grid_sums[:, None, :] * actual_amplitudes.square(),
