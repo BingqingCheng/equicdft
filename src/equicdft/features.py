@@ -6,7 +6,7 @@ kernel normalization.
 """
 
 from numbers import Integral
-from typing import Mapping, Optional, Union
+from typing import Mapping, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -101,6 +101,11 @@ class CartesianAFeatures(nn.Module):
         Number of Gaussian radial channels. Their positive initial decay
         coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
         squared grid units.
+    radial_exponents
+        Optional positive initial decay coefficients ``alpha_n`` for the
+        Gaussian weights ``exp(-alpha_n * |q|**2)``. When supplied, its length
+        must equal ``n_radial_channels``. ``None`` retains the default
+        logarithmic sequence from 0.5 to 4.0.
     trainable_radial_exponents
         If ``True``, optimize the Gaussian decay coefficients. They are stored
         in logarithmic form so that the resulting ``alpha`` values stay
@@ -130,6 +135,7 @@ class CartesianAFeatures(nn.Module):
         mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
         n_radial_channels: int = 4,
+        radial_exponents: Optional[Sequence[float]] = None,
         trainable_radial_exponents: bool = False,
         n_types: int = 1,
         n_channels: Optional[int] = None,
@@ -197,15 +203,31 @@ class CartesianAFeatures(nn.Module):
                 powers[None, :, axis]
             )
 
-        # Gaussian channel n uses the radial weight
-        # R_n(q) = exp(-alpha_n * |q|**2).
-        # For four radial channels, the alpha values are [0.5, 1, 2, 4].
-        initial_radial_exponents = 2.0 ** torch.linspace(
-            -1.0,
-            2.0,
-            steps=n_radial_channels,
-            dtype=torch.get_default_dtype(),
-        )
+        # Gaussian channel n uses R_n(q) = exp(-alpha_n * |q|**2). The
+        # explicit option makes the effective range a fitting choice rather
+        # than coupling it implicitly to the integer stencil cutoff.
+        if radial_exponents is None:
+            initial_radial_exponents = 2.0 ** torch.linspace(
+                -1.0,
+                2.0,
+                steps=n_radial_channels,
+                dtype=torch.get_default_dtype(),
+            )
+        else:
+            initial_radial_exponents = torch.as_tensor(
+                radial_exponents,
+                dtype=torch.get_default_dtype(),
+            ).detach().clone()
+            if initial_radial_exponents.ndim != 1:
+                raise ValueError("radial_exponents must be one-dimensional")
+            if initial_radial_exponents.numel() != n_radial_channels:
+                raise ValueError(
+                    "radial_exponents must contain n_radial_channels values"
+                )
+            if not torch.all(torch.isfinite(initial_radial_exponents)).item():
+                raise ValueError("radial_exponents must be finite")
+            if not torch.all(initial_radial_exponents > 0.0).item():
+                raise ValueError("radial_exponents must be positive")
         log_radial_exponents = torch.log(initial_radial_exponents)
         if trainable_radial_exponents:
             self.log_radial_exponents = nn.Parameter(log_radial_exponents)

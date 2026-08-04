@@ -185,9 +185,18 @@ class TestCartesianAFeatures(unittest.TestCase):
             cutoff_grid=1,
             max_power=1,
             n_radial_channels=2,
+            radial_exponents=(0.05, 0.2),
             trainable_radial_exponents=True,
         )
         self.assertIsInstance(module.log_radial_exponents, nn.Parameter)
+        self.assertTrue(
+            torch.allclose(
+                module.radial_exponents.detach(),
+                torch.tensor(
+                    [0.05, 0.2], dtype=module.radial_exponents.dtype
+                ),
+            )
+        )
 
         rho = torch.arange(
             1,
@@ -208,7 +217,21 @@ class TestCartesianAFeatures(unittest.TestCase):
             torch.all(torch.isfinite(module.log_radial_exponents.grad))
         )
 
-
+    def test_explicit_radial_exponents_are_validated(self):
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=0,
+                mean_density=1.0,
+                n_radial_channels=2,
+                radial_exponents=(0.1,),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=0,
+                mean_density=1.0,
+                n_radial_channels=2,
+                radial_exponents=(0.1, 0.0),
+            )
 class TestCartesianAFeatureChannelMixing(unittest.TestCase):
     def test_known_linear_map_and_shape(self):
         module = CartesianAFeatures(

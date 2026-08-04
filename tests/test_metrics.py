@@ -159,6 +159,28 @@ class TestMetrics(unittest.TestCase):
         self.assertAlmostEqual(values["mae"].item(), 1.2)
         self.assertAlmostEqual(values["rmse"].item(), math.sqrt(2.0))
 
+    def test_ordered_targets_mix_known_and_inferred_values(self):
+        metrics = Metrics(
+            target_key=("beta_mu", "average_mu"),
+            prediction_key="local_mu",
+            metric_keys=("mae", "rmse"),
+        )
+        outputs = {
+            "local_mu": torch.tensor(
+                [
+                    [[1.0], [3.0]],
+                    [[4.0], [6.0]],
+                ]
+            ),
+            "average_mu": torch.tensor([[2.0], [5.0]]),
+        }
+        batch = {"beta_mu": torch.tensor([[float("nan")], [4.0]])}
+
+        values = metrics(outputs, batch)
+
+        self.assertAlmostEqual(values["mae"].item(), 1.0)
+        self.assertAlmostEqual(values["rmse"].item(), math.sqrt(1.5))
+
     def test_missing_and_empty_metric_masks_are_reported(self):
         metrics = Metrics("target", prediction_key="prediction", mask_key="mask")
         outputs = {"prediction": torch.ones(2)}

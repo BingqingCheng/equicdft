@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
     GridCACEModel,
@@ -78,6 +79,7 @@ class TestGridCACEModel(unittest.TestCase):
         compute_chemical_potential=False,
         rho_min=0.0,
         mean_temperature=1.0,
+        with_bulk=False,
         with_long_range=False,
     ):
         a_features = CartesianAFeatures(
@@ -93,6 +95,12 @@ class TestGridCACEModel(unittest.TestCase):
         )
         long_range_features = None
         long_range_readout = None
+        bulk_readout = None
+        if with_bulk:
+            bulk_readout = BulkReadout(
+                n_types=1,
+                hidden_sizes=(4,),
+            )
         if with_long_range:
             long_range_features = ReciprocalFeatures(
                 radial_exponents=(0.25, 0.5),
@@ -111,6 +119,7 @@ class TestGridCACEModel(unittest.TestCase):
             mean_temperature=mean_temperature,
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
+            bulk_readout=bulk_readout,
             long_range_features=long_range_features,
             long_range_readout=long_range_readout,
             compute_c1=compute_c1,
@@ -150,6 +159,81 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertIsNotNone(final_gradient)
         self.assertTrue(torch.all(torch.isfinite(final_gradient)))
         self.assertGreater(torch.linalg.vector_norm(final_gradient).item(), 0.0)
+
+    def test_bulk_energy_is_combined_before_functional_derivative(self):
+        local_readout = _ConstantPerParticleReadout()
+        with torch.no_grad():
+            local_readout.value.zero_()
+        bulk_readout = BulkReadout(
+            n_types=1,
+            hidden_sizes=(),
+            zero_init=False,
+        )
+        # beta_a_bulk = 2 * rho_bar. Therefore
+        # beta_F_bulk = 2 * V * rho_bar**2 and c1_bulk = -4 * rho_bar.
+        with torch.no_grad():
+            bulk_readout.mlp[-1].weight.copy_(torch.tensor([[0.0, 2.0]]))
+            bulk_readout.mlp[-1].bias.zero_()
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=local_readout,
+            bulk_readout=bulk_readout,
+            grid_spacing=0.5,
+            mean_temperature=1.0,
+            compute_c1=True,
+        )
+        data = self._make_data()
+
+        outputs = model(data)
+
+        mean_density = data["rho"].mean()
+        expected_energy = (
+            model.cell_volume
+            * data["rho"].sum()
+            * 2.0
+            * mean_density
+        )
+        self.assertTrue(
+            torch.allclose(outputs["beta_F_exc_bulk"], expected_energy)
+        )
+        self.assertTrue(
+            torch.allclose(
+                outputs["c1"],
+                -4.0 * mean_density * torch.ones_like(data["rho"]),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"],
+                outputs["beta_F_exc_local"]
+                + outputs["beta_F_exc_bulk"],
+            )
+        )
+
+    def test_bulk_and_long_range_branches_are_independently_additive(self):
+        model = self._make_model(
+            compute_c1=True,
+            with_bulk=True,
+            with_long_range=True,
+        )
+        with torch.no_grad():
+            model.bulk_readout.mlp[-1].bias.fill_(0.3)
+            model.long_range_readout.mlp[-1].bias.fill_(0.2)
+
+        outputs = model(self._make_data())
+
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"],
+                outputs["beta_F_exc_local"]
+                + outputs["beta_F_exc_bulk"]
+                + outputs["beta_F_exc_long_range"],
+            )
+        )
+        outputs["c1"].square().mean().backward()
+        self.assertIsNotNone(model.bulk_readout.mlp[-1].bias.grad)
+        self.assertIsNotNone(model.long_range_readout.mlp[-1].bias.grad)
 
     def test_exposes_persistent_inference_metadata(self):
         model = self._make_model(mean_temperature=1.2)
@@ -198,6 +282,15 @@ class TestGridCACEModel(unittest.TestCase):
         outputs = model(data)
 
         self.assertEqual(outputs["beta_F_exc"].shape, ())
+
+    def test_pre_bulk_pickled_model_state_remains_local_only(self):
+        model = self._make_model()
+        del model.bulk_readout
+
+        outputs = model(self._make_data())
+
+        self.assertFalse(model.has_bulk)
+        self.assertNotIn("beta_F_exc_bulk", outputs)
 
     def test_collects_outputs_and_initializes_density_gradient(self):
         model = self._make_model()

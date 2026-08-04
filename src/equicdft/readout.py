@@ -90,6 +90,79 @@ class LocalReadout(nn.Module):
         return self.mlp(local_features)
 
 
+class BulkReadout(nn.Module):
+    """Map temperature and mean densities to a bulk free energy per particle.
+
+    The state vector contains normalized temperature followed by one
+    normalized mean density per physical component. The output contains one
+    dimensionless bulk excess free energy per particle and component. The
+    model combines it with the particle numbers according to
+
+    ``beta_F_exc_bulk = sum_i N_i * beta_a_exc_bulk_i``.
+
+    Parameters
+    ----------
+    n_types
+        Number of physical density components.
+    hidden_sizes
+        Width of each hidden layer. An empty sequence gives a linear readout.
+    zero_init
+        If true, initialize the final layer to zero. Attaching the branch then
+        leaves a pretrained local model unchanged before fine-tuning.
+    """
+
+    def __init__(
+        self,
+        n_types: int = 1,
+        hidden_sizes: Sequence[int] = (16, 16),
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
+            raise TypeError("n_types must be a positive integer")
+        if int(n_types) < 1:
+            raise ValueError("n_types must be a positive integer")
+        if not isinstance(zero_init, bool):
+            raise TypeError("zero_init must be a boolean")
+
+        self.n_types = int(n_types)
+        self.n_state_features = 1 + self.n_types
+
+        layers = []
+        input_width = self.n_state_features
+        for hidden_width in hidden_sizes:
+            if isinstance(hidden_width, bool) or not isinstance(
+                hidden_width,
+                Integral,
+            ):
+                raise TypeError("hidden_sizes must contain positive integers")
+            hidden_width = int(hidden_width)
+            if hidden_width < 1:
+                raise ValueError(
+                    "hidden_sizes must contain positive integers"
+                )
+            layers.extend((nn.Linear(input_width, hidden_width), nn.SiLU()))
+            input_width = hidden_width
+
+        final_layer = nn.Linear(input_width, self.n_types)
+        if zero_init:
+            nn.init.zeros_(final_layer.weight)
+            nn.init.zeros_(final_layer.bias)
+        layers.append(final_layer)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
+        """Return ``beta_a_exc_bulk`` with shape ``[..., n_types]``."""
+
+        if state_features.shape[-1] != self.n_state_features:
+            raise ValueError(
+                "state_features must end with normalized temperature and "
+                "one mean density per type"
+            )
+        return self.mlp(state_features)
+
+
 class LongRangeReadout(nn.Module):
     """Map thermodynamic state to a reciprocal quadratic kernel.
 

@@ -4,12 +4,46 @@ import numpy as np
 import torch
 
 from equicdft import (
+    BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
     LocalReadout,
     compute_grid_derivative,
     get_neighbor_indices,
 )
+
+
+class TestBulkReadout(unittest.TestCase):
+    def test_zero_initialization_gives_zero_per_particle_energy(self):
+        readout = BulkReadout(n_types=2, hidden_sizes=(4,))
+        state = torch.randn(3, 3)
+
+        output = readout(state)
+
+        self.assertEqual(output.shape, (3, 2))
+        self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+
+    def test_linear_state_mapping(self):
+        readout = BulkReadout(
+            n_types=1,
+            hidden_sizes=(),
+            zero_init=False,
+        )
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(torch.tensor([[2.0, -1.0]]))
+            readout.mlp[-1].bias.fill_(0.5)
+
+        output = readout(torch.tensor([[1.5, 0.25], [0.5, 2.0]]))
+
+        self.assertTrue(
+            torch.equal(output, torch.tensor([[3.25], [-0.5]]))
+        )
+
+    def test_rejects_incompatible_state_width(self):
+        readout = BulkReadout(n_types=2)
+
+        with self.assertRaisesRegex(ValueError, "state_features"):
+            readout(torch.ones(4, 2))
 
 
 class TestLocalReadout(unittest.TestCase):

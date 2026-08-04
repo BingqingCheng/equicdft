@@ -6,6 +6,8 @@ from typing import Dict, Optional, Sequence, Union
 import torch
 from torch import nn
 
+from ._targets import TargetKeys, normalize_target_keys, resolve_target
+
 
 class TensorLoss(nn.Module):
     """Apply one weighted scalar loss to a prediction/target tensor pair.
@@ -17,8 +19,11 @@ class TensorLoss(nn.Module):
     prediction_key
         Key selecting the predicted tensor from the model outputs.
     target_key
-        Key selecting the reference tensor. The training batch is checked
-        first, followed by the model outputs.
+        One key or an ordered sequence of keys selecting the reference
+        tensor. For each key the training batch is checked first, followed by
+        the model outputs. The first available finite value is used. This
+        permits, for example, known ``beta_mu`` targets for GCMC fields and a
+        model-derived ``average_chemical_potential`` fallback for NVT fields.
     weights_key
         Optional key selecting element weights from the model outputs or batch.
         With weights, the default is elementwise squared error followed by a
@@ -39,7 +44,7 @@ class TensorLoss(nn.Module):
         self,
         name: str,
         prediction_key: str,
-        target_key: str,
+        target_key: TargetKeys,
         loss_fn: Optional[nn.Module] = None,
         weights_key: Optional[str] = None,
         weight: float = 1.0,
@@ -48,7 +53,12 @@ class TensorLoss(nn.Module):
 
         self.name = _validate_name(name)
         self.prediction_key = _validate_key(prediction_key, "prediction_key")
-        self.target_key = _validate_key(target_key, "target_key")
+        self.target_keys = normalize_target_keys(target_key)
+        self.target_key = (
+            self.target_keys[0]
+            if len(self.target_keys) == 1
+            else self.target_keys
+        )
         self.weights_key = (
             None
             if weights_key is None
@@ -83,34 +93,14 @@ class TensorLoss(nn.Module):
                     self.prediction_key
                 )
             )
-        if self.target_key in batch:
-            target = batch[self.target_key]
-        elif self.target_key in outputs:
-            target = outputs[self.target_key]
-        else:
-            raise KeyError(
-                "batch and model outputs are missing target '{}'".format(
-                    self.target_key
-                )
-            )
-
         prediction = outputs[self.prediction_key]
-        if prediction.shape != target.shape:
-            component_target_shape = (
-                prediction.shape[:-2] + prediction.shape[-1:]
-            )
-            if target.shape == component_target_shape:
-                target = target.unsqueeze(-2).expand_as(prediction)
-            else:
-                raise ValueError(
-                    "prediction '{}' has shape {}, but target '{}' has shape "
-                    "{}".format(
-                        self.prediction_key,
-                        tuple(prediction.shape),
-                        self.target_key,
-                        tuple(target.shape),
-                    )
-                )
+        target = resolve_target(
+            prediction=prediction,
+            prediction_key=self.prediction_key,
+            target_keys=self.target_keys,
+            outputs=outputs,
+            batch=batch,
+        )
 
         value = self.loss_fn(prediction, target)
         if self.weights_key is None:

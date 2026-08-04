@@ -10,7 +10,7 @@ from torch import nn
 
 from .derivatives import compute_grid_derivative
 from .features import CartesianAFeatures
-from .readout import LocalReadout, LongRangeReadout
+from .readout import BulkReadout, LocalReadout, LongRangeReadout
 from .reciprocal import ReciprocalFeatures
 from .symmetrize import CartesianBFeatures
 
@@ -22,11 +22,15 @@ class GridCACEModel(nn.Module):
 
     ``rho -> A -> B -> (B, T) -> beta_F_exc_local``
 
+    with the optional homogeneous branch
+
+    ``(mean(rho), T) -> beta_F_exc_bulk``
+
     with the optional reciprocal branch
 
     ``rho -> reciprocal features -> beta_F_exc_long_range``.
 
-    The two scalar energies are added before the response calculation,
+    The scalar energy contributions are added before the response calculation,
 
     ``beta_F_exc -> c1 -> c2``,
 
@@ -60,12 +64,20 @@ class GridCACEModel(nn.Module):
         point, before multiplication by the voxel volume.
     ``beta_F_exc``
         Shape ``[...]`` (a scalar without batching). Dimensionless excess free
-        energy for each complete density field. With a reciprocal branch this
-        is the sum of ``beta_F_exc_local`` and
-        ``beta_F_exc_long_range``; otherwise it is the integrated local term.
+        energy for each complete density field. It is the sum of the local,
+        optional bulk, and optional long-range contributions.
     ``beta_F_exc_local``
         Shape ``[...]``. Integral of ``beta_free_energy_density`` over the
-        grid. This key is present when a reciprocal branch is configured.
+        grid. This key is present when a bulk or reciprocal branch is
+        configured.
+    ``beta_bulk_free_energy_per_particle``
+        Shape ``[..., n_types]``. Homogeneous dimensionless excess free energy
+        per particle predicted from normalized temperature and mean densities.
+        This key is present when a bulk branch is configured.
+    ``beta_F_exc_bulk``
+        Shape ``[...]``. Extensive homogeneous contribution
+        ``sum_i N_i beta_a_exc_bulk_i``. This key is present when a bulk branch
+        is configured.
     ``beta_F_exc_long_range``
         Shape ``[...]``. Nonlocal reciprocal-space contribution for each
         complete density field. This key is present when a reciprocal branch
@@ -104,6 +116,11 @@ class GridCACEModel(nn.Module):
     readout
         Module that predicts the per-particle excess free energy from the
         flattened local ``B`` features and normalized scalar temperature.
+    bulk_readout
+        Optional module that maps normalized temperature and mean densities to
+        one homogeneous per-particle excess free energy per component. The
+        model multiplies these values by the corresponding particle numbers
+        and adds the resulting scalar to the local and long-range energies.
     long_range_features
         Optional module that constructs translation-invariant reciprocal
         quadratic features from the complete density field.
@@ -160,6 +177,7 @@ class GridCACEModel(nn.Module):
         compute_c2: bool = False,
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
+        bulk_readout: Optional[BulkReadout] = None,
     ) -> None:
         super().__init__()
 
@@ -171,6 +189,13 @@ class GridCACEModel(nn.Module):
             raise TypeError("compute_local_mu must be a boolean")
         if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
+        if bulk_readout is not None:
+            if not isinstance(bulk_readout, BulkReadout):
+                raise TypeError("bulk_readout must be BulkReadout or None")
+            if bulk_readout.n_types != a_features.n_types:
+                raise ValueError(
+                    "bulk_readout n_types does not match local features"
+                )
         if (long_range_features is None) != (long_range_readout is None):
             raise ValueError(
                 "long_range_features and long_range_readout must be supplied "
@@ -210,6 +235,7 @@ class GridCACEModel(nn.Module):
         self.a_features = a_features
         self.b_features = b_features
         self.readout = readout
+        self.bulk_readout = bulk_readout
         self.long_range_features = long_range_features
         self.long_range_readout = long_range_readout
         self.compute_c1 = compute_c1 or compute_c2
@@ -297,10 +323,17 @@ class GridCACEModel(nn.Module):
             "beta_free_energy_per_particle",
             "beta_free_energy_density",
         ]
-        if self.has_long_range:
+        if self.has_bulk or self.has_long_range:
+            self.model_outputs.append("beta_F_exc_local")
+        if self.has_bulk:
             self.model_outputs.extend(
-                ("beta_F_exc_local", "beta_F_exc_long_range")
+                (
+                    "beta_bulk_free_energy_per_particle",
+                    "beta_F_exc_bulk",
+                )
             )
+        if self.has_long_range:
+            self.model_outputs.append("beta_F_exc_long_range")
         self.model_outputs.append("beta_F_exc")
         if self.compute_c1:
             self.model_outputs.append("c1")
@@ -338,6 +371,12 @@ class GridCACEModel(nn.Module):
         """Whether the model contains the optional reciprocal branch."""
 
         return self.long_range_features is not None
+
+    @property
+    def has_bulk(self) -> bool:
+        """Whether the model contains the optional homogeneous branch."""
+
+        return getattr(self, "bulk_readout", None) is not None
 
     @property
     def cell_volume(self) -> torch.Tensor:
@@ -481,10 +520,17 @@ class GridCACEModel(nn.Module):
             "beta_free_energy_per_particle",
             "beta_free_energy_density",
         ]
-        if self.has_long_range:
+        if self.has_bulk or self.has_long_range:
+            requested_outputs.append("beta_F_exc_local")
+        if self.has_bulk:
             requested_outputs.extend(
-                ("beta_F_exc_local", "beta_F_exc_long_range")
+                (
+                    "beta_bulk_free_energy_per_particle",
+                    "beta_F_exc_bulk",
+                )
             )
+        if self.has_long_range:
+            requested_outputs.append("beta_F_exc_long_range")
         requested_outputs.append("beta_F_exc")
         if compute_c1:
             requested_outputs.append("c1")
@@ -598,18 +644,14 @@ class GridCACEModel(nn.Module):
                 dim=-1,
             )
 
-            if self.has_long_range:
-                if "grid_size" not in data:
-                    raise KeyError(
-                        "long-range evaluation requires data['grid_size']"
-                    )
-                reciprocal_features = self.long_range_features(
-                    rho=data["rho"],
-                    grid_size=data["grid_size"],
-                    grid_spacing=self.grid_spacing,
-                )
+            # The bulk and reciprocal branches use the same global state:
+            # normalized temperature and one normalized mean density per
+            # component. Mean density retains its connection to rho so both
+            # optional energies contribute to functional derivatives.
+            if self.has_bulk or self.has_long_range:
+                mean_density = data["rho"].mean(dim=-2)
                 mean_density_feature = (
-                    data["rho"].mean(dim=-2)
+                    mean_density
                     / self.mean_density.to(
                         device=data["rho"].device,
                         dtype=data["rho"].dtype,
@@ -622,6 +664,43 @@ class GridCACEModel(nn.Module):
                     ),
                     dim=-1,
                 )
+
+            if self.has_bulk:
+                # beta_bulk_free_energy_per_particle has shape
+                # [..., n_types]. Multiplication by particle_numbers makes the
+                # bulk contribution extensive and exactly zero in vacuum.
+                beta_bulk_free_energy_per_particle = self.bulk_readout(
+                    state_features
+                )
+                if beta_bulk_free_energy_per_particle.shape != mean_density.shape:
+                    raise ValueError(
+                        "bulk readout must return one value per field and type"
+                    )
+                particle_numbers = cell_volume * torch.sum(
+                    data["rho"],
+                    dim=-2,
+                )
+                beta_F_exc_bulk = torch.sum(
+                    particle_numbers * beta_bulk_free_energy_per_particle,
+                    dim=-1,
+                )
+                if beta_F_exc_bulk.shape != beta_F_exc_local.shape:
+                    raise ValueError(
+                        "bulk readout must return one scalar energy per field"
+                    )
+            else:
+                beta_F_exc_bulk = torch.zeros_like(beta_F_exc_local)
+
+            if self.has_long_range:
+                if "grid_size" not in data:
+                    raise KeyError(
+                        "long-range evaluation requires data['grid_size']"
+                    )
+                reciprocal_features = self.long_range_features(
+                    rho=data["rho"],
+                    grid_size=data["grid_size"],
+                    grid_spacing=self.grid_spacing,
+                )
                 beta_F_exc_long_range = self.long_range_readout(
                     reciprocal_features,
                     state_features,
@@ -633,7 +712,11 @@ class GridCACEModel(nn.Module):
             else:
                 beta_F_exc_long_range = torch.zeros_like(beta_F_exc_local)
 
-            beta_F_exc = beta_F_exc_local + beta_F_exc_long_range
+            beta_F_exc = (
+                beta_F_exc_local
+                + beta_F_exc_bulk
+                + beta_F_exc_long_range
+            )
 
             outputs = {
                 "beta_free_energy_per_particle": (
@@ -642,8 +725,14 @@ class GridCACEModel(nn.Module):
                 "beta_free_energy_density": beta_free_energy_density,
                 "beta_F_exc": beta_F_exc,
             }
-            if self.has_long_range:
+            if self.has_bulk or self.has_long_range:
                 outputs["beta_F_exc_local"] = beta_F_exc_local
+            if self.has_bulk:
+                outputs["beta_bulk_free_energy_per_particle"] = (
+                    beta_bulk_free_energy_per_particle
+                )
+                outputs["beta_F_exc_bulk"] = beta_F_exc_bulk
+            if self.has_long_range:
                 outputs["beta_F_exc_long_range"] = beta_F_exc_long_range
 
             if compute_c1:

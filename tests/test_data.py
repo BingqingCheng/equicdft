@@ -350,6 +350,27 @@ class TestGridData(unittest.TestCase):
         self.assertNotIn("mu", batch)
         self.assertNotIn("c1", batch)
 
+    def test_mixed_mu_selection_collates_with_nan_sentinel(self):
+        without_mu_path = (
+            Path(self.temporary_directory.name) / "without-mu-mixed.extxyz"
+        )
+        _write_grid(without_mu_path, include_mu=False)
+
+        data = GridData.from_xyz(
+            [without_mu_path, self.path],
+            cutoff_grid=1,
+        )
+        batch = next(iter(DataLoader(data, batch_size=2, shuffle=False)))
+
+        self.assertTrue(torch.isnan(data[0]["mu"]).all())
+        self.assertTrue(torch.isnan(data[0]["beta_mu"]).all())
+        self.assertTrue(torch.isfinite(data[1]["beta_mu"]).all())
+        self.assertEqual(batch["beta_mu"].shape, (2, 1))
+        self.assertTrue(torch.isnan(batch["beta_mu"][0]).all())
+        self.assertTrue(torch.isfinite(batch["beta_mu"][1]).all())
+        self.assertNotIn("c1", data[0])
+        self.assertNotIn("c1", data[1])
+
     def test_nan_mu_placeholder_is_treated_as_absent(self):
         path = Path(self.temporary_directory.name) / "nan-mu.extxyz"
         _write_grid(path, mu_value=float("nan"))

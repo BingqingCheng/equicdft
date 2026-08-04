@@ -161,6 +161,57 @@ class TestWeightedTensorLoss(unittest.TestCase):
         # the empty voxel remains excluded by the same hard mask.
         self.assertAlmostEqual(loss.item(), 11.0 / 3.0, places=6)
 
+    def test_ordered_targets_mix_known_and_inferred_mu(self):
+        prediction = torch.tensor(
+            [
+                [[1.0], [3.0]],
+                [[4.0], [6.0]],
+            ],
+            requires_grad=True,
+        )
+        outputs = {
+            "local_chemical_potential": prediction,
+            "average_chemical_potential": torch.tensor([[2.0], [5.0]]),
+            "chemical_potential_weights": torch.ones_like(prediction),
+        }
+        batch = {"beta_mu": torch.tensor([[float("nan")], [4.0]])}
+        term = TensorLoss(
+            name="local_chemical_potential",
+            prediction_key="local_chemical_potential",
+            target_key=("beta_mu", "average_chemical_potential"),
+            weights_key="chemical_potential_weights",
+        )
+
+        loss = term(outputs, batch)
+        loss.backward()
+
+        # The NVT row falls back to its inferred mean [2, 2], while the GCMC
+        # row uses the known beta_mu [4, 4].
+        self.assertAlmostEqual(loss.item(), 1.5, places=6)
+        self.assertTrue(torch.all(torch.isfinite(prediction.grad)))
+
+    def test_ordered_targets_require_a_complete_finite_fallback(self):
+        prediction = torch.ones(1, 2, 1)
+        term = TensorLoss(
+            "mu",
+            "local_mu",
+            ("beta_mu", "average_mu"),
+        )
+
+        with self.assertRaisesRegex(KeyError, "target candidates"):
+            term({"local_mu": prediction}, {})
+        with self.assertRaisesRegex(ValueError, "unresolved nonfinite"):
+            term(
+                {"local_mu": prediction},
+                {"beta_mu": torch.tensor([[float("nan")]])},
+            )
+
+    def test_ordered_target_configuration_is_validated(self):
+        for target_key in ((), ("beta_mu", "beta_mu"), ("beta_mu", "")):
+            with self.subTest(target_key=target_key):
+                with self.assertRaisesRegex(ValueError, "target_key"):
+                    TensorLoss("mu", "local_mu", target_key)
+
     def test_zero_total_element_weight_is_rejected(self):
         outputs, batch = self._example()
         outputs["chemical_potential_weights"].zero_()

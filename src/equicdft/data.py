@@ -81,7 +81,8 @@ class GridData(dict):
         temperature                 scalar
         beta                        scalar
         mu                          [n_types] (optional)
-        beta_mu                     [n_types] (if mu exists)
+        beta_mu                     [n_types] (if mu exists; NaN for frames
+                                    without mu in a mixed-mu selection)
         n_types                     scalar
         thermal_wavelength          [n_types] (if V_ext exists or built directly)
         grid_spacing                [3]
@@ -235,6 +236,30 @@ class GridData(dict):
             for frame in data:
                 frame.pop("c1_plus_beta_mu", None)
                 frame.pop("c1", None)
+        elif any("c1" not in frame for frame in data):
+            for frame in data:
+                frame.pop("c1", None)
+
+        # A combined NVT/GCMC selection has a known chemical potential only
+        # for its GCMC frames. Default PyTorch collation requires identical
+        # dictionary keys, so retain beta_mu for the complete selection and
+        # mark unavailable per-frame values by NaN. Ordered target fallback in
+        # TensorLoss and Metrics then substitutes a later target only for
+        # those entries. A dataset with no chemical potentials remains
+        # unchanged and keeps these optional keys absent.
+        has_beta_mu = ["beta_mu" in frame for frame in data]
+        if any(has_beta_mu) and not all(has_beta_mu):
+            for frame, available in zip(data, has_beta_mu):
+                if available:
+                    continue
+                n_types = int(frame["n_types"].item())
+                missing_mu = torch.full(
+                    (n_types,),
+                    float("nan"),
+                    dtype=frame["temperature"].dtype,
+                )
+                frame["mu"] = missing_mu.clone()
+                frame["beta_mu"] = missing_mu
         if resolved_grid_info is not None:
             for frame in data:
                 _validate_frame_grid_info(frame, resolved_grid_info)

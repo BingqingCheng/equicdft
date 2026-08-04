@@ -5,6 +5,8 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from ._targets import TargetKeys, normalize_target_keys, resolve_target
+
 
 SUPPORTED_METRICS = (
     "mae",
@@ -99,9 +101,10 @@ class Metrics(nn.Module):
     Parameters
     ----------
     target_key
-        Key selecting the reference tensor. The batch is checked first,
-        followed by the model outputs. A componentwise target without the
-        prediction's grid axis is expanded over that axis.
+        One key or an ordered sequence of reference keys. For each key the
+        batch is checked first, followed by model outputs. The first available
+        finite value is used. A componentwise target without the prediction's
+        grid axis is expanded over that axis.
     prediction_key
         Key selecting the predicted tensor from the model outputs. Defaults to
         ``target_key``.
@@ -124,7 +127,7 @@ class Metrics(nn.Module):
 
     def __init__(
         self,
-        target_key: str,
+        target_key: TargetKeys,
         prediction_key: Optional[str] = None,
         name: Optional[str] = None,
         metric_keys: Sequence[str] = (
@@ -138,13 +141,19 @@ class Metrics(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.target_key = _nonempty_string(target_key, "target_key")
+        self.target_keys = normalize_target_keys(target_key)
+        self.target_key = (
+            self.target_keys[0]
+            if len(self.target_keys) == 1
+            else self.target_keys
+        )
+        default_target_name = self.target_keys[0]
         self.prediction_key = _nonempty_string(
-            target_key if prediction_key is None else prediction_key,
+            default_target_name if prediction_key is None else prediction_key,
             "prediction_key",
         )
         self.name = _nonempty_string(
-            target_key if name is None else name,
+            default_target_name if name is None else name,
             "name",
         )
         self.mask_key = (
@@ -232,34 +241,14 @@ class Metrics(nn.Module):
                     self.prediction_key
                 )
             )
-        if self.target_key in batch:
-            target = batch[self.target_key]
-        elif self.target_key in outputs:
-            target = outputs[self.target_key]
-        else:
-            raise KeyError(
-                "batch and model outputs are missing target '{}'".format(
-                    self.target_key
-                )
-            )
-
         prediction = outputs[self.prediction_key]
-        if prediction.shape != target.shape:
-            component_target_shape = (
-                prediction.shape[:-2] + prediction.shape[-1:]
-            )
-            if target.shape == component_target_shape:
-                target = target.unsqueeze(-2).expand_as(prediction)
-            else:
-                raise ValueError(
-                    "prediction '{}' has shape {}, but target '{}' has shape "
-                    "{}".format(
-                        self.prediction_key,
-                        tuple(prediction.shape),
-                        self.target_key,
-                        tuple(target.shape),
-                    )
-                )
+        target = resolve_target(
+            prediction=prediction,
+            prediction_key=self.prediction_key,
+            target_keys=self.target_keys,
+            outputs=outputs,
+            batch=batch,
+        )
 
         if self.mask_key is not None:
             if self.mask_key in outputs:
