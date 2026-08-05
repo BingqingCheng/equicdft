@@ -89,10 +89,10 @@ class CartesianAFeatures(nn.Module):
     where ``j`` runs over the canonically ordered integer stencil. With
     ``radial_basis="gaussian"``,
     ``w[n, j] = exp(-alpha[n] * r_grid[j]^2)``. With
-    ``radial_basis="none"``, there is one channel with
-    ``w[0, j] = 1 / N_stencil``. The latter gives every stencil point equal
-    relative weight, keeps the scalar moment on the density scale, and
-    resolves the environment only through its Cartesian polynomial moments.
+    ``radial_basis="none"``, there is one channel with equal weight on all
+    included neighbors. When ``separate_center=True``, the central point is
+    excluded from every A channel and supplied directly to the local readout
+    by the model.
     Grid-volume quadrature is deliberately left to the free-energy readout
     rather than included in these local descriptors.
 
@@ -105,8 +105,7 @@ class CartesianAFeatures(nn.Module):
         Maximum total Cartesian power ``a + b + c``.
     radial_basis
         Radial representation. ``"gaussian"`` uses Gaussian decay channels;
-        ``"none"`` uses one constant, discrete-sum-normalized channel and
-        therefore only Cartesian polynomial moments.
+        ``"none"`` uses one constant, discrete-sum-normalized channel.
     n_radial_channels
         Number of Gaussian radial channels. Their positive initial decay
         coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
@@ -120,6 +119,10 @@ class CartesianAFeatures(nn.Module):
         If ``True``, optimize the Gaussian decay coefficients. They are stored
         in logarithmic form so that the resulting ``alpha`` values stay
         positive. If ``False``, they remain fixed model buffers.
+    separate_center
+        If ``True``, remove the zero offset from all neighbor channels. The
+        model then concatenates the normalized central density to the
+        invariant neighbor features exactly once.
     n_types
         Number of physical density components in the input field.
     n_channels
@@ -148,6 +151,7 @@ class CartesianAFeatures(nn.Module):
         n_radial_channels: int = 4,
         radial_exponents: Optional[Sequence[float]] = None,
         trainable_radial_exponents: bool = False,
+        separate_center: bool = False,
         n_types: int = 1,
         n_channels: Optional[int] = None,
     ) -> None:
@@ -169,6 +173,8 @@ class CartesianAFeatures(nn.Module):
             raise ValueError("n_radial_channels must be a positive integer")
         if not isinstance(trainable_radial_exponents, bool):
             raise TypeError("trainable_radial_exponents must be a boolean")
+        if not isinstance(separate_center, bool):
+            raise TypeError("separate_center must be a boolean")
         if isinstance(n_types, bool) or not isinstance(n_types, Integral):
             raise TypeError("n_types must be a positive integer")
         n_types = int(n_types)
@@ -226,6 +232,11 @@ class CartesianAFeatures(nn.Module):
         # undamped polynomial representation has exactly one radial channel
         # and no radial parameters. Its constant weight is normalized by the
         # stencil size so products of scalar moments remain well conditioned.
+        center_mask = squared_distances == 0
+        neighbor_mask = ~center_mask if separate_center else torch.ones_like(
+            center_mask
+        )
+
         if radial_basis == "gaussian":
             if radial_exponents is None:
                 initial_radial_exponents = 2.0 ** torch.linspace(
@@ -278,6 +289,7 @@ class CartesianAFeatures(nn.Module):
         self.radial_basis = radial_basis
         self.n_radial_channels = n_radial_channels
         self.trainable_radial_exponents = trainable_radial_exponents
+        self.separate_center = separate_center
         self.n_types = n_types
         self.n_channels = n_channels
         self.n_output_channels = n_types if n_channels is None else n_channels
@@ -294,6 +306,9 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("powers", powers)
         self.register_buffer("monomial_values", monomial_values)
         self.register_buffer("mean_density", mean_density_tensor)
+        # This deterministic constructor product is not fitted state. Keeping
+        # it out of state_dict lets older checkpoints load strictly.
+        self.register_buffer("neighbor_mask", neighbor_mask, persistent=False)
 
     @property
     def radial_exponents(self) -> Optional[torch.Tensor]:
@@ -354,10 +369,18 @@ class CartesianAFeatures(nn.Module):
                 -self.squared_distances[:, None]
                 * self.radial_exponents[None, :]
             )
+            if getattr(self, "separate_center", False):
+                radial_values = radial_values * self.neighbor_mask[:, None]
         else:
             radial_values = self.squared_distances.new_ones(
                 (self.squared_distances.shape[0], 1)
-            ) / self.squared_distances.shape[0]
+            )
+            if getattr(self, "separate_center", False):
+                radial_values = radial_values * self.neighbor_mask[:, None]
+            radial_values = radial_values / torch.clamp(
+                torch.sum(radial_values),
+                min=1.0,
+            )
         basis_values = (
             radial_values[:, :, None] * self.monomial_values[:, None, :]
         )

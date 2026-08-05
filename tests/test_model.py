@@ -981,6 +981,37 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertIsNotNone(mixing_gradient)
         self.assertTrue(torch.all(torch.isfinite(mixing_gradient)))
 
+    def test_separate_center_is_added_once_to_local_readout(self):
+        data = self._make_data()
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="none",
+            n_radial_channels=1,
+            separate_center=True,
+        )
+        b_features = CartesianBFeatures(
+            max_power=1,
+            max_product_order=2,
+        )
+        readout = LocalReadout(n_types=1, hidden_sizes=(8,))
+        model = GridCACEModel(
+            a_features,
+            b_features,
+            [readout],
+            grid_spacing=0.5,
+        )
+
+        outputs = model(data)
+        expected_input_width = (
+            a_features.n_radial_channels * b_features.n_features + 2
+        )
+        self.assertEqual(readout.mlp[0].in_features, expected_input_width)
+        self.assertEqual(outputs["c1"].shape, data["rho"].shape)
+        outputs["c1"].square().mean().backward()
+        self.assertTrue(torch.all(torch.isfinite(data["rho"].grad)))
+
 
 if __name__ == "__main__":
     unittest.main()

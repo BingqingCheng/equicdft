@@ -389,18 +389,25 @@ class GridCACEModel(nn.Module):
                 item.requires_local_features for item in self.readout
             ):
                 # Construct the shared invariant local representation once.
-                # Any readout that requests local features receives the same
-                # flattened B features and normalized temperature.
+                # When requested, the normalized center density is supplied
+                # explicitly and excluded from every neighbor A channel.
                 A = self.a_features(data)
                 B = self.b_features(A)
                 B_flat = B.flatten(start_dim=-3)
                 temperature_feature = normalized_temperature[
                     ..., None, None
                 ].expand(*B_flat.shape[:-1], 1)
-                local_features = torch.cat(
-                    (B_flat, temperature_feature),
-                    dim=-1,
-                )
+                feature_blocks = []
+                if getattr(self.a_features, "separate_center", False):
+                    feature_blocks.append(
+                        rho
+                        / self.mean_density.to(
+                            device=rho.device,
+                            dtype=rho.dtype,
+                        )
+                    )
+                feature_blocks.extend((B_flat, temperature_feature))
+                local_features = torch.cat(feature_blocks, dim=-1)
 
             # Construct the shared global state only when requested. Mean
             # density retains its connection to rho, so energy readouts using

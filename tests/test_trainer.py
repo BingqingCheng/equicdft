@@ -38,6 +38,7 @@ class TestTrainer(unittest.TestCase):
         checkpoint_dir=None,
         scheduler=False,
         log_dir=None,
+        early_stopping_patience=None,
     ):
         loss = Loss(
             [
@@ -67,6 +68,7 @@ class TestTrainer(unittest.TestCase):
             checkpoint_dir=checkpoint_dir,
             checkpoint_interval=1,
             save_best=True,
+            early_stopping_patience=early_stopping_patience,
             log_dir=log_dir,
         )
 
@@ -145,6 +147,7 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("optimizer_state_dict", checkpoint)
         self.assertIn("scheduler_state_dict", checkpoint)
         self.assertIn("best_valid_loss", checkpoint)
+        self.assertIn("epochs_without_improvement", checkpoint)
         self.assertIn("torch_rng_state", checkpoint)
         self.assertIn("train_loader_generator_state", checkpoint)
         self.assertEqual(len(checkpoint["history"]), 2)
@@ -290,6 +293,14 @@ class TestTrainer(unittest.TestCase):
                 Loss([TensorLoss("target", "prediction", "target")]),
                 checkpoint_interval=0,
             )
+        for invalid_patience in (0, -1, True, 1.5):
+            with self.subTest(invalid_patience=invalid_patience):
+                with self.assertRaises(ValueError):
+                    Trainer(
+                        _LinearDictionaryModel(),
+                        Loss([TensorLoss("target", "prediction", "target")]),
+                        early_stopping_patience=invalid_patience,
+                    )
 
         trainer = self._make_trainer()
         with self.assertRaisesRegex(ValueError, "train_loader"):
@@ -299,6 +310,42 @@ class TestTrainer(unittest.TestCase):
                 epochs=1,
                 verbose=False,
             )
+
+    def test_early_stopping_and_resume_preserve_patience(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_dir = Path(temporary_directory) / "checkpoints"
+            trainer = self._make_trainer(
+                checkpoint_dir=checkpoint_dir,
+                early_stopping_patience=2,
+            )
+            trainer.optimizer_args = {"lr": 0.0}
+            train_loader = DataLoader(_dataset([1, 2]), batch_size=2)
+            valid_loader = DataLoader(_dataset([3, 4]), batch_size=2)
+            history = trainer.fit(
+                train_loader,
+                valid_loader,
+                epochs=10,
+                verbose=False,
+            )
+            self.assertEqual(len(history), 3)
+            self.assertEqual(trainer.epochs_without_improvement, 2)
+
+            resumed = self._make_trainer(
+                checkpoint_dir=checkpoint_dir,
+                early_stopping_patience=2,
+            )
+            resumed.optimizer_args = {"lr": 0.0}
+            resumed.load_checkpoint(
+                checkpoint_dir / "last.pt",
+                train_loader=train_loader,
+            )
+            resumed.fit(
+                train_loader,
+                valid_loader,
+                epochs=5,
+                verbose=False,
+            )
+            self.assertEqual(len(resumed.history), 3)
 
     def test_epoch_summary_uses_aligned_tables(self):
         record = {

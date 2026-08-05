@@ -129,6 +129,7 @@ trainer = Trainer(
     checkpoint_dir=None,
     checkpoint_interval=10,
     save_best=True,
+    early_stopping_patience=5,
 )
 history = trainer.fit(
     train_loader,
@@ -143,6 +144,9 @@ Set `scheduler_cls` and `scheduler_args` to use an epoch scheduler. A
 schedulers are stepped once per epoch. Setting `checkpoint_dir` writes
 periodic `checkpoint_epoch_XXXX.pt` files and updates `last.pt`; with
 `save_best=True`, it also maintains `best.pt`.
+`early_stopping_patience` optionally stops after the requested number of
+consecutive epochs without validation-loss improvement. The patience counter
+is stored in checkpoints and therefore continues correctly after a restart.
 
 For manual preprocessing, compute one mean density per frame with:
 
@@ -219,6 +223,26 @@ Set `radial_basis="none"` and `n_radial_channels=1` to replace the Gaussian
 channels by one equal-weight neighborhood average. The resulting descriptors
 use only Cartesian polynomial moments; the constant radial weight is divided
 by the stencil size so that invariant products remain well scaled.
+
+With `separate_center=True`, the zero offset is removed from every radial
+channel and `GridCACEModel` inserts `rho / mean_density` exactly once before
+the invariant neighbor features:
+
+```python
+a_features = CartesianAFeatures(
+    mean_density=mean_density,
+    cutoff_grid=3,
+    max_power=2,
+    radial_basis="none",
+    n_radial_channels=1,
+    separate_center=True,
+    n_types=n_types,
+)
+```
+
+Center separation is opt-in. The default retains the original basis with the
+center included, and previously saved checkpoints and full models remain
+loadable.
 
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
 Both `rho` and `beta` passed to `GridCACEModel` retain their physical values;

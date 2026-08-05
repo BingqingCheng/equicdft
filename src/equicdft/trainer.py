@@ -62,6 +62,10 @@ class Trainer(nn.Module):
     save_best
         When checkpointing is enabled, update ``best.pt`` whenever validation
         loss improves. ``last.pt`` is updated after every epoch regardless.
+    early_stopping_patience
+        Optional number of consecutive epochs without validation-loss
+        improvement allowed before stopping. ``None`` disables early
+        stopping. The counter is preserved across checkpoint restarts.
     log_dir
         Optional directory for ``history.csv`` and ``training.log``.
         ``history.csv`` is atomically reconstructed from the complete trainer
@@ -81,6 +85,7 @@ class Trainer(nn.Module):
         checkpoint_dir: Optional[Union[str, Path]] = None,
         checkpoint_interval: int = 1,
         save_best: bool = True,
+        early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
@@ -96,6 +101,15 @@ class Trainer(nn.Module):
             raise ValueError("checkpoint_interval must be a positive integer")
         if not isinstance(save_best, bool):
             raise TypeError("save_best must be a boolean")
+        if early_stopping_patience is not None:
+            if (
+                isinstance(early_stopping_patience, bool)
+                or not isinstance(early_stopping_patience, int)
+                or early_stopping_patience <= 0
+            ):
+                raise ValueError(
+                    "early_stopping_patience must be a positive integer or None"
+                )
 
         metrics = list(metrics)
         if any(not isinstance(metric, Metrics) for metric in metrics):
@@ -114,6 +128,7 @@ class Trainer(nn.Module):
         self.device = torch.device(device)
         self.checkpoint_interval = checkpoint_interval
         self.save_best = save_best
+        self.early_stopping_patience = early_stopping_patience
 
         self.checkpoint_dir = None
         if checkpoint_dir is not None:
@@ -133,6 +148,7 @@ class Trainer(nn.Module):
         self.scheduler = None
         self.history = []
         self.best_valid_loss = math.inf
+        self.epochs_without_improvement = 0
         self._train_loader_generator = None
         self.to(self.device)
 
@@ -156,6 +172,16 @@ class Trainer(nn.Module):
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization(train_loader)
         start_epoch = len(self.history) + 1
+
+        if self._early_stopping_reached():
+            self.log_message(
+                "Early stopping already reached after {} epochs without "
+                "validation-loss improvement.".format(
+                    self.epochs_without_improvement
+                ),
+                display=verbose,
+            )
+            return self.history
 
         for epoch in range(start_epoch, start_epoch + epochs):
             train_losses, train_metrics = self._run_loader(
@@ -185,6 +211,16 @@ class Trainer(nn.Module):
             self._write_history_csv()
             if verbose and epoch % print_interval == 0:
                 self.log_message(format_record(record))
+            if self._early_stopping_reached():
+                self.log_message(
+                    "Early stopping at epoch {} after {} epochs without "
+                    "validation-loss improvement.".format(
+                        epoch,
+                        self.epochs_without_improvement,
+                    ),
+                    display=verbose,
+                )
+                break
 
         return self.history
 
@@ -207,6 +243,7 @@ class Trainer(nn.Module):
             "record": record,
             "history": self.history,
             "best_valid_loss": self.best_valid_loss,
+            "epochs_without_improvement": self.epochs_without_improvement,
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state_all": (
                 torch.cuda.get_rng_state_all()
@@ -299,6 +336,21 @@ class Trainer(nn.Module):
             self.best_valid_loss = min(
                 record["valid_losses"]["total"] for record in history
             )
+        if "epochs_without_improvement" in checkpoint:
+            self.epochs_without_improvement = int(
+                checkpoint["epochs_without_improvement"]
+            )
+        else:
+            best_loss = math.inf
+            epochs_without_improvement = 0
+            for record in history:
+                valid_loss = record["valid_losses"]["total"]
+                if valid_loss < best_loss:
+                    best_loss = valid_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+            self.epochs_without_improvement = epochs_without_improvement
 
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
@@ -431,6 +483,9 @@ class Trainer(nn.Module):
         improved = valid_loss < self.best_valid_loss
         if improved:
             self.best_valid_loss = valid_loss
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
         if self.checkpoint_dir is None:
             return
 
@@ -444,6 +499,15 @@ class Trainer(nn.Module):
         if is_best:
             self.save_checkpoint(self.checkpoint_dir / "best.pt", record)
         self.save_checkpoint(self.checkpoint_dir / "last.pt", record)
+
+    def _early_stopping_reached(self) -> bool:
+        """Return whether the configured validation patience is exhausted."""
+
+        return (
+            self.early_stopping_patience is not None
+            and self.epochs_without_improvement
+            >= self.early_stopping_patience
+        )
 
     def _move_optimizer_state_to_device(self) -> None:
         """Move restored optimizer tensors onto the configured device."""

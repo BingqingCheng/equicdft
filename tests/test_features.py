@@ -239,6 +239,66 @@ class TestCartesianAFeatures(unittest.TestCase):
                 radial_basis="unknown",
             )
 
+    def test_separate_center_removes_it_from_neighbor_moments(self):
+        module = CartesianAFeatures(
+            mean_density=2.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="none",
+            n_radial_channels=1,
+            separate_center=True,
+        )
+        rho = torch.arange(
+            1,
+            8,
+            dtype=module.monomial_values.dtype,
+        ).reshape(7, 1)
+        local_density_index = torch.arange(7).repeat(7, 1)
+        reference = module(
+            {
+                "rho": rho,
+                "local_density_index": local_density_index,
+            }
+        )
+        changed_center = rho.clone()
+        changed_center[0] = 1000.0
+        changed = module(
+            {
+                "rho": changed_center,
+                "local_density_index": local_density_index,
+            }
+        )
+
+        self.assertTrue(module.separate_center)
+        self.assertFalse(module.neighbor_mask[0].item())
+        self.assertTrue(torch.allclose(reference, changed))
+        self.assertEqual(int(module.neighbor_mask.sum()), 6)
+
+    def test_center_flag_does_not_break_legacy_checkpoints_or_models(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=0,
+            radial_basis="none",
+            n_radial_channels=1,
+        )
+        state_keys = set(module.state_dict())
+        self.assertNotIn("neighbor_mask", state_keys)
+
+        rho = torch.arange(1.0, 8.0).reshape(7, 1)
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(7).repeat(7, 1),
+        }
+        expected = module(data)
+
+        # Mimic an older torch.save(model) object, which has neither the flag
+        # nor its deterministic center mask.
+        del module.separate_center
+        del module._buffers["neighbor_mask"]
+        actual = module(data)
+        self.assertTrue(torch.allclose(actual, expected))
+
     def test_mean_density_must_be_positive_scalar(self):
         with self.assertRaises(ValueError):
             CartesianAFeatures(max_power=0, mean_density=0.0)
