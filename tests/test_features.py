@@ -173,6 +173,72 @@ class TestCartesianAFeatures(unittest.TestCase):
             )
         )
 
+    def test_undamped_polynomial_features(self):
+        module = CartesianAFeatures(
+            mean_density=2.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="none",
+            n_radial_channels=1,
+        )
+        self.assertEqual(module.radial_basis, "none")
+        self.assertIsNone(module.radial_exponents)
+        self.assertFalse(hasattr(module, "log_radial_exponents"))
+
+        rho = torch.arange(
+            1,
+            8,
+            dtype=module.monomial_values.dtype,
+        ).reshape(7, 1)
+        local_density_index = torch.arange(7).repeat(7, 1)
+        features = module(
+            {
+                "rho": rho,
+                "local_density_index": local_density_index,
+            }
+        )
+
+        # The scalar moment averages the center and all six neighbors. The
+        # vector moments retain the canonical signed stencil geometry.
+        expected = torch.einsum(
+            "jt,jk->kt",
+            rho / module.mean_density,
+            module.monomial_values,
+        ) / module.local_density_positions.shape[0]
+        self.assertEqual(features.shape, (7, 1, 4, 1))
+        self.assertTrue(torch.allclose(features[0, 0], expected))
+
+    def test_undamped_polynomial_options_are_validated(self):
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="none",
+                n_radial_channels=2,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="none",
+                n_radial_channels=1,
+                radial_exponents=(1.0,),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="none",
+                n_radial_channels=1,
+                trainable_radial_exponents=True,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="unknown",
+            )
+
     def test_mean_density_must_be_positive_scalar(self):
         with self.assertRaises(ValueError):
             CartesianAFeatures(max_power=0, mean_density=0.0)

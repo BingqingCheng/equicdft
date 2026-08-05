@@ -1,8 +1,9 @@
 """Cartesian moment features for density fields on fixed integer grids.
 
-The angular basis uses integer stencil coordinates. Gaussian radial functions
-are evaluated using squared integer-grid distances without an additional
-kernel normalization.
+The angular basis uses integer stencil coordinates. The optional Gaussian
+radial basis is evaluated using squared integer-grid distances without an
+additional kernel normalization. A purely polynomial representation can
+instead use one undamped radial channel.
 """
 
 from numbers import Integral
@@ -79,16 +80,21 @@ def _make_powers(max_power: int) -> torch.Tensor:
 class CartesianAFeatures(nn.Module):
     """Compute normalized Cartesian ``A`` features on a fixed stencil.
 
-    For central grid point ``g``, Gaussian channel ``n``, monomial
+    For central grid point ``g``, radial channel ``n``, monomial
     ``k = (a, b, c)``, and component ``t``, the module computes
 
     ``A[g, n, k, t] = sum_j (rho[g, j, t] / mean_density)``
     ``* w[n, j] * x_j^a * y_j^b * z_j^c``,
 
-    where ``j`` runs over the canonically ordered integer stencil and
-    ``w[n, j] = exp(-alpha[n] * r_grid[j]^2)``. Grid-volume quadrature is
-    deliberately left to the free-energy readout rather than included in
-    these local descriptors.
+    where ``j`` runs over the canonically ordered integer stencil. With
+    ``radial_basis="gaussian"``,
+    ``w[n, j] = exp(-alpha[n] * r_grid[j]^2)``. With
+    ``radial_basis="none"``, there is one channel with
+    ``w[0, j] = 1 / N_stencil``. The latter gives every stencil point equal
+    relative weight, keeps the scalar moment on the density scale, and
+    resolves the environment only through its Cartesian polynomial moments.
+    Grid-volume quadrature is deliberately left to the free-energy readout
+    rather than included in these local descriptors.
 
     Parameters
     ----------
@@ -97,10 +103,14 @@ class CartesianAFeatures(nn.Module):
         three, matching :class:`equicdft.data.GridData`.
     max_power
         Maximum total Cartesian power ``a + b + c``.
+    radial_basis
+        Radial representation. ``"gaussian"`` uses Gaussian decay channels;
+        ``"none"`` uses one constant, discrete-sum-normalized channel and
+        therefore only Cartesian polynomial moments.
     n_radial_channels
         Number of Gaussian radial channels. Their positive initial decay
         coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
-        squared grid units.
+        squared grid units. Must equal one when ``radial_basis="none"``.
     radial_exponents
         Optional positive initial decay coefficients ``alpha_n`` for the
         Gaussian weights ``exp(-alpha_n * |q|**2)``. When supplied, its length
@@ -134,6 +144,7 @@ class CartesianAFeatures(nn.Module):
         max_power: int,
         mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
+        radial_basis: str = "gaussian",
         n_radial_channels: int = 4,
         radial_exponents: Optional[Sequence[float]] = None,
         trainable_radial_exponents: bool = False,
@@ -141,6 +152,12 @@ class CartesianAFeatures(nn.Module):
         n_channels: Optional[int] = None,
     ) -> None:
         super().__init__()
+
+        if not isinstance(radial_basis, str):
+            raise TypeError("radial_basis must be 'gaussian' or 'none'")
+        radial_basis = radial_basis.lower()
+        if radial_basis not in ("gaussian", "none"):
+            raise ValueError("radial_basis must be 'gaussian' or 'none'")
 
         if isinstance(n_radial_channels, bool) or not isinstance(
             n_radial_channels,
@@ -205,40 +222,60 @@ class CartesianAFeatures(nn.Module):
 
         # Gaussian channel n uses R_n(q) = exp(-alpha_n * |q|**2). The
         # explicit option makes the effective range a fitting choice rather
-        # than coupling it implicitly to the integer stencil cutoff.
-        if radial_exponents is None:
-            initial_radial_exponents = 2.0 ** torch.linspace(
-                -1.0,
-                2.0,
-                steps=n_radial_channels,
-                dtype=torch.get_default_dtype(),
-            )
-        else:
-            initial_radial_exponents = torch.as_tensor(
-                radial_exponents,
-                dtype=torch.get_default_dtype(),
-            ).detach().clone()
-            if initial_radial_exponents.ndim != 1:
-                raise ValueError("radial_exponents must be one-dimensional")
-            if initial_radial_exponents.numel() != n_radial_channels:
-                raise ValueError(
-                    "radial_exponents must contain n_radial_channels values"
+        # than coupling it implicitly to the integer stencil cutoff. The
+        # undamped polynomial representation has exactly one radial channel
+        # and no radial parameters. Its constant weight is normalized by the
+        # stencil size so products of scalar moments remain well conditioned.
+        if radial_basis == "gaussian":
+            if radial_exponents is None:
+                initial_radial_exponents = 2.0 ** torch.linspace(
+                    -1.0,
+                    2.0,
+                    steps=n_radial_channels,
+                    dtype=torch.get_default_dtype(),
                 )
-            if not torch.all(torch.isfinite(initial_radial_exponents)).item():
-                raise ValueError("radial_exponents must be finite")
-            if not torch.all(initial_radial_exponents > 0.0).item():
-                raise ValueError("radial_exponents must be positive")
-        log_radial_exponents = torch.log(initial_radial_exponents)
-        if trainable_radial_exponents:
-            self.log_radial_exponents = nn.Parameter(log_radial_exponents)
+            else:
+                initial_radial_exponents = torch.as_tensor(
+                    radial_exponents,
+                    dtype=torch.get_default_dtype(),
+                ).detach().clone()
+                if initial_radial_exponents.ndim != 1:
+                    raise ValueError("radial_exponents must be one-dimensional")
+                if initial_radial_exponents.numel() != n_radial_channels:
+                    raise ValueError(
+                        "radial_exponents must contain n_radial_channels values"
+                    )
+                if not torch.all(
+                    torch.isfinite(initial_radial_exponents)
+                ).item():
+                    raise ValueError("radial_exponents must be finite")
+                if not torch.all(initial_radial_exponents > 0.0).item():
+                    raise ValueError("radial_exponents must be positive")
+            log_radial_exponents = torch.log(initial_radial_exponents)
+            if trainable_radial_exponents:
+                self.log_radial_exponents = nn.Parameter(log_radial_exponents)
+            else:
+                self.register_buffer(
+                    "log_radial_exponents",
+                    log_radial_exponents,
+                )
         else:
-            self.register_buffer(
-                "log_radial_exponents",
-                log_radial_exponents,
-            )
+            if n_radial_channels != 1:
+                raise ValueError(
+                    "n_radial_channels must equal one when radial_basis='none'"
+                )
+            if radial_exponents is not None:
+                raise ValueError(
+                    "radial_exponents are unavailable when radial_basis='none'"
+                )
+            if trainable_radial_exponents:
+                raise ValueError(
+                    "trainable_radial_exponents requires radial_basis='gaussian'"
+                )
 
         self.cutoff_grid = int(cutoff_grid)
         self.max_power = int(max_power)
+        self.radial_basis = radial_basis
         self.n_radial_channels = n_radial_channels
         self.trainable_radial_exponents = trainable_radial_exponents
         self.n_types = n_types
@@ -259,9 +296,11 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("mean_density", mean_density_tensor)
 
     @property
-    def radial_exponents(self) -> torch.Tensor:
-        """Positive Gaussian decay coefficients in inverse grid units squared."""
+    def radial_exponents(self) -> Optional[torch.Tensor]:
+        """Positive Gaussian decay coefficients, or ``None`` when undamped."""
 
+        if self.radial_basis == "none":
+            return None
         return torch.exp(self.log_radial_exponents)
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -306,13 +345,19 @@ class CartesianAFeatures(nn.Module):
                 )
             )
 
-        # The radial values are recomputed on every forward pass because the
-        # alpha values may be trainable. Distances themselves are fixed model
-        # geometry and are therefore stored once as a buffer.
-        radial_values = torch.exp(
-            -self.squared_distances[:, None]
-            * self.radial_exponents[None, :]
-        )
+        # Gaussian values are recomputed because alpha may be trainable. The
+        # undamped representation deliberately assigns equal relative radial
+        # weight to the central and noncentral stencil points. Dividing by the
+        # stencil size makes its scalar moment a neighborhood average.
+        if self.radial_basis == "gaussian":
+            radial_values = torch.exp(
+                -self.squared_distances[:, None]
+                * self.radial_exponents[None, :]
+            )
+        else:
+            radial_values = self.squared_distances.new_ones(
+                (self.squared_distances.shape[0], 1)
+            ) / self.squared_distances.shape[0]
         basis_values = (
             radial_values[:, :, None] * self.monomial_values[:, None, :]
         )

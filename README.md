@@ -215,6 +215,11 @@ average_chemical_potential = outputs.get("average_chemical_potential")
 chemical_potential_weights = outputs.get("chemical_potential_weights")
 ```
 
+Set `radial_basis="none"` and `n_radial_channels=1` to replace the Gaussian
+channels by one equal-weight neighborhood average. The resulting descriptors
+use only Cartesian polynomial moments; the constant radial weight is divided
+by the stencil size so that invariant products remain well scaled.
+
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
 Both `rho` and `beta` passed to `GridCACEModel` retain their physical values;
 density normalization is confined to `CartesianAFeatures`.
