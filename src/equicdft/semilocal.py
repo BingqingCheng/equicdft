@@ -1,12 +1,18 @@
 """Pointwise and gradient-expanded free-energy building blocks."""
 
 import math
-from numbers import Integral
 from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
+from ._nn import (
+    build_mlp,
+    optional_positive_integer,
+    positive_integer,
+    positive_scalar_tensor,
+    validate_hidden_sizes,
+)
 from .energy import EnergyReadout
 
 
@@ -48,55 +54,16 @@ class LDAReadout(EnergyReadout):
     ) -> None:
         super().__init__()
 
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
-            raise TypeError("n_types must be a positive integer")
-        n_types = int(n_types)
-        if n_types < 1:
-            raise ValueError("n_types must be a positive integer")
-        if not isinstance(zero_init, bool):
-            raise TypeError("zero_init must be a boolean")
-
-        density_scale = torch.as_tensor(
-            mean_density,
-            dtype=torch.get_default_dtype(),
-        ).detach().clone().reshape(-1)
-        if density_scale.numel() != 1:
-            raise ValueError("mean_density must be a positive scalar")
-        density_scale = density_scale.reshape(())
-        if (
-            not torch.isfinite(density_scale).item()
-            or density_scale.item() <= 0.0
-        ):
-            raise ValueError("mean_density must be a positive scalar")
-
-        self.n_types = n_types
-        self.n_state_features = n_types + 1
+        self.n_types = positive_integer(n_types, "n_types")
+        self.n_state_features = self.n_types + 1
+        density_scale = positive_scalar_tensor(mean_density, "mean_density")
         self.register_buffer("mean_density", density_scale)
-
-        layers = []
-        input_width = self.n_state_features
-        for hidden_width in hidden_sizes:
-            if isinstance(hidden_width, bool) or not isinstance(
-                hidden_width,
-                Integral,
-            ):
-                raise TypeError(
-                    "hidden_sizes must contain positive integers"
-                )
-            hidden_width = int(hidden_width)
-            if hidden_width < 1:
-                raise ValueError(
-                    "hidden_sizes must contain positive integers"
-                )
-            layers.extend((nn.Linear(input_width, hidden_width), nn.SiLU()))
-            input_width = hidden_width
-
-        final_layer = nn.Linear(input_width, 1)
-        if zero_init:
-            nn.init.zeros_(final_layer.weight)
-            nn.init.zeros_(final_layer.bias)
-        layers.append(final_layer)
-        self.mlp = nn.Sequential(*layers)
+        self.mlp = build_mlp(
+            self.n_state_features,
+            hidden_sizes,
+            1,
+            zero_init=zero_init,
+        )
 
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
         """Return ``beta_a_exc_lda`` with shape ``[..., n_grid, 1]``."""
@@ -176,21 +143,8 @@ class GGAReadout(EnergyReadout):
     ) -> None:
         super().__init__()
 
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
-            raise TypeError("n_types must be a positive integer")
-        if int(n_types) < 1:
-            raise ValueError("n_types must be a positive integer")
-        self.n_types = int(n_types)
-
-        if n_features is not None:
-            if isinstance(n_features, bool) or not isinstance(
-                n_features,
-                Integral,
-            ):
-                raise TypeError("n_features must be a positive integer or None")
-            n_features = int(n_features)
-            if n_features < 1:
-                raise ValueError("n_features must be a positive integer")
+        self.n_types = positive_integer(n_types, "n_types")
+        n_features = optional_positive_integer(n_features, "n_features")
 
         try:
             minimum_coefficient = float(minimum_coefficient)
@@ -207,44 +161,22 @@ class GGAReadout(EnergyReadout):
                 "initial_coefficient must be finite and exceed the minimum"
             )
 
-        validated_hidden_sizes = []
-        for hidden_width in hidden_sizes:
-            if isinstance(hidden_width, bool) or not isinstance(
-                hidden_width,
-                Integral,
-            ):
-                raise TypeError("hidden_sizes must contain positive integers")
-            hidden_width = int(hidden_width)
-            if hidden_width < 1:
-                raise ValueError("hidden_sizes must contain positive integers")
-            validated_hidden_sizes.append(hidden_width)
+        validated_hidden_sizes = validate_hidden_sizes(hidden_sizes)
         if n_features is None and not validated_hidden_sizes:
             raise ValueError(
                 "n_features is required when hidden_sizes is empty"
             )
 
-        layers = []
-        input_width = n_features
-        for layer_index, hidden_width in enumerate(validated_hidden_sizes):
-            if layer_index == 0 and input_width is None:
-                linear = nn.LazyLinear(hidden_width)
-            else:
-                linear = nn.Linear(input_width, hidden_width)
-            layers.extend((linear, nn.SiLU()))
-            input_width = hidden_width
-
-        final_layer = nn.Linear(input_width, 1)
+        self.mlp = build_mlp(n_features, validated_hidden_sizes, 1)
+        final_layer = self.mlp[-1]
         nn.init.zeros_(final_layer.weight)
         softplus_value = initial_coefficient - minimum_coefficient
         inverse_softplus = softplus_value + math.log(
             -math.expm1(-softplus_value)
         )
         nn.init.constant_(final_layer.bias, inverse_softplus)
-        layers.append(final_layer)
-
         self.minimum_coefficient = minimum_coefficient
         self.initial_coefficient = initial_coefficient
-        self.mlp = nn.Sequential(*layers)
 
     def forward(self, local_features: torch.Tensor) -> torch.Tensor:
         """Return ``beta_kappa`` with shape ``[..., n_grid, 1]``."""

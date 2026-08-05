@@ -15,103 +15,16 @@ from .symmetrize import CartesianBFeatures
 
 
 class GridCACEModel(nn.Module):
-    """Collect the complete density-to-free-energy computational graph.
+    """Combine free-energy readouts and differentiate their scalar sum.
 
-    Each module in ``readout`` evaluates one scalar contribution from a shared
-    context containing the density, temperature, grid metadata, and any local
-    or global features it requested. The model adds those contributions before
-    the response calculation,
-
-    ``beta_F_exc -> c1 -> c2``,
-
-    and, when an external field is supplied,
-
-    ``(rho, V_ext, T, c1) -> local_chemical_potential``.
-
-    It returns the canonical physical outputs as one dictionary. Density is
-    marked as differentiable before the representation is built so ``c1``
-    includes every overlapping local environment.
-
-    During training, the graph used to construct response outputs is retained
-    so a derivative-level loss can be differentiated with respect to model
-    parameters. A requested ``c2`` row also retains the ``c1`` graph long
-    enough to take the second density derivative. In evaluation mode, a
-    ``c1``-only calculation avoids this higher-order graph. Setting both
-    response flags to ``False`` leaves ``rho`` unchanged. Constructor values
-    are defaults that an individual forward call can override.
-
-    In the shapes below, ``...`` denotes optional leading batch dimensions,
-    ``g`` runs over ``n_grid`` grid points, and ``i`` runs over ``n_types``
-    density components. The returned dictionary contains:
-
-    ``beta_F_exc``
-        Shape ``[...]`` (a scalar without batching). Dimensionless excess free
-        energy for each complete density field, summed over every readout.
-    ``c1``
-        Shape ``[..., n_grid, n_types]``. First direct correlation
-        ``-delta(beta_F_exc) / delta(rho)`` in the continuum
-        functional-derivative convention. This key is present only when
-        ``compute_c1=True``.
-    ``c2``
-        Shape ``[..., n_grid, n_types]``. One row of the second direct
-        correlation, obtained by differentiating the selected
-        ``c1[..., reference_grid, reference_type]`` with respect to the
-        complete density field. This key is present only when
-        ``compute_c2=True``. For a homogeneous fluid, translational symmetry
-        makes this row a function of relative grid displacement.
-    ``local_chemical_potential``
-        Shape ``[..., n_grid, n_types]``. Dimensionless local chemical
-        potential obtained from the Euler--Lagrange equation. This key is
-        returned when ``compute_local_mu=True``, ``compute_c1`` is enabled,
-        and the input contains ``V_ext``.
-    ``average_chemical_potential``
-        Shape ``[..., n_types]``. Hard-mask-weighted spatial average of
-        ``local_chemical_potential`` with weights ``rho > rho_min``. It is
-        returned together with the local field when ``compute_local_mu=True``.
-    ``chemical_potential_weights``
-        Shape ``[..., n_grid, n_types]``. Detached hard-mask weights used for
-        both the average and the local-chemical-potential loss.
-
-    Parameters
-    ----------
-    a_features
-        Module that constructs local Cartesian density moments. It may be
-        ``None`` if no readout requests local features.
-    b_features
-        Module that contracts Cartesian moments into invariant features. It is
-        supplied together with ``a_features``.
-    readout
-        Nonempty sequence of :class:`EnergyReadout` modules. Every module owns
-        the mathematical details of its contribution and returns one scalar
-        energy per field through ``energy(context)``.
-    grid_spacing
-        One value for an isotropic grid or three Cartesian spacings. The
-        discretization is fixed by training and stored with the model.
-    mean_temperature
-        Positive temperature scale computed from the development data. The
-        readout receives ``temperature / mean_temperature``; physical
-        thermodynamic expressions continue to use the unscaled temperature.
-    boltzmann_constant
-        Boltzmann constant in the energy and temperature units used to train
-        the model. It is stored for inference thermodynamics.
-    thermal_wavelength
-        One positive value or one value per density component. It fixes the
-        ideal-gas convention used to reconstruct external potentials.
-    compute_c1
-        If ``True``, initialize density gradients and include ``c1`` in the
-        collected outputs. Disable it for energy-only evaluation.
-    compute_c2
-        If ``True``, include one selected row of ``c2`` in the collected
-        outputs. Computing ``c2`` requires ``c1`` and therefore enables it
-        automatically. The reference grid and component may be selected on
-        each forward call.
-    compute_local_mu
-        If ``True``, include both ``local_chemical_potential`` and its
-        hard-mask-weighted ``average_chemical_potential``. This requires
-        ``c1``, enabled by either response flag.
-    rho_min
-        Nonnegative density threshold defining the hard weights used by
-        :meth:`average_chemical_potential`.
+    Every configured :class:`EnergyReadout` receives a shared context and
+    returns one ``beta_F_exc`` contribution per field. Their sum is
+    differentiated with respect to the complete density to obtain
+    ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
+    of ``c2 = delta(c1)/delta(rho)``. If ``V_ext`` is available, the model may
+    also return the local and spatially averaged dimensionless chemical
+    potential. Constructor response flags provide defaults that individual
+    forward calls may override.
     """
 
     def __init__(
@@ -281,21 +194,6 @@ class GridCACEModel(nn.Module):
             thermal_wavelength_tensor,
         )
 
-        self.required_derivatives = ["rho"] if self.compute_c1 else []
-        self.model_outputs = ["beta_F_exc"]
-        if self.compute_c1:
-            self.model_outputs.append("c1")
-        if compute_c2:
-            self.model_outputs.append("c2")
-        if compute_local_mu:
-            self.model_outputs.extend(
-                (
-                    "local_chemical_potential",
-                    "average_chemical_potential",
-                    "chemical_potential_weights",
-                )
-            )
-
     @property
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
@@ -352,7 +250,7 @@ class GridCACEModel(nn.Module):
             ),
         }
 
-    def compute_local_chemical_potential(
+    def _compute_local_chemical_potential(
         self,
         data: Dict[str, torch.Tensor],
         c1: torch.Tensor,
@@ -375,7 +273,7 @@ class GridCACEModel(nn.Module):
             torch.zeros_like(local_chemical_potential),
         )
 
-    def weight_mask(self, rho: torch.Tensor) -> torch.Tensor:
+    def _weight_mask(self, rho: torch.Tensor) -> torch.Tensor:
         """Return hard averaging weights from the physical density."""
 
         return (rho.detach() > self.rho_min).to(dtype=rho.dtype)
@@ -441,61 +339,6 @@ class GridCACEModel(nn.Module):
             raise IndexError("c2 reference type index is out of bounds")
         return reference_grid, reference_type
 
-    def initialize_derivatives(
-        self,
-        data: Dict[str, torch.Tensor],
-        compute_c1: Optional[bool] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Enable gradients for the fields required by response outputs."""
-
-        if compute_c1 is None:
-            compute_c1 = self.compute_c1
-        required_derivatives = ["rho"] if compute_c1 else []
-        for key in required_derivatives:
-            data[key].requires_grad_(True)
-        return data
-
-    def extract_outputs(
-        self,
-        data: Dict[str, torch.Tensor],
-        compute_c1: Optional[bool] = None,
-        compute_c2: Optional[bool] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Return only the canonical model outputs."""
-
-        if compute_c2 is None:
-            compute_c2 = self.compute_c2
-        if compute_c1 is None:
-            compute_c1 = self.compute_c1
-        compute_c1 = compute_c1 or compute_c2
-        response_outputs = {
-            "c1",
-            "c2",
-            "local_chemical_potential",
-            "average_chemical_potential",
-            "chemical_potential_weights",
-        }
-        requested_outputs = [
-            key for key in self.model_outputs if key not in response_outputs
-        ]
-        if compute_c1:
-            requested_outputs.append("c1")
-            if compute_c2:
-                requested_outputs.append("c2")
-            if self.compute_local_mu:
-                requested_outputs.extend(
-                    (
-                        "local_chemical_potential",
-                        "average_chemical_potential",
-                        "chemical_potential_weights",
-                    )
-                )
-        return {
-            key: data[key]
-            for key in requested_outputs
-            if key in data
-        }
-
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -523,7 +366,8 @@ class GridCACEModel(nn.Module):
         )
         with gradient_context:
             self._validate_grid_spacing(data)
-            data = self.initialize_derivatives(data, compute_c1=compute_c1)
+            if compute_c1:
+                data["rho"].requires_grad_(True)
 
             rho = data["rho"]
             temperature = data["temperature"].to(
@@ -670,7 +514,7 @@ class GridCACEModel(nn.Module):
                     and "V_ext" in data
                 ):
                     local_chemical_potential = (
-                        self.compute_local_chemical_potential(
+                        self._compute_local_chemical_potential(
                             data=data,
                             c1=outputs["c1"],
                         )
@@ -678,7 +522,7 @@ class GridCACEModel(nn.Module):
                     outputs["local_chemical_potential"] = (
                         local_chemical_potential
                     )
-                    weights = self.weight_mask(data["rho"])
+                    weights = self._weight_mask(data["rho"])
                     outputs["chemical_potential_weights"] = weights
                     outputs["average_chemical_potential"] = (
                         self.average_chemical_potential(
@@ -687,8 +531,4 @@ class GridCACEModel(nn.Module):
                         )
                     )
 
-        return self.extract_outputs(
-            outputs,
-            compute_c1=compute_c1,
-            compute_c2=compute_c2,
-        )
+        return outputs

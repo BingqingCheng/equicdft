@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from equicdft import coarsen_grid, get_neighbor_indices, make_stencil
+from equicdft.stencil import coarsen_grid, get_neighbor_indices, make_stencil
 
 
 class TestGridStencil(unittest.TestCase):

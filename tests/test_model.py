@@ -14,8 +14,8 @@ from equicdft import (
     LocalReadout,
     LongRangeReadout,
     ReciprocalFeatures,
-    get_neighbor_indices,
 )
+from equicdft.stencil import get_neighbor_indices
 
 
 class _DensityFeatures(nn.Module):
@@ -583,7 +583,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        self.assertEqual(list(outputs), model.model_outputs)
+        self.assertEqual(list(outputs), ["beta_F_exc", "c1"])
         self.assertTrue(data["rho"].requires_grad)
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 1))
@@ -831,7 +831,6 @@ class TestGridCACEModel(unittest.TestCase):
             list(outputs),
             ["beta_F_exc"],
         )
-        self.assertEqual(model.required_derivatives, [])
         self.assertFalse(data["rho"].requires_grad)
         self.assertFalse(outputs["beta_F_exc"].requires_grad)
 

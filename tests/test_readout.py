@@ -8,9 +8,9 @@ from equicdft import (
     CartesianAFeatures,
     CartesianBFeatures,
     LocalReadout,
-    compute_grid_derivative,
-    get_neighbor_indices,
 )
+from equicdft.derivatives import compute_grid_derivative
+from equicdft.stencil import get_neighbor_indices
 
 
 class TestBulkReadout(unittest.TestCase):

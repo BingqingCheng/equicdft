@@ -1,6 +1,6 @@
 """Split complete density fields and construct PyTorch data loaders."""
 
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -166,18 +166,16 @@ def _mean_density(datasets: Sequence[Dataset]) -> float:
     """Average the spatial-and-component mean of each selected frame."""
 
     frame_means = []
-    for dataset in datasets:
-        for frame_index in range(len(dataset)):
-            frame = dataset[frame_index]
-            if "rho" not in frame:
-                raise KeyError("dataset frame is missing required field 'rho'")
-            rho = torch.as_tensor(frame["rho"])
-            if rho.numel() == 0:
-                raise ValueError("rho tensors must not be empty")
-            frame_mean = rho.detach().to(dtype=torch.float64).mean()
-            if not torch.isfinite(frame_mean).item():
-                raise ValueError("rho tensors must contain finite values")
-            frame_means.append(frame_mean)
+    for frame in _frames(datasets):
+        if "rho" not in frame:
+            raise KeyError("dataset frame is missing required field 'rho'")
+        rho = torch.as_tensor(frame["rho"])
+        if rho.numel() == 0:
+            raise ValueError("rho tensors must not be empty")
+        frame_mean = rho.detach().to(dtype=torch.float64).mean()
+        if not torch.isfinite(frame_mean).item():
+            raise ValueError("rho tensors must contain finite values")
+        frame_means.append(frame_mean)
     return torch.stack(frame_means).mean().item()
 
 
@@ -185,25 +183,31 @@ def _mean_temperature(datasets: Sequence[Dataset]) -> float:
     """Average the scalar temperature of each selected frame."""
 
     temperatures = []
+    for frame in _frames(datasets):
+        if "temperature" not in frame:
+            raise KeyError(
+                "dataset frame is missing required field 'temperature'"
+            )
+        temperature = torch.as_tensor(frame["temperature"])
+        if temperature.numel() != 1:
+            raise ValueError(
+                "temperature tensors must contain exactly one value"
+            )
+        temperature = temperature.detach().to(dtype=torch.float64).reshape(())
+        if not torch.isfinite(temperature).item():
+            raise ValueError("temperature tensors must contain finite values")
+        if temperature.item() <= 0.0:
+            raise ValueError("temperature values must be positive")
+        temperatures.append(temperature)
+    return torch.stack(temperatures).mean().item()
+
+
+def _frames(datasets: Sequence[Dataset]) -> Iterator[Dict[str, torch.Tensor]]:
+    """Yield every frame in an ordered collection of datasets."""
+
     for dataset in datasets:
         for frame_index in range(len(dataset)):
-            frame = dataset[frame_index]
-            if "temperature" not in frame:
-                raise KeyError(
-                    "dataset frame is missing required field 'temperature'"
-                )
-            temperature = torch.as_tensor(frame["temperature"])
-            if temperature.numel() != 1:
-                raise ValueError(
-                    "temperature tensors must contain exactly one value"
-                )
-            temperature = temperature.detach().to(dtype=torch.float64).reshape(())
-            if not torch.isfinite(temperature).item():
-                raise ValueError("temperature tensors must contain finite values")
-            if temperature.item() <= 0.0:
-                raise ValueError("temperature values must be positive")
-            temperatures.append(temperature)
-    return torch.stack(temperatures).mean().item()
+            yield dataset[frame_index]
 
 
 def _require_nonempty(dataset: Optional[Dataset], name: str) -> None:

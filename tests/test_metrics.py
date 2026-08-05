@@ -3,7 +3,8 @@ import unittest
 
 import torch
 
-from equicdft import Metrics, compute_metric
+from equicdft import Metrics
+from equicdft.metrics import compute_metric
 from equicdft.metrics import format_metric_value, metric_label
 
 

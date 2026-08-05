@@ -1,11 +1,10 @@
 """Local readout for invariant grid features."""
 
-from numbers import Integral
 from typing import Dict, Optional, Sequence
 
 import torch
-from torch import nn
 
+from ._nn import build_mlp, optional_positive_integer, positive_integer
 from .energy import EnergyReadout
 from .reciprocal import ReciprocalFeatures
 
@@ -44,6 +43,7 @@ class LocalReadout(EnergyReadout):
     """
 
     requires_local_features = True
+
     def __init__(
         self,
         n_types: int = 1,
@@ -52,39 +52,13 @@ class LocalReadout(EnergyReadout):
     ) -> None:
         super().__init__()
 
-        if n_features is not None:
-            if isinstance(n_features, bool) or not isinstance(
-                n_features,
-                Integral,
-            ):
-                raise TypeError("n_features must be a positive integer or None")
-            n_features = int(n_features)
-            if n_features < 1:
-                raise ValueError("n_features must be a positive integer or None")
-
-        self.n_features = n_features
-        self.n_types = n_types
-
-        layers = []
-        for layer_index, n_hidden in enumerate(hidden_sizes):
-            if layer_index == 0:
-                linear = (
-                    nn.LazyLinear(n_hidden)
-                    if n_features is None
-                    else nn.Linear(n_features, n_hidden)
-                )
-            else:
-                linear = nn.Linear(hidden_sizes[layer_index - 1], n_hidden)
-            layers.extend((linear, nn.SiLU()))
-        if hidden_sizes:
-            layers.append(nn.Linear(hidden_sizes[-1], n_types))
-        else:
-            layers.append(
-                nn.LazyLinear(n_types)
-                if n_features is None
-                else nn.Linear(n_features, n_types)
-            )
-        self.mlp = nn.Sequential(*layers)
+        self.n_features = optional_positive_integer(n_features, "n_features")
+        self.n_types = positive_integer(n_types, "n_types")
+        self.mlp = build_mlp(
+            self.n_features,
+            hidden_sizes,
+            self.n_types,
+        )
 
     def forward(
         self,
@@ -98,7 +72,7 @@ class LocalReadout(EnergyReadout):
         self,
         context: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Return the integrated density-weighted CACE contribution."""
+        """Return the integrated density-weighted local contribution."""
 
         rho = context["rho"]
         per_particle = self(context["local_features"])
@@ -135,6 +109,7 @@ class BulkReadout(EnergyReadout):
     """
 
     requires_state_features = True
+
     def __init__(
         self,
         n_types: int = 1,
@@ -143,38 +118,14 @@ class BulkReadout(EnergyReadout):
     ) -> None:
         super().__init__()
 
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
-            raise TypeError("n_types must be a positive integer")
-        if int(n_types) < 1:
-            raise ValueError("n_types must be a positive integer")
-        if not isinstance(zero_init, bool):
-            raise TypeError("zero_init must be a boolean")
-
-        self.n_types = int(n_types)
+        self.n_types = positive_integer(n_types, "n_types")
         self.n_state_features = 1 + self.n_types
-
-        layers = []
-        input_width = self.n_state_features
-        for hidden_width in hidden_sizes:
-            if isinstance(hidden_width, bool) or not isinstance(
-                hidden_width,
-                Integral,
-            ):
-                raise TypeError("hidden_sizes must contain positive integers")
-            hidden_width = int(hidden_width)
-            if hidden_width < 1:
-                raise ValueError(
-                    "hidden_sizes must contain positive integers"
-                )
-            layers.extend((nn.Linear(input_width, hidden_width), nn.SiLU()))
-            input_width = hidden_width
-
-        final_layer = nn.Linear(input_width, self.n_types)
-        if zero_init:
-            nn.init.zeros_(final_layer.weight)
-            nn.init.zeros_(final_layer.bias)
-        layers.append(final_layer)
-        self.mlp = nn.Sequential(*layers)
+        self.mlp = build_mlp(
+            self.n_state_features,
+            hidden_sizes,
+            self.n_types,
+            zero_init=zero_init,
+        )
 
     def forward(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return ``beta_a_exc_bulk`` with shape ``[..., n_types]``."""
@@ -229,6 +180,7 @@ class LongRangeReadout(EnergyReadout):
     """
 
     requires_state_features = True
+
     def __init__(
         self,
         n_kernels: int,
@@ -239,16 +191,8 @@ class LongRangeReadout(EnergyReadout):
     ) -> None:
         super().__init__()
 
-        for value, name in ((n_kernels, "n_kernels"), (n_types, "n_types")):
-            if isinstance(value, bool) or not isinstance(value, Integral):
-                raise TypeError("{} must be a positive integer".format(name))
-            if int(value) < 1:
-                raise ValueError("{} must be a positive integer".format(name))
-        if not isinstance(zero_init, bool):
-            raise TypeError("zero_init must be a boolean")
-
-        self.n_kernels = int(n_kernels)
-        self.n_types = int(n_types)
+        self.n_kernels = positive_integer(n_kernels, "n_kernels")
+        self.n_types = positive_integer(n_types, "n_types")
         self.n_type_pairs = self.n_types * (self.n_types + 1) // 2
         self.n_state_features = 1 + self.n_types
         if features is not None:
@@ -260,29 +204,13 @@ class LongRangeReadout(EnergyReadout):
                 raise ValueError("features and readout kernel counts differ")
         self.features = features
 
-        layers = []
-        input_width = self.n_state_features
-        for hidden_width in hidden_sizes:
-            if isinstance(hidden_width, bool) or not isinstance(
-                hidden_width,
-                Integral,
-            ):
-                raise TypeError("hidden_sizes must contain positive integers")
-            hidden_width = int(hidden_width)
-            if hidden_width < 1:
-                raise ValueError(
-                    "hidden_sizes must contain positive integers"
-                )
-            layers.extend((nn.Linear(input_width, hidden_width), nn.SiLU()))
-            input_width = hidden_width
-
         output_width = self.n_kernels * self.n_type_pairs
-        final_layer = nn.Linear(input_width, output_width)
-        if zero_init:
-            nn.init.zeros_(final_layer.weight)
-            nn.init.zeros_(final_layer.bias)
-        layers.append(final_layer)
-        self.mlp = nn.Sequential(*layers)
+        self.mlp = build_mlp(
+            self.n_state_features,
+            hidden_sizes,
+            output_width,
+            zero_init=zero_init,
+        )
 
     def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""

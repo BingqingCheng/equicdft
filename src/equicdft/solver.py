@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Union
 import torch
 from torch import nn
 
-from ._solver_helpers import (
+from ._solver_numerics import (
     _component_tensor,
     _continued_fields,
     _euler_residual,

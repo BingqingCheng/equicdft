@@ -92,11 +92,10 @@ def compute_metric(
 class Metrics(nn.Module):
     """Record predictions and targets and report dataset-level metrics.
 
-    The interface follows the CACE metric workflow: call
-    :meth:`update_metrics` for every batch, then :meth:`retrieve_metrics` once
-    at the end of an epoch. Metrics are evaluated after concatenating all
-    batches, so RMSE and R2 are true dataset-level values
-    rather than averages of per-batch values.
+    Call :meth:`update_metrics` for every batch, then
+    :meth:`retrieve_metrics` once at the end of an epoch. Metrics are evaluated
+    after concatenating all batches, so RMSE and R2 are true dataset-level
+    values rather than averages of per-batch values.
 
     Parameters
     ----------

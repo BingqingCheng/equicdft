@@ -2,11 +2,8 @@ import unittest
 
 import torch
 
-from equicdft import (
-    GGAReadout,
-    LDAReadout,
-    periodic_gradient_energy_density,
-)
+from equicdft import GGAReadout, LDAReadout
+from equicdft.semilocal import periodic_gradient_energy_density
 
 
 class TestLDAReadout(unittest.TestCase):
