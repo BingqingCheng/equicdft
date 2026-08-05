@@ -3,48 +3,16 @@ import unittest
 import torch
 from torch import nn
 
-from equicdft import (
-    DensityPerturbationStabilityLoss,
-    GlobalDensityStabilityLoss,
-    Loss,
-    TensorLoss,
-)
+from equicdft import Loss, TensorLoss
 
 
 class _PredictionPenalty(nn.Module):
-    """Minimal specialized term used to test the aggregation interface."""
+    """Minimal specialized term used to test loss aggregation."""
 
     name = "prediction_penalty"
 
     def forward(self, outputs, batch):
         return outputs["c1"].abs().mean()
-
-
-class _UnstableQuadraticFunctional(nn.Module):
-    """Small energy model whose concentrated fields are too favorable."""
-
-    def __init__(self):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(3.0))
-        self.register_buffer("thermal_wavelength", torch.ones(1))
-
-    def forward(self, data, compute_c1=False):
-        self.last_rho = data["rho"].detach().clone()
-        beta_F_exc = -self.scale * torch.sum(
-            data["rho"].square(),
-            dim=(-2, -1),
-        )
-        return {"beta_F_exc": beta_F_exc}
-
-
-class _GridSizeRequiringFunctional(_UnstableQuadraticFunctional):
-    """Energy model emulating the reciprocal branch input requirement."""
-
-    def forward(self, data, compute_c1=False):
-        if "grid_size" not in data:
-            raise KeyError("grid_size")
-        self.last_grid_size = data["grid_size"].detach().clone()
-        return super().forward(data, compute_c1=compute_c1)
 
 
 class TestTensorLoss(unittest.TestCase):
@@ -71,17 +39,14 @@ class TestTensorLoss(unittest.TestCase):
 
     def test_default_is_mean_squared_error(self):
         term = TensorLoss("c1", "c1", "c1")
-
         value = term(
             {"c1": torch.tensor([1.0, 3.0])},
             {"c1": torch.tensor([0.0, 1.0])},
         )
-
         self.assertAlmostEqual(value.item(), 2.5)
 
     def test_shapes_must_match_exactly(self):
         term = TensorLoss("c1", "c1", "c1")
-
         with self.assertRaisesRegex(ValueError, "shape"):
             term(
                 {"c1": torch.ones(2, 3, 1)},
@@ -90,7 +55,6 @@ class TestTensorLoss(unittest.TestCase):
 
     def test_missing_prediction_and_target_are_reported(self):
         term = TensorLoss("c1", "predicted_c1", "target_c1")
-
         with self.assertRaisesRegex(KeyError, "prediction"):
             term({}, {"target_c1": torch.tensor(0.0)})
         with self.assertRaisesRegex(KeyError, "target"):
@@ -103,12 +67,8 @@ class TestTensorLoss(unittest.TestCase):
             "c1",
             loss_fn=nn.MSELoss(reduction="none"),
         )
-
         with self.assertRaisesRegex(ValueError, "scalar"):
-            term(
-                {"c1": torch.ones(2)},
-                {"c1": torch.zeros(2)},
-            )
+            term({"c1": torch.ones(2)}, {"c1": torch.zeros(2)})
 
     def test_weight_must_be_finite_and_nonnegative(self):
         for weight in (-1.0, float("inf"), float("nan"), "invalid"):
@@ -121,22 +81,18 @@ class TestWeightedTensorLoss(unittest.TestCase):
     @staticmethod
     def _example():
         rho = torch.tensor([[[1.0], [2.0], [0.0], [4.0]]])
-
-        # On the three unmasked grid points, construct local values
-        # [1, 3, 5]. Their spatial mean is 3.
-        desired_local = torch.tensor([[[1.0], [3.0], [0.0], [5.0]]])
-        local_chemical_potential = desired_local.clone().requires_grad_(True)
-        average_chemical_potential = (
-            local_chemical_potential[:, [0, 1, 3], :].mean(dim=-2)
+        local = torch.tensor(
+            [[[1.0], [3.0], [0.0], [5.0]]],
+            requires_grad=True,
         )
-        chemical_potential_weights = (rho > 0.5).to(rho.dtype)
-        batch = {}
         outputs = {
-            "local_chemical_potential": local_chemical_potential,
-            "average_chemical_potential": average_chemical_potential,
-            "chemical_potential_weights": chemical_potential_weights,
+            "local_chemical_potential": local,
+            "average_chemical_potential": local[:, [0, 1, 3], :].mean(
+                dim=-2
+            ),
+            "chemical_potential_weights": (rho > 0.5).to(rho.dtype),
         }
-        return outputs, batch
+        return outputs, {}
 
     @staticmethod
     def _loss():
@@ -149,7 +105,6 @@ class TestWeightedTensorLoss(unittest.TestCase):
 
     def test_unknown_mu_is_masked_spatial_mean(self):
         outputs, batch = self._example()
-
         loss = self._loss()(outputs, batch)
         self.assertAlmostEqual(loss.item(), 8.0 / 3.0, places=6)
         loss.backward()
@@ -159,24 +114,17 @@ class TestWeightedTensorLoss(unittest.TestCase):
 
     def test_known_beta_mu_is_selected_from_batch(self):
         outputs, _ = self._example()
-        batch = {"beta_mu": torch.tensor([[2.0]])}
         loss = TensorLoss(
             name="local_chemical_potential",
             prediction_key="local_chemical_potential",
             target_key="beta_mu",
             weights_key="chemical_potential_weights",
-        )(outputs, batch)
-
-        # The known componentwise beta*mu is expanded over the grid axis;
-        # the empty voxel remains excluded by the same hard mask.
+        )(outputs, {"beta_mu": torch.tensor([[2.0]])})
         self.assertAlmostEqual(loss.item(), 11.0 / 3.0, places=6)
 
     def test_ordered_targets_mix_known_and_inferred_mu(self):
         prediction = torch.tensor(
-            [
-                [[1.0], [3.0]],
-                [[4.0], [6.0]],
-            ],
+            [[[1.0], [3.0]], [[4.0], [6.0]]],
             requires_grad=True,
         )
         outputs = {
@@ -191,12 +139,8 @@ class TestWeightedTensorLoss(unittest.TestCase):
             target_key=("beta_mu", "average_chemical_potential"),
             weights_key="chemical_potential_weights",
         )
-
         loss = term(outputs, batch)
         loss.backward()
-
-        # The NVT row falls back to its inferred mean [2, 2], while the GCMC
-        # row uses the known beta_mu [4, 4].
         self.assertAlmostEqual(loss.item(), 1.5, places=6)
         self.assertTrue(torch.all(torch.isfinite(prediction.grad)))
 
@@ -207,7 +151,6 @@ class TestWeightedTensorLoss(unittest.TestCase):
             "local_mu",
             ("beta_mu", "average_mu"),
         )
-
         with self.assertRaisesRegex(KeyError, "target candidates"):
             term({"local_mu": prediction}, {})
         with self.assertRaisesRegex(ValueError, "unresolved nonfinite"):
@@ -225,308 +168,8 @@ class TestWeightedTensorLoss(unittest.TestCase):
     def test_zero_total_element_weight_is_rejected(self):
         outputs, batch = self._example()
         outputs["chemical_potential_weights"].zero_()
-
         with self.assertRaisesRegex(ValueError, "positive sum"):
             self._loss()(outputs, batch)
-
-
-class TestDensityPerturbationStabilityLoss(unittest.TestCase):
-    @staticmethod
-    def _batch():
-        return {
-            "rho": torch.full((1, 4, 1), 0.5),
-            "V_ext": torch.zeros(1, 4, 1),
-            "beta": torch.ones(1),
-            "temperature": torch.ones(1),
-            "grid_spacing": torch.ones(1, 3),
-            "grid_positions": torch.tensor(
-                [[[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]]
-            ),
-            "local_density_index": torch.arange(4).reshape(1, 4, 1),
-        }
-
-    def test_penalizes_lower_concentrated_objective_and_backpropagates(self):
-        model = _UnstableQuadraticFunctional()
-        batch = self._batch()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.05,),
-        )
-
-        value = term(outputs, batch, model=model)
-        value.backward()
-
-        self.assertGreater(value.item(), 0.0)
-        self.assertGreater(model.scale.grad.item(), 0.0)
-        perturbed_sums = torch.sum(model.last_rho, dim=-2)
-        self.assertTrue(
-            torch.allclose(perturbed_sums, torch.full_like(perturbed_sums, 2.0))
-        )
-        relative_change = torch.abs(
-            model.last_rho - batch["rho"][:, None, :, :]
-        ) / batch["rho"][:, None, :, :]
-        self.assertLessEqual(relative_change.max().item(), 0.0501)
-
-    def test_aggregate_passes_model_only_to_model_dependent_term(self):
-        model = _UnstableQuadraticFunctional()
-        batch = self._batch()
-        outputs = model(batch)
-        loss = Loss(
-            [
-                DensityPerturbationStabilityLoss(
-                    maximum_density=1.0,
-                    relative_amplitudes=(0.05,),
-                )
-            ]
-        )
-
-        values = loss(outputs, batch, model=model)
-
-        self.assertGreater(
-            values["density_perturbation_stability"].item(),
-            0.0,
-        )
-        self.assertEqual(
-            values["total"].item(),
-            values["density_perturbation_stability"].item(),
-        )
-
-    def test_rejects_reference_density_above_cap(self):
-        model = _UnstableQuadraticFunctional()
-        batch = self._batch()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=0.4,
-            relative_amplitudes=(0.05,),
-        )
-
-        with self.assertRaisesRegex(ValueError, "exceeds"):
-            term(outputs, batch, model=model)
-
-    def test_large_float32_grid_preserves_particle_number(self):
-        n_grid = 16**3
-        linear_index = torch.arange(n_grid)
-        batch = {
-            "rho": torch.linspace(0.001, 1.7, n_grid).reshape(1, n_grid, 1),
-            "V_ext": torch.zeros(1, n_grid, 1),
-            "beta": torch.ones(1),
-            "temperature": torch.ones(1),
-            "grid_spacing": torch.full((1, 3), 0.5),
-            "grid_positions": torch.stack(
-                (
-                    linear_index % 16,
-                    (linear_index // 16) % 16,
-                    linear_index // 16**2,
-                ),
-                dim=-1,
-            ).unsqueeze(0),
-            "local_density_index": linear_index.reshape(1, n_grid, 1),
-        }
-        model = _UnstableQuadraticFunctional()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=1.8,
-            relative_amplitudes=(0.05,),
-        )
-
-        value = term(outputs, batch, model=model)
-
-        self.assertTrue(torch.isfinite(value).item())
-        perturbed_sums = torch.sum(model.last_rho.double(), dim=-2)
-        # The fixed-N target is the sum represented by the float32 training
-        # batch; only the correction and verification reductions use float64.
-        reference_sums = torch.sum(batch["rho"], dim=-2).double()
-        self.assertTrue(
-            torch.allclose(
-                perturbed_sums,
-                reference_sums[:, None, :],
-                atol=1.0e-4,
-                rtol=0.0,
-            )
-        )
-
-    def test_fourier_strategy_penalizes_each_mode_and_backpropagates(self):
-        model = _UnstableQuadraticFunctional()
-        batch = self._batch()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.05,),
-            perturbation_strategy="fourier",
-            fourier_modes=((1, 0, 0), (2, 0, 0)),
-        )
-
-        value = term(outputs, batch, model=model)
-        value.backward()
-
-        self.assertGreater(value.item(), 0.0)
-        self.assertGreater(model.scale.grad.item(), 0.0)
-        # Two modes, one amplitude, and two perturbation signs are evaluated.
-        self.assertEqual(model.last_rho.shape, (1, 4, 4, 1))
-        perturbed_sums = torch.sum(model.last_rho, dim=-2)
-        self.assertTrue(
-            torch.allclose(
-                perturbed_sums,
-                torch.full_like(perturbed_sums, 2.0),
-            )
-        )
-        self.assertGreaterEqual(model.last_rho.min().item(), 0.0)
-        self.assertLessEqual(model.last_rho.max().item(), 1.0)
-
-    def test_perturbed_model_call_forwards_grid_size(self):
-        batch = self._batch()
-        batch["grid_size"] = torch.tensor([[4, 1, 1]])
-        model = _GridSizeRequiringFunctional()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.05,),
-            perturbation_strategy="fourier",
-            fourier_modes=((1, 0, 0), (2, 0, 0)),
-        )
-
-        value = term(outputs, batch, model=model)
-
-        self.assertTrue(torch.isfinite(value).item())
-        self.assertEqual(model.last_grid_size.shape, (1, 4, 3))
-        self.assertTrue(
-            torch.equal(
-                model.last_grid_size,
-                torch.tensor([[[4, 1, 1]] * 4]),
-            )
-        )
-
-    def test_fourier_strategy_applies_all_modes_to_all_fields(self):
-        x, y = torch.meshgrid(torch.arange(4), torch.arange(2), indexing="ij")
-        positions = torch.stack(
-            (x.reshape(-1), y.reshape(-1), torch.zeros(8, dtype=torch.long)),
-            dim=-1,
-        )
-        batch = {
-            "rho": torch.stack(
-                (torch.full((8, 1), 0.4), torch.full((8, 1), 0.6))
-            ),
-            "V_ext": torch.zeros(2, 8, 1),
-            "beta": torch.ones(2),
-            "temperature": torch.ones(2),
-            "grid_spacing": torch.ones(2, 3),
-            "grid_positions": positions.unsqueeze(0).expand(2, -1, -1),
-            "local_density_index": torch.arange(8)
-            .reshape(1, 8, 1)
-            .expand(2, -1, -1),
-        }
-        model = _UnstableQuadraticFunctional()
-        outputs = model(batch)
-        term = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.05,),
-            perturbation_strategy="fourier",
-            fourier_modes=((1, 0, 0), (0, 1, 0)),
-        )
-
-        value = term(outputs, batch, model=model)
-
-        self.assertTrue(torch.isfinite(value).item())
-        self.assertEqual(model.last_rho.shape, (2, 4, 8, 1))
-        expected_sums = torch.tensor([3.2, 4.8]).reshape(2, 1, 1)
-        self.assertTrue(
-            torch.allclose(
-                torch.sum(model.last_rho, dim=-2),
-                expected_sums.expand(-1, 4, -1),
-                atol=1.0e-6,
-            )
-        )
-
-    def test_homogeneous_ideal_fluid_has_unit_fourier_curvature(self):
-        model = _UnstableQuadraticFunctional()
-        model.scale.data.zero_()
-        batch = self._batch()
-        outputs = model(batch)
-
-        below_unit = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.01,),
-            perturbation_strategy="fourier",
-            fourier_modes=((1, 0, 0),),
-            minimum_normalized_curvature=0.9,
-        )(outputs, batch, model=model)
-        above_unit = DensityPerturbationStabilityLoss(
-            maximum_density=1.0,
-            relative_amplitudes=(0.01,),
-            perturbation_strategy="fourier",
-            fourier_modes=((1, 0, 0),),
-            minimum_normalized_curvature=1.1,
-        )(outputs, batch, model=model)
-
-        self.assertEqual(below_unit.item(), 0.0)
-        self.assertGreater(above_unit.item(), 0.0)
-
-    def test_validates_fourier_configuration(self):
-        with self.assertRaisesRegex(ValueError, "perturbation_strategy"):
-            DensityPerturbationStabilityLoss(
-                maximum_density=1.0,
-                perturbation_strategy="unknown",
-            )
-        with self.assertRaisesRegex(ValueError, "zero mode"):
-            DensityPerturbationStabilityLoss(
-                maximum_density=1.0,
-                perturbation_strategy="fourier",
-                fourier_modes=((0, 0, 0),),
-            )
-        with self.assertRaisesRegex(ValueError, "integers"):
-            DensityPerturbationStabilityLoss(
-                maximum_density=1.0,
-                perturbation_strategy="fourier",
-                fourier_modes=((0.5, 0, 0),),
-            )
-
-
-class TestGlobalDensityStabilityLoss(unittest.TestCase):
-    @staticmethod
-    def _batch():
-        return TestDensityPerturbationStabilityLoss._batch()
-
-    def test_penalizes_lower_finite_candidate_and_preserves_particles(self):
-        model = _UnstableQuadraticFunctional()
-        batch = self._batch()
-        outputs = model(batch)
-        term = GlobalDensityStabilityLoss(
-            maximum_density=1.0,
-            mixing_fractions=(0.25, 0.5, 1.0),
-        )
-        term.eval()
-
-        value = term(outputs, batch, model=model)
-        value.backward()
-
-        self.assertGreater(value.item(), 0.0)
-        self.assertGreater(model.scale.grad.item(), 0.0)
-        candidate_sums = torch.sum(model.last_rho, dim=-2)
-        self.assertTrue(
-            torch.allclose(
-                candidate_sums,
-                torch.full_like(candidate_sums, 2.0),
-            )
-        )
-        self.assertGreaterEqual(model.last_rho.min().item(), 0.0)
-        self.assertLessEqual(model.last_rho.max().item(), 1.0)
-
-    def test_validates_mixing_fractions(self):
-        for fractions in ((), (0.0,), (1.1,), (0.5, 0.25)):
-            with self.subTest(fractions=fractions):
-                with self.assertRaisesRegex(ValueError, "mixing_fractions"):
-                    GlobalDensityStabilityLoss(
-                        maximum_density=1.0,
-                        mixing_fractions=fractions,
-                    )
-
-    def test_validates_trial_strategy(self):
-        with self.assertRaisesRegex(ValueError, "trial_strategy"):
-            GlobalDensityStabilityLoss(
-                maximum_density=1.0,
-                trial_strategy="unknown",
-            )
 
 
 class TestLossAggregation(unittest.TestCase):
@@ -551,19 +194,14 @@ class TestLossAggregation(unittest.TestCase):
                 ),
             ]
         )
-
         values = loss(
-            {
-                "c1": c1_prediction,
-                "beta_F_exc": energy_prediction,
-            },
+            {"c1": c1_prediction, "beta_F_exc": energy_prediction},
             {
                 "c1": torch.tensor([0.0, 1.0]),
                 "beta_F_exc": torch.tensor([1.0]),
             },
         )
         values["total"].backward()
-
         self.assertEqual(list(values), ["c1", "free_energy", "total"])
         self.assertAlmostEqual(values["c1"].item(), 5.0)
         self.assertAlmostEqual(values["free_energy"].item(), 1.0)
@@ -572,10 +210,10 @@ class TestLossAggregation(unittest.TestCase):
         self.assertIsNotNone(energy_prediction.grad)
 
     def test_accepts_specialized_term_with_same_interface(self):
-        loss = Loss([_PredictionPenalty()])
-
-        values = loss({"c1": torch.tensor([-2.0, 4.0])}, {})
-
+        values = Loss([_PredictionPenalty()])(
+            {"c1": torch.tensor([-2.0, 4.0])},
+            {},
+        )
         self.assertAlmostEqual(values["prediction_penalty"].item(), 3.0)
         self.assertAlmostEqual(values["total"].item(), 3.0)
 

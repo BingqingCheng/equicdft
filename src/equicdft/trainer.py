@@ -396,7 +396,7 @@ class Trainer(nn.Module):
                     self.optimizer.zero_grad(set_to_none=True)
 
                 outputs = self.model(batch)
-                loss_values = self.loss(outputs, batch, model=self.model)
+                loss_values = self.loss(outputs, batch)
                 for metric in self.metrics:
                     metric.update_metrics(subset, outputs, batch)
 
