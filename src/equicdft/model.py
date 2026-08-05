@@ -1,4 +1,4 @@
-"""Collected grid-CACE density-functional model."""
+"""Collected grid density-functional model."""
 
 import math
 from contextlib import nullcontext
@@ -9,28 +9,18 @@ import torch
 from torch import nn
 
 from .derivatives import compute_grid_derivative
+from .energy import EnergyReadout
 from .features import CartesianAFeatures
-from .readout import BulkReadout, LocalReadout, LongRangeReadout
-from .reciprocal import ReciprocalFeatures
 from .symmetrize import CartesianBFeatures
 
 
 class GridCACEModel(nn.Module):
     """Collect the complete density-to-free-energy computational graph.
 
-    The model applies the registered modules in the order
-
-    ``rho -> A -> B -> (B, T) -> beta_F_exc_local``
-
-    with the optional homogeneous branch
-
-    ``(mean(rho), T) -> beta_F_exc_bulk``
-
-    with the optional reciprocal branch
-
-    ``rho -> reciprocal features -> beta_F_exc_long_range``.
-
-    The scalar energy contributions are added before the response calculation,
+    Each module in ``readout`` evaluates one scalar contribution from a shared
+    context containing the density, temperature, grid metadata, and any local
+    or global features it requested. The model adds those contributions before
+    the response calculation,
 
     ``beta_F_exc -> c1 -> c2``,
 
@@ -54,34 +44,9 @@ class GridCACEModel(nn.Module):
     ``g`` runs over ``n_grid`` grid points, and ``i`` runs over ``n_types``
     density components. The returned dictionary contains:
 
-    ``beta_free_energy_per_particle``
-        Shape ``[..., n_grid, n_types]``. Dimensionless per-particle excess
-        free energies
-        ``beta_a_exc[..., grid, type]`` predicted by the local readout.
-    ``beta_free_energy_density``
-        Shape ``[..., n_grid]``. Dimensionless excess free-energy density
-        ``sum_i rho[..., grid, i] * beta_a_exc[..., grid, i]`` at each grid
-        point, before multiplication by the voxel volume.
     ``beta_F_exc``
         Shape ``[...]`` (a scalar without batching). Dimensionless excess free
-        energy for each complete density field. It is the sum of the local,
-        optional bulk, and optional long-range contributions.
-    ``beta_F_exc_local``
-        Shape ``[...]``. Integral of ``beta_free_energy_density`` over the
-        grid. This key is present when a bulk or reciprocal branch is
-        configured.
-    ``beta_bulk_free_energy_per_particle``
-        Shape ``[..., n_types]``. Homogeneous dimensionless excess free energy
-        per particle predicted from normalized temperature and mean densities.
-        This key is present when a bulk branch is configured.
-    ``beta_F_exc_bulk``
-        Shape ``[...]``. Extensive homogeneous contribution
-        ``sum_i N_i beta_a_exc_bulk_i``. This key is present when a bulk branch
-        is configured.
-    ``beta_F_exc_long_range``
-        Shape ``[...]``. Nonlocal reciprocal-space contribution for each
-        complete density field. This key is present when a reciprocal branch
-        is configured.
+        energy for each complete density field, summed over every readout.
     ``c1``
         Shape ``[..., n_grid, n_types]``. First direct correlation
         ``-delta(beta_F_exc) / delta(rho)`` in the continuum
@@ -110,24 +75,15 @@ class GridCACEModel(nn.Module):
     Parameters
     ----------
     a_features
-        Module that constructs local Cartesian density moments.
+        Module that constructs local Cartesian density moments. It may be
+        ``None`` if no readout requests local features.
     b_features
-        Module that contracts the Cartesian moments into invariant features.
+        Module that contracts Cartesian moments into invariant features. It is
+        supplied together with ``a_features``.
     readout
-        Module that predicts the per-particle excess free energy from the
-        flattened local ``B`` features and normalized scalar temperature.
-    bulk_readout
-        Optional module that maps normalized temperature and mean densities to
-        one homogeneous per-particle excess free energy per component. The
-        model multiplies these values by the corresponding particle numbers
-        and adds the resulting scalar to the local and long-range energies.
-    long_range_features
-        Optional module that constructs translation-invariant reciprocal
-        quadratic features from the complete density field.
-    long_range_readout
-        Optional module that maps temperature and mean density to reciprocal
-        kernel coefficients and contracts them with ``long_range_features``.
-        Supply both long-range modules or neither.
+        Nonempty sequence of :class:`EnergyReadout` modules. Every module owns
+        the mathematical details of its contribution and returns one scalar
+        energy per field through ``energy(context)``.
     grid_spacing
         One value for an isotropic grid or three Cartesian spacings. The
         discretization is fixed by training and stored with the model.
@@ -160,9 +116,9 @@ class GridCACEModel(nn.Module):
 
     def __init__(
         self,
-        a_features: CartesianAFeatures,
-        b_features: CartesianBFeatures,
-        readout: LocalReadout,
+        a_features: Optional[CartesianAFeatures],
+        b_features: Optional[CartesianBFeatures],
+        readout: Sequence[EnergyReadout],
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
         mean_temperature: Union[float, torch.Tensor] = 1.0,
         boltzmann_constant: float = 1.0,
@@ -171,13 +127,10 @@ class GridCACEModel(nn.Module):
             Sequence[float],
             torch.Tensor,
         ] = 1.0,
-        long_range_features: Optional[ReciprocalFeatures] = None,
-        long_range_readout: Optional[LongRangeReadout] = None,
         compute_c1: bool = True,
         compute_c2: bool = False,
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
-        bulk_readout: Optional[BulkReadout] = None,
     ) -> None:
         super().__init__()
 
@@ -189,41 +142,54 @@ class GridCACEModel(nn.Module):
             raise TypeError("compute_local_mu must be a boolean")
         if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
-        if bulk_readout is not None:
-            if not isinstance(bulk_readout, BulkReadout):
-                raise TypeError("bulk_readout must be BulkReadout or None")
-            if bulk_readout.n_types != a_features.n_types:
-                raise ValueError(
-                    "bulk_readout n_types does not match local features"
-                )
-        if (long_range_features is None) != (long_range_readout is None):
+
+        if (a_features is None) != (b_features is None):
             raise ValueError(
-                "long_range_features and long_range_readout must be supplied "
-                "together"
+                "a_features and b_features must be supplied together"
             )
-        if long_range_features is not None:
-            if not isinstance(long_range_features, ReciprocalFeatures):
-                raise TypeError(
-                    "long_range_features must be ReciprocalFeatures or None"
-                )
-            if not isinstance(long_range_readout, LongRangeReadout):
-                raise TypeError(
-                    "long_range_readout must be LongRangeReadout or None"
-                )
-            if long_range_features.n_types != a_features.n_types:
-                raise ValueError(
-                    "long_range_features n_types does not match local features"
-                )
-            if long_range_readout.n_types != a_features.n_types:
-                raise ValueError(
-                    "long_range_readout n_types does not match local features"
-                )
+        if isinstance(readout, EnergyReadout):
+            raise TypeError(
+                "readout must be a sequence of EnergyReadout modules"
+            )
+        try:
+            readouts = list(readout)
+        except TypeError:
+            raise TypeError(
+                "readout must be a sequence of EnergyReadout modules"
+            )
+        if not readouts:
+            raise ValueError("readout must contain at least one energy readout")
+        if not all(isinstance(module, EnergyReadout) for module in readouts):
+            raise TypeError("every readout must be an EnergyReadout module")
+        if (
+            any(item.requires_local_features for item in readouts)
+            and a_features is None
+        ):
+            raise ValueError(
+                "a_features and b_features are required by a configured readout"
+            )
+        if a_features is not None:
+            n_types = a_features.n_types
+        else:
+            typed_readouts = [
+                item for item in readouts if hasattr(item, "n_types")
+            ]
+            if not typed_readouts:
+                raise ValueError("n_types cannot be inferred from the readouts")
+            n_types = typed_readouts[0].n_types
+        for item in readouts:
+            if hasattr(item, "n_types") and item.n_types != n_types:
+                raise ValueError("all readouts must use the same n_types")
             if (
-                long_range_readout.n_kernels
-                != long_range_features.n_kernels
+                a_features is not None
+                and hasattr(item, "mean_density")
+                and not torch.allclose(
+                    a_features.mean_density,
+                    item.mean_density.to(a_features.mean_density),
+                )
             ):
                 raise ValueError(
-                    "long-range feature and readout kernel counts differ"
+                    "readouts and local features must use the same mean_density"
                 )
         try:
             rho_min = float(rho_min)
@@ -234,10 +200,7 @@ class GridCACEModel(nn.Module):
 
         self.a_features = a_features
         self.b_features = b_features
-        self.readout = readout
-        self.bulk_readout = bulk_readout
-        self.long_range_features = long_range_features
-        self.long_range_readout = long_range_readout
+        self.readout = nn.ModuleList(readouts)
         self.compute_c1 = compute_c1 or compute_c2
         self.compute_c2 = compute_c2
         self.compute_local_mu = compute_local_mu
@@ -319,22 +282,7 @@ class GridCACEModel(nn.Module):
         )
 
         self.required_derivatives = ["rho"] if self.compute_c1 else []
-        self.model_outputs = [
-            "beta_free_energy_per_particle",
-            "beta_free_energy_density",
-        ]
-        if self.has_bulk or self.has_long_range:
-            self.model_outputs.append("beta_F_exc_local")
-        if self.has_bulk:
-            self.model_outputs.extend(
-                (
-                    "beta_bulk_free_energy_per_particle",
-                    "beta_F_exc_bulk",
-                )
-            )
-        if self.has_long_range:
-            self.model_outputs.append("beta_F_exc_long_range")
-        self.model_outputs.append("beta_F_exc")
+        self.model_outputs = ["beta_F_exc"]
         if self.compute_c1:
             self.model_outputs.append("c1")
         if compute_c2:
@@ -352,31 +300,35 @@ class GridCACEModel(nn.Module):
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
 
-        return self.a_features.cutoff_grid
+        return self.a_features.cutoff_grid if self.has_local_features else 0
 
     @property
     def n_types(self) -> int:
         """Number of physical density components accepted by the model."""
 
-        return self.a_features.n_types
+        if self.has_local_features:
+            return self.a_features.n_types
+        for item in self.readout:
+            if hasattr(item, "n_types"):
+                return item.n_types
+        raise RuntimeError("n_types is unavailable")
 
     @property
     def mean_density(self) -> torch.Tensor:
         """Density scale fitted from the development data."""
 
-        return self.a_features.mean_density
+        if self.has_local_features:
+            return self.a_features.mean_density
+        for item in self.readout:
+            if hasattr(item, "mean_density"):
+                return item.mean_density
+        raise RuntimeError("mean_density is unavailable")
 
     @property
-    def has_long_range(self) -> bool:
-        """Whether the model contains the optional reciprocal branch."""
+    def has_local_features(self) -> bool:
+        """Whether local invariant environment features are configured."""
 
-        return self.long_range_features is not None
-
-    @property
-    def has_bulk(self) -> bool:
-        """Whether the model contains the optional homogeneous branch."""
-
-        return getattr(self, "bulk_readout", None) is not None
+        return getattr(self, "a_features", None) is not None
 
     @property
     def cell_volume(self) -> torch.Tensor:
@@ -516,22 +468,16 @@ class GridCACEModel(nn.Module):
         if compute_c1 is None:
             compute_c1 = self.compute_c1
         compute_c1 = compute_c1 or compute_c2
+        response_outputs = {
+            "c1",
+            "c2",
+            "local_chemical_potential",
+            "average_chemical_potential",
+            "chemical_potential_weights",
+        }
         requested_outputs = [
-            "beta_free_energy_per_particle",
-            "beta_free_energy_density",
+            key for key in self.model_outputs if key not in response_outputs
         ]
-        if self.has_bulk or self.has_long_range:
-            requested_outputs.append("beta_F_exc_local")
-        if self.has_bulk:
-            requested_outputs.extend(
-                (
-                    "beta_bulk_free_energy_per_particle",
-                    "beta_F_exc_bulk",
-                )
-            )
-        if self.has_long_range:
-            requested_outputs.append("beta_F_exc_long_range")
-        requested_outputs.append("beta_F_exc")
         if compute_c1:
             requested_outputs.append("c1")
             if compute_c2:
@@ -579,76 +525,46 @@ class GridCACEModel(nn.Module):
             self._validate_grid_spacing(data)
             data = self.initialize_derivatives(data, compute_c1=compute_c1)
 
-            # A[..., g, n, k, c] contains Cartesian density moment k in radial
-            # channel n and descriptor channel c around grid point g. Channel
-            # c is physical without mixing and latent when mixing is enabled.
-            A = self.a_features(data)
-
-            # B[..., g, n, gamma, c] contains cubic-invariant contraction gamma
-            # formed from the Cartesian components of A.
-            B = self.b_features(A)
-
-            # Flatten the radial, invariant, and channel axes into one local
-            # feature vector [..., n_grid, n_B]. The scale-only normalized
-            # temperature T/<T> has shape [...] and is broadcast over the
-            # grid before being appended once, giving [..., n_grid, n_B + 1].
-            B_flat = B.flatten(start_dim=-3)
+            rho = data["rho"]
             temperature = data["temperature"].to(
-                device=B_flat.device,
-                dtype=B_flat.dtype,
+                device=rho.device,
+                dtype=rho.dtype,
             )
-            if temperature.shape != B_flat.shape[:-2]:
+            if temperature.shape != rho.shape[:-2]:
                 raise ValueError(
                     "temperature must be scalar for one field or have the "
-                    "same leading batch shape as B"
+                    "same leading batch shape as rho"
                 )
             normalized_temperature = temperature / self.mean_temperature.to(
-                device=B_flat.device,
-                dtype=B_flat.dtype,
-            )
-            temperature_feature = normalized_temperature[
-                ..., None, None
-            ].expand(
-                *B_flat.shape[:-1],
-                1,
-            )
-            local_features = torch.cat(
-                (B_flat, temperature_feature),
-                dim=-1,
+                device=rho.device,
+                dtype=rho.dtype,
             )
 
-            # beta_free_energy_per_particle has shape
-            #     [..., n_grid, n_types].
-            # Entry [..., g, i] is the dimensionless excess free energy
-            # assigned to one particle of type i at grid point g.
-            beta_free_energy_per_particle = self.readout(local_features)
+            local_features = None
+            if any(
+                item.requires_local_features for item in self.readout
+            ):
+                # Construct the shared invariant local representation once.
+                # Any readout that requests local features receives the same
+                # flattened B features and normalized temperature.
+                A = self.a_features(data)
+                B = self.b_features(A)
+                B_flat = B.flatten(start_dim=-3)
+                temperature_feature = normalized_temperature[
+                    ..., None, None
+                ].expand(*B_flat.shape[:-1], 1)
+                local_features = torch.cat(
+                    (B_flat, temperature_feature),
+                    dim=-1,
+                )
 
-            # beta_free_energy_density has shape [..., n_grid]. Entry [..., g]
-            # is beta*f_exc at grid point g. The density is still in physical
-            # number-density units, and no voxel volume has been applied.
-            beta_free_energy_density = torch.sum(
-                data["rho"] * beta_free_energy_per_particle,
-                dim=-1,
-            )
-
-            # cell_volume is a scalar fixed by the training-grid
-            # discretization. beta_F_exc has shape [...] (or scalar shape []
-            # without a batch) and stores one dimensionless excess free energy
-            # per field.
-            cell_volume = self.cell_volume.to(
-                device=beta_free_energy_density.device,
-                dtype=beta_free_energy_density.dtype,
-            )
-            beta_F_exc_local = cell_volume * torch.sum(
-                beta_free_energy_density,
-                dim=-1,
-            )
-
-            # The bulk and reciprocal branches use the same global state:
-            # normalized temperature and one normalized mean density per
-            # component. Mean density retains its connection to rho so both
-            # optional energies contribute to functional derivatives.
-            if self.has_bulk or self.has_long_range:
+            # Construct the shared global state only when requested. Mean
+            # density retains its connection to rho, so energy readouts using
+            # this state remain part of the functional derivative.
+            state_features = None
+            if any(
+                item.requires_state_features for item in self.readout
+            ):
                 mean_density = data["rho"].mean(dim=-2)
                 mean_density_feature = (
                     mean_density
@@ -665,75 +581,38 @@ class GridCACEModel(nn.Module):
                     dim=-1,
                 )
 
-            if self.has_bulk:
-                # beta_bulk_free_energy_per_particle has shape
-                # [..., n_types]. Multiplication by particle_numbers makes the
-                # bulk contribution extensive and exactly zero in vacuum.
-                beta_bulk_free_energy_per_particle = self.bulk_readout(
-                    state_features
-                )
-                if beta_bulk_free_energy_per_particle.shape != mean_density.shape:
-                    raise ValueError(
-                        "bulk readout must return one value per field and type"
-                    )
-                particle_numbers = cell_volume * torch.sum(
-                    data["rho"],
-                    dim=-2,
-                )
-                beta_F_exc_bulk = torch.sum(
-                    particle_numbers * beta_bulk_free_energy_per_particle,
-                    dim=-1,
-                )
-                if beta_F_exc_bulk.shape != beta_F_exc_local.shape:
-                    raise ValueError(
-                        "bulk readout must return one scalar energy per field"
-                    )
-            else:
-                beta_F_exc_bulk = torch.zeros_like(beta_F_exc_local)
-
-            if self.has_long_range:
-                if "grid_size" not in data:
-                    raise KeyError(
-                        "long-range evaluation requires data['grid_size']"
-                    )
-                reciprocal_features = self.long_range_features(
-                    rho=data["rho"],
-                    grid_size=data["grid_size"],
-                    grid_spacing=self.grid_spacing,
-                )
-                beta_F_exc_long_range = self.long_range_readout(
-                    reciprocal_features,
-                    state_features,
-                )
-                if beta_F_exc_long_range.shape != beta_F_exc_local.shape:
-                    raise ValueError(
-                        "long-range readout must return one scalar per field"
-                    )
-            else:
-                beta_F_exc_long_range = torch.zeros_like(beta_F_exc_local)
-
-            beta_F_exc = (
-                beta_F_exc_local
-                + beta_F_exc_bulk
-                + beta_F_exc_long_range
+            cell_volume = self.cell_volume.to(
+                device=rho.device,
+                dtype=rho.dtype,
             )
-
-            outputs = {
-                "beta_free_energy_per_particle": (
-                    beta_free_energy_per_particle
-                ),
-                "beta_free_energy_density": beta_free_energy_density,
-                "beta_F_exc": beta_F_exc,
+            context = {
+                "rho": rho,
+                "normalized_temperature": normalized_temperature,
+                "cell_volume": cell_volume,
+                "grid_spacing": self.grid_spacing.to(rho),
             }
-            if self.has_bulk or self.has_long_range:
-                outputs["beta_F_exc_local"] = beta_F_exc_local
-            if self.has_bulk:
-                outputs["beta_bulk_free_energy_per_particle"] = (
-                    beta_bulk_free_energy_per_particle
-                )
-                outputs["beta_F_exc_bulk"] = beta_F_exc_bulk
-            if self.has_long_range:
-                outputs["beta_F_exc_long_range"] = beta_F_exc_long_range
+            if local_features is not None:
+                context["local_features"] = local_features
+            if state_features is not None:
+                context["state_features"] = state_features
+            if "grid_size" in data:
+                context["grid_size"] = data["grid_size"]
+
+            readout_energies = []
+            for item in self.readout:
+                energy = item.energy(context)
+                if energy.shape != rho.shape[:-2]:
+                    raise ValueError(
+                        "every readout must return one scalar energy per field"
+                    )
+                readout_energies.append(energy)
+
+            # Summing the scalar energies before differentiation makes every
+            # enabled readout part of the same variational functional.
+            beta_F_exc = readout_energies[0]
+            for energy in readout_energies[1:]:
+                beta_F_exc = beta_F_exc + energy
+            outputs = {"beta_F_exc": beta_F_exc}
 
             if compute_c1:
                 # beta_F_exc_derivative and c1 have the same shape as rho:

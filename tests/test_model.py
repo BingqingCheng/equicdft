@@ -8,7 +8,9 @@ from equicdft import (
     BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
+    GGAReadout,
     GridCACEModel,
+    LDAReadout,
     LocalReadout,
     LongRangeReadout,
     ReciprocalFeatures,
@@ -34,22 +36,336 @@ class _IdentityModule(nn.Module):
         return values
 
 
-class _FirstFeatureReadout(nn.Module):
+class _FirstFeatureReadout(LocalReadout):
     """Return the density feature and ignore scalar conditioning inputs."""
 
     def forward(self, local_features):
         return local_features[..., :1]
 
 
-class _ConstantPerParticleReadout(nn.Module):
+class _ConstantPerParticleReadout(LocalReadout):
     """Return a trainable constant, making the functional linear in rho."""
 
     def __init__(self):
-        super().__init__()
+        nn.Module.__init__(self)
+        self.n_types = 1
         self.value = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, local_features):
         return self.value.expand(*local_features.shape[:-1], 1)
+
+
+class TestGridLDABranch(unittest.TestCase):
+    @staticmethod
+    def _data():
+        return {
+            "rho": torch.linspace(0.2, 0.8, steps=8).reshape(8, 1),
+            "temperature": torch.tensor(1.5),
+            "beta": torch.tensor(1.0 / 1.5),
+            "grid_spacing": torch.full((3,), 0.5),
+            "grid_size": torch.tensor([2, 2, 2]),
+        }
+
+    @staticmethod
+    def _quadratic_model(compute_c2=False, with_long_range=False):
+        lda_readout = LDAReadout(
+            mean_density=1.0,
+            n_types=1,
+            hidden_sizes=(),
+        )
+        # beta_a_exc_lda = rho, so beta_F_exc_lda = DeltaV * sum rho**2.
+        with torch.no_grad():
+            lda_readout.mlp[-1].weight.copy_(torch.tensor([[1.0, 0.0]]))
+            lda_readout.mlp[-1].bias.zero_()
+
+        long_range_features = None
+        long_range_readout = None
+        if with_long_range:
+            long_range_features = ReciprocalFeatures(
+                radial_exponents=(0.5,),
+                n_types=1,
+            )
+            long_range_readout = LongRangeReadout(
+                n_kernels=1,
+                n_types=1,
+                hidden_sizes=(),
+                zero_init=False,
+                features=long_range_features,
+            )
+            with torch.no_grad():
+                long_range_readout.mlp[-1].weight.zero_()
+                long_range_readout.mlp[-1].bias.fill_(0.2)
+
+        readouts = [lda_readout]
+        if long_range_readout is not None:
+            readouts.append(long_range_readout)
+        return GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=readouts,
+            grid_spacing=0.5,
+            mean_temperature=1.0,
+            compute_c1=True,
+            compute_c2=compute_c2,
+        )
+
+    def test_lda_energy_and_c1_need_no_neighborhood_data(self):
+        model = self._quadratic_model()
+        data = self._data()
+
+        outputs = model(data)
+
+        expected_energy = model.cell_volume * torch.sum(data["rho"].square())
+        self.assertTrue(torch.allclose(outputs["beta_F_exc"], expected_energy))
+        self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
+        self.assertEqual(model.cutoff_grid, 0)
+        self.assertIsInstance(model.readout[0], LDAReadout)
+        self.assertNotIn("local_density_index", data)
+
+    def test_lda_c2_has_expected_local_hessian(self):
+        model = self._quadratic_model(compute_c2=True)
+        data = self._data()
+
+        outputs = model(data, c2_reference=(3, 0))
+
+        expected = torch.zeros_like(data["rho"])
+        expected[3, 0] = -2.0 / model.cell_volume
+        self.assertTrue(torch.equal(outputs["c2"], expected))
+
+    def test_lda_vacuum_energy_is_exactly_zero(self):
+        model = self._quadratic_model()
+        data = self._data()
+        data["rho"].zero_()
+
+        outputs = model(data)
+
+        self.assertEqual(outputs["beta_F_exc"].item(), 0.0)
+        self.assertTrue(torch.all(torch.isfinite(outputs["c1"])))
+
+    def test_multicomponent_lda_uses_complete_local_composition(self):
+        readout = LDAReadout(
+            mean_density=1.0,
+            n_types=2,
+            hidden_sizes=(),
+        )
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(torch.tensor([[1.0, 2.0, 0.0]]))
+            readout.mlp[-1].bias.zero_()
+        model = GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=[readout],
+            grid_spacing=1.0,
+            compute_c1=False,
+        )
+        rho = torch.tensor([[0.2, 0.3], [0.4, 0.1]])
+        data = {
+            "rho": rho,
+            "temperature": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+
+        outputs = model(data)
+
+        beta_a = rho[:, :1] + 2.0 * rho[:, 1:]
+        expected_density = torch.sum(rho, dim=-1) * beta_a[:, 0]
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"],
+                expected_density.sum(),
+            )
+        )
+
+    def test_lda_and_long_range_energies_are_additive_and_trainable(self):
+        model = self._quadratic_model(with_long_range=True)
+        data = self._data()
+
+        outputs = model(data)
+
+        self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
+        outputs["c1"].square().mean().backward()
+        self.assertIsNotNone(model.readout[0].mlp[-1].weight.grad)
+        self.assertIsNotNone(model.readout[1].mlp[-1].bias.grad)
+
+    def test_cace_is_an_additive_correction_to_lda(self):
+        lda_readout = LDAReadout(
+            mean_density=1.0,
+            hidden_sizes=(),
+        )
+        with torch.no_grad():
+            lda_readout.mlp[-1].weight.copy_(torch.tensor([[1.0, 0.0]]))
+            lda_readout.mlp[-1].bias.zero_()
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[lda_readout, _FirstFeatureReadout()],
+            grid_spacing=0.5,
+        )
+        data = self._data()
+
+        outputs = model(data)
+
+        expected_energy = 0.5**3 * torch.sum(data["rho"].square())
+        self.assertTrue(
+            torch.allclose(outputs["beta_F_exc"], 2.0 * expected_energy)
+        )
+        self.assertTrue(torch.allclose(outputs["c1"], -4.0 * data["rho"]))
+
+    def test_at_least_one_local_energy_branch_is_required(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            GridCACEModel(
+                a_features=None,
+                b_features=None,
+                readout=[],
+                grid_spacing=1.0,
+            )
+
+
+class TestGridLDAGGABranch(unittest.TestCase):
+    @staticmethod
+    def _model(with_long_range=False):
+        lda_readout = LDAReadout(
+            mean_density=1.0,
+            n_types=1,
+            hidden_sizes=(),
+            zero_init=True,
+        )
+        gga_readout = GGAReadout(
+            hidden_sizes=(),
+            n_features=2,
+            initial_coefficient=0.2,
+        )
+        long_range_features = None
+        long_range_readout = None
+        if with_long_range:
+            long_range_features = ReciprocalFeatures(
+                radial_exponents=(0.5,),
+                n_types=1,
+            )
+            long_range_readout = LongRangeReadout(
+                n_kernels=1,
+                n_types=1,
+                hidden_sizes=(),
+                zero_init=False,
+                features=long_range_features,
+            )
+            with torch.no_grad():
+                long_range_readout.mlp[-1].weight.zero_()
+                long_range_readout.mlp[-1].bias.fill_(0.1)
+        readouts = [lda_readout, gga_readout]
+        if long_range_readout is not None:
+            readouts.append(long_range_readout)
+        return GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=readouts,
+            grid_spacing=1.0,
+            compute_c1=True,
+        )
+
+    @staticmethod
+    def _data(rho=None):
+        if rho is None:
+            rho = torch.tensor([[0.0], [1.0], [0.0], [1.0]])
+        return {
+            "rho": rho,
+            "temperature": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+            "grid_size": torch.tensor([4, 1, 1]),
+        }
+
+    def test_positive_gga_energy_and_analytic_c1(self):
+        model = self._model()
+
+        outputs = model(self._data())
+
+        self.assertIsInstance(model.readout, nn.ModuleList)
+        self.assertEqual(len(model.readout), 2)
+        self.assertTrue(model.has_local_features)
+        self.assertAlmostEqual(outputs["beta_F_exc"].item(), 0.4, places=6)
+        expected_c1 = torch.tensor([[0.4], [-0.4], [0.4], [-0.4]])
+        self.assertTrue(torch.allclose(outputs["c1"], expected_c1))
+
+    def test_homogeneous_density_has_no_gga_contribution(self):
+        model = self._model()
+
+        outputs = model(self._data(torch.full((4, 1), 0.7)))
+
+        self.assertEqual(outputs["beta_F_exc"].item(), 0.0)
+
+    def test_c1_loss_trains_gga_readout(self):
+        model = self._model()
+
+        outputs = model(self._data())
+        outputs["c1"].square().mean().backward()
+
+        self.assertIsNotNone(model.readout[1].mlp[-1].weight.grad)
+        self.assertIsNotNone(model.readout[1].mlp[-1].bias.grad)
+        self.assertGreater(
+            model.readout[1].mlp[-1].bias.grad.abs().item(),
+            0.0,
+        )
+
+    def test_lda_gga_and_long_range_energies_are_additive(self):
+        model = self._model(with_long_range=True)
+
+        outputs = model(self._data())
+
+        self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
+
+    def test_gga_can_augment_cace_but_requires_local_features(self):
+        gga_readout = GGAReadout(n_features=2)
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[_FirstFeatureReadout(), gga_readout],
+            grid_spacing=1.0,
+        )
+        self.assertEqual(len(model.readout), 2)
+        with self.assertRaisesRegex(ValueError, "required by"):
+            GridCACEModel(
+                a_features=None,
+                b_features=None,
+                readout=[LDAReadout(mean_density=1.0), gga_readout],
+                grid_spacing=1.0,
+            )
+
+    def test_lda_cace_and_gga_are_all_additive_before_autodiff(self):
+        lda_readout = LDAReadout(
+            mean_density=1.0,
+            hidden_sizes=(),
+            zero_init=True,
+        )
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[
+                lda_readout,
+                _FirstFeatureReadout(),
+                GGAReadout(
+                    hidden_sizes=(),
+                    n_features=2,
+                    initial_coefficient=0.2,
+                ),
+            ],
+            grid_spacing=1.0,
+            compute_c1=True,
+        )
+
+        outputs = model(self._data())
+
+        self.assertIsInstance(model.readout, nn.ModuleList)
+        self.assertEqual(
+            [module.__class__.__name__ for module in model.readout],
+            [
+                "LDAReadout",
+                "_FirstFeatureReadout",
+                "GGAReadout",
+            ],
+        )
+        self.assertAlmostEqual(outputs["beta_F_exc"].item(), 2.4, places=6)
+        expected_c1 = torch.tensor([[0.4], [-2.4], [0.4], [-2.4]])
+        self.assertTrue(torch.allclose(outputs["c1"], expected_c1))
 
 
 class TestGridCACEModel(unittest.TestCase):
@@ -110,18 +426,21 @@ class TestGridCACEModel(unittest.TestCase):
                 n_kernels=2,
                 n_types=1,
                 hidden_sizes=(4,),
+                features=long_range_features,
             )
+        readouts = [readout]
+        if bulk_readout is not None:
+            readouts.append(bulk_readout)
+        if long_range_readout is not None:
+            readouts.append(long_range_readout)
         return GridCACEModel(
             a_features,
             b_features,
-            readout,
+            readouts,
             grid_spacing=0.5,
             mean_temperature=mean_temperature,
             boltzmann_constant=1.0,
             thermal_wavelength=1.0,
-            bulk_readout=bulk_readout,
-            long_range_features=long_range_features,
-            long_range_readout=long_range_readout,
             compute_c1=compute_c1,
             compute_c2=compute_c2,
             compute_local_mu=compute_chemical_potential,
@@ -135,7 +454,7 @@ class TestGridCACEModel(unittest.TestCase):
             with_long_range=True,
         )
         with torch.no_grad():
-            model.long_range_readout.mlp[-1].bias.fill_(0.2)
+            model.readout[1].mlp[-1].bias.fill_(0.2)
         data = self._make_data()
         data["V_ext"] = torch.zeros_like(data["rho"])
 
@@ -146,16 +465,8 @@ class TestGridCACEModel(unittest.TestCase):
         )
         centered_local_mu.square().mean().backward()
 
-        self.assertEqual(outputs["beta_F_exc_local"].shape, ())
-        self.assertEqual(outputs["beta_F_exc_long_range"].shape, ())
-        self.assertTrue(
-            torch.allclose(
-                outputs["beta_F_exc"],
-                outputs["beta_F_exc_local"]
-                + outputs["beta_F_exc_long_range"],
-            )
-        )
-        final_gradient = model.long_range_readout.mlp[-1].bias.grad
+        self.assertEqual(outputs["beta_F_exc"].shape, ())
+        final_gradient = model.readout[1].mlp[-1].bias.grad
         self.assertIsNotNone(final_gradient)
         self.assertTrue(torch.all(torch.isfinite(final_gradient)))
         self.assertGreater(torch.linalg.vector_norm(final_gradient).item(), 0.0)
@@ -177,8 +488,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=local_readout,
-            bulk_readout=bulk_readout,
+            readout=[local_readout, bulk_readout],
             grid_spacing=0.5,
             mean_temperature=1.0,
             compute_c1=True,
@@ -194,20 +504,11 @@ class TestGridCACEModel(unittest.TestCase):
             * 2.0
             * mean_density
         )
-        self.assertTrue(
-            torch.allclose(outputs["beta_F_exc_bulk"], expected_energy)
-        )
+        self.assertTrue(torch.allclose(outputs["beta_F_exc"], expected_energy))
         self.assertTrue(
             torch.allclose(
                 outputs["c1"],
                 -4.0 * mean_density * torch.ones_like(data["rho"]),
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["beta_F_exc"],
-                outputs["beta_F_exc_local"]
-                + outputs["beta_F_exc_bulk"],
             )
         )
 
@@ -218,22 +519,15 @@ class TestGridCACEModel(unittest.TestCase):
             with_long_range=True,
         )
         with torch.no_grad():
-            model.bulk_readout.mlp[-1].bias.fill_(0.3)
-            model.long_range_readout.mlp[-1].bias.fill_(0.2)
+            model.readout[1].mlp[-1].bias.fill_(0.3)
+            model.readout[2].mlp[-1].bias.fill_(0.2)
 
         outputs = model(self._make_data())
 
-        self.assertTrue(
-            torch.allclose(
-                outputs["beta_F_exc"],
-                outputs["beta_F_exc_local"]
-                + outputs["beta_F_exc_bulk"]
-                + outputs["beta_F_exc_long_range"],
-            )
-        )
+        self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
         outputs["c1"].square().mean().backward()
-        self.assertIsNotNone(model.bulk_readout.mlp[-1].bias.grad)
-        self.assertIsNotNone(model.long_range_readout.mlp[-1].bias.grad)
+        self.assertIsNotNone(model.readout[1].mlp[-1].bias.grad)
+        self.assertIsNotNone(model.readout[2].mlp[-1].bias.grad)
 
     def test_exposes_persistent_inference_metadata(self):
         model = self._make_model(mean_temperature=1.2)
@@ -283,15 +577,6 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(outputs["beta_F_exc"].shape, ())
 
-    def test_pre_bulk_pickled_model_state_remains_local_only(self):
-        model = self._make_model()
-        del model.bulk_readout
-
-        outputs = model(self._make_data())
-
-        self.assertFalse(model.has_bulk)
-        self.assertNotIn("beta_F_exc_bulk", outputs)
-
     def test_collects_outputs_and_initializes_density_gradient(self):
         model = self._make_model()
         data = self._make_data()
@@ -300,11 +585,6 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(list(outputs), model.model_outputs)
         self.assertTrue(data["rho"].requires_grad)
-        self.assertEqual(
-            outputs["beta_free_energy_per_particle"].shape,
-            (27, 1),
-        )
-        self.assertEqual(outputs["beta_free_energy_density"].shape, (27,))
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 1))
 
@@ -315,7 +595,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=_FirstFeatureReadout(),
+            readout=[_FirstFeatureReadout()],
             grid_spacing=0.5,
             compute_c1=True,
         )
@@ -337,7 +617,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=_FirstFeatureReadout(),
+            readout=[_FirstFeatureReadout()],
             grid_spacing=0.5,
             compute_c2=True,
         )
@@ -430,7 +710,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=readout,
+            readout=[readout],
             grid_spacing=0.5,
             mean_temperature=2.0,
             compute_c1=False,
@@ -446,14 +726,13 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        expected = (
-            data["temperature"][:, None, None] / 2.0
-        ).expand(2, 27, 1)
+        per_particle = data["temperature"][:, None, None] / 2.0
+        expected = model.cell_volume * torch.sum(
+            data["rho"] * per_particle,
+            dim=(-2, -1),
+        )
         self.assertTrue(
-            torch.equal(
-                outputs["beta_free_energy_per_particle"],
-                expected,
-            )
+            torch.allclose(outputs["beta_F_exc"], expected)
         )
 
     def test_mean_temperature_must_be_positive_scalar(self):
@@ -469,15 +748,6 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        self.assertTrue(
-            torch.all(torch.isfinite(outputs["beta_free_energy_per_particle"]))
-        )
-        self.assertTrue(
-            torch.equal(
-                outputs["beta_free_energy_density"],
-                torch.zeros_like(outputs["beta_free_energy_density"]),
-            )
-        )
         self.assertEqual(outputs["beta_F_exc"].item(), 0.0)
 
     def test_training_c1_loss_reaches_readout_parameters(self):
@@ -518,7 +788,7 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),
-            readout=readout,
+            readout=[readout],
             grid_spacing=0.5,
             compute_c2=True,
         )
@@ -559,11 +829,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(
             list(outputs),
-            [
-                "beta_free_energy_per_particle",
-                "beta_free_energy_density",
-                "beta_F_exc",
-            ],
+            ["beta_F_exc"],
         )
         self.assertEqual(model.required_derivatives, [])
         self.assertFalse(data["rho"].requires_grad)
@@ -633,7 +899,7 @@ class TestGridCACEModel(unittest.TestCase):
                     n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
-                LocalReadout(n_types=1),
+                [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_c1=1,
             )
@@ -647,7 +913,7 @@ class TestGridCACEModel(unittest.TestCase):
                     n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
-                LocalReadout(n_types=1),
+                [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_c2=1,
             )
@@ -661,7 +927,7 @@ class TestGridCACEModel(unittest.TestCase):
                     n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
-                LocalReadout(n_types=1),
+                [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_local_mu=1,
             )
@@ -675,7 +941,7 @@ class TestGridCACEModel(unittest.TestCase):
                     n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
-                LocalReadout(n_types=1),
+                [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_c1=False,
                 compute_local_mu=True,
@@ -703,16 +969,13 @@ class TestGridCACEModel(unittest.TestCase):
         model = GridCACEModel(
             a_features,
             b_features,
-            readout,
+            [readout],
             grid_spacing=0.5,
         )
 
         outputs = model(data)
 
-        self.assertEqual(
-            outputs["beta_free_energy_per_particle"].shape,
-            (27, 2),
-        )
+        self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 2))
         outputs["c1"].square().mean().backward()
         mixing_gradient = model.a_features.channel_mixing.weight.grad

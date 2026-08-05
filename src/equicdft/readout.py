@@ -1,13 +1,16 @@
 """Local readout for invariant grid features."""
 
 from numbers import Integral
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import torch
 from torch import nn
 
+from .energy import EnergyReadout
+from .reciprocal import ReciprocalFeatures
 
-class LocalReadout(nn.Module):
+
+class LocalReadout(EnergyReadout):
     """Map local invariant features to one output per physical component.
 
     A shared MLP maps a local feature vector at each grid point to one output
@@ -17,8 +20,9 @@ class LocalReadout(nn.Module):
     features and temperature, and interprets the outputs as dimensionless
     per-particle excess free energies.
 
-    Density weighting, grid integration, and functional differentiation are
-    handled by :class:`equicdft.model.GridCACEModel`.
+    Its :meth:`energy` method performs density weighting and grid integration;
+    :class:`equicdft.model.GridCACEModel` only sums scalar readout energies and
+    differentiates their total.
 
     Parameters
     ----------
@@ -39,6 +43,7 @@ class LocalReadout(nn.Module):
     Smooth SiLU activations keep higher functional derivatives well defined.
     """
 
+    requires_local_features = True
     def __init__(
         self,
         n_types: int = 1,
@@ -89,8 +94,26 @@ class LocalReadout(nn.Module):
 
         return self.mlp(local_features)
 
+    def energy(
+        self,
+        context: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return the integrated density-weighted CACE contribution."""
 
-class BulkReadout(nn.Module):
+        rho = context["rho"]
+        per_particle = self(context["local_features"])
+        if per_particle.shape != rho.shape:
+            raise ValueError(
+                "LocalReadout must return one value per grid and type"
+            )
+        free_energy_density = torch.sum(rho * per_particle, dim=-1)
+        return context["cell_volume"] * torch.sum(
+            free_energy_density,
+            dim=-1,
+        )
+
+
+class BulkReadout(EnergyReadout):
     """Map temperature and mean densities to a bulk free energy per particle.
 
     The state vector contains normalized temperature followed by one
@@ -111,6 +134,7 @@ class BulkReadout(nn.Module):
         leaves a pretrained local model unchanged before fine-tuning.
     """
 
+    requires_state_features = True
     def __init__(
         self,
         n_types: int = 1,
@@ -162,8 +186,23 @@ class BulkReadout(nn.Module):
             )
         return self.mlp(state_features)
 
+    def energy(
+        self,
+        context: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return the extensive homogeneous free-energy contribution."""
 
-class LongRangeReadout(nn.Module):
+        rho = context["rho"]
+        per_particle = self(context["state_features"])
+        if per_particle.shape != rho.mean(dim=-2).shape:
+            raise ValueError(
+                "BulkReadout must return one value per field and type"
+            )
+        particle_numbers = context["cell_volume"] * torch.sum(rho, dim=-2)
+        return torch.sum(particle_numbers * per_particle, dim=-1)
+
+
+class LongRangeReadout(EnergyReadout):
     """Map thermodynamic state to a reciprocal quadratic kernel.
 
     The readout predicts one coefficient for every fixed reciprocal kernel and
@@ -184,14 +223,19 @@ class LongRangeReadout(nn.Module):
     zero_init
         If true, initialize the final coefficient layer to zero. This makes an
         attached long-range branch leave a pretrained local model unchanged.
+    features
+        Reciprocal feature module used by :meth:`energy`. It may be omitted
+        when the readout is used only as a standalone coefficient contraction.
     """
 
+    requires_state_features = True
     def __init__(
         self,
         n_kernels: int,
         n_types: int = 1,
         hidden_sizes: Sequence[int] = (16, 16),
         zero_init: bool = True,
+        features: Optional[ReciprocalFeatures] = None,
     ) -> None:
         super().__init__()
 
@@ -207,6 +251,14 @@ class LongRangeReadout(nn.Module):
         self.n_types = int(n_types)
         self.n_type_pairs = self.n_types * (self.n_types + 1) // 2
         self.n_state_features = 1 + self.n_types
+        if features is not None:
+            if not isinstance(features, ReciprocalFeatures):
+                raise TypeError("features must be ReciprocalFeatures or None")
+            if features.n_types != self.n_types:
+                raise ValueError("features and readout n_types differ")
+            if features.n_kernels != self.n_kernels:
+                raise ValueError("features and readout kernel counts differ")
+        self.features = features
 
         layers = []
         input_width = self.n_state_features
@@ -269,3 +321,29 @@ class LongRangeReadout(nn.Module):
             coefficients * reciprocal_features,
             dim=(-2, -1),
         )
+
+    def energy(
+        self,
+        context: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return the reciprocal-space contribution for a complete field."""
+
+        if self.features is None:
+            raise ValueError(
+                "LongRangeReadout requires ReciprocalFeatures for model use"
+            )
+        if "grid_size" not in context:
+            raise KeyError(
+                "long-range evaluation requires data['grid_size']"
+            )
+        reciprocal_features = self.features(
+            rho=context["rho"],
+            grid_size=context["grid_size"],
+            grid_spacing=context["grid_spacing"],
+        )
+        energy = self(reciprocal_features, context["state_features"])
+        if energy.shape != context["rho"].shape[:-2]:
+            raise ValueError(
+                "LongRangeReadout must return one scalar per field"
+            )
+        return energy

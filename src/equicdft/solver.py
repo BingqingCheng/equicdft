@@ -1229,11 +1229,14 @@ def _thermodynamic_objective(
             * evaluation["beta"].to(accumulation_dtype)
             * evaluation["mu"].to(accumulation_dtype)[None, :]
         )
-    objective_density = (
-        torch.sum(component_density, dim=-1)
-        + evaluation["beta_free_energy_density"].to(accumulation_dtype)
+    ideal_external_objective = (
+        cell_volume.to(accumulation_dtype)
+        * torch.sum(component_density)
     )
-    return cell_volume.to(accumulation_dtype) * torch.sum(objective_density)
+    return (
+        ideal_external_objective
+        + evaluation["beta_F_exc"].to(accumulation_dtype)
+    )
 
 
 def _mirror_descent_trial(
