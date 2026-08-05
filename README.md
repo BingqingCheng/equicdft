@@ -270,7 +270,7 @@ external-potential, and chemical-potential tensors are assigned afterward in
 their canonical flattened shapes.
 
 Use `GridSolver` for prescribed-density thermodynamics or equilibrium
-minimization:
+solving:
 
 ```python
 from equicdft import GridSolver
@@ -288,8 +288,11 @@ rho = equilibrium["rho"]
 canonical = solver.solve(external_data, particle_numbers=[128.0])
 ```
 
-The minimization uses energy-only model calls and evaluates `c1` after
-convergence. `GridCACEModel.forward(..., compute_c1=False)` can likewise be
+The default solver is the adaptively mixed Euler fixed-point iteration. Use
+`method="minimize"` for positivity-preserving mirror descent with an Armijo
+line search on the free energy or grand potential. The minimization uses
+energy-only trial evaluations and computes `c1` for its update and convergence
+diagnostics. `GridCACEModel.forward(..., compute_c1=False)` can likewise be
 used directly when only `beta_F_exc` is needed.
 
 For a multicomponent density field, an optional learned, bias-free channel map
