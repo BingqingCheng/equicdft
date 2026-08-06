@@ -70,7 +70,9 @@ class TestLocalReadout(unittest.TestCase):
             mean_density=0.5,
             cutoff_grid=1,
             max_power=2,
+            radial_basis="gaussian",
             n_radial_channels=1,
+            separate_center=False,
         )(data)
         B_module = CartesianBFeatures(max_power=2, max_product_order=3)
         B = B_module(A)
@@ -156,7 +158,9 @@ class TestLocalReadout(unittest.TestCase):
                 mean_density=0.5,
                 cutoff_grid=1,
                 max_power=2,
+                radial_basis="gaussian",
                 n_radial_channels=1,
+                separate_center=False,
             )(perturbed_data)
             perturbed_B = CartesianBFeatures(
                 max_power=2,

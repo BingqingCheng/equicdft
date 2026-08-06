@@ -119,6 +119,12 @@ class CartesianAFeatures(nn.Module):
         If ``True``, optimize the Gaussian decay coefficients. They are stored
         in logarithmic form so that the resulting ``alpha`` values stay
         positive. If ``False``, they remain fixed model buffers.
+    coordinate_scaling
+        Cartesian-coordinate convention used in the monomials. ``"none"``
+        uses the raw integer stencil offsets. ``"cutoff"`` divides each
+        coordinate by ``cutoff_grid``, keeping polynomial moments similarly
+        scaled when comparing different cutoffs. Gaussian radial distances
+        remain in raw squared grid units.
     separate_center
         If ``True``, remove the zero offset from all neighbor channels. The
         model then concatenates the normalized central density to the
@@ -147,11 +153,12 @@ class CartesianAFeatures(nn.Module):
         max_power: int,
         mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
-        radial_basis: str = "gaussian",
-        n_radial_channels: int = 4,
+        radial_basis: str = "none",
+        n_radial_channels: int = 1,
         radial_exponents: Optional[Sequence[float]] = None,
         trainable_radial_exponents: bool = False,
-        separate_center: bool = False,
+        coordinate_scaling: str = "none",
+        separate_center: bool = True,
         n_types: int = 1,
         n_channels: Optional[int] = None,
     ) -> None:
@@ -173,6 +180,11 @@ class CartesianAFeatures(nn.Module):
             raise ValueError("n_radial_channels must be a positive integer")
         if not isinstance(trainable_radial_exponents, bool):
             raise TypeError("trainable_radial_exponents must be a boolean")
+        if not isinstance(coordinate_scaling, str):
+            raise TypeError("coordinate_scaling must be 'none' or 'cutoff'")
+        coordinate_scaling = coordinate_scaling.lower()
+        if coordinate_scaling not in ("none", "cutoff"):
+            raise ValueError("coordinate_scaling must be 'none' or 'cutoff'")
         if not isinstance(separate_center, bool):
             raise TypeError("separate_center must be a boolean")
         if isinstance(n_types, bool) or not isinstance(n_types, Integral):
@@ -217,14 +229,17 @@ class CartesianAFeatures(nn.Module):
         # of the density configuration.
         positions = local_density_positions.to(dtype=torch.get_default_dtype())
         squared_distances = torch.sum(positions**2, dim=1)
+        monomial_positions = positions
+        if coordinate_scaling == "cutoff" and int(cutoff_grid) > 0:
+            monomial_positions = positions / float(cutoff_grid)
         monomial_values = torch.ones(
             (positions.shape[0], powers.shape[0]),
             dtype=torch.get_default_dtype(),
         )
         for axis in range(3):
-            monomial_values = monomial_values * positions[:, axis, None].pow(
-                powers[None, :, axis]
-            )
+            monomial_values = monomial_values * monomial_positions[
+                :, axis, None
+            ].pow(powers[None, :, axis])
 
         # Gaussian channel n uses R_n(q) = exp(-alpha_n * |q|**2). The
         # explicit option makes the effective range a fitting choice rather
@@ -289,6 +304,7 @@ class CartesianAFeatures(nn.Module):
         self.radial_basis = radial_basis
         self.n_radial_channels = n_radial_channels
         self.trainable_radial_exponents = trainable_radial_exponents
+        self.coordinate_scaling = coordinate_scaling
         self.separate_center = separate_center
         self.n_types = n_types
         self.n_channels = n_channels

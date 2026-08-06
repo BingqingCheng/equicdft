@@ -191,6 +191,7 @@ a_features = CartesianAFeatures(
     mean_density=mean_density,
     cutoff_grid=3,
     max_power=4,
+    radial_basis="gaussian",
     n_radial_channels=4,
     trainable_radial_exponents=False,
     n_types=n_types,
@@ -219,10 +220,10 @@ average_chemical_potential = outputs.get("average_chemical_potential")
 chemical_potential_weights = outputs.get("chemical_potential_weights")
 ```
 
-Set `radial_basis="none"` and `n_radial_channels=1` to replace the Gaussian
-channels by one equal-weight neighborhood average. The resulting descriptors
-use only Cartesian polynomial moments; the constant radial weight is divided
-by the stencil size so that invariant products remain well scaled.
+By default, `CartesianAFeatures` uses one equal-weight neighborhood channel.
+The resulting descriptors contain only Cartesian polynomial moments; the
+constant radial weight is divided by the number of noncentral stencil points
+so that invariant products remain well scaled.
 
 With `separate_center=True`, the zero offset is removed from every radial
 channel and `GridCACEModel` inserts `rho / mean_density` exactly once before
@@ -233,16 +234,21 @@ a_features = CartesianAFeatures(
     mean_density=mean_density,
     cutoff_grid=3,
     max_power=2,
-    radial_basis="none",
-    n_radial_channels=1,
-    separate_center=True,
     n_types=n_types,
 )
 ```
 
-Center separation is opt-in. The default retains the original basis with the
-center included, and previously saved checkpoints and full models remain
-loadable.
+The center is also separated by default: the zero offset is excluded from the
+neighbor moments and `GridCACEModel` inserts `rho / mean_density` exactly once
+before the invariant neighbor features. Set `separate_center=False` to include
+the center in the moments. Gaussian channels remain available explicitly with,
+for example, `radial_basis="gaussian"` and `n_radial_channels=4`.
+
+For undamped polynomial features compared across different cutoffs,
+`coordinate_scaling="cutoff"` evaluates Cartesian monomials using
+`q / cutoff_grid`. This keeps their numerical scale comparable while leaving
+Gaussian radial distances in raw squared grid units. The default `"none"`
+retains the original integer-coordinate convention.
 
 Temperature is required, and `GridData` always stores `beta = 1 / (k_B T)`.
 Both `rho` and `beta` passed to `GridCACEModel` retain their physical values;
@@ -332,6 +338,7 @@ a_features = CartesianAFeatures(
     mean_density=mean_density,
     cutoff_grid=3,
     max_power=4,
+    radial_basis="gaussian",
     n_radial_channels=4,
     n_types=n_types,
     n_channels=4,

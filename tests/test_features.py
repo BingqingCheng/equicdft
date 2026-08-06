@@ -13,7 +13,9 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=2.0,
             cutoff_grid=1,
             max_power=2,
+            radial_basis="gaussian",
             n_radial_channels=4,
+            separate_center=False,
             trainable_radial_exponents=False,
         )
 
@@ -101,7 +103,9 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=2.0,
             cutoff_grid=0,
             max_power=0,
+            radial_basis="gaussian",
             n_radial_channels=3,
+            separate_center=False,
         )
         rho = torch.tensor(
             [[[2.0]], [[3.0]]],
@@ -131,7 +135,9 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=2.0,
             cutoff_grid=2,
             max_power=2,
+            radial_basis="gaussian",
             n_radial_channels=2,
+            separate_center=False,
         )
 
         position_lookup = {
@@ -173,6 +179,41 @@ class TestCartesianAFeatures(unittest.TestCase):
             )
         )
 
+    def test_cutoff_scaled_cartesian_monomials(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=2,
+            coordinate_scaling="cutoff",
+            separate_center=False,
+        )
+        position_lookup = {
+            tuple(position): index
+            for index, position in enumerate(
+                module.local_density_positions.tolist()
+            )
+        }
+        plus_two_z = position_lookup[(0, 0, 2)]
+
+        self.assertEqual(module.coordinate_scaling, "cutoff")
+        self.assertEqual(module.monomial_values[plus_two_z, 3].item(), 1.0)
+        self.assertEqual(module.monomial_values[plus_two_z, 9].item(), 1.0)
+        self.assertEqual(module.squared_distances[plus_two_z].item(), 4.0)
+
+    def test_coordinate_scaling_is_validated(self):
+        with self.assertRaises(TypeError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                coordinate_scaling=True,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                coordinate_scaling="unknown",
+            )
+
     def test_undamped_polynomial_features(self):
         module = CartesianAFeatures(
             mean_density=2.0,
@@ -180,6 +221,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             max_power=1,
             radial_basis="none",
             n_radial_channels=1,
+            separate_center=False,
         )
         self.assertEqual(module.radial_basis, "none")
         self.assertIsNone(module.radial_exponents)
@@ -239,6 +281,19 @@ class TestCartesianAFeatures(unittest.TestCase):
                 radial_basis="unknown",
             )
 
+    def test_polynomial_center_separated_defaults(self):
+        module = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=1,
+        )
+
+        self.assertEqual(module.radial_basis, "none")
+        self.assertEqual(module.n_radial_channels, 1)
+        self.assertFalse(module.trainable_radial_exponents)
+        self.assertEqual(module.coordinate_scaling, "none")
+        self.assertTrue(module.separate_center)
+
     def test_separate_center_removes_it_from_neighbor_moments(self):
         module = CartesianAFeatures(
             mean_density=2.0,
@@ -281,6 +336,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             max_power=0,
             radial_basis="none",
             n_radial_channels=1,
+            separate_center=False,
         )
         state_keys = set(module.state_dict())
         self.assertNotIn("neighbor_mask", state_keys)
@@ -310,6 +366,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=1,
             max_power=1,
+            radial_basis="gaussian",
             n_radial_channels=2,
             radial_exponents=(0.05, 0.2),
             trainable_radial_exponents=True,
@@ -348,6 +405,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             CartesianAFeatures(
                 max_power=0,
                 mean_density=1.0,
+                radial_basis="gaussian",
                 n_radial_channels=2,
                 radial_exponents=(0.1,),
             )
@@ -355,6 +413,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             CartesianAFeatures(
                 max_power=0,
                 mean_density=1.0,
+                radial_basis="gaussian",
                 n_radial_channels=2,
                 radial_exponents=(0.1, 0.0),
             )
@@ -365,6 +424,7 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
             cutoff_grid=0,
             max_power=0,
             n_radial_channels=1,
+            separate_center=False,
             n_types=2,
             n_channels=3,
         )
