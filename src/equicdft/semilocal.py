@@ -24,10 +24,13 @@ class LDAReadout(EnergyReadout):
 
     ``(rho_1 / mean_density, ..., rho_M / mean_density, T / mean_T)``.
 
-    The shared MLP returns one scalar ``beta_a_exc_lda``. The model multiplies
-    it by total local density and the voxel volume, giving
+    The shared MLP returns one reduced scalar ``a_exc_lda``. The model
+    multiplies it by total local density and the voxel volume, giving
 
-    ``beta_F_exc_lda = DeltaV * sum_g rho_total,g * beta_a_exc_lda,g``.
+    ``E_exc_lda = DeltaV * sum_g rho_total,g * a_exc_lda,g``.
+
+    ``E_exc_lda`` follows the free-energy convention selected by the
+    containing model.
 
     No neighboring density enters this module, so it is a strict local-density
     approximation. Supplying the complete local component vector still permits
@@ -66,7 +69,7 @@ class LDAReadout(EnergyReadout):
         )
 
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
-        """Return ``beta_a_exc_lda`` with shape ``[..., n_grid, 1]``."""
+        """Return ``a_exc_lda`` with shape ``[..., n_grid, 1]``."""
 
         if local_state.shape[-1] != self.n_state_features:
             raise ValueError(
@@ -110,7 +113,7 @@ class GGAReadout(EnergyReadout):
     normalized temperature. The shared MLP returns one coefficient per grid
     point,
 
-    ``beta_kappa = minimum_coefficient + softplus(raw_coefficient)``.
+    ``kappa = minimum_coefficient + softplus(raw_coefficient)``.
 
     The positive transformation makes the quadratic gradient contribution
     nonnegative for every density field. ``initial_coefficient`` initializes
@@ -179,7 +182,7 @@ class GGAReadout(EnergyReadout):
         self.initial_coefficient = initial_coefficient
 
     def forward(self, local_features: torch.Tensor) -> torch.Tensor:
-        """Return ``beta_kappa`` with shape ``[..., n_grid, 1]``."""
+        """Return ``kappa`` with shape ``[..., n_grid, 1]``."""
 
         return self.minimum_coefficient + torch.nn.functional.softplus(
             self.mlp(local_features)

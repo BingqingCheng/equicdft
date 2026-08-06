@@ -18,8 +18,13 @@ class GridCACEModel(nn.Module):
     """Combine free-energy readouts and differentiate their scalar sum.
 
     Every configured :class:`EnergyReadout` receives a shared context and
-    returns one ``beta_F_exc`` contribution per field. Their sum is
-    differentiated with respect to the complete density to obtain
+    returns one reduced free-energy contribution per field. With
+    ``free_energy_mode="beta"`` (the default), the sum is interpreted as
+    ``beta_F_exc``. With ``free_energy_mode="physical"``, the sum is
+    interpreted as ``F_exc / (k_B * mean_temperature)`` and converted to
+    ``beta_F_exc`` using the input temperature. The resulting
+    ``beta_F_exc`` is differentiated with respect to the complete density to
+    obtain
     ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
     of ``c2 = delta(c1)/delta(rho)``. If ``V_ext`` is available, the model may
     also return the local and spatially averaged dimensionless chemical
@@ -44,6 +49,7 @@ class GridCACEModel(nn.Module):
         compute_c2: bool = False,
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
+        free_energy_mode: str = "beta",
     ) -> None:
         super().__init__()
 
@@ -55,6 +61,10 @@ class GridCACEModel(nn.Module):
             raise TypeError("compute_local_mu must be a boolean")
         if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
+        if free_energy_mode not in ("beta", "physical"):
+            raise ValueError(
+                "free_energy_mode must be 'beta' or 'physical'"
+            )
 
         if (a_features is None) != (b_features is None):
             raise ValueError(
@@ -118,6 +128,7 @@ class GridCACEModel(nn.Module):
         self.compute_c2 = compute_c2
         self.compute_local_mu = compute_local_mu
         self.rho_min = rho_min
+        self.free_energy_mode = free_energy_mode
 
         grid_spacing_tensor = torch.as_tensor(
             grid_spacing,
@@ -233,6 +244,12 @@ class GridCACEModel(nn.Module):
         """Volume represented by one grid point."""
 
         return torch.prod(self.grid_spacing)
+
+    @property
+    def reference_energy(self) -> torch.Tensor:
+        """Energy scale ``k_B * mean_temperature`` used in physical mode."""
+
+        return self.boltzmann_constant * self.mean_temperature
 
     @property
     def grid_info(self) -> Dict[str, Any]:
@@ -458,12 +475,29 @@ class GridCACEModel(nn.Module):
                     )
                 readout_energies.append(energy)
 
-            # Summing the scalar energies before differentiation makes every
-            # enabled readout part of the same variational functional.
-            beta_F_exc = readout_energies[0]
+            # Summing the scalar readouts before conversion and
+            # differentiation makes every enabled contribution part of one
+            # variational functional.
+            readout_energy = readout_energies[0]
             for energy in readout_energies[1:]:
-                beta_F_exc = beta_F_exc + energy
-            outputs = {"beta_F_exc": beta_F_exc}
+                readout_energy = readout_energy + energy
+
+            # getattr preserves full-model checkpoints saved before the mode
+            # flag existed; their readouts used the beta-F convention.
+            if getattr(self, "free_energy_mode", "beta") == "physical":
+                # The network represents F_exc / (k_B*T_ref). Therefore
+                # beta*F_exc = readout_energy * T_ref/T. This explicit known
+                # factor leaves the model to learn the physical free energy's
+                # remaining temperature dependence.
+                F_exc = self.reference_energy.to(rho) * readout_energy
+                beta_F_exc = readout_energy / normalized_temperature
+                outputs = {
+                    "F_exc": F_exc,
+                    "beta_F_exc": beta_F_exc,
+                }
+            else:
+                beta_F_exc = readout_energy
+                outputs = {"beta_F_exc": beta_F_exc}
 
             if compute_c1:
                 # beta_F_exc_derivative and c1 have the same shape as rho:

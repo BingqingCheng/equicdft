@@ -16,8 +16,8 @@ class LocalReadout(EnergyReadout):
     per component. The readout itself is agnostic about the construction and
     physical meaning of its inputs and outputs.
     :class:`equicdft.model.GridCACEModel` supplies flattened invariant B
-    features and temperature, and interprets the outputs as dimensionless
-    per-particle excess free energies.
+    features and temperature, and interprets the outputs as reduced
+    per-particle excess free energies according to its model-level convention.
 
     Its :meth:`energy` method performs density weighting and grid integration;
     :class:`equicdft.model.GridCACEModel` only sums scalar readout energies and
@@ -92,10 +92,13 @@ class BulkReadout(EnergyReadout):
 
     The state vector contains normalized temperature followed by one
     normalized mean density per physical component. The output contains one
-    dimensionless bulk excess free energy per particle and component. The
-    model combines it with the particle numbers according to
+    reduced bulk excess free energy per particle and component. The model
+    combines it with the particle numbers according to
 
-    ``beta_F_exc_bulk = sum_i N_i * beta_a_exc_bulk_i``.
+    ``E_exc_bulk = sum_i N_i * a_exc_bulk_i``,
+
+    where ``E_exc_bulk`` follows the free-energy convention selected by the
+    containing model.
 
     Parameters
     ----------
@@ -128,7 +131,7 @@ class BulkReadout(EnergyReadout):
         )
 
     def forward(self, state_features: torch.Tensor) -> torch.Tensor:
-        """Return ``beta_a_exc_bulk`` with shape ``[..., n_types]``."""
+        """Return ``a_exc_bulk`` with shape ``[..., n_types]``."""
 
         if state_features.shape[-1] != self.n_state_features:
             raise ValueError(
@@ -231,7 +234,7 @@ class LongRangeReadout(EnergyReadout):
         reciprocal_features: torch.Tensor,
         state_features: torch.Tensor,
     ) -> torch.Tensor:
-        """Return one dimensionless long-range free energy per field."""
+        """Return one reduced long-range contribution per field."""
 
         expected_trailing_shape = (self.n_kernels, self.n_type_pairs)
         if reciprocal_features.shape[-2:] != expected_trailing_shape:

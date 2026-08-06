@@ -397,6 +397,7 @@ class TestGridCACEModel(unittest.TestCase):
         mean_temperature=1.0,
         with_bulk=False,
         with_long_range=False,
+        free_energy_mode="beta",
     ):
         a_features = CartesianAFeatures(
             mean_density=0.5,
@@ -445,6 +446,7 @@ class TestGridCACEModel(unittest.TestCase):
             compute_c2=compute_c2,
             compute_local_mu=compute_chemical_potential,
             rho_min=rho_min,
+            free_energy_mode=free_energy_mode,
         )
 
     def test_long_range_energy_is_combined_before_local_mu_derivative(self):
@@ -609,6 +611,85 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(outputs["beta_F_exc"].shape, (2,))
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
+
+    def test_physical_free_energy_is_scaled_before_differentiation(self):
+        # The analytic readout gives f_tilde = DeltaV*sum(rho**2), where
+        # f_tilde = F_exc/(k_B*T_ref). At T_ref=2, k_B=3, and T=1.5,
+        # F_exc=6*f_tilde and beta_F_exc=(2/1.5)*f_tilde.
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[_FirstFeatureReadout()],
+            grid_spacing=0.5,
+            mean_temperature=2.0,
+            boltzmann_constant=3.0,
+            compute_c1=True,
+            free_energy_mode="physical",
+        )
+        data = self._make_data()
+
+        outputs = model(data)
+
+        reduced_free_energy = model.cell_volume * torch.sum(
+            data["rho"].square()
+        )
+        self.assertTrue(
+            torch.allclose(outputs["F_exc"], 6.0 * reduced_free_energy)
+        )
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"],
+                (2.0 / 1.5) * reduced_free_energy,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(outputs["c1"], -(4.0 / 1.5) * data["rho"])
+        )
+
+    def test_physical_mode_applies_inverse_temperature_to_same_free_energy(self):
+        model = GridCACEModel(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[_FirstFeatureReadout()],
+            grid_spacing=0.5,
+            mean_temperature=2.0,
+            boltzmann_constant=3.0,
+            compute_c1=False,
+            free_energy_mode="physical",
+        )
+        first = self._make_data()
+        second = self._make_data()
+        first["temperature"] = torch.tensor(1.0)
+        second["temperature"] = torch.tensor(2.0)
+        data = {
+            key: torch.stack((first[key], second[key]))
+            for key in first
+        }
+
+        outputs = model(data)
+
+        self.assertTrue(
+            torch.allclose(outputs["F_exc"][0], outputs["F_exc"][1])
+        )
+        self.assertTrue(
+            torch.allclose(
+                outputs["beta_F_exc"][0],
+                2.0 * outputs["beta_F_exc"][1],
+            )
+        )
+
+    def test_free_energy_mode_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "free_energy_mode"):
+            self._make_model(free_energy_mode="unknown")
+
+    def test_pre_mode_checkpoint_defaults_to_beta_free_energy(self):
+        model = self._make_model()
+        del model.free_energy_mode
+
+        outputs = model(self._make_data())
+
+        self.assertEqual(list(outputs), ["beta_F_exc", "c1"])
+        self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
 
     def test_model_applies_c2_sign_and_cell_volume_to_one_row(self):
         # Continuing the analytic quadratic functional above,
