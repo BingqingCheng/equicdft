@@ -69,9 +69,9 @@ class GridData(dict):
     available::
 
         temperature                 scalar
-        beta                        scalar
-        mu                          [n_types] (optional)
-        beta_mu                     [n_types] (optional)
+        beta                        scalar, 1 / (k_B*T)
+        mu                          [n_types] (optional, energy units)
+        beta_mu                     [n_types] (optional, dimensionless beta*mu)
         n_types                     scalar
         thermal_wavelength          [n_types] (when needed for inference)
         grid_spacing                [3]
@@ -79,7 +79,7 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
-        c1_plus_beta_mu             [n_grid, n_types] (optional)
+        c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors]
         local_density_positions     [n_neighbors, 3]

@@ -28,8 +28,11 @@ class GridCACEModel(nn.Module):
     ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
     of ``c2 = delta(c1)/delta(rho)``. If ``V_ext`` is available, the model may
     also return the local and spatially averaged dimensionless chemical
-    potential. Constructor response flags provide defaults that individual
-    forward calls may override.
+    potentials. Specifically, the outputs ``local_chemical_potential`` and
+    ``average_chemical_potential`` represent ``beta * mu_local`` and
+    ``beta * mu_average``; despite their established key names, they are not
+    energy-valued chemical potentials. Constructor response flags provide
+    defaults that individual forward calls may override.
     """
 
     def __init__(
@@ -272,7 +275,13 @@ class GridCACEModel(nn.Module):
         data: Dict[str, torch.Tensor],
         c1: torch.Tensor,
     ) -> torch.Tensor:
-        """Return ``log(rho*Lambda**3) + beta*V_ext - c1``."""
+        """Return dimensionless ``beta*mu_local`` at every grid point.
+
+        The returned quantity is
+        ``log(rho*Lambda**3) + beta*V_ext - c1``. It is stored under the
+        established ``local_chemical_potential`` output key but includes the
+        factor ``beta = 1 / (k_B*T)``.
+        """
 
         rho = data["rho"].detach()
         beta = data["beta"].detach().to(rho)
@@ -300,7 +309,12 @@ class GridCACEModel(nn.Module):
         local_chemical_potential: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the componentwise weighted average over grid points."""
+        """Return dimensionless ``beta*mu_average`` for each component.
+
+        This is the weighted spatial average of ``beta*mu_local``. The result
+        is stored under the established ``average_chemical_potential`` output
+        key and therefore also includes the factor ``beta``.
+        """
 
         weights = weights.detach().to(local_chemical_potential)
         total_weight = weights.sum(dim=-2)
@@ -549,7 +563,9 @@ class GridCACEModel(nn.Module):
                         outputs["c1"] = outputs["c1"].detach()
 
                 # Chemical-potential response is controlled by one model flag.
-                # V_ext remains optional for intrinsic-functional evaluation.
+                # Both returned chemical-potential fields are dimensionless
+                # beta*mu quantities. V_ext remains optional for intrinsic-
+                # functional evaluation.
                 if (
                     self.compute_local_mu
                     and "V_ext" in data

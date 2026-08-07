@@ -241,7 +241,12 @@ def _euler_residual(
     density_threshold: float,
     maximum_density: Optional[torch.Tensor] = None,
 ):
-    """Return the physical residual, including an optional upper-bound KKT."""
+    """Return the dimensionless beta*mu residual and optional bound KKT.
+
+    Both ``local_chemical_potential`` and ``chemical_potential`` below denote
+    dimensionless ``beta*mu`` quantities, so their difference is likewise
+    dimensionless.
+    """
 
     local_chemical_potential = (
         _log_dimensionless_density(rho, thermal_wavelength)
