@@ -107,6 +107,7 @@ class TestGridLDABranch(unittest.TestCase):
             mean_temperature=1.0,
             compute_c1=True,
             compute_c2=compute_c2,
+            free_energy_mode="beta",
         )
 
     def test_lda_energy_and_c1_need_no_neighborhood_data(self):
@@ -200,6 +201,7 @@ class TestGridLDABranch(unittest.TestCase):
             b_features=_IdentityModule(),
             readout=[lda_readout, _FirstFeatureReadout()],
             grid_spacing=0.5,
+            free_energy_mode="beta",
         )
         data = self._data()
 
@@ -449,6 +451,21 @@ class TestGridCACEModel(unittest.TestCase):
             free_energy_mode=free_energy_mode,
         )
 
+    def test_physical_free_energy_is_constructor_default(self):
+        model = GridCACEModel(
+            CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=1,
+                max_power=2,
+                n_radial_channels=1,
+            ),
+            CartesianBFeatures(max_power=2, max_product_order=3),
+            [LocalReadout(n_types=1, hidden_sizes=(8,))],
+            grid_spacing=0.5,
+        )
+
+        self.assertEqual(model.free_energy_mode, "physical")
+
     def test_long_range_energy_is_combined_before_local_mu_derivative(self):
         model = self._make_model(
             compute_c1=True,
@@ -494,6 +511,7 @@ class TestGridCACEModel(unittest.TestCase):
             grid_spacing=0.5,
             mean_temperature=1.0,
             compute_c1=True,
+            free_energy_mode="beta",
         )
         data = self._make_data()
 
@@ -600,6 +618,7 @@ class TestGridCACEModel(unittest.TestCase):
             readout=[_FirstFeatureReadout()],
             grid_spacing=0.5,
             compute_c1=True,
+            free_energy_mode="beta",
         )
         data = self._make_data()
         data = {
@@ -701,6 +720,7 @@ class TestGridCACEModel(unittest.TestCase):
             readout=[_FirstFeatureReadout()],
             grid_spacing=0.5,
             compute_c2=True,
+            free_energy_mode="beta",
         )
         data = self._make_data()
         data = {
@@ -795,6 +815,7 @@ class TestGridCACEModel(unittest.TestCase):
             grid_spacing=0.5,
             mean_temperature=2.0,
             compute_c1=False,
+            free_energy_mode="beta",
         )
 
         first = self._make_data()

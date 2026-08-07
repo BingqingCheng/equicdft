@@ -51,6 +51,12 @@ model = GridCACEModel(
 )
 ```
 
+The model defaults to ``free_energy_mode="physical"``. Its readouts therefore
+represent ``F_exc / (k_B * mean_temperature)``, which the model converts to
+``beta_F_exc`` using each input field's temperature before taking functional
+derivatives. Set ``free_energy_mode="beta"`` explicitly only when a readout is
+intended to represent ``beta_F_exc`` directly.
+
 Choose the local-chemical-potential target in the training configuration. Use
 the dimensionless reservoir value `beta_mu` when it is known, or the model's
 masked spatial `average_chemical_potential` when it is latent:
