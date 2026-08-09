@@ -1,5 +1,6 @@
 """Evaluate learned grid functionals and minimize thermodynamic objectives."""
 
+import math
 from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
@@ -7,7 +8,6 @@ from torch import nn
 
 from ._solver_numerics import (
     _component_tensor,
-    _continued_fields,
     _euler_residual,
     _log_dimensionless_density,
     _maximum_relative_change,
@@ -136,12 +136,12 @@ class GridSolver:
         maximum_mixing: float = 0.2,
         mixing_growth: float = 1.1,
         mixing_backtrack_factor: float = 0.5,
-        continuation_steps: int = 5,
         max_log_density_change: float = 2.0,
         residual_density_threshold: Optional[float] = None,
         maximum_density: Optional[
             Union[float, Sequence[float], torch.Tensor]
         ] = None,
+        beta_multiplier: float = 0.0,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic functional to obtain equilibrium.
 
@@ -158,13 +158,21 @@ class GridSolver:
         condition: a capped grid point may have a negative unconstrained
         residual because increasing its density is forbidden.
 
+        When no density is supplied through ``initial_rho`` or ``data["rho"]``,
+        the initial profile is proportional to
+        ``exp(-beta_multiplier * beta * V_ext)``. The default
+        ``beta_multiplier=0`` exactly recovers the former uniform
+        initialization, including its chemical-potential-dependent amplitude.
+        ``beta_multiplier=1`` is the physical ideal-gas field profile, and
+        intermediate values smoothly temper its spatial modulation. An
+        explicitly supplied density always takes precedence.
+
         The default ``method="euler"`` uses a damped Euler--Lagrange fixed-point
         iteration. By default, its mixing is increased after an improving
         density-weighted RMS residual and backtracked after a worsening
         trial. Set ``adaptive_mixing=False`` to use a fixed mixing value.
-        Both methods can introduce the external field by continuation and
-        use the physical projected functional gradient as a convergence
-        diagnostic.
+        Both methods act directly on the supplied external field and use the
+        physical projected functional gradient as a convergence diagnostic.
 
         ``tolerance_residual`` bounds the largest active-grid residual. When
         ``tolerance_rms_residual`` is supplied, its density-weighted RMS bound
@@ -174,15 +182,13 @@ class GridSolver:
 
         if method not in ("minimize", "euler"):
             raise ValueError("method must be 'minimize' or 'euler'")
+        beta_multiplier = float(beta_multiplier)
+        if not math.isfinite(beta_multiplier) or beta_multiplier < 0.0:
+            raise ValueError(
+                "beta_multiplier must be finite and nonnegative"
+            )
         if not isinstance(max_iter, int) or max_iter <= 0:
             raise ValueError("max_iter must be a positive integer")
-        if (
-            not isinstance(continuation_steps, int)
-            or continuation_steps < 0
-        ):
-            raise ValueError(
-                "continuation_steps must be a nonnegative integer"
-            )
         tolerance_residual = float(tolerance_residual)
         if tolerance_rms_residual is not None:
             tolerance_rms_residual = float(tolerance_rms_residual)
@@ -306,8 +312,8 @@ class GridSolver:
                 "residual_density_threshold must be nonnegative"
             )
 
-        if initial_rho is None:
-            initial_rho = data.get("rho")
+        if initial_rho is None and "rho" in data:
+            initial_rho = data["rho"]
         if initial_rho is not None:
             initial_rho = torch.as_tensor(
                 initial_rho,
@@ -320,11 +326,19 @@ class GridSolver:
                 raise ValueError("initial_rho must be positive")
             rho = initial_rho.detach().clone()
         elif fixed_N is None:
-            rho = torch.exp(data["beta"] * mu)[None, :].expand_as(V_ext)
-            rho = rho / thermal_wavelength[None, :] ** 3
+            log_rho = data["beta"] * (
+                mu[None, :] - beta_multiplier * V_ext
+            )
+            rho = torch.exp(log_rho) / thermal_wavelength[None, :] ** 3
         else:
-            uniform_density = fixed_N / (cell_volume * V_ext.shape[0])
-            rho = uniform_density[None, :].expand_as(V_ext).clone()
+            boltzmann_weights = torch.softmax(
+                -beta_multiplier * data["beta"] * V_ext,
+                dim=0,
+            )
+            rho = torch.clamp(
+                boltzmann_weights,
+                min=torch.finfo(V_ext.dtype).tiny,
+            )
 
         if fixed_N is not None:
             rho = _normalize_particle_numbers(
@@ -355,7 +369,6 @@ class GridSolver:
                     minimum_step_size=minimum_step_size,
                     line_search_factor=line_search_factor,
                     armijo_factor=armijo_factor,
-                    continuation_steps=continuation_steps,
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
@@ -379,7 +392,6 @@ class GridSolver:
                     maximum_mixing=maximum_mixing,
                     mixing_growth=mixing_growth,
                     mixing_backtrack_factor=mixing_backtrack_factor,
-                    continuation_steps=continuation_steps,
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
@@ -414,11 +426,10 @@ class GridSolver:
             tolerance_rms_residual,
         )
         result["solver_method"] = method
+        result["solver_beta_multiplier"] = beta_multiplier
         result["n_iter"] = state["n_iter"]
         result["n_evaluations"] = state["n_evaluations"]
-        result["stage_objective_history"] = state[
-            "stage_objective_history"
-        ]
+        result["objective_history"] = state["objective_history"]
         result["final_relative_density_change"] = state[
             "final_relative_density_change"
         ]
@@ -443,148 +454,137 @@ class GridSolver:
         minimum_step_size: float,
         line_search_factor: float,
         armijo_factor: float,
-        continuation_steps: int,
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
-        """Minimize each continued thermodynamic objective by mirror descent."""
+        """Minimize the thermodynamic objective by mirror descent."""
 
-        stage_histories = []
+        objective_history = []
         n_iter = 0
         n_evaluations = 0
         line_search_failures = 0
         final_relative_change = float("inf")
 
-        for stage_V_ext in _continued_fields(V_ext, continuation_steps):
-            stage_history = []
-            next_step_size = step_size
+        next_step_size = step_size
+        for _ in range(max_iter):
+            current_data = dict(data)
+            current_data["rho"] = rho.detach().clone()
+            current_data["V_ext"] = V_ext
+            evaluation = self.evaluate(current_data, compute_c1=True)
+            n_evaluations += 1
+            objective = _thermodynamic_objective(
+                evaluation,
+                fixed_N is not None,
+                cell_volume,
+                thermal_wavelength,
+            ).detach()
+            if not torch.isfinite(objective).item():
+                raise ValueError(
+                    "the thermodynamic objective became non-finite"
+                )
+            if not objective_history:
+                objective_history.append(objective.item())
 
-            for _ in range(max_iter):
-                current_data = dict(data)
-                current_data["rho"] = rho.detach().clone()
-                current_data["V_ext"] = stage_V_ext
-                evaluation = self.evaluate(current_data, compute_c1=True)
+            residual, _, max_residual, rms_residual = _euler_residual(
+                rho,
+                evaluation["c1"].detach(),
+                V_ext,
+                data["beta"],
+                thermal_wavelength,
+                mu,
+                residual_density_threshold,
+                maximum_density,
+            )
+            if _residuals_converged(
+                max_residual,
+                rms_residual,
+                tolerance_residual,
+                tolerance_rms_residual,
+            ):
+                break
+
+            # Armijo needs the true objective derivative, whereas the
+            # update and convergence test use the projected KKT residual
+            # when an upper density bound is active.
+            line_search_gradient = (
+                _log_dimensionless_density(rho, thermal_wavelength)
+                + data["beta"] * V_ext
+                - evaluation["c1"].detach()
+            )
+            if fixed_N is None:
+                line_search_gradient = (
+                    line_search_gradient - data["beta"] * mu[None, :]
+                )
+
+            accepted = False
+            trial_step_size = next_step_size
+            while trial_step_size >= minimum_step_size:
+                trial_rho = _mirror_descent_trial(
+                    rho,
+                    residual,
+                    trial_step_size,
+                    fixed_N,
+                    cell_volume,
+                    max_log_density_change,
+                    maximum_density,
+                )
+                displacement = trial_rho - rho
+                objective_dtype = objective.dtype
+                directional_derivative = cell_volume.to(
+                    objective_dtype
+                ) * torch.sum(
+                    line_search_gradient.to(objective_dtype)
+                    * displacement.to(objective_dtype)
+                )
+
+                trial_data = dict(data)
+                trial_data["rho"] = trial_rho.detach().clone()
+                trial_data["V_ext"] = V_ext
+                trial_evaluation = self.evaluate(
+                    trial_data,
+                    compute_c1=False,
+                )
                 n_evaluations += 1
-                objective = _thermodynamic_objective(
-                    evaluation,
+                trial_objective = _thermodynamic_objective(
+                    trial_evaluation,
                     fixed_N is not None,
                     cell_volume,
                     thermal_wavelength,
                 ).detach()
-                if not torch.isfinite(objective).item():
-                    raise ValueError(
-                        "the thermodynamic objective became non-finite"
-                    )
-                if not stage_history:
-                    stage_history.append(objective.item())
 
-                (
-                    residual,
-                    chemical_potential,
-                    max_residual,
-                    rms_residual,
-                ) = _euler_residual(
-                    rho,
-                    evaluation["c1"].detach(),
-                    stage_V_ext,
-                    data["beta"],
-                    thermal_wavelength,
-                    mu,
-                    residual_density_threshold,
-                    maximum_density,
+                sufficient_decrease = (
+                    objective + armijo_factor * directional_derivative
                 )
-                if _residuals_converged(
-                    max_residual,
-                    rms_residual,
-                    tolerance_residual,
-                    tolerance_rms_residual,
+                if (
+                    torch.isfinite(trial_objective).item()
+                    and directional_derivative.item() < 0.0
+                    and trial_objective.item()
+                    <= sufficient_decrease.item()
                 ):
+                    accepted = True
                     break
+                trial_step_size *= line_search_factor
 
-                # Armijo needs the true objective derivative, whereas the
-                # update and convergence test use the projected KKT residual
-                # when an upper density bound is active.
-                line_search_gradient = (
-                    _log_dimensionless_density(rho, thermal_wavelength)
-                    + data["beta"] * stage_V_ext
-                    - evaluation["c1"].detach()
-                )
-                if fixed_N is None:
-                    line_search_gradient = (
-                        line_search_gradient - data["beta"] * mu[None, :]
-                    )
+            if not accepted:
+                line_search_failures += 1
+                break
 
-                accepted = False
-                trial_step_size = next_step_size
-                while trial_step_size >= minimum_step_size:
-                    trial_rho = _mirror_descent_trial(
-                        rho,
-                        residual,
-                        trial_step_size,
-                        fixed_N,
-                        cell_volume,
-                        max_log_density_change,
-                        maximum_density,
-                    )
-                    displacement = trial_rho - rho
-                    objective_dtype = objective.dtype
-                    directional_derivative = cell_volume.to(
-                        objective_dtype
-                    ) * torch.sum(
-                        line_search_gradient.to(objective_dtype)
-                        * displacement.to(objective_dtype)
-                    )
-
-                    trial_data = dict(data)
-                    trial_data["rho"] = trial_rho.detach().clone()
-                    trial_data["V_ext"] = stage_V_ext
-                    trial_evaluation = self.evaluate(
-                        trial_data,
-                        compute_c1=False,
-                    )
-                    n_evaluations += 1
-                    trial_objective = _thermodynamic_objective(
-                        trial_evaluation,
-                        fixed_N is not None,
-                        cell_volume,
-                        thermal_wavelength,
-                    ).detach()
-
-                    sufficient_decrease = (
-                        objective + armijo_factor * directional_derivative
-                    )
-                    if (
-                        torch.isfinite(trial_objective).item()
-                        and directional_derivative.item() < 0.0
-                        and trial_objective.item()
-                        <= sufficient_decrease.item()
-                    ):
-                        accepted = True
-                        break
-                    trial_step_size *= line_search_factor
-
-                if not accepted:
-                    line_search_failures += 1
-                    break
-
-                relative_change = _maximum_relative_change(rho, trial_rho)
-                rho = trial_rho.detach()
-                n_iter += 1
-                final_relative_change = relative_change
-                stage_history.append(trial_objective.item())
-                next_step_size = min(
-                    step_size,
-                    trial_step_size / line_search_factor,
-                )
-
-            stage_histories.append(stage_history)
+            relative_change = _maximum_relative_change(rho, trial_rho)
+            rho = trial_rho.detach()
+            n_iter += 1
+            final_relative_change = relative_change
+            objective_history.append(trial_objective.item())
+            next_step_size = min(
+                step_size,
+                trial_step_size / line_search_factor,
+            )
 
         return {
             "rho": rho,
             "n_iter": n_iter,
             "n_evaluations": n_evaluations,
-            "stage_objective_history": stage_histories,
+            "objective_history": objective_history,
             "final_relative_density_change": final_relative_change,
             "line_search_failures": line_search_failures,
         }
@@ -608,194 +608,161 @@ class GridSolver:
         maximum_mixing: float,
         mixing_growth: float,
         mixing_backtrack_factor: float,
-        continuation_steps: int,
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
         """Solve the Euler fixed point with optional residual backtracking."""
 
-        stage_histories = []
+        objective_history = []
         n_iter = 0
         n_evaluations = 0
         mixing_backtracks = 0
         final_relative_change = float("inf")
         current_mixing = mixing
-        final_stage_converged = False
+        current_data = dict(data)
+        current_data["rho"] = rho.detach().clone()
+        current_data["V_ext"] = V_ext
+        evaluation = self.evaluate(current_data, compute_c1=True)
+        n_evaluations += 1
+        objective = _thermodynamic_objective(
+            evaluation,
+            fixed_N is not None,
+            cell_volume,
+            thermal_wavelength,
+        )
+        objective_history.append(objective.detach().item())
 
-        continued_fields = _continued_fields(V_ext, continuation_steps)
-        for stage_V_ext in continued_fields:
-            current_data = dict(data)
-            current_data["rho"] = rho.detach().clone()
-            current_data["V_ext"] = stage_V_ext
-            evaluation = self.evaluate(current_data, compute_c1=True)
-            n_evaluations += 1
-            objective = _thermodynamic_objective(
-                evaluation,
-                fixed_N is not None,
-                cell_volume,
-                thermal_wavelength,
-            )
-            stage_history = [objective.detach().item()]
-            stage_converged = False
-
-            for _ in range(max_iter):
-                c1 = evaluation["c1"].detach()
-                _, _, max_residual, rms_residual = _euler_residual(
-                    rho,
-                    c1,
-                    stage_V_ext,
-                    data["beta"],
-                    thermal_wavelength,
-                    mu,
-                    residual_density_threshold,
-                    maximum_density,
-                )
-                if _residuals_converged(
-                    max_residual,
-                    rms_residual,
-                    tolerance_residual,
-                    tolerance_rms_residual,
-                ):
-                    stage_converged = True
-                    break
-
-                current_log_density = torch.log(
-                    torch.clamp(
-                        rho,
-                        min=torch.finfo(rho.dtype).tiny,
-                    )
-                )
-                if fixed_N is None:
-                    target_log_density = (
-                        data["beta"] * (mu[None, :] - stage_V_ext)
-                        + c1
-                        - 3.0 * torch.log(thermal_wavelength)[None, :]
-                    )
-                    log_change = torch.clamp(
-                        target_log_density - current_log_density,
-                        min=-max_log_density_change,
-                        max=max_log_density_change,
-                    )
-                    target_rho = torch.exp(
-                        current_log_density + log_change
-                    )
-                    if maximum_density is not None:
-                        target_rho = torch.minimum(
-                            target_rho,
-                            maximum_density[None, :],
-                        )
-                else:
-                    logits = -data["beta"] * stage_V_ext + c1
-                    target_rho = (
-                        fixed_N[None, :]
-                        * torch.softmax(logits, dim=0)
-                        / cell_volume
-                    )
-
-                trial_mixing = current_mixing
-                while True:
-                    next_rho = (
-                        (1.0 - trial_mixing) * rho
-                        + trial_mixing * target_rho
-                    )
-                    if fixed_N is not None:
-                        next_rho = _normalize_particle_numbers(
-                            next_rho,
-                            fixed_N,
-                            cell_volume,
-                            maximum_density=maximum_density,
-                        )
-                    elif maximum_density is not None:
-                        next_rho = torch.minimum(
-                            next_rho,
-                            maximum_density[None, :],
-                        )
-
-                    trial_data = dict(data)
-                    trial_data["rho"] = next_rho.detach().clone()
-                    trial_data["V_ext"] = stage_V_ext
-                    trial_evaluation = self.evaluate(
-                        trial_data,
-                        compute_c1=True,
-                    )
-                    n_evaluations += 1
-                    _, _, _, trial_rms_residual = _euler_residual(
-                        next_rho,
-                        trial_evaluation["c1"].detach(),
-                        stage_V_ext,
-                        data["beta"],
-                        thermal_wavelength,
-                        mu,
-                        residual_density_threshold,
-                        maximum_density,
-                    )
-
-                    if (
-                        not adaptive_mixing
-                        or trial_rms_residual <= rms_residual
-                        or trial_mixing <= minimum_mixing
-                    ):
-                        break
-                    trial_mixing = max(
-                        minimum_mixing,
-                        trial_mixing * mixing_backtrack_factor,
-                    )
-                    mixing_backtracks += 1
-
-                relative_change = _maximum_relative_change(rho, next_rho)
-                rho = next_rho.detach()
-                evaluation = trial_evaluation
-                n_iter += 1
-                final_relative_change = relative_change
-                objective = _thermodynamic_objective(
-                    evaluation,
-                    fixed_N is not None,
-                    cell_volume,
-                    thermal_wavelength,
-                )
-                stage_history.append(objective.detach().item())
-
-                if adaptive_mixing:
-                    current_mixing = min(
-                        maximum_mixing,
-                        trial_mixing * mixing_growth,
-                    )
-                else:
-                    current_mixing = mixing
-                if relative_change <= tolerance_change:
-                    break
-
-            stage_histories.append(stage_history)
-            final_c1 = evaluation["c1"].detach()
-            _, _, final_max_residual, final_rms_residual = _euler_residual(
+        for _ in range(max_iter):
+            c1 = evaluation["c1"].detach()
+            _, _, max_residual, rms_residual = _euler_residual(
                 rho,
-                final_c1,
-                stage_V_ext,
+                c1,
+                V_ext,
                 data["beta"],
                 thermal_wavelength,
                 mu,
                 residual_density_threshold,
                 maximum_density,
             )
-            stage_converged = stage_converged or _residuals_converged(
-                final_max_residual,
-                final_rms_residual,
+            if _residuals_converged(
+                max_residual,
+                rms_residual,
                 tolerance_residual,
                 tolerance_rms_residual,
+            ):
+                break
+
+            current_log_density = torch.log(
+                torch.clamp(rho, min=torch.finfo(rho.dtype).tiny)
             )
-            final_stage_converged = stage_converged
+            if fixed_N is None:
+                target_log_density = (
+                    data["beta"] * (mu[None, :] - V_ext)
+                    + c1
+                    - 3.0 * torch.log(thermal_wavelength)[None, :]
+                )
+                log_change = torch.clamp(
+                    target_log_density - current_log_density,
+                    min=-max_log_density_change,
+                    max=max_log_density_change,
+                )
+                target_rho = torch.exp(current_log_density + log_change)
+                if maximum_density is not None:
+                    target_rho = torch.minimum(
+                        target_rho,
+                        maximum_density[None, :],
+                    )
+            else:
+                logits = -data["beta"] * V_ext + c1
+                target_rho = (
+                    fixed_N[None, :]
+                    * torch.softmax(logits, dim=0)
+                    / cell_volume
+                )
+
+            trial_mixing = current_mixing
+            while True:
+                next_rho = (
+                    (1.0 - trial_mixing) * rho
+                    + trial_mixing * target_rho
+                )
+                if fixed_N is not None:
+                    next_rho = _normalize_particle_numbers(
+                        next_rho,
+                        fixed_N,
+                        cell_volume,
+                        maximum_density=maximum_density,
+                    )
+                elif maximum_density is not None:
+                    next_rho = torch.minimum(
+                        next_rho,
+                        maximum_density[None, :],
+                    )
+
+                trial_data = dict(data)
+                trial_data["rho"] = next_rho.detach().clone()
+                trial_data["V_ext"] = V_ext
+                trial_evaluation = self.evaluate(
+                    trial_data,
+                    compute_c1=True,
+                )
+                n_evaluations += 1
+                _, _, _, trial_rms_residual = _euler_residual(
+                    next_rho,
+                    trial_evaluation["c1"].detach(),
+                    V_ext,
+                    data["beta"],
+                    thermal_wavelength,
+                    mu,
+                    residual_density_threshold,
+                    maximum_density,
+                )
+
+                if (
+                    not adaptive_mixing
+                    or trial_rms_residual <= rms_residual
+                    or trial_mixing <= minimum_mixing
+                ):
+                    break
+                trial_mixing = max(
+                    minimum_mixing,
+                    trial_mixing * mixing_backtrack_factor,
+                )
+                mixing_backtracks += 1
+
+            relative_change = _maximum_relative_change(rho, next_rho)
+            rho = next_rho.detach()
+            evaluation = trial_evaluation
+            n_iter += 1
+            final_relative_change = relative_change
+            objective = _thermodynamic_objective(
+                evaluation,
+                fixed_N is not None,
+                cell_volume,
+                thermal_wavelength,
+            )
+            objective_history.append(objective.detach().item())
+
+            if adaptive_mixing:
+                current_mixing = min(
+                    maximum_mixing,
+                    trial_mixing * mixing_growth,
+                )
+            else:
+                current_mixing = mixing
+            if relative_change <= tolerance_change:
+                break
 
         return {
             "rho": rho,
             "n_iter": n_iter,
             "n_evaluations": n_evaluations,
-            "stage_objective_history": stage_histories,
+            "objective_history": objective_history,
             "final_relative_density_change": final_relative_change,
             "line_search_failures": 0,
             "mixing_backtracks": mixing_backtracks,
             "final_mixing": current_mixing,
-            "converged": final_stage_converged,
         }
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:

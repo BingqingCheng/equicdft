@@ -34,24 +34,6 @@ def _component_tensor(
     return values
 
 
-def _continued_fields(
-    V_ext: torch.Tensor,
-    continuation_steps: int,
-):
-    """Return external fields from zero to the requested full field."""
-
-    if continuation_steps == 0:
-        return (V_ext,)
-    fractions = torch.linspace(
-        0.0,
-        1.0,
-        steps=continuation_steps + 1,
-        dtype=V_ext.dtype,
-        device=V_ext.device,
-    )
-    return tuple(fraction * V_ext for fraction in fractions)
-
-
 def _thermodynamic_objective(
     evaluation: Dict[str, torch.Tensor],
     fixed_particle_numbers: bool,

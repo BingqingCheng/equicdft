@@ -28,13 +28,27 @@ class _DensityReadout(LocalReadout):
         return local_features[..., :1]
 
 
-class TestGridSolver(unittest.TestCase):
-    def assert_objective_histories_nonincreasing(self, histories):
-        """Check monotonic descent separately for every continued field."""
+class _IdealGasModel(nn.Module):
+    """Minimal zero-excess model for testing solver initialization."""
 
-        for history in histories:
-            for previous, current in zip(history, history[1:]):
-                self.assertLessEqual(current, previous + 1.0e-12)
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("zero", torch.tensor(0.0))
+
+    def forward(self, data, compute_c1=True):
+        rho = data["rho"]
+        outputs = {"beta_F_exc": self.zero.to(rho) * torch.sum(rho)}
+        if compute_c1:
+            outputs["c1"] = torch.zeros_like(rho)
+        return outputs
+
+
+class TestGridSolver(unittest.TestCase):
+    def assert_objective_history_nonincreasing(self, history):
+        """Check that every accepted minimization step lowers the objective."""
+
+        for previous, current in zip(history, history[1:]):
+            self.assertLessEqual(current, previous + 1.0e-12)
 
     def _make_model(self):
         # beta_F_exc = sum_g rho_g^2 and c1 = -2 rho for unit voxels.
@@ -106,7 +120,6 @@ class TestGridSolver(unittest.TestCase):
             self._make_data(target_rho),
             method="minimize",
             max_iter=200,
-            continuation_steps=0,
             tolerance_residual=1.0e-8,
         )
 
@@ -120,8 +133,8 @@ class TestGridSolver(unittest.TestCase):
         self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
         self.assertEqual(result["solver_method"], "minimize")
         self.assertLessEqual(result["line_search_failures"], 1)
-        self.assert_objective_histories_nonincreasing(
-            result["stage_objective_history"]
+        self.assert_objective_history_nonincreasing(
+            result["objective_history"]
         )
 
     def test_fixed_particle_number_solve_enforces_constraint(self):
@@ -146,9 +159,101 @@ class TestGridSolver(unittest.TestCase):
             1.0e-12,
         )
         self.assertTrue(result["converged"])
-        self.assert_objective_histories_nonincreasing(
-            result["stage_objective_history"]
+        self.assert_objective_history_nonincreasing(
+            result["objective_history"]
         )
+
+    def test_beta_multiplier_initialization_is_exact_for_fixed_n_ideal_gas(
+        self,
+    ):
+        data = self._make_data(include_mu=False)
+        data["V_ext"] = torch.tensor(
+            [[-1.0], [0.0], [0.5], [1.0]],
+            dtype=torch.float64,
+        )
+        expected = 2.0 * torch.softmax(-data["V_ext"], dim=0)
+
+        ideal = GridSolver(_IdealGasModel()).solve(
+            data,
+            particle_numbers=[2.0],
+            beta_multiplier=1.0,
+            max_iter=1,
+            tolerance_residual=1.0e-10,
+        )
+        uniform = GridSolver(_IdealGasModel()).solve(
+            data,
+            particle_numbers=[2.0],
+            max_iter=1,
+            tolerance_residual=1.0e-10,
+            adaptive_mixing=False,
+        )
+
+        self.assertEqual(ideal["solver_beta_multiplier"], 1.0)
+        self.assertEqual(ideal["n_iter"], 0)
+        self.assertTrue(torch.allclose(ideal["rho"], expected))
+        self.assertEqual(uniform["solver_beta_multiplier"], 0.0)
+        self.assertEqual(uniform["n_iter"], 1)
+        self.assertFalse(torch.allclose(uniform["rho"], expected))
+
+        tempered_expected = 2.0 * torch.softmax(
+            -0.5 * data["V_ext"], dim=0
+        )
+        tempered = GridSolver(_IdealGasModel()).solve(
+            data,
+            particle_numbers=[2.0],
+            beta_multiplier=0.5,
+            max_iter=1,
+            tolerance_residual=10.0,
+        )
+        self.assertEqual(tempered["solver_beta_multiplier"], 0.5)
+        self.assertTrue(torch.allclose(tempered["rho"], tempered_expected))
+
+    def test_solver_beta_multiplier_is_validated(self):
+        for invalid_value in (-1.0, float("inf"), float("nan")):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(ValueError, "beta_multiplier"):
+                    GridSolver(self._make_model()).solve(
+                        self._make_data(),
+                        beta_multiplier=invalid_value,
+                    )
+
+    def test_explicit_density_overrides_beta_profile(self):
+        initial_rho = torch.full((4, 1), 0.5, dtype=torch.float64)
+        result = GridSolver(self._make_model()).solve(
+            self._make_data(include_mu=False),
+            initial_rho=initial_rho,
+            particle_numbers=[2.0],
+            beta_multiplier=1.0,
+            max_iter=1,
+            tolerance_residual=10.0,
+        )
+        self.assertTrue(torch.allclose(result["rho"], initial_rho))
+
+    def test_known_mu_beta_multiplier_only_scales_external_field(self):
+        data = self._make_data()
+        data["mu"] = torch.tensor([0.7], dtype=torch.float64)
+        expected = torch.exp(
+            data["beta"]
+            * (data["mu"][None, :] - 0.5 * data["V_ext"])
+        )
+        result = GridSolver(_IdealGasModel()).solve(
+            data,
+            beta_multiplier=0.5,
+            max_iter=1,
+            tolerance_residual=100.0,
+        )
+        self.assertTrue(torch.allclose(result["rho"], expected))
+
+        uniform = GridSolver(_IdealGasModel()).solve(
+            data,
+            beta_multiplier=0.0,
+            max_iter=1,
+            tolerance_residual=100.0,
+        )
+        old_uniform = torch.exp(
+            data["beta"] * data["mu"]
+        )[None, :].expand_as(data["V_ext"])
+        self.assertTrue(torch.allclose(uniform["rho"], old_uniform))
 
     def test_fixed_particle_solver_recovers_from_concentrated_initial_density(
         self,
@@ -166,7 +271,6 @@ class TestGridSolver(unittest.TestCase):
             particle_numbers=[2.0],
             method="minimize",
             max_iter=200,
-            continuation_steps=1,
             tolerance_residual=1.0e-7,
         )
 
@@ -180,14 +284,12 @@ class TestGridSolver(unittest.TestCase):
         )
         self.assertTrue(result["converged"])
         self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
-        self.assertTrue(
-            any(
-                history[-1] < history[0]
-                for history in result["stage_objective_history"]
-            )
+        self.assertLess(
+            result["objective_history"][-1],
+            result["objective_history"][0],
         )
-        self.assert_objective_histories_nonincreasing(
-            result["stage_objective_history"]
+        self.assert_objective_history_nonincreasing(
+            result["objective_history"]
         )
 
     def test_euler_is_the_default_method(self):
@@ -250,7 +352,6 @@ class TestGridSolver(unittest.TestCase):
             particle_numbers=[2.0],
             method="minimize",
             maximum_density=0.6,
-            continuation_steps=0,
             max_iter=500,
             tolerance_residual=1.0e-7,
         )
@@ -283,14 +384,12 @@ class TestGridSolver(unittest.TestCase):
             method="euler",
             step_size="unused",
             max_iter=1,
-            continuation_steps=0,
         )
         GridSolver(self._make_model()).solve(
             self._make_data(),
             method="minimize",
             mixing="unused",
             max_iter=1,
-            continuation_steps=0,
         )
 
     def test_zero_density_is_included_in_default_physical_residual(self):
