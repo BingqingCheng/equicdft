@@ -12,14 +12,14 @@ and local-chemical-potential objective as the current Lennard--Jones fits.
 
 ## Method in one page
 
-For grid-cell volume \(\Delta V\), density \(\rho_g\), and a learned local
-excess free energy per particle \(a_g^{\mathrm{exc}}\), the beta-energy
+For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
+excess free energy per particle $a_g^{\mathrm{exc}}$, the beta-energy
 convention used by the included example is
 
-\[
+$$
 \beta F_{\mathrm{exc}}[\rho,T]
 = \Delta V\sum_g \rho_g\,\beta a_g^{\mathrm{exc}}.
-\]
+$$
 
 Each grid point is represented by the density in a periodic integer-spherical
 neighborhood. Cartesian density moments are symmetrized under the 48 signed
@@ -31,22 +31,22 @@ derivative is taken.
 
 The first direct correlation follows from the discrete functional derivative
 
-\[
+$$
 c_g^{(1)} = -\frac{1}{\Delta V}
 \frac{\partial\,\beta F_{\mathrm{exc}}}{\partial \rho_g}.
-\]
+$$
 
 For an equilibrium field in an external potential, the dimensionless local
 chemical potential is
 
-\[
+$$
 \beta\mu_g^{\mathrm{loc}}
 = \log(\rho_g\Lambda^3)+\beta V_g^{\mathrm{ext}}-c_g^{(1)}.
-\]
+$$
 
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
-\(\beta\mu_g^{\mathrm{loc}}\) about its per-field mean. If a reservoir chemical
+$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. If a reservoir chemical
 potential is known, the same tensor loss can instead target `beta_mu`.
 
 One complete density field is one dataset item. Fields are never split into
@@ -67,7 +67,7 @@ supported.
 ## Five-minute example
 
 The repository contains five reduced-unit Lennard--Jones density fields on
-\(16^3\) grids. Run a two-epoch smoke test from the repository root:
+$16^3$ grids. Run a two-epoch smoke test from the repository root:
 
 ```bash
 python examples/lj_nvt/train.py --epochs 2
@@ -95,21 +95,21 @@ The annotated example exposes the important options while using these defaults:
 
 | Setting | Value |
 |---|---:|
-| grid spacing | \(0.5\sigma\) |
-| local cutoff | 3 grid cells, \(|\mathbf q|^2\leq 3^2\) |
-| Cartesian degree | \(p=3\) |
-| invariant product order | \(\nu=2\) |
+| grid spacing | $0.5\sigma$ |
+| local cutoff | 3 grid cells, $\lvert\mathbf q\rvert^2\leq 3^2$ |
+| Cartesian degree | $p=3$ |
+| invariant product order | $\nu=2$ |
 | radial channels | none (equal-weight polynomial moments) |
 | center treatment | separate normalized center density |
 | energy readouts | LDA + local invariant readout |
 | MLP hidden widths | 32, 16 with SiLU activations |
 | density scale | train+validation mean density |
 | temperature scale | train+validation mean temperature |
-| density mask | \(\rho>10^{-3}\) |
+| density mask | $\rho>10^{-3}$ |
 | batch size | 2 complete fields |
-| optimizer | Adam, learning rate \(10^{-4}\) |
+| optimizer | Adam, learning rate $10^{-4}$ |
 | scheduler | ReduceLROnPlateau, factor 0.5, patience 3 |
-| objective | spatial constancy of \(\beta\mu^{\mathrm{loc}}\) |
+| objective | spatial constancy of $\beta\mu^{\mathrm{loc}}$ |
 
 The data split acts on complete fields and is reproducible from the seed. For
 scientific benchmarks, thermodynamic states intended for testing should be
@@ -125,7 +125,7 @@ default field names and requirements are:
 |---|---|---:|---|
 | frame metadata | `T` | yes | temperature |
 | frame metadata | `grid_spacing` | yes | one or three physical grid spacings |
-| frame metadata | `grid_size` | no | \((N_x,N_y,N_z)\); inferred from positions if absent |
+| frame metadata | `grid_size` | no | $(N_x,N_y,N_z)$; inferred from positions if absent |
 | frame metadata | `grid_indexing` | no | `zero_based` (default) or `one_based` |
 | frame metadata | `mu` | no | reservoir chemical potential per component |
 | per-grid array | `density` | conditional | density component(s) |
@@ -144,7 +144,7 @@ X  0  0  1   0.0189  -0.281
 ```
 
 Here `...` only abbreviates the remaining records: an actual frame must contain
-exactly \(N_xN_yN_z\) distinct sites. The three `pos` values are integer grid
+exactly $N_xN_yN_z$ distinct sites. The three `pos` values are integer grid
 indices, not physical Cartesian coordinates. They must cover the complete
 regular grid; input row order is arbitrary because `GridData` sorts sites into
 C order (the last index varies fastest). Physical displacements are obtained by
@@ -157,16 +157,16 @@ used for intrinsic-functional evaluation, while a potential-only grid is the
 starting point for an equilibrium solve. `mu` may be omitted (or stored as
 `nan`) for NVT data.
 
-For a mixture with \(M\) components, declare `density:R:M` and `V_ext:R:M` in
+For a mixture with $M$ components, declare `density:R:M` and `V_ext:R:M` in
 the `Properties` field and place the component columns consecutively in each
 record. When both arrays are present they must have the same width; this width
 defines `n_types`. A scalar field is normalized internally to `[n_grid, 1]`,
 and a mixture to `[n_grid, n_types]`.
 
 All numerical units must be mutually consistent. `GridData` computes
-\(\beta=1/(k_BT)\) from `T` and the `boltzmann_constant` argument, while
+$\beta=1/(k_BT)$ from `T` and the `boltzmann_constant` argument, while
 `thermal_wavelength` fixes the ideal-gas logarithm. The bundled example uses
-Lennard--Jones reduced units with \(k_B=\Lambda=1\).
+Lennard--Jones reduced units with $k_B=\Lambda=1$.
 
 ```python
 from equicdft import GridData
@@ -239,6 +239,6 @@ python -m unittest discover -s tests -p "test_*.py"
 Implemented capabilities include multicomponent density tensors, optional LDA,
 GGA, and reciprocal-space readouts, first direct correlations, selected rows of
 the second direct correlation, supervised or latent chemical-potential
-training, and fixed-\(N\)/fixed-\(\mu\) equilibrium solves. The compact example
+training, and fixed $N$/fixed $\mu$ equilibrium solves. The compact example
 uses the validated short-range LDA + Cartesian-invariant model and does not
-enable GGA, reciprocal-space terms, or direct \(c^{(2)}\) supervision.
+enable GGA, reciprocal-space terms, or direct $c^{(2)}$ supervision.
