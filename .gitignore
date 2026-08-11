@@ -9,3 +9,6 @@ dist/
 *.pt
 *.pth
 *.log
+
+# Output of the bundled pedagogical training example.
+examples/lj_nvt/fit/
