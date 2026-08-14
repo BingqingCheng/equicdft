@@ -234,14 +234,14 @@ Run the test suite with:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-The versioned `lj-paper-v1` production regression additionally freezes one
-held-out `T=1.5` field and the released model. It checks both gauge-aligned
+The `lj_paper_v1_regression` example freezes one held-out `T=1.5` field and
+the released model. It doubles as a regression test for gauge-aligned
 density-to-external-potential inference and the fixed-particle-number reverse
 solve:
 
 ```bash
-python -m regression.lj_paper_v1.forward
-python -m regression.lj_paper_v1.solve
+python -m examples.lj_paper_v1_regression.forward
+python -m examples.lj_paper_v1_regression.solve
 ```
 
 ## Scope

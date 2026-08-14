@@ -7,7 +7,7 @@ __pycache__/
 build/
 dist/
 *.pt
-!regression/lj_paper_v1/model.pt
+!examples/lj_paper_v1_regression/model.pt
 *.pth
 *.log
 

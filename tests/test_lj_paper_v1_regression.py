@@ -1,8 +1,8 @@
 import unittest
 
-from regression.lj_paper_v1.common import check_thresholds
-from regression.lj_paper_v1.forward import evaluate_forward
-from regression.lj_paper_v1.solve import evaluate_solve
+from examples.lj_paper_v1_regression.common import check_thresholds
+from examples.lj_paper_v1_regression.forward import evaluate_forward
+from examples.lj_paper_v1_regression.solve import evaluate_solve
 
 
 class TestLJPaperV1Regression(unittest.TestCase):

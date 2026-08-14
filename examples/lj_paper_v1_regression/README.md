@@ -14,8 +14,8 @@ After installing the checkout with `python -m pip install -e .`, run from the
 repository root:
 
 ```bash
-python -m regression.lj_paper_v1.forward
-python -m regression.lj_paper_v1.solve
+python -m examples.lj_paper_v1_regression.forward
+python -m examples.lj_paper_v1_regression.solve
 ```
 
 Each command prints machine-readable metrics and exits nonzero when an

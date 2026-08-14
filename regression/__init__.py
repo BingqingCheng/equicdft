@@ -1,1 +1,0 @@
-"""Versioned scientific regression bundles."""
