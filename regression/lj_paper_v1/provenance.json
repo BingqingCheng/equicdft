@@ -1,0 +1,28 @@
+{
+  "production_tag": "lj-paper-v1",
+  "production_commit": "ba9419124a32cd39aedc52438be1a6b0535d78d8",
+  "source_repository": "https://github.com/BingqingCheng/equicdft-lj-data",
+  "field_selection": {
+    "archive": "reference_data/heldout_nvt_general.zip",
+    "member": "data/training/general/nvt-T1.5-0.5sigma.extxyz",
+    "source_member_sha256": "62843d2c80cf8d8622343f9846f0113b7e06e891147090169a180c2e5e66c8ac",
+    "frame_index": 120,
+    "frame_indexing": "zero_based",
+    "partition": "test",
+    "field_family": "general_3D",
+    "temperature": 1.5,
+    "particle_number": 208,
+    "mean_density": 0.40625,
+    "density_standard_deviation": 0.14990942180156708
+  },
+  "artifacts": {
+    "model": {
+      "source": "model/model.pt",
+      "sha256": "d725f38b5151407984aa3a5b20e0ab4aac9e6b4ea66bb03d37bca72fd5cd67a8"
+    },
+    "field": {
+      "source": "the selected archive member and frame above",
+      "sha256": "e3bcf4e390db14e9a6606f89c8be291f583a74c1beecb43fb1809f8faa095b9a"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "forward": {
+    "reference": {
+      "forward_rmse": 0.028907022796108055,
+      "forward_r2": 0.9987666963128374
+    },
+    "acceptance": {
+      "maximum": {
+        "forward_rmse": 0.035
+      },
+      "minimum": {
+        "forward_r2": 0.998
+      }
+    }
+  },
+  "solve": {
+    "reference": {
+      "reverse_rmse": 0.00729851683448415,
+      "reverse_r2": 0.9976290770641263,
+      "iterations": 41,
+      "max_residual": 0.009824752807617188,
+      "particle_error": 0.0
+    },
+    "acceptance": {
+      "maximum": {
+        "reverse_rmse": 0.01,
+        "particle_error": 0.0001,
+        "maximum_density": 2.0
+      },
+      "minimum": {
+        "reverse_r2": 0.995,
+        "minimum_density": 0.0
+      },
+      "equal": {
+        "converged": true,
+        "finite_density": true
+      }
+    }
+  }
+}

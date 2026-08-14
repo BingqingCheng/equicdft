@@ -234,6 +234,16 @@ Run the test suite with:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
+The versioned `lj-paper-v1` production regression additionally freezes one
+held-out `T=1.5` field and the released model. It checks both gauge-aligned
+density-to-external-potential inference and the fixed-particle-number reverse
+solve:
+
+```bash
+python -m regression.lj_paper_v1.forward
+python -m regression.lj_paper_v1.solve
+```
+
 ## Scope
 
 Implemented capabilities include multicomponent density tensors, optional LDA,
