@@ -116,6 +116,45 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
+## Experimental Fourier stability loss
+
+`FourierStabilityLoss` is an optional one-component regularizer for the local
+curvature of the complete intrinsic free energy. For every explicitly selected
+integer reciprocal-grid mode, it evaluates cosine and sine perturbations with
+zero density sum and applies a squared hinge to the symmetric finite-difference
+curvature. For a homogeneous fluid its dimensionless normalization approaches
+$1/S(k)$. The ideal-gas contribution is included; external-potential and
+reservoir terms need not be evaluated because their second differences vanish.
+
+```python
+from equicdft import FourierStabilityLoss, Loss, TensorLoss
+
+loss = Loss(
+    [
+        TensorLoss(
+            name="local_chemical_potential",
+            prediction_key="local_chemical_potential",
+            target_key="average_chemical_potential",
+            weights_key="chemical_potential_weights",
+        ),
+        FourierStabilityLoss(
+            modes=((1, 0, 0), (2, 0, 0), (4, 0, 0), (6, 0, 0)),
+            relative_amplitude=0.05,
+            minimum_curvature=0.0,
+            weight=1.0e-3,
+        ),
+    ]
+)
+```
+
+Mode indices are lattice indices, not physical wavevectors; their physical
+values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. They must therefore be
+chosen deliberately for each grid shape and physical box. One loss evaluation
+adds `4 * len(modes)` energy evaluations per field (two real phases and two
+perturbation signs), batched into one model call. The loss is exploratory and
+is not enabled by default. Mixtures require a later component-coupled stability
+formulation rather than applying this scalar version independently.
+
 ## Data format
 
 `GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
@@ -224,7 +263,8 @@ the tests for the full option set.
 - `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
 - `readout.py`, `lda.py`, `gga.py`: composable free-energy contributions
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
-- `loss.py`, `metrics.py`, `trainer.py`: fitting, reporting, and restart state
+- `loss.py`, `stability.py`: composable objectives and optional stability terms
+- `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support
 

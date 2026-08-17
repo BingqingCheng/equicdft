@@ -14,6 +14,7 @@ from .semilocal import (
     LDAReadout,
 )
 from .solver import GridSolver
+from .stability import FourierStabilityLoss
 from .symmetrize import CartesianBFeatures
 from .trainer import Trainer
 
@@ -26,6 +27,7 @@ __all__ = [
     "GridSolver",
     "GGAReadout",
     "EnergyReadout",
+    "FourierStabilityLoss",
     "LocalReadout",
     "LDAReadout",
     "LongRangeReadout",
