@@ -138,7 +138,7 @@ loss = Loss(
             weights_key="chemical_potential_weights",
         ),
         FourierStabilityLoss(
-            modes=((1, 0, 0), (2, 0, 0), (4, 0, 0), (6, 0, 0)),
+            random_modes_per_field=1,
             relative_amplitude=0.05,
             minimum_curvature=0.0,
             weight=1.0e-3,
@@ -148,11 +148,15 @@ loss = Loss(
 ```
 
 Mode indices are lattice indices, not physical wavevectors; their physical
-values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. They must therefore be
-chosen deliberately for each grid shape and physical box. One loss evaluation
-adds `4 * len(modes)` energy evaluations per field (two real phases and two
-perturbation signs), batched into one model call. The loss is exploratory and
-is not enabled by default. Mixtures require a later component-coupled stability
+values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. In random mode, each
+field independently samples the requested number of nonzero triplets inside
+the isotropically complete Nyquist sphere. A random triplet is not expanded to
+its cubic symmetry orbit. Its cost is four energy evaluations per field: two
+real phases and two perturbation signs, batched into one model call. Cubic-orbit
+expansion remains available for explicitly supplied fixed modes. Random
+sampling is active only during training by default, so validation checkpoint
+selection retains the original data objective. The loss is exploratory and is
+not enabled by default. Mixtures require a later component-coupled stability
 formulation rather than applying this scalar version independently.
 
 ## Data format

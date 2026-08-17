@@ -196,15 +196,24 @@ class TestWeightedTensorLoss(unittest.TestCase):
 
 class TestFourierStabilityLoss(unittest.TestCase):
     @staticmethod
-    def _batch(dtype=torch.float64):
+    def _batch(dtype=torch.float64, n_fields=1):
         n_grid = 8
         return {
-            "rho": torch.full((1, n_grid, 1), 0.5, dtype=dtype),
-            "temperature": torch.ones(1, dtype=dtype),
-            "grid_spacing": torch.ones(1, 3, dtype=dtype),
-            "grid_size": torch.tensor([[n_grid, 1, 1]]),
+            "rho": torch.full(
+                (n_fields, n_grid, 1),
+                0.5,
+                dtype=dtype,
+            ),
+            "temperature": torch.ones(n_fields, dtype=dtype),
+            "grid_spacing": torch.ones(n_fields, 3, dtype=dtype),
+            "grid_size": torch.tensor(
+                [[n_grid, 1, 1]] * n_fields
+            ),
             "grid_positions": torch.tensor(
-                [[[index, 0, 0] for index in range(n_grid)]]
+                [
+                    [[index, 0, 0] for index in range(n_grid)]
+                    for _ in range(n_fields)
+                ]
             ),
         }
 
@@ -292,6 +301,81 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 model=model,
             )
 
+    def test_random_triplets_are_sampled_per_field_inside_nyquist_sphere(self):
+        n_grid = 8
+        positions = torch.tensor(
+            [
+                [x, y, z]
+                for x in range(n_grid)
+                for y in range(n_grid)
+                for z in range(n_grid)
+            ]
+        )
+        batch = {
+            "rho": torch.full((2, n_grid**3, 1), 0.5),
+            "temperature": torch.ones(2),
+            "grid_spacing": torch.ones(2, 3),
+            "grid_size": torch.tensor([[n_grid] * 3] * 2),
+            "grid_positions": positions[None].expand(2, -1, -1),
+        }
+        term = FourierStabilityLoss(random_modes_per_field=3)
+        torch.manual_seed(11)
+
+        modes, valid = term._select_modes(batch, batch["rho"])
+
+        self.assertTrue(torch.all(valid.sum(dim=-1) == 3).item())
+        scaled_squared_norm = torch.sum(
+            (2.0 * modes.to(torch.float32) / n_grid) ** 2,
+            dim=-1,
+        )
+        self.assertTrue(
+            torch.all(scaled_squared_norm[valid] <= 1.0 + 1.0e-6).item()
+        )
+        self.assertTrue(torch.all(torch.any(modes[valid] != 0, dim=-1)).item())
+
+    def test_cubic_orbit_expansion_includes_axis_equivalents(self):
+        n_grid = 8
+        positions = torch.tensor(
+            [
+                [x, y, z]
+                for x in range(n_grid)
+                for y in range(n_grid)
+                for z in range(n_grid)
+            ]
+        )
+        batch = {
+            "rho": torch.full((1, n_grid**3, 1), 0.5),
+            "temperature": torch.ones(1),
+            "grid_spacing": torch.ones(1, 3),
+            "grid_size": torch.tensor([[n_grid] * 3]),
+            "grid_positions": positions[None],
+        }
+        term = FourierStabilityLoss(
+            modes=((2, 0, 0),),
+            expand_cubic_orbits=True,
+        )
+
+        modes, valid = term._select_modes(batch, batch["rho"])
+        selected = {tuple(mode) for mode in modes[0, valid[0]].tolist()}
+
+        self.assertEqual(
+            selected,
+            {(2, 0, 0), (0, 2, 0), (0, 0, 2)},
+        )
+
+    def test_training_only_random_loss_is_zero_during_validation(self):
+        batch = self._batch()
+        model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
+        outputs = model(batch)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            training_only=True,
+        ).eval()
+
+        value = term(outputs, batch, model=model)
+
+        self.assertEqual(value.item(), 0.0)
+
     def test_configuration_and_scope_are_validated(self):
         for modes in ((), ((0, 0, 0),), ((1.5, 0, 0),)):
             with self.subTest(modes=modes):
@@ -299,6 +383,18 @@ class TestFourierStabilityLoss(unittest.TestCase):
                     FourierStabilityLoss(modes=modes)
         with self.assertRaisesRegex(ValueError, "relative_amplitude"):
             FourierStabilityLoss(((1, 0, 0),), relative_amplitude=1.0)
+        with self.assertRaisesRegex(ValueError, "random_modes_per_field"):
+            FourierStabilityLoss(random_modes_per_field=0)
+        with self.assertRaisesRegex(ValueError, "must be zero"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                random_modes_per_field=1,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot use"):
+            FourierStabilityLoss(
+                random_modes_per_field=1,
+                expand_cubic_orbits=True,
+            )
 
         batch = self._batch()
         batch["rho"] = batch["rho"].expand(-1, -1, 2).clone()
