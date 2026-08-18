@@ -116,55 +116,6 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
-## Experimental Fourier stability loss
-
-`FourierStabilityLoss` is an optional regularizer for the local curvature of
-the complete intrinsic free energy. For every selected integer reciprocal-grid
-mode, it evaluates cosine and sine perturbations at fixed particle number and
-applies a squared hinge to the symmetric finite-difference curvature. For a
-homogeneous one-component fluid its dimensionless normalization approaches
-$1/S(k)$. In a mixture, each component is perturbed independently at fixed
-$N_a$. The ideal-gas contribution is included; external-potential and reservoir
-terms need not be evaluated because their second differences vanish.
-
-```python
-from equicdft import FourierStabilityLoss, Loss, TensorLoss
-
-loss = Loss(
-    [
-        TensorLoss(
-            name="local_chemical_potential",
-            prediction_key="local_chemical_potential",
-            target_key="average_chemical_potential",
-            weights_key="chemical_potential_weights",
-        ),
-        FourierStabilityLoss(
-            random_modes_per_field=1,
-            relative_amplitude=0.05,
-            minimum_curvature=0.0,
-            weight=1.0,
-        ),
-    ]
-)
-```
-
-Mode indices are lattice indices, not physical wavevectors; their physical
-values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. For anisotropic grid
-spacings, feasible modes are filtered using these physical wavevectors and the
-largest isotropically complete Nyquist sphere. Each field independently samples
-the requested number of nonzero triplets. Symmetry-equivalent directions are
-not added automatically.
-
-For $M$ modes and $C$ present density components, the loss evaluates $4MC$
-perturbed fields: two real phases, two perturbation signs, and one independent
-fixed-$N_a$ direction per component. They are batched into one model call. The
-reported loss is averaged over all valid fields, modes, phases, and components,
-so its weight does not grow with $C$. This constrains the diagonal species
-curvatures, not coupled composition eigenmodes of a mixture. Random sampling is
-active only during training by default, so validation checkpoint selection
-retains the original data objective. The loss is exploratory and is not enabled
-by default.
-
 ## Data format
 
 `GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
@@ -273,7 +224,7 @@ the tests for the full option set.
 - `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
 - `readout.py`, `lda.py`, `gga.py`: composable free-energy contributions
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
-- `loss.py`, `stability.py`: composable objectives and optional stability terms
+- `loss.py`: composable training objectives
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support
