@@ -12,12 +12,13 @@ from ._argument_checks import (
     positive_integer,
     positive_scalar,
 )
+from ._grid import grid_spacing_tensor
 from ._nn import (
     build_mlp,
     positive_scalar_tensor,
     validate_hidden_sizes,
 )
-from .energy import EnergyReadout
+from .energy import EnergyReadout, density_weighted_integral
 
 
 class LDAReadout(EnergyReadout):
@@ -103,10 +104,10 @@ class LDAReadout(EnergyReadout):
                 "LDAReadout must return one scalar per grid point"
             )
         per_particle = scalar_per_particle.expand_as(rho)
-        free_energy_density = torch.sum(rho * per_particle, dim=-1)
-        return context["cell_volume"] * torch.sum(
-            free_energy_density,
-            dim=-1,
+        return density_weighted_integral(
+            rho,
+            per_particle,
+            context["voxel_volume"],
         )
 
 
@@ -210,7 +211,7 @@ class GGAReadout(EnergyReadout):
             grid_size=context["grid_size"],
             grid_spacing=context["grid_spacing"],
         )
-        return context["cell_volume"] * torch.sum(
+        return context["voxel_volume"] * torch.sum(
             free_energy_density,
             dim=-1,
         )
@@ -255,13 +256,11 @@ def periodic_gradient_energy_density(
     if nx * ny * nz != rho.shape[-2]:
         raise ValueError("grid_size is inconsistent with rho")
 
-    spacing = torch.as_tensor(
+    spacing = grid_spacing_tensor(
         grid_spacing,
         device=rho.device,
         dtype=rho.dtype,
-    ).reshape(-1)
-    if spacing.numel() != 3 or torch.any(spacing <= 0.0).item():
-        raise ValueError("grid_spacing must contain three positive values")
+    )
 
     leading_shape = rho.shape[:-2]
     n_types = rho.shape[-1]

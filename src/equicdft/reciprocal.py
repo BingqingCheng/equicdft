@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
+from ._grid import grid_spacing_tensor, voxel_volume
 
 
 class ReciprocalFeatures(nn.Module):
@@ -138,9 +139,9 @@ class ReciprocalFeatures(nn.Module):
             keepdim=True,
         )
 
-        cell_volume = torch.prod(spacing)
-        volume = cell_volume * float(nx * ny * nz)
-        fourier_density = cell_volume * torch.fft.fftn(
+        volume_element = voxel_volume(spacing)
+        volume = volume_element * float(nx * ny * nz)
+        fourier_density = volume_element * torch.fft.fftn(
             density_fluctuation,
             dim=spatial_dims,
         )
@@ -265,18 +266,8 @@ class ReciprocalFeatures(nn.Module):
     ) -> torch.Tensor:
         """Return one validated three-component spacing on rho's device."""
 
-        spacing = torch.as_tensor(
+        return grid_spacing_tensor(
             grid_spacing,
             device=rho.device,
             dtype=rho.dtype,
-        ).reshape(-1)
-        if spacing.numel() == 1:
-            spacing = spacing.repeat(3)
-        if spacing.shape != (3,):
-            raise ValueError("grid_spacing must contain one or three values")
-        if (
-            not torch.all(torch.isfinite(spacing)).item()
-            or torch.any(spacing <= 0.0).item()
-        ):
-            raise ValueError("grid_spacing values must be finite and positive")
-        return spacing
+        )

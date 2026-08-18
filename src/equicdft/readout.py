@@ -10,7 +10,7 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._nn import build_mlp
-from .energy import EnergyReadout
+from .energy import EnergyReadout, density_weighted_integral
 from .reciprocal import ReciprocalFeatures
 
 
@@ -85,10 +85,10 @@ class LocalReadout(EnergyReadout):
             raise ValueError(
                 "LocalReadout must return one value per grid and type"
             )
-        free_energy_density = torch.sum(rho * per_particle, dim=-1)
-        return context["cell_volume"] * torch.sum(
-            free_energy_density,
-            dim=-1,
+        return density_weighted_integral(
+            rho,
+            per_particle,
+            context["voxel_volume"],
         )
 
 
@@ -157,8 +157,11 @@ class BulkReadout(EnergyReadout):
             raise ValueError(
                 "BulkReadout must return one value per field and type"
             )
-        particle_numbers = context["cell_volume"] * torch.sum(rho, dim=-2)
-        return torch.sum(particle_numbers * per_particle, dim=-1)
+        return density_weighted_integral(
+            rho,
+            per_particle.unsqueeze(-2),
+            context["voxel_volume"],
+        )
 
 
 class LongRangeReadout(EnergyReadout):

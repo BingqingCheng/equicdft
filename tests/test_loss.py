@@ -10,6 +10,7 @@ from equicdft import (
     Loss,
     TensorLoss,
 )
+from equicdft._grid import voxel_volume
 from equicdft.stability import _feasible_modes
 
 
@@ -32,13 +33,13 @@ class _QuadraticExcessModel(nn.Module):
 
     def forward(self, data, compute_c1=None):
         rho = data["rho"]
-        cell_volume = torch.prod(data["grid_spacing"].to(rho), dim=-1)
+        volume_element = voxel_volume(data["grid_spacing"].to(rho))
         self.last_rho = rho.detach()
         return {
             "beta_F_exc": (
                 0.5
                 * self.coefficient.to(rho)
-                * cell_volume
+                * volume_element
                 * torch.sum(rho.square(), dim=(-2, -1))
             )
         }

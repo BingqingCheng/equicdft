@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from equicdft import FourierStabilityLoss, Loss, Metrics, TensorLoss, Trainer
+from equicdft._grid import voxel_volume
 
 
 class _LinearDictionaryModel(nn.Module):
@@ -30,12 +31,12 @@ class _QuadraticDictionaryFunctional(nn.Module):
 
     def forward(self, batch, compute_c1=None):
         rho = batch["rho"]
-        cell_volume = torch.prod(batch["grid_spacing"].to(rho), dim=-1)
+        volume_element = voxel_volume(batch["grid_spacing"].to(rho))
         return {
             "beta_F_exc": (
                 0.5
                 * self.coefficient
-                * cell_volume
+                * volume_element
                 * torch.sum(rho.square(), dim=(-2, -1))
             )
         }

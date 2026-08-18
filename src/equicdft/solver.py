@@ -12,6 +12,7 @@ from ._argument_checks import (
     positive_integer,
     positive_scalar,
 )
+from ._grid import voxel_volume
 from ._solver_numerics import (
     _component_tensor,
     _euler_residual,
@@ -22,6 +23,7 @@ from ._solver_numerics import (
     _residuals_converged,
     _thermodynamic_objective,
 )
+from .energy import density_weighted_integral
 
 
 class GridSolver:
@@ -85,7 +87,7 @@ class GridSolver:
         }
         result.update(outputs)
 
-        cell_volume = torch.prod(data["grid_spacing"], dim=-1)
+        volume_element = voxel_volume(data["grid_spacing"])
         thermal_wavelength = data.get(
             "thermal_wavelength",
             torch.ones(
@@ -98,29 +100,32 @@ class GridSolver:
             rho,
             thermal_wavelength,
         )
-        ideal_density = torch.where(
+        ideal_per_particle = torch.where(
             rho > 0.0,
-            rho * (log_density - 1.0),
+            log_density - 1.0,
             torch.zeros_like(rho),
         )
-        result["beta_F_id"] = cell_volume * torch.sum(
-            ideal_density,
-            dim=(-2, -1),
+        result["beta_F_id"] = density_weighted_integral(
+            rho,
+            ideal_per_particle,
+            volume_element,
         )
         result["beta_F"] = result["beta_F_id"] + result["beta_F_exc"]
 
         if "V_ext" in data:
             beta = data["beta"][..., None, None]
-            result["beta_V_ext"] = cell_volume * torch.sum(
-                rho * beta * data["V_ext"],
-                dim=(-2, -1),
+            result["beta_V_ext"] = density_weighted_integral(
+                rho,
+                beta * data["V_ext"],
+                volume_element,
             )
 
         if "V_ext" in data and "mu" in data:
             beta = data["beta"][..., None, None]
-            beta_mu_N = cell_volume * torch.sum(
-                rho * beta * data["mu"][..., None, :],
-                dim=(-2, -1),
+            beta_mu_N = density_weighted_integral(
+                rho,
+                beta * data["mu"][..., None, :],
+                volume_element,
             )
             result["beta_mu_N"] = beta_mu_N
             result["beta_Omega"] = (
@@ -311,7 +316,7 @@ class GridSolver:
             V_ext,
             "thermal_wavelength",
         )
-        cell_volume = torch.prod(data["grid_spacing"])
+        volume_element = voxel_volume(data["grid_spacing"])
 
         density_cap = None
         if maximum_density is not None:
@@ -343,7 +348,7 @@ class GridSolver:
                 raise ValueError("particle_numbers must be positive")
             if density_cap is not None:
                 maximum_particle_numbers = (
-                    cell_volume * accessible_mask.sum() * density_cap
+                    volume_element * accessible_mask.sum() * density_cap
                 )
                 if torch.any(fixed_N > maximum_particle_numbers).item():
                     raise ValueError(
@@ -404,7 +409,7 @@ class GridSolver:
             rho = _normalize_particle_numbers(
                 rho,
                 fixed_N,
-                cell_volume,
+                volume_element,
                 maximum_density=density_cap,
                 accessible_mask=accessible_mask,
             )
@@ -422,7 +427,7 @@ class GridSolver:
                     thermal_wavelength=thermal_wavelength,
                     mu=mu,
                     fixed_N=fixed_N,
-                    cell_volume=cell_volume,
+                    voxel_volume=volume_element,
                     max_iter=max_iter,
                     tolerance_residual=tolerance_residual,
                     tolerance_rms_residual=tolerance_rms_residual,
@@ -443,7 +448,7 @@ class GridSolver:
                     thermal_wavelength=thermal_wavelength,
                     mu=mu,
                     fixed_N=fixed_N,
-                    cell_volume=cell_volume,
+                    voxel_volume=volume_element,
                     max_iter=max_iter,
                     tolerance_residual=tolerance_residual,
                     tolerance_rms_residual=tolerance_rms_residual,
@@ -510,7 +515,7 @@ class GridSolver:
         thermal_wavelength: torch.Tensor,
         mu: Optional[torch.Tensor],
         fixed_N: Optional[torch.Tensor],
-        cell_volume: torch.Tensor,
+        voxel_volume: torch.Tensor,
         max_iter: int,
         tolerance_residual: float,
         tolerance_rms_residual: Optional[float],
@@ -541,7 +546,7 @@ class GridSolver:
             objective = _thermodynamic_objective(
                 evaluation,
                 fixed_N is not None,
-                cell_volume,
+                voxel_volume,
                 thermal_wavelength,
             ).detach()
             if not torch.isfinite(objective).item():
@@ -596,14 +601,14 @@ class GridSolver:
                     residual,
                     trial_step_size,
                     fixed_N,
-                    cell_volume,
+                    voxel_volume,
                     max_log_density_change,
                     maximum_density,
                     accessible_mask,
                 )
                 displacement = trial_rho - rho
                 objective_dtype = objective.dtype
-                directional_derivative = cell_volume.to(
+                directional_derivative = voxel_volume.to(
                     objective_dtype
                 ) * torch.sum(
                     line_search_gradient.to(objective_dtype)
@@ -621,7 +626,7 @@ class GridSolver:
                 trial_objective = _thermodynamic_objective(
                     trial_evaluation,
                     fixed_N is not None,
-                    cell_volume,
+                    voxel_volume,
                     thermal_wavelength,
                 ).detach()
 
@@ -669,7 +674,7 @@ class GridSolver:
         thermal_wavelength: torch.Tensor,
         mu: Optional[torch.Tensor],
         fixed_N: Optional[torch.Tensor],
-        cell_volume: torch.Tensor,
+        voxel_volume: torch.Tensor,
         max_iter: int,
         tolerance_residual: float,
         tolerance_rms_residual: Optional[float],
@@ -701,7 +706,7 @@ class GridSolver:
         objective = _thermodynamic_objective(
             evaluation,
             fixed_N is not None,
-            cell_volume,
+            voxel_volume,
             thermal_wavelength,
         )
         objective_history.append(objective.detach().item())
@@ -759,7 +764,7 @@ class GridSolver:
                 target_rho = (
                     fixed_N[None, :]
                     * torch.softmax(logits, dim=0)
-                    / cell_volume
+                    / voxel_volume
                 )
 
             trial_mixing = current_mixing
@@ -772,7 +777,7 @@ class GridSolver:
                     next_rho = _normalize_particle_numbers(
                         next_rho,
                         fixed_N,
-                        cell_volume,
+                        voxel_volume,
                         maximum_density=maximum_density,
                         accessible_mask=accessible_mask,
                     )
@@ -822,7 +827,7 @@ class GridSolver:
             objective = _thermodynamic_objective(
                 evaluation,
                 fixed_N is not None,
-                cell_volume,
+                voxel_volume,
                 thermal_wavelength,
             )
             objective_history.append(objective.detach().item())

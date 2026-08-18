@@ -4,6 +4,8 @@ from typing import Dict, Optional, Sequence, Union
 
 import torch
 
+from .energy import density_weighted_integral
+
 
 def _log_dimensionless_density(
     rho: torch.Tensor,
@@ -37,7 +39,7 @@ def _component_tensor(
 def _thermodynamic_objective(
     evaluation: Dict[str, torch.Tensor],
     fixed_particle_numbers: bool,
-    cell_volume: torch.Tensor,
+    voxel_volume: torch.Tensor,
     thermal_wavelength: torch.Tensor,
 ) -> torch.Tensor:
     """Return the objective with high-precision scalar accumulation."""
@@ -48,20 +50,19 @@ def _thermodynamic_objective(
     wavelength = thermal_wavelength.to(accumulation_dtype)
     log_density = _log_dimensionless_density(rho, wavelength)
     beta = evaluation["beta"].to(accumulation_dtype)
-    component_density = (
-        rho * (log_density - 1.0)
-        + rho * beta * evaluation["V_ext"].to(accumulation_dtype)
+    per_particle = (
+        log_density - 1.0
+        + beta * evaluation["V_ext"].to(accumulation_dtype)
     )
     if not fixed_particle_numbers:
-        component_density = (
-            component_density
-            - rho
-            * beta
-            * evaluation["mu"].to(accumulation_dtype)[None, :]
+        per_particle = (
+            per_particle
+            - beta * evaluation["mu"].to(accumulation_dtype)[None, :]
         )
-    ideal_external_objective = (
-        cell_volume.to(accumulation_dtype)
-        * torch.sum(component_density)
+    ideal_external_objective = density_weighted_integral(
+        rho,
+        per_particle,
+        voxel_volume.to(accumulation_dtype),
     )
     return (
         ideal_external_objective
@@ -74,7 +75,7 @@ def _mirror_descent_trial(
     functional_gradient: torch.Tensor,
     step_size: float,
     particle_numbers: Optional[torch.Tensor],
-    cell_volume: torch.Tensor,
+    voxel_volume: torch.Tensor,
     max_log_density_change: float,
     maximum_density: Optional[torch.Tensor],
     accessible_mask: Optional[torch.Tensor] = None,
@@ -104,12 +105,12 @@ def _mirror_descent_trial(
     trial_rho = (
         particle_numbers.to(accumulation_dtype)[None, :]
         * torch.softmax(trial_log_rho.to(accumulation_dtype), dim=0)
-        / cell_volume.to(accumulation_dtype)
+        / voxel_volume.to(accumulation_dtype)
     )
     return _normalize_particle_numbers(
         trial_rho.to(rho.dtype),
         particle_numbers,
-        cell_volume,
+        voxel_volume,
         maximum_density=maximum_density,
         accessible_mask=accessible_mask,
     )
@@ -129,7 +130,7 @@ def _maximum_relative_change(
 def _normalize_particle_numbers(
     rho: torch.Tensor,
     particle_numbers: torch.Tensor,
-    cell_volume: torch.Tensor,
+    voxel_volume: torch.Tensor,
     maximum_density: Optional[torch.Tensor] = None,
     accessible_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -144,7 +145,7 @@ def _normalize_particle_numbers(
     )
     target_sums = (
         particle_numbers.to(accumulation_dtype)
-        / cell_volume.to(accumulation_dtype)
+        / voxel_volume.to(accumulation_dtype)
     )
 
     if maximum_density is None:

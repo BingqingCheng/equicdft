@@ -116,7 +116,7 @@ class TestGridLDABranch(unittest.TestCase):
 
         outputs = model(data)
 
-        expected_energy = model.cell_volume * torch.sum(data["rho"].square())
+        expected_energy = model.voxel_volume * torch.sum(data["rho"].square())
         self.assertTrue(torch.allclose(outputs["beta_F_exc"], expected_energy))
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
         self.assertEqual(model.cutoff_grid, 0)
@@ -130,7 +130,7 @@ class TestGridLDABranch(unittest.TestCase):
         outputs = model(data, c2_reference=(3, 0))
 
         expected = torch.zeros_like(data["rho"])
-        expected[3, 0] = -2.0 / model.cell_volume
+        expected[3, 0] = -2.0 / model.voxel_volume
         self.assertTrue(torch.equal(outputs["c2"], expected))
 
     def test_lda_vacuum_energy_is_exactly_zero(self):
@@ -519,7 +519,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         mean_density = data["rho"].mean()
         expected_energy = (
-            model.cell_volume
+            model.voxel_volume
             * data["rho"].sum()
             * 2.0
             * mean_density
@@ -558,7 +558,7 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertTrue(
             torch.equal(model.grid_spacing, torch.full((3,), 0.5))
         )
-        self.assertEqual(model.cell_volume.item(), 0.125)
+        self.assertEqual(model.voxel_volume.item(), 0.125)
         self.assertEqual(model.boltzmann_constant.item(), 1.0)
         self.assertAlmostEqual(model.mean_temperature.item(), 1.2)
         self.assertTrue(
@@ -608,7 +608,7 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 1))
 
-    def test_model_applies_c1_sign_and_cell_volume(self):
+    def test_model_applies_c1_sign_and_voxel_volume(self):
         # With per-particle free energy equal to rho,
         # beta_F_exc = Delta V * sum_g rho_g^2. Its discrete derivative is
         # 2*Delta V*rho, while the continuum c1 must be -2*rho.
@@ -649,7 +649,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        reduced_free_energy = model.cell_volume * torch.sum(
+        reduced_free_energy = model.voxel_volume * torch.sum(
             data["rho"].square()
         )
         self.assertTrue(
@@ -710,7 +710,7 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(list(outputs), ["beta_F_exc", "c1"])
         self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
 
-    def test_model_applies_c2_sign_and_cell_volume_to_one_row(self):
+    def test_model_applies_c2_sign_and_voxel_volume_to_one_row(self):
         # Continuing the analytic quadratic functional above,
         # c2(g0, g) = -2 delta(g0, g) / Delta V. Only one Hessian row is
         # evaluated and returned for each independent batch entry.
@@ -731,7 +731,7 @@ class TestGridCACEModel(unittest.TestCase):
         outputs = model(data, c2_reference=(5, 0))
 
         expected = torch.zeros_like(data["rho"])
-        expected[:, 5, 0] = -2.0 / model.cell_volume
+        expected[:, 5, 0] = -2.0 / model.voxel_volume
         self.assertEqual(outputs["c2"].shape, (2, 27, 1))
         self.assertTrue(torch.equal(outputs["c2"], expected))
 
@@ -829,7 +829,7 @@ class TestGridCACEModel(unittest.TestCase):
         outputs = model(data)
 
         per_particle = data["temperature"][:, None, None] / 2.0
-        expected = model.cell_volume * torch.sum(
+        expected = model.voxel_volume * torch.sum(
             data["rho"] * per_particle,
             dim=(-2, -1),
         )

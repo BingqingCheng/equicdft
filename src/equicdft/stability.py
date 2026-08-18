@@ -13,6 +13,8 @@ from ._argument_checks import (
     nonnegative_integer,
     nonnegative_scalar,
 )
+from ._grid import voxel_volume
+from .energy import density_weighted_integral
 
 
 class FourierStabilityLoss(nn.Module):
@@ -193,15 +195,15 @@ class FourierStabilityLoss(nn.Module):
         if "beta_F_exc" not in perturbed_outputs:
             raise KeyError("model outputs are missing 'beta_F_exc'")
 
-        cell_volume = torch.prod(batch["grid_spacing"].to(rho), dim=-1)
+        volume_element = voxel_volume(batch["grid_spacing"].to(rho))
         reference_energy = (
-            self._ideal_free_energy(rho, cell_volume)
+            self._ideal_free_energy(rho, volume_element)
             + outputs["beta_F_exc"]
         )
         perturbed_energy = (
             self._ideal_free_energy(
                 perturbed_rho,
-                cell_volume[:, None].expand(-1, 2 * n_directions),
+                volume_element[:, None].expand(-1, 2 * n_directions),
             )
             + perturbed_outputs["beta_F_exc"]
         )
@@ -211,7 +213,7 @@ class FourierStabilityLoss(nn.Module):
             plus_energy + minus_energy - 2.0 * reference_energy[:, None]
         )
 
-        perturbation_norm = cell_volume[:, None] * torch.sum(
+        perturbation_norm = volume_element[:, None] * torch.sum(
             delta_rho.square(),
             dim=(-2, -1),
         )
@@ -383,18 +385,22 @@ class FourierStabilityLoss(nn.Module):
     @staticmethod
     def _ideal_free_energy(
         rho: torch.Tensor,
-        cell_volume: torch.Tensor,
+        voxel_volume: torch.Tensor,
     ) -> torch.Tensor:
         """Return discrete ``beta*F_id``; omitted linear terms cancel."""
 
         positive = rho > 0.0
         safe_density = torch.where(positive, rho, torch.ones_like(rho))
-        integrand = torch.where(
+        per_particle = torch.where(
             positive,
-            rho * (torch.log(safe_density) - 1.0),
+            torch.log(safe_density) - 1.0,
             torch.zeros_like(rho),
         )
-        return cell_volume * torch.sum(integrand, dim=(-2, -1))
+        return density_weighted_integral(
+            rho,
+            per_particle,
+            voxel_volume,
+        )
 
 
 def _feasible_modes(

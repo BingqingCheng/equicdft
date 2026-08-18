@@ -13,6 +13,11 @@ from ._argument_checks import (
     optional_boolean,
     positive_scalar,
 )
+from ._grid import (
+    grid_spacing_tensor,
+    require_matching_grid_spacing,
+    voxel_volume as compute_voxel_volume,
+)
 from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout
 from .features import CartesianAFeatures
@@ -130,21 +135,10 @@ class GridCACEModel(nn.Module):
         self.rho_min = rho_min
         self.free_energy_mode = free_energy_mode
 
-        grid_spacing_tensor = torch.as_tensor(
+        spacing = grid_spacing_tensor(
             grid_spacing,
             dtype=torch.get_default_dtype(),
-        ).detach().clone().reshape(-1)
-        if grid_spacing_tensor.numel() == 1:
-            grid_spacing_tensor = grid_spacing_tensor.repeat(3)
-        if grid_spacing_tensor.shape != (3,):
-            raise ValueError(
-                "grid_spacing must contain one or three values"
-            )
-        if (
-            not torch.all(torch.isfinite(grid_spacing_tensor)).item()
-            or torch.any(grid_spacing_tensor <= 0.0).item()
-        ):
-            raise ValueError("grid_spacing values must be finite and positive")
+        )
 
         mean_temperature_tensor = torch.as_tensor(
             mean_temperature,
@@ -188,7 +182,7 @@ class GridCACEModel(nn.Module):
                 "thermal_wavelength values must be finite and positive"
             )
 
-        self.register_buffer("grid_spacing", grid_spacing_tensor)
+        self.register_buffer("grid_spacing", spacing)
         self.register_buffer("mean_temperature", mean_temperature_tensor)
         self.register_buffer(
             "boltzmann_constant",
@@ -234,10 +228,10 @@ class GridCACEModel(nn.Module):
         return getattr(self, "a_features", None) is not None
 
     @property
-    def cell_volume(self) -> torch.Tensor:
-        """Volume represented by one grid point."""
+    def voxel_volume(self) -> torch.Tensor:
+        """Quadrature volume represented by one grid point."""
 
-        return torch.prod(self.grid_spacing)
+        return compute_voxel_volume(self.grid_spacing)
 
     @property
     def reference_energy(self) -> torch.Tensor:
@@ -318,25 +312,6 @@ class GridCACEModel(nn.Module):
             / total_weight
         )
 
-    def _validate_grid_spacing(self, data: Dict[str, torch.Tensor]) -> None:
-        """Reject grids inconsistent with the trained discretization."""
-
-        if "grid_spacing" not in data:
-            return
-        input_spacing = data["grid_spacing"]
-        if input_spacing.shape[-1:] != (3,):
-            raise ValueError(
-                "input grid_spacing must have three Cartesian values"
-            )
-        expected = self.grid_spacing.to(
-            device=input_spacing.device,
-            dtype=input_spacing.dtype,
-        ).expand_as(input_spacing)
-        if not torch.allclose(input_spacing, expected):
-            raise ValueError(
-                "input grid_spacing does not match the trained model"
-            )
-
     def _validate_c2_reference(
         self,
         c2_reference: Tuple[int, int],
@@ -385,7 +360,11 @@ class GridCACEModel(nn.Module):
             torch.enable_grad() if compute_c1 else nullcontext()
         )
         with gradient_context:
-            self._validate_grid_spacing(data)
+            if "grid_spacing" in data:
+                require_matching_grid_spacing(
+                    data["grid_spacing"],
+                    self.grid_spacing,
+                )
             if compute_c1:
                 data["rho"].requires_grad_(True)
 
@@ -452,14 +431,14 @@ class GridCACEModel(nn.Module):
                     dim=-1,
                 )
 
-            cell_volume = self.cell_volume.to(
+            volume_element = self.voxel_volume.to(
                 device=rho.device,
                 dtype=rho.dtype,
             )
             context = {
                 "rho": rho,
                 "normalized_temperature": normalized_temperature,
-                "cell_volume": cell_volume,
+                "voxel_volume": volume_element,
                 "grid_spacing": self.grid_spacing.to(rho),
             }
             if local_features is not None:
@@ -518,7 +497,7 @@ class GridCACEModel(nn.Module):
                 )
                 outputs["c1"] = (
                     -beta_F_exc_derivative
-                    / cell_volume
+                    / volume_element
                 )
 
                 if compute_c2:
@@ -544,7 +523,7 @@ class GridCACEModel(nn.Module):
                         data["rho"],
                         create_graph=self.training,
                         allow_unused=True,
-                    ) / cell_volume
+                    ) / volume_element
                     if not self.training:
                         # The c1 graph was needed only as an intermediate for
                         # c2. Match the graph-free evaluation semantics of a

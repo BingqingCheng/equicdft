@@ -9,8 +9,8 @@ def evaluate_solve():
     model, solver, frame = load_case()
     solve_data = dict(frame)
     target = solve_data.pop("rho")
-    cell_volume = torch.prod(solve_data["grid_spacing"])
-    particle_numbers = cell_volume * torch.sum(target, dim=0)
+    volume_element = model.voxel_volume.to(target)
+    particle_numbers = volume_element * torch.sum(target, dim=0)
     result = solver.solve(
         solve_data,
         particle_numbers=particle_numbers,
@@ -23,7 +23,7 @@ def evaluate_solve():
         maximum_density=2.0,
     )
     prediction = result["rho"].detach()
-    predicted_particles = cell_volume * torch.sum(prediction, dim=0)
+    predicted_particles = volume_element * torch.sum(prediction, dim=0)
     metrics = {
         "reverse_rmse": rmse(target, prediction),
         "reverse_r2": r2(target, prediction),
