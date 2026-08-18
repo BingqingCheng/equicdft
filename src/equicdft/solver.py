@@ -1,7 +1,7 @@
 """Evaluate learned grid functionals and minimize thermodynamic objectives."""
 
 import math
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -28,6 +28,8 @@ class GridSolver:
     the available fields. ``solve(data)`` requires ``V_ext`` and either ``mu``
     or fixed ``particle_numbers``. Equilibrium solving supports one complete,
     unbatched field; prescribed-density evaluation also supports batches.
+    An optional Boolean ``mask`` has shape ``[..., n_grid]``; true entries are
+    hard exclusions whose density is fixed to zero and omitted from residuals.
     """
 
     def __init__(
@@ -56,11 +58,22 @@ class GridSolver:
         rho = data["rho"]
         if torch.any(rho < 0.0).item():
             raise ValueError("rho must be nonnegative")
+        excluded_mask, _ = _hard_wall_masks(data, rho)
+        excluded_density = excluded_mask[..., None].expand_as(rho)
+        if torch.any(rho[excluded_density] != 0.0).item():
+            raise ValueError("rho must be zero at masked grid points")
 
         outputs = self.model(data, compute_c1=compute_c1)
         result = {
             key: data[key]
-            for key in ("rho", "V_ext", "mu", "temperature", "beta")
+            for key in (
+                "rho",
+                "V_ext",
+                "mu",
+                "temperature",
+                "beta",
+                "mask",
+            )
             if key in data
         }
         result.update(outputs)
@@ -107,9 +120,13 @@ class GridSolver:
                 result["beta_F"] + result["beta_V_ext"] - beta_mu_N
             )
             if "local_chemical_potential" in result:
-                result["euler_lagrange_residual"] = (
+                residual = (
                     result["local_chemical_potential"]
                     - beta * data["mu"][..., None, :]
+                )
+                result["euler_lagrange_residual"] = residual.masked_fill(
+                    excluded_density,
+                    0.0,
                 )
 
         return result
@@ -157,6 +174,12 @@ class GridSolver:
         constraint. The reported residual then uses the corresponding KKT
         condition: a capped grid point may have a negative unconstrained
         residual because increasing its density is forbidden.
+
+        A true entry in ``data["mask"]`` is an inaccessible grid point,
+        mathematically equivalent to an infinite external potential. Masked
+        densities remain exactly zero, fixed particle numbers are normalized
+        over accessible points, and masked residuals do not enter convergence.
+        The mask does not alter the periodic neighborhood topology.
 
         When no density is supplied through ``initial_rho`` or ``data["rho"]``,
         the initial profile is proportional to
@@ -255,6 +278,7 @@ class GridSolver:
         V_ext = data["V_ext"]
         if V_ext.ndim != 2:
             raise ValueError("solve currently accepts one unbatched field")
+        excluded_mask, accessible_mask = _hard_wall_masks(data, V_ext)
 
         n_types = V_ext.shape[-1]
         thermal_wavelength = _component_tensor(
@@ -295,7 +319,7 @@ class GridSolver:
                 raise ValueError("particle_numbers must be positive")
             if density_cap is not None:
                 maximum_particle_numbers = (
-                    cell_volume * V_ext.shape[0] * density_cap
+                    cell_volume * accessible_mask.sum() * density_cap
                 )
                 if torch.any(fixed_N > maximum_particle_numbers).item():
                     raise ValueError(
@@ -322,22 +346,35 @@ class GridSolver:
             )
             if initial_rho.shape != V_ext.shape:
                 raise ValueError("initial_rho must have the same shape as V_ext")
-            if torch.any(initial_rho <= 0.0).item():
-                raise ValueError("initial_rho must be positive")
-            rho = initial_rho.detach().clone()
+            if torch.any(initial_rho[accessible_mask] <= 0.0).item():
+                raise ValueError(
+                    "initial_rho must be positive on accessible grid points"
+                )
+            rho = initial_rho.detach().clone().masked_fill(
+                excluded_mask[:, None],
+                0.0,
+            )
         elif fixed_N is None:
             log_rho = data["beta"] * (
                 mu[None, :] - beta_multiplier * V_ext
             )
             rho = torch.exp(log_rho) / thermal_wavelength[None, :] ** 3
+            rho = rho.masked_fill(excluded_mask[:, None], 0.0)
         else:
+            initial_logits = (
+                -beta_multiplier * data["beta"] * V_ext
+            ).masked_fill(excluded_mask[:, None], -torch.inf)
             boltzmann_weights = torch.softmax(
-                -beta_multiplier * data["beta"] * V_ext,
+                initial_logits,
                 dim=0,
             )
-            rho = torch.clamp(
-                boltzmann_weights,
-                min=torch.finfo(V_ext.dtype).tiny,
+            rho = torch.where(
+                accessible_mask[:, None],
+                torch.clamp(
+                    boltzmann_weights,
+                    min=torch.finfo(V_ext.dtype).tiny,
+                ),
+                torch.zeros_like(boltzmann_weights),
             )
 
         if fixed_N is not None:
@@ -346,6 +383,7 @@ class GridSolver:
                 fixed_N,
                 cell_volume,
                 maximum_density=density_cap,
+                accessible_mask=accessible_mask,
             )
         elif density_cap is not None:
             rho = torch.minimum(rho, density_cap[None, :])
@@ -372,6 +410,7 @@ class GridSolver:
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
+                    accessible_mask=accessible_mask,
                 )
             else:
                 state = self._solve_euler(
@@ -395,6 +434,7 @@ class GridSolver:
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
+                    accessible_mask=accessible_mask,
                 )
 
             final_data = dict(data)
@@ -413,6 +453,7 @@ class GridSolver:
                 mu,
                 residual_density_threshold,
                 density_cap,
+                accessible_mask,
             )
         )
         result["euler_lagrange_residual"] = residual
@@ -457,6 +498,7 @@ class GridSolver:
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
+        accessible_mask: torch.Tensor,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic objective by mirror descent."""
 
@@ -495,6 +537,7 @@ class GridSolver:
                 mu,
                 residual_density_threshold,
                 maximum_density,
+                accessible_mask,
             )
             if _residuals_converged(
                 max_residual,
@@ -516,6 +559,11 @@ class GridSolver:
                 line_search_gradient = (
                     line_search_gradient - data["beta"] * mu[None, :]
                 )
+            line_search_gradient = torch.where(
+                accessible_mask[:, None],
+                line_search_gradient,
+                torch.zeros_like(line_search_gradient),
+            )
 
             accepted = False
             trial_step_size = next_step_size
@@ -528,6 +576,7 @@ class GridSolver:
                     cell_volume,
                     max_log_density_change,
                     maximum_density,
+                    accessible_mask,
                 )
                 displacement = trial_rho - rho
                 objective_dtype = objective.dtype
@@ -611,6 +660,7 @@ class GridSolver:
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
+        accessible_mask: torch.Tensor,
     ) -> Dict[str, Any]:
         """Solve the Euler fixed point with optional residual backtracking."""
 
@@ -644,6 +694,7 @@ class GridSolver:
                 mu,
                 residual_density_threshold,
                 maximum_density,
+                accessible_mask,
             )
             if _residuals_converged(
                 max_residual,
@@ -673,8 +724,15 @@ class GridSolver:
                         target_rho,
                         maximum_density[None, :],
                     )
+                target_rho = target_rho.masked_fill(
+                    ~accessible_mask[:, None],
+                    0.0,
+                )
             else:
-                logits = -data["beta"] * V_ext + c1
+                logits = (-data["beta"] * V_ext + c1).masked_fill(
+                    ~accessible_mask[:, None],
+                    -torch.inf,
+                )
                 target_rho = (
                     fixed_N[None, :]
                     * torch.softmax(logits, dim=0)
@@ -693,6 +751,7 @@ class GridSolver:
                         fixed_N,
                         cell_volume,
                         maximum_density=maximum_density,
+                        accessible_mask=accessible_mask,
                     )
                 elif maximum_density is not None:
                     next_rho = torch.minimum(
@@ -717,6 +776,7 @@ class GridSolver:
                     mu,
                     residual_density_threshold,
                     maximum_density,
+                    accessible_mask,
                 )
 
                 if (
@@ -778,3 +838,28 @@ def _module_device(module: nn.Module) -> torch.device:
         return parameter.device
     buffer = next(module.buffers(), None)
     return torch.device("cpu") if buffer is None else buffer.device
+
+
+def _hard_wall_masks(
+    data: Dict[str, Any],
+    field: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return validated excluded and accessible masks for a grid field."""
+
+    expected_shape = field.shape[:-1]
+    mask = data.get("mask")
+    if mask is None:
+        excluded = torch.zeros(
+            expected_shape,
+            dtype=torch.bool,
+            device=field.device,
+        )
+    else:
+        if not torch.is_tensor(mask) or mask.dtype != torch.bool:
+            raise TypeError("mask must be a Boolean tensor")
+        if mask.shape != expected_shape:
+            raise ValueError("mask must have shape field.shape[:-1]")
+        excluded = mask.to(device=field.device)
+    if torch.any(torch.all(excluded, dim=-1)).item():
+        raise ValueError("mask must leave at least one accessible grid point")
+    return excluded, ~excluded

@@ -163,6 +163,68 @@ class TestGridSolver(unittest.TestCase):
             result["objective_history"]
         )
 
+    def test_hard_wall_fixed_n_is_enforced_by_both_solvers(self):
+        expected = torch.tensor(
+            [[0.0], [0.5], [0.5], [0.0]],
+            dtype=torch.float64,
+        )
+        for method in ("euler", "minimize"):
+            with self.subTest(method=method):
+                data = self._make_data(include_mu=False)
+                data["V_ext"].zero_()
+                data["mask"] = torch.tensor(
+                    [True, False, False, True]
+                )
+                result = GridSolver(self._make_model()).solve(
+                    data,
+                    initial_rho=torch.ones_like(data["V_ext"]),
+                    particle_numbers=[1.0],
+                    method=method,
+                    max_iter=200,
+                    tolerance_residual=1.0e-8,
+                )
+
+                self.assertTrue(torch.equal(result["mask"], data["mask"]))
+                self.assertTrue(torch.allclose(result["rho"], expected))
+                self.assertAlmostEqual(result["rho"].sum().item(), 1.0)
+                self.assertTrue(
+                    torch.all(
+                        result["euler_lagrange_residual"][data["mask"]]
+                        == 0.0
+                    )
+                )
+                self.assertTrue(result["converged"])
+
+    def test_hard_wall_grand_canonical_is_enforced_by_both_solvers(self):
+        expected = torch.tensor(
+            [[0.0], [1.0], [1.0], [0.0]],
+            dtype=torch.float64,
+        )
+        for method in ("euler", "minimize"):
+            with self.subTest(method=method):
+                data = self._make_data()
+                data["V_ext"].zero_()
+                data["mask"] = torch.tensor(
+                    [True, False, False, True]
+                )
+                result = GridSolver(_IdealGasModel()).solve(
+                    data,
+                    method=method,
+                    max_iter=20,
+                    tolerance_residual=1.0e-10,
+                )
+
+                self.assertTrue(torch.allclose(result["rho"], expected))
+                self.assertTrue(result["converged"])
+
+    def test_evaluate_rejects_density_inside_hard_wall(self):
+        data = self._make_data()
+        data["mask"] = torch.tensor([True, False, False, False])
+        data["rho"] = torch.ones_like(data["V_ext"])
+
+        with self.assertRaisesRegex(ValueError, "masked"):
+            GridSolver(self._make_model()).evaluate(data)
+
     def test_beta_multiplier_initialization_is_exact_for_fixed_n_ideal_gas(
         self,
     ):
@@ -371,6 +433,17 @@ class TestGridSolver(unittest.TestCase):
                 maximum_density=0.4,
             )
 
+    def test_density_cap_feasibility_uses_accessible_volume(self):
+        data = self._make_data(include_mu=False)
+        data["mask"] = torch.tensor([True, False, False, True])
+
+        with self.assertRaisesRegex(ValueError, "infeasible"):
+            GridSolver(self._make_model()).solve(
+                data,
+                particle_numbers=[1.0],
+                maximum_density=0.4,
+            )
+
     def test_solver_method_is_validated(self):
         with self.assertRaisesRegex(ValueError, "method"):
             GridSolver(self._make_model()).solve(
@@ -423,6 +496,26 @@ class TestGridSolver(unittest.TestCase):
 
         self.assertLess(max_residual, 1.0e-5)
         self.assertLess(rms_residual, 1.0e-5)
+
+    def test_hard_wall_is_excluded_from_residual_diagnostics(self):
+        rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
+        residual, chemical_potential, max_residual, rms_residual = (
+            _euler_residual(
+                rho=rho,
+                c1=torch.zeros_like(rho),
+                V_ext=torch.zeros_like(rho),
+                beta=torch.tensor(1.0, dtype=rho.dtype),
+                thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
+                mu=None,
+                density_threshold=0.0,
+                accessible_mask=torch.tensor([True, False]),
+            )
+        )
+
+        self.assertTrue(torch.equal(residual, torch.zeros_like(rho)))
+        self.assertTrue(torch.equal(chemical_potential, torch.zeros(1)))
+        self.assertEqual(max_residual, 0.0)
+        self.assertEqual(rms_residual, 0.0)
 
     def test_maximum_and_rms_residual_tolerances_are_both_required(self):
         self.assertTrue(_residuals_converged(0.02, 0.005, 0.03, 0.01))

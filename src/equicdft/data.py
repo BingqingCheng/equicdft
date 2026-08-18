@@ -36,6 +36,7 @@ default_data_key = {
     "grid_positions": "positions",
     "V_ext": "V_ext",
     "rho": "density",
+    "mask": "mask",
 }
 
 
@@ -79,6 +80,7 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
+        mask                        [n_grid] bool; true grid points are excluded
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors]
@@ -224,6 +226,7 @@ class GridData(dict):
             "temperature",
             "T",
             "n_types",
+            "mask",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -261,5 +264,6 @@ class GridData(dict):
                 cutoff_grid=cutoff_grid,
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
+                mask=values.get("mask"),
             )
         )

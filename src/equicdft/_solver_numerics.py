@@ -77,6 +77,7 @@ def _mirror_descent_trial(
     cell_volume: torch.Tensor,
     max_log_density_change: float,
     maximum_density: Optional[torch.Tensor],
+    accessible_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return one positive exponentiated-gradient trial density."""
 
@@ -89,6 +90,7 @@ def _mirror_descent_trial(
         max=max_log_density_change,
     )
     trial_log_rho = log_rho + log_change
+    accessible = _accessible_density_mask(rho, accessible_mask)
     if particle_numbers is None:
         trial_rho = torch.exp(trial_log_rho)
         if maximum_density is not None:
@@ -96,7 +98,7 @@ def _mirror_descent_trial(
                 trial_rho,
                 maximum_density[None, :],
             )
-        return trial_rho
+        return torch.where(accessible, trial_rho, torch.zeros_like(trial_rho))
 
     accumulation_dtype = _accumulation_dtype(rho.dtype)
     trial_rho = (
@@ -109,6 +111,7 @@ def _mirror_descent_trial(
         particle_numbers,
         cell_volume,
         maximum_density=maximum_density,
+        accessible_mask=accessible_mask,
     )
 
 
@@ -128,11 +131,17 @@ def _normalize_particle_numbers(
     particle_numbers: torch.Tensor,
     cell_volume: torch.Tensor,
     maximum_density: Optional[torch.Tensor] = None,
+    accessible_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Normalize each component, optionally subject to an upper density."""
 
     accumulation_dtype = _accumulation_dtype(rho.dtype)
-    rho_accumulated = rho.to(accumulation_dtype)
+    accessible = _accessible_density_mask(rho, accessible_mask)
+    rho_accumulated = torch.where(
+        accessible,
+        rho.to(accumulation_dtype),
+        torch.zeros((), dtype=accumulation_dtype, device=rho.device),
+    )
     target_sums = (
         particle_numbers.to(accumulation_dtype)
         / cell_volume.to(accumulation_dtype)
@@ -140,6 +149,10 @@ def _normalize_particle_numbers(
 
     if maximum_density is None:
         current_sums = torch.sum(rho_accumulated, dim=0)
+        if torch.any(current_sums <= 0.0).item():
+            raise ValueError(
+                "rho must have positive weight on accessible grid points"
+            )
         normalized_accumulated = (
             rho_accumulated * (target_sums / current_sums)[None, :]
         )
@@ -151,11 +164,7 @@ def _normalize_particle_numbers(
                 rho_accumulated[:, component],
                 min=torch.finfo(accumulation_dtype).tiny,
             )
-            active = torch.ones(
-                rho.shape[0],
-                dtype=torch.bool,
-                device=rho.device,
-            )
+            active = accessible[:, component].clone()
             remaining = target_sums[component]
             cap = caps[component]
 
@@ -199,8 +208,10 @@ def _normalize_particle_numbers(
         )
         correction = (target_sums[component] - current_sum).to(rho.dtype)
         if correction.item() > 0.0 and maximum_density is not None:
-            available = (
-                maximum_density[component] - normalized[:, component]
+            available = torch.where(
+                accessible[:, component],
+                maximum_density[component] - normalized[:, component],
+                torch.full_like(normalized[:, component], -torch.inf),
             )
             grid_index = torch.argmax(available)
             if correction > available[grid_index]:
@@ -210,7 +221,7 @@ def _normalize_particle_numbers(
         else:
             grid_index = torch.argmax(normalized[:, component])
         normalized[grid_index, component] += correction
-    return normalized
+    return torch.where(accessible, normalized, torch.zeros_like(normalized))
 
 
 def _euler_residual(
@@ -222,6 +233,7 @@ def _euler_residual(
     mu: Optional[torch.Tensor],
     density_threshold: float,
     maximum_density: Optional[torch.Tensor] = None,
+    accessible_mask: Optional[torch.Tensor] = None,
 ):
     """Return the dimensionless beta*mu residual and optional bound KKT.
 
@@ -230,21 +242,31 @@ def _euler_residual(
     dimensionless.
     """
 
+    accessible = _accessible_density_mask(rho, accessible_mask)
     local_chemical_potential = (
         _log_dimensionless_density(rho, thermal_wavelength)
         + beta * V_ext
         - c1
     )
+    local_chemical_potential = torch.where(
+        accessible,
+        local_chemical_potential,
+        torch.zeros_like(local_chemical_potential),
+    )
     if mu is None:
-        averaging_weights = rho
+        averaging_weights = torch.where(
+            accessible,
+            rho,
+            torch.zeros_like(rho),
+        )
         if maximum_density is not None:
             cap_tolerance = 1.0e-6 * torch.maximum(
                 maximum_density,
                 torch.ones_like(maximum_density),
             )
-            below_cap = rho < (
+            below_cap = accessible & (rho < (
                 maximum_density - cap_tolerance
-            )[None, :]
+            )[None, :])
             free_weights = rho * below_cap
             has_free_weight = torch.sum(free_weights, dim=0) > 0.0
             averaging_weights = torch.where(
@@ -259,6 +281,7 @@ def _euler_residual(
     else:
         chemical_potential = beta * mu
     residual = local_chemical_potential - chemical_potential[None, :]
+    residual = torch.where(accessible, residual, torch.zeros_like(residual))
 
     constrained_residual = residual
     if maximum_density is not None:
@@ -266,14 +289,16 @@ def _euler_residual(
             maximum_density,
             torch.ones_like(maximum_density),
         )
-        at_cap = rho >= (maximum_density - cap_tolerance)[None, :]
+        at_cap = accessible & (
+            rho >= (maximum_density - cap_tolerance)[None, :]
+        )
         constrained_residual = torch.where(
             at_cap,
             torch.clamp(residual, min=0.0),
             residual,
         )
 
-    active = (
+    active = accessible & (
         torch.ones_like(rho, dtype=torch.bool)
         if density_threshold == 0.0
         else rho > density_threshold
@@ -291,6 +316,24 @@ def _euler_residual(
         max_residual = float("inf")
         rms_residual = float("inf")
     return constrained_residual, chemical_potential, max_residual, rms_residual
+
+
+def _accessible_density_mask(
+    rho: torch.Tensor,
+    accessible_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Broadcast a shared per-grid accessibility mask over components."""
+
+    if accessible_mask is None:
+        return torch.ones_like(rho, dtype=torch.bool)
+    accessible_mask = torch.as_tensor(
+        accessible_mask,
+        dtype=torch.bool,
+        device=rho.device,
+    )
+    if accessible_mask.shape != rho.shape[:-1]:
+        raise ValueError("accessible_mask must have shape rho.shape[:-1]")
+    return accessible_mask[..., None].expand_as(rho)
 
 
 def _residuals_converged(
