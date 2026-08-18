@@ -132,12 +132,12 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(metrics.logs["valid"]["prediction"], [])
         self.assertEqual(metrics.logs["valid"]["target"], [])
 
-    def test_output_target_is_expanded_and_hard_masked(self):
+    def test_output_target_is_expanded_and_selection_masked(self):
         metrics = Metrics(
             target_key="average_mu",
             prediction_key="local_mu",
             metric_keys=("mae", "rmse"),
-            mask_key="rho_mask",
+            selection_mask_key="rho_selection",
         )
         outputs = {
             "local_mu": torch.tensor(
@@ -147,7 +147,7 @@ class TestMetrics(unittest.TestCase):
                 ]
             ),
             "average_mu": torch.tensor([[2.0], [6.0]]),
-            "rho_mask": torch.tensor(
+            "rho_selection": torch.tensor(
                 [
                     [[1.0], [1.0], [0.0]],
                     [[1.0], [1.0], [1.0]],
@@ -182,16 +182,23 @@ class TestMetrics(unittest.TestCase):
         self.assertAlmostEqual(values["mae"].item(), 1.0)
         self.assertAlmostEqual(values["rmse"].item(), math.sqrt(1.5))
 
-    def test_missing_and_empty_metric_masks_are_reported(self):
-        metrics = Metrics("target", prediction_key="prediction", mask_key="mask")
+    def test_missing_and_empty_selection_masks_are_reported(self):
+        metrics = Metrics(
+            "target",
+            prediction_key="prediction",
+            selection_mask_key="selection",
+        )
         outputs = {"prediction": torch.ones(2)}
         batch = {"target": torch.ones(2)}
 
-        with self.assertRaisesRegex(KeyError, "mask"):
+        with self.assertRaisesRegex(KeyError, "selection mask"):
             metrics(outputs, batch)
         with self.assertRaisesRegex(ValueError, "retain"):
             metrics(
-                {"prediction": torch.ones(2), "mask": torch.zeros(2)},
+                {
+                    "prediction": torch.ones(2),
+                    "selection": torch.zeros(2),
+                },
                 batch,
             )
 

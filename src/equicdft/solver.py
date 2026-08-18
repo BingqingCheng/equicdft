@@ -28,8 +28,9 @@ class GridSolver:
     the available fields. ``solve(data)`` requires ``V_ext`` and either ``mu``
     or fixed ``particle_numbers``. Equilibrium solving supports one complete,
     unbatched field; prescribed-density evaluation also supports batches.
-    An optional Boolean ``mask`` has shape ``[..., n_grid]``; true entries are
-    hard exclusions whose density is fixed to zero and omitted from residuals.
+    An optional Boolean ``excluded_mask`` has shape ``[..., n_grid]``; true
+    entries are hard exclusions whose density is fixed to zero and omitted
+    from residuals.
     """
 
     def __init__(
@@ -58,10 +59,10 @@ class GridSolver:
         rho = data["rho"]
         if torch.any(rho < 0.0).item():
             raise ValueError("rho must be nonnegative")
-        excluded_mask, _ = _hard_wall_masks(data, rho)
+        excluded_mask, _ = _resolve_accessibility_masks(data, rho)
         excluded_density = excluded_mask[..., None].expand_as(rho)
         if torch.any(rho[excluded_density] != 0.0).item():
-            raise ValueError("rho must be zero at masked grid points")
+            raise ValueError("rho must be zero at excluded grid points")
 
         outputs = self.model(data, compute_c1=compute_c1)
         result = {
@@ -72,7 +73,7 @@ class GridSolver:
                 "mu",
                 "temperature",
                 "beta",
-                "mask",
+                "excluded_mask",
             )
             if key in data
         }
@@ -175,11 +176,12 @@ class GridSolver:
         condition: a capped grid point may have a negative unconstrained
         residual because increasing its density is forbidden.
 
-        A true entry in ``data["mask"]`` is an inaccessible grid point,
-        mathematically equivalent to an infinite external potential. Masked
-        densities remain exactly zero, fixed particle numbers are normalized
-        over accessible points, and masked residuals do not enter convergence.
-        The mask does not alter the periodic neighborhood topology.
+        A true entry in ``data["excluded_mask"]`` is an inaccessible grid
+        point, mathematically equivalent to an infinite external potential.
+        Excluded densities remain exactly zero, fixed particle numbers are
+        normalized over accessible points, and excluded residuals do not enter
+        convergence. The exclusion mask does not alter the periodic
+        neighborhood topology.
 
         When no density is supplied through ``initial_rho`` or ``data["rho"]``,
         the initial profile is proportional to
@@ -278,7 +280,10 @@ class GridSolver:
         V_ext = data["V_ext"]
         if V_ext.ndim != 2:
             raise ValueError("solve currently accepts one unbatched field")
-        excluded_mask, accessible_mask = _hard_wall_masks(data, V_ext)
+        excluded_mask, accessible_mask = _resolve_accessibility_masks(
+            data,
+            V_ext,
+        )
 
         n_types = V_ext.shape[-1]
         thermal_wavelength = _component_tensor(
@@ -840,26 +845,33 @@ def _module_device(module: nn.Module) -> torch.device:
     return torch.device("cpu") if buffer is None else buffer.device
 
 
-def _hard_wall_masks(
+def _resolve_accessibility_masks(
     data: Dict[str, Any],
     field: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return validated excluded and accessible masks for a grid field."""
 
     expected_shape = field.shape[:-1]
-    mask = data.get("mask")
-    if mask is None:
+    excluded_mask = data.get("excluded_mask")
+    if excluded_mask is None:
         excluded = torch.zeros(
             expected_shape,
             dtype=torch.bool,
             device=field.device,
         )
     else:
-        if not torch.is_tensor(mask) or mask.dtype != torch.bool:
-            raise TypeError("mask must be a Boolean tensor")
-        if mask.shape != expected_shape:
-            raise ValueError("mask must have shape field.shape[:-1]")
-        excluded = mask.to(device=field.device)
+        if (
+            not torch.is_tensor(excluded_mask)
+            or excluded_mask.dtype != torch.bool
+        ):
+            raise TypeError("excluded_mask must be a Boolean tensor")
+        if excluded_mask.shape != expected_shape:
+            raise ValueError(
+                "excluded_mask must have shape field.shape[:-1]"
+            )
+        excluded = excluded_mask.to(device=field.device)
     if torch.any(torch.all(excluded, dim=-1)).item():
-        raise ValueError("mask must leave at least one accessible grid point")
+        raise ValueError(
+            "excluded_mask must leave at least one accessible grid point"
+        )
     return excluded, ~excluded

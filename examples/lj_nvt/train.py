@@ -189,7 +189,7 @@ def main():
             prediction_key="local_chemical_potential",
             target_key="average_chemical_potential",
             metric_keys=("mae", "rmse", "rmse_percent"),
-            mask_key="chemical_potential_weights",
+            selection_mask_key="chemical_potential_weights",
         )
     ]
 

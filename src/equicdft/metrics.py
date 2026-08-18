@@ -118,10 +118,10 @@ class Metrics(nn.Module):
     subsets
         Independent accumulation buffers to create. The defaults are
         ``train``, ``valid``, and ``test``.
-    mask_key
-        Optional key selecting a hard mask from the model outputs or batch.
-        Positive entries are retained. The mask must have the same shape as
-        the prediction.
+    selection_mask_key
+        Optional key selecting an inclusion mask from the model outputs or
+        batch. Positive entries are retained. The selection mask must have the
+        same shape as the prediction.
     """
 
     def __init__(
@@ -136,7 +136,7 @@ class Metrics(nn.Module):
             "r2",
         ),
         subsets: Sequence[str] = ("train", "valid", "test"),
-        mask_key: Optional[str] = None,
+        selection_mask_key: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -155,10 +155,13 @@ class Metrics(nn.Module):
             default_target_name if name is None else name,
             "name",
         )
-        self.mask_key = (
+        self.selection_mask_key = (
             None
-            if mask_key is None
-            else _nonempty_string(mask_key, "mask_key")
+            if selection_mask_key is None
+            else _nonempty_string(
+                selection_mask_key,
+                "selection_mask_key",
+            )
         )
         self.metric_keys = _unique_strings(metric_keys, "metric_keys")
         unknown_metrics = set(self.metric_keys) - set(SUPPORTED_METRICS)
@@ -249,24 +252,29 @@ class Metrics(nn.Module):
             batch=batch,
         )
 
-        if self.mask_key is not None:
-            if self.mask_key in outputs:
-                mask = outputs[self.mask_key]
-            elif self.mask_key in batch:
-                mask = batch[self.mask_key]
+        if self.selection_mask_key is not None:
+            if self.selection_mask_key in outputs:
+                selection_mask = outputs[self.selection_mask_key]
+            elif self.selection_mask_key in batch:
+                selection_mask = batch[self.selection_mask_key]
             else:
                 raise KeyError(
-                    "batch and model outputs are missing mask '{}'".format(
-                        self.mask_key
+                    "batch and model outputs are missing selection mask "
+                    "'{}'".format(
+                        self.selection_mask_key
                     )
                 )
-            if mask.shape != prediction.shape:
-                raise ValueError("mask and prediction must have same shape")
-            mask = mask.detach().to(dtype=torch.bool)
-            prediction = prediction[mask]
-            target = target[mask]
+            if selection_mask.shape != prediction.shape:
+                raise ValueError(
+                    "selection mask and prediction must have same shape"
+                )
+            selection_mask = selection_mask.detach().to(dtype=torch.bool)
+            prediction = prediction[selection_mask]
+            target = target[selection_mask]
             if prediction.numel() == 0:
-                raise ValueError("metric mask must retain at least one value")
+                raise ValueError(
+                    "selection mask must retain at least one value"
+                )
 
         if prediction.ndim == 0:
             prediction = prediction.unsqueeze(0)

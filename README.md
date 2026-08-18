@@ -130,7 +130,7 @@ default field names and requirements are:
 | frame metadata | `mu` | no | reservoir chemical potential per component |
 | per-grid array | `density` | conditional | density component(s) |
 | per-grid array | `V_ext` | conditional | external-potential component(s) |
-| per-grid array | `mask` | no | Boolean hard exclusion; `True` means inaccessible |
+| per-grid array | `excluded_mask` | no | Boolean hard exclusion; `True` means inaccessible |
 
 Each EXTXYZ frame has the usual three-part structure: the number of grid
 points, one metadata/property line, and one record per grid point. An
@@ -184,14 +184,15 @@ fields = GridData.from_xyz(
 provided through `data_key`, and `GridData.from_dict` constructs an empty
 regular grid for inference.
 
-Every processed field contains a Boolean `mask` tensor with shape `[n_grid]`.
-Missing masks default to all `False`. A `True` value represents an exact hard
-wall: the corresponding density must be zero for every component. This is a
-geometric constraint and is distinct from the density-threshold mask used to
-exclude noisy targets from the local-chemical-potential loss. A mask may be
-coarsened only when every coarse block is either entirely accessible or
-entirely excluded; partially accessible coarse voxels require an explicit
-accessible-volume representation and are rejected.
+Every processed field contains a Boolean `excluded_mask` tensor with shape
+`[n_grid]`. Missing exclusion masks default to all `False`. A `True` value
+represents an exact hard wall: the corresponding density must be zero for every
+component. This geometric constraint is distinct from the selection mask used
+to omit noisy targets from metrics and from the numerical weights used by the
+local-chemical-potential loss. An exclusion mask may be coarsened only when
+every coarse block is either entirely accessible or entirely excluded;
+partially accessible coarse voxels require an explicit accessible-volume
+representation and are rejected.
 
 ## Inference and equilibrium solution
 
@@ -226,12 +227,12 @@ print(outputs["beta_F_exc"], outputs["c1"])
   potential using Euler iteration or direct free-energy minimization.
 
 The solver validates the grid against `model.grid_info`. See its docstring and
-the tests for the full option set. Both equilibrium algorithms keep masked
+the tests for the full option set. Both equilibrium algorithms keep excluded
 densities exactly zero, normalize fixed particle numbers over accessible grid
 points only, and omit excluded points from Euler--Lagrange convergence
-diagnostics. This treats the mask as an infinite external potential on the
-existing periodic grid; it does not replace periodic stencils or reciprocal
-kernels with nonperiodic boundary conditions.
+diagnostics. This treats the exclusion mask as an infinite external potential
+on the existing periodic grid; it does not replace periodic stencils or
+reciprocal kernels with nonperiodic boundary conditions.
 
 ## Package map
 

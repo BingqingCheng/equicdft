@@ -172,7 +172,7 @@ class TestGridSolver(unittest.TestCase):
             with self.subTest(method=method):
                 data = self._make_data(include_mu=False)
                 data["V_ext"].zero_()
-                data["mask"] = torch.tensor(
+                data["excluded_mask"] = torch.tensor(
                     [True, False, False, True]
                 )
                 result = GridSolver(self._make_model()).solve(
@@ -184,12 +184,19 @@ class TestGridSolver(unittest.TestCase):
                     tolerance_residual=1.0e-8,
                 )
 
-                self.assertTrue(torch.equal(result["mask"], data["mask"]))
+                self.assertTrue(
+                    torch.equal(
+                        result["excluded_mask"],
+                        data["excluded_mask"],
+                    )
+                )
                 self.assertTrue(torch.allclose(result["rho"], expected))
                 self.assertAlmostEqual(result["rho"].sum().item(), 1.0)
                 self.assertTrue(
                     torch.all(
-                        result["euler_lagrange_residual"][data["mask"]]
+                        result["euler_lagrange_residual"][
+                            data["excluded_mask"]
+                        ]
                         == 0.0
                     )
                 )
@@ -204,7 +211,7 @@ class TestGridSolver(unittest.TestCase):
             with self.subTest(method=method):
                 data = self._make_data()
                 data["V_ext"].zero_()
-                data["mask"] = torch.tensor(
+                data["excluded_mask"] = torch.tensor(
                     [True, False, False, True]
                 )
                 result = GridSolver(_IdealGasModel()).solve(
@@ -219,10 +226,12 @@ class TestGridSolver(unittest.TestCase):
 
     def test_evaluate_rejects_density_inside_hard_wall(self):
         data = self._make_data()
-        data["mask"] = torch.tensor([True, False, False, False])
+        data["excluded_mask"] = torch.tensor(
+            [True, False, False, False]
+        )
         data["rho"] = torch.ones_like(data["V_ext"])
 
-        with self.assertRaisesRegex(ValueError, "masked"):
+        with self.assertRaisesRegex(ValueError, "excluded"):
             GridSolver(self._make_model()).evaluate(data)
 
     def test_beta_multiplier_initialization_is_exact_for_fixed_n_ideal_gas(
@@ -435,7 +444,9 @@ class TestGridSolver(unittest.TestCase):
 
     def test_density_cap_feasibility_uses_accessible_volume(self):
         data = self._make_data(include_mu=False)
-        data["mask"] = torch.tensor([True, False, False, True])
+        data["excluded_mask"] = torch.tensor(
+            [True, False, False, True]
+        )
 
         with self.assertRaisesRegex(ValueError, "infeasible"):
             GridSolver(self._make_model()).solve(

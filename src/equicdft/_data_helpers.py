@@ -135,7 +135,11 @@ def process_atoms(
     grid_positions = grid_positions[order]
 
     rho = _ordered_optional_field(atoms, data_key["rho"], order, "rho")
-    mask = _ordered_optional_mask(atoms, data_key["mask"], order)
+    excluded_mask = _ordered_optional_excluded_mask(
+        atoms,
+        data_key["excluded_mask"],
+        order,
+    )
     V_ext = _ordered_optional_field(
         atoms,
         data_key["V_ext"],
@@ -162,8 +166,8 @@ def process_atoms(
         fields_to_coarsen = [
             field for field in (rho, V_ext) if field is not None
         ]
-        if mask is not None:
-            fields_to_coarsen.append(mask[:, None].astype(float))
+        if excluded_mask is not None:
+            fields_to_coarsen.append(excluded_mask[:, None].astype(float))
         fields, grid_positions, grid_spacing = coarsen_grid(
             values=np.column_stack(fields_to_coarsen),
             grid_positions=grid_positions,
@@ -177,21 +181,24 @@ def process_atoms(
         if V_ext is not None:
             V_ext = fields[:, field_start : field_start + n_types]
             field_start += n_types
-        if mask is not None:
-            coarse_mask_fraction = fields[:, field_start]
-            uniform_mask = np.isclose(coarse_mask_fraction, 0.0) | np.isclose(
-                coarse_mask_fraction,
+        if excluded_mask is not None:
+            coarse_excluded_fraction = fields[:, field_start]
+            uniform_exclusion = np.isclose(
+                coarse_excluded_fraction,
+                0.0,
+            ) | np.isclose(
+                coarse_excluded_fraction,
                 1.0,
             )
-            if not np.all(uniform_mask):
+            if not np.all(uniform_exclusion):
                 raise ValueError(
                     "coarsening would create partially accessible grid "
-                    "points; supply a hard-wall mask on the target grid"
+                    "points; supply excluded_mask on the target grid"
                 )
-            mask = np.isclose(coarse_mask_fraction, 1.0)
+            excluded_mask = np.isclose(coarse_excluded_fraction, 1.0)
         grid_size = grid_positions.max(axis=0) + 1
-        if mask is None:
-            mask = np.zeros(len(grid_positions), dtype=bool)
+        if excluded_mask is None:
+            excluded_mask = np.zeros(len(grid_positions), dtype=bool)
 
     temperature = positive_scalar(
         _required_source_value(
@@ -213,7 +220,7 @@ def process_atoms(
         rho=rho,
         V_ext=V_ext,
         mu=_get_source_value(atoms, data_key["mu"]),
-        mask=mask,
+        excluded_mask=excluded_mask,
         geometry_cache=geometry_cache,
         include_thermal_wavelength=V_ext is not None,
     )
@@ -231,7 +238,7 @@ def build_grid_data(
     rho: Optional[Any] = None,
     V_ext: Optional[Any] = None,
     mu: Optional[Any] = None,
-    mask: Optional[Any] = None,
+    excluded_mask: Optional[Any] = None,
     geometry_cache: Optional[Dict[Any, Any]] = None,
     include_thermal_wavelength: bool = True,
 ) -> Dict[str, torch.Tensor]:
@@ -267,14 +274,14 @@ def build_grid_data(
         "V_ext",
     )
     mu_values = _normalize_optional_mu(mu, n_type_values)
-    mask_values = _normalize_mask(mask, n_grid)
+    excluded_mask_values = _normalize_excluded_mask(excluded_mask, n_grid)
     if rho_values is not None and np.any(
-        np.abs(rho_values[mask_values]) > 1.0e-12
+        np.abs(rho_values[excluded_mask_values]) > 1.0e-12
     ):
-        raise ValueError("rho must be zero at masked grid points")
+        raise ValueError("rho must be zero at excluded grid points")
     if rho_values is not None:
         rho_values = rho_values.copy()
-        rho_values[mask_values] = 0.0
+        rho_values[excluded_mask_values] = 0.0
     wavelength_values = None
     if include_thermal_wavelength:
         wavelength_values = per_type_positive_values(
@@ -299,7 +306,10 @@ def build_grid_data(
         "grid_spacing": torch.tensor(grid_spacing_values, dtype=dtype),
         "index": torch.arange(n_grid, dtype=torch.long),
         "grid_positions": torch.tensor(positions, dtype=torch.long),
-        "mask": torch.tensor(mask_values, dtype=torch.bool),
+        "excluded_mask": torch.tensor(
+            excluded_mask_values,
+            dtype=torch.bool,
+        ),
         "local_density_index": local_density_index,
         "local_density_positions": local_density_positions,
     }
@@ -319,7 +329,7 @@ def build_grid_data(
         mu=mu_values,
         beta=beta,
         thermal_wavelength=wavelength_values,
-        mask=mask_values,
+        excluded_mask=excluded_mask_values,
     )
     return data
 
@@ -478,17 +488,17 @@ def _ordered_optional_field(
     return field
 
 
-def _ordered_optional_mask(
+def _ordered_optional_excluded_mask(
     atoms: Atoms,
     source_key: str,
     order: np.ndarray,
 ) -> Optional[np.ndarray]:
-    """Return an optional Boolean hard-wall mask in canonical grid order."""
+    """Return an optional Boolean exclusion mask in canonical grid order."""
 
     value = _get_source_value(atoms, source_key)
     if value is None:
         return None
-    return _normalize_mask(np.asarray(value)[order], len(order))
+    return _normalize_excluded_mask(np.asarray(value)[order], len(order))
 
 
 def _normalize_grid_field(
@@ -514,32 +524,41 @@ def _normalize_grid_field(
     return field
 
 
-def _normalize_mask(value: Optional[Any], n_grid: int) -> np.ndarray:
+def _normalize_excluded_mask(
+    value: Optional[Any],
+    n_grid: int,
+) -> np.ndarray:
     """Return a Boolean exclusion mask with one value per grid point."""
 
     if value is None:
         return np.zeros(n_grid, dtype=bool)
-    mask = np.asarray(value)
-    if mask.ndim == 2 and mask.shape[1] == 1:
-        mask = mask[:, 0]
-    if mask.shape != (n_grid,):
-        raise ValueError("mask must have shape [n_grid]")
-    if mask.dtype != np.bool_:
+    excluded_mask = np.asarray(value)
+    if excluded_mask.ndim == 2 and excluded_mask.shape[1] == 1:
+        excluded_mask = excluded_mask[:, 0]
+    if excluded_mask.shape != (n_grid,):
+        raise ValueError("excluded_mask must have shape [n_grid]")
+    if excluded_mask.dtype != np.bool_:
         try:
-            numeric_mask = np.asarray(mask, dtype=float)
+            numeric_mask = np.asarray(excluded_mask, dtype=float)
         except (TypeError, ValueError):
-            raise ValueError("mask values must be Boolean or binary")
+            raise ValueError(
+                "excluded_mask values must be Boolean or binary"
+            )
         if (
             not np.all(np.isfinite(numeric_mask))
             or not np.all((numeric_mask == 0.0) | (numeric_mask == 1.0))
         ):
-            raise ValueError("mask values must be Boolean or binary")
-        mask = numeric_mask.astype(bool)
+            raise ValueError(
+                "excluded_mask values must be Boolean or binary"
+            )
+        excluded_mask = numeric_mask.astype(bool)
     else:
-        mask = mask.astype(bool, copy=False)
-    if np.all(mask):
-        raise ValueError("mask must leave at least one accessible grid point")
-    return mask
+        excluded_mask = excluded_mask.astype(bool, copy=False)
+    if np.all(excluded_mask):
+        raise ValueError(
+            "excluded_mask must leave at least one accessible grid point"
+        )
+    return excluded_mask
 
 
 def _normalize_optional_mu(
@@ -592,7 +611,7 @@ def _add_thermodynamic_fields(
     mu: Optional[np.ndarray],
     beta: float,
     thermal_wavelength: Optional[np.ndarray],
-    mask: np.ndarray,
+    excluded_mask: np.ndarray,
 ) -> None:
     dtype = torch.get_default_dtype()
     if mu is not None:
@@ -602,22 +621,22 @@ def _add_thermodynamic_fields(
         rho is None
         or V_ext is None
         or thermal_wavelength is None
-        or not np.all(rho[~mask] > 0.0)
+        or not np.all(rho[~excluded_mask] > 0.0)
     ):
         return
     safe_rho = rho.copy()
-    safe_rho[mask] = 1.0
+    safe_rho[excluded_mask] = 1.0
     c1_plus_beta_mu = (
         np.log(safe_rho * thermal_wavelength[None, :] ** 3) + beta * V_ext
     )
-    c1_plus_beta_mu[mask] = 0.0
+    c1_plus_beta_mu[excluded_mask] = 0.0
     data["c1_plus_beta_mu"] = torch.tensor(
         c1_plus_beta_mu,
         dtype=dtype,
     )
     if mu is not None:
         c1 = c1_plus_beta_mu - beta * mu[None, :]
-        c1[mask] = 0.0
+        c1[excluded_mask] = 0.0
         data["c1"] = torch.tensor(
             c1,
             dtype=dtype,

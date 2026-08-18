@@ -19,7 +19,7 @@ def _write_grid(
     include_v_ext=True,
     density_offset=0.25,
     mu_value=-1.0,
-    mask=None,
+    excluded_mask=None,
 ):
     shape = (4, 4, 4)
     spacing = 0.5
@@ -35,14 +35,17 @@ def _write_grid(
     )
     if include_rho:
         density = values + density_offset
-        if mask is not None:
+        if excluded_mask is not None:
             density = density.copy()
-            density[np.asarray(mask, dtype=bool)] = 0.0
+            density[np.asarray(excluded_mask, dtype=bool)] = 0.0
         atoms.arrays["density"] = density[order]
     if include_v_ext:
         atoms.arrays["V_ext"] = (-values)[order]
-    if mask is not None:
-        atoms.arrays["mask"] = np.asarray(mask, dtype=bool)[order]
+    if excluded_mask is not None:
+        atoms.arrays["excluded_mask"] = np.asarray(
+            excluded_mask,
+            dtype=bool,
+        )[order]
     atoms.info["grid_size"] = np.asarray(shape)
     atoms.info["grid_spacing"] = np.repeat(spacing, 3)
     atoms.info["grid_indexing"] = "zero_based"
@@ -219,39 +222,53 @@ class TestGridData(unittest.TestCase):
         )
         self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
         self.assertEqual(data["local_density_index"].shape, (60, 7))
-        self.assertEqual(data["mask"].dtype, torch.bool)
-        self.assertFalse(torch.any(data["mask"]).item())
+        self.assertEqual(data["excluded_mask"].dtype, torch.bool)
+        self.assertFalse(torch.any(data["excluded_mask"]).item())
 
     def test_from_dict_accepts_hard_wall_mask(self):
-        mask = [True, False, False, True]
+        excluded_mask = [True, False, False, True]
         data = GridData.from_dict(
             {
                 "grid_size": [4, 1, 1],
                 "n_types": 1,
                 "grid_spacing": 0.5,
                 "temperature": 1.5,
-                "mask": mask,
+                "excluded_mask": excluded_mask,
             },
             cutoff_grid=0,
             boltzmann_constant=1.0,
         )
 
-        self.assertTrue(torch.equal(data["mask"], torch.tensor(mask)))
+        self.assertTrue(
+            torch.equal(
+                data["excluded_mask"],
+                torch.tensor(excluded_mask),
+            )
+        )
 
     def test_hard_wall_mask_is_read_in_canonical_grid_order(self):
-        mask = np.zeros(64, dtype=bool)
-        mask[[0, 5]] = True
-        path = Path(self.temporary_directory.name) / "masked.extxyz"
-        _write_grid(path, mask=mask)
+        excluded_mask = np.zeros(64, dtype=bool)
+        excluded_mask[[0, 5]] = True
+        path = Path(self.temporary_directory.name) / "excluded.extxyz"
+        _write_grid(path, excluded_mask=excluded_mask)
 
         data = GridData.from_xyz(path, cutoff_grid=1)[0]
 
-        self.assertTrue(torch.equal(data["mask"], torch.tensor(mask)))
-        self.assertTrue(torch.all(data["rho"][data["mask"]] == 0.0))
-        self.assertTrue(torch.all(data["c1"][data["mask"]] == 0.0))
+        self.assertTrue(
+            torch.equal(
+                data["excluded_mask"],
+                torch.tensor(excluded_mask),
+            )
+        )
+        self.assertTrue(
+            torch.all(data["rho"][data["excluded_mask"]] == 0.0)
+        )
+        self.assertTrue(
+            torch.all(data["c1"][data["excluded_mask"]] == 0.0)
+        )
         batch = next(iter(DataLoader([data, data], batch_size=2)))
-        self.assertEqual(batch["mask"].shape, (2, 64))
-        self.assertEqual(batch["mask"].dtype, torch.bool)
+        self.assertEqual(batch["excluded_mask"].shape, (2, 64))
+        self.assertEqual(batch["excluded_mask"].dtype, torch.bool)
 
     def test_hard_wall_mask_validation_and_coarsening(self):
         with self.assertRaisesRegex(ValueError, "accessible"):
@@ -261,7 +278,7 @@ class TestGridData(unittest.TestCase):
                     "n_types": 1,
                     "grid_spacing": 0.5,
                     "temperature": 1.5,
-                    "mask": [True, True],
+                    "excluded_mask": [True, True],
                 }
             )
         with self.assertRaisesRegex(ValueError, "binary"):
@@ -271,21 +288,24 @@ class TestGridData(unittest.TestCase):
                     "n_types": 1,
                     "grid_spacing": 0.5,
                     "temperature": 1.5,
-                    "mask": [0, 2],
+                    "excluded_mask": [0, 2],
                 }
             )
 
-        mask = np.zeros(64, dtype=bool)
-        mask[0] = True
-        path = Path(self.temporary_directory.name) / "masked-coarse.extxyz"
-        _write_grid(path, mask=mask)
+        excluded_mask = np.zeros(64, dtype=bool)
+        excluded_mask[0] = True
+        path = Path(self.temporary_directory.name) / "excluded-coarse.extxyz"
+        _write_grid(path, excluded_mask=excluded_mask)
         with self.assertRaisesRegex(ValueError, "coarsening"):
             GridData.from_xyz(path, target_grid_spacing=1.0)
 
-        uniform_mask = np.zeros((4, 4, 4), dtype=bool)
-        uniform_mask[:2, :, :] = True
-        path = Path(self.temporary_directory.name) / "uniform-mask.extxyz"
-        _write_grid(path, mask=uniform_mask.reshape(-1))
+        uniform_excluded_mask = np.zeros((4, 4, 4), dtype=bool)
+        uniform_excluded_mask[:2, :, :] = True
+        path = Path(self.temporary_directory.name) / "uniform-exclusion.extxyz"
+        _write_grid(
+            path,
+            excluded_mask=uniform_excluded_mask.reshape(-1),
+        )
         coarse = GridData.from_xyz(
             path,
             cutoff_grid=0,
@@ -293,13 +313,13 @@ class TestGridData(unittest.TestCase):
         )[0]
         self.assertTrue(
             torch.equal(
-                coarse["mask"],
+                coarse["excluded_mask"],
                 torch.tensor([True] * 4 + [False] * 4),
             )
         )
 
         atoms = read(path)
-        atoms.arrays["density"][atoms.arrays["mask"]] = 1.0
+        atoms.arrays["density"][atoms.arrays["excluded_mask"]] = 1.0
         write(path, atoms, format="extxyz")
         with self.assertRaisesRegex(ValueError, "rho must be zero"):
             GridData.from_xyz(path)
@@ -375,7 +395,7 @@ class TestGridData(unittest.TestCase):
                 "grid_spacing",
                 "index",
                 "grid_positions",
-                "mask",
+                "excluded_mask",
                 "V_ext",
                 "rho",
                 "c1_plus_beta_mu",
@@ -513,7 +533,7 @@ class TestGridData(unittest.TestCase):
                 "grid_spacing",
                 "index",
                 "grid_positions",
-                "mask",
+                "excluded_mask",
                 "rho",
                 "local_density_index",
                 "local_density_positions",
@@ -648,7 +668,10 @@ class TestGridData(unittest.TestCase):
             torch.equal(data["local_density_index"][:, 0], data["index"])
         )
         self.assertEqual(default_data_key["rho"], "density")
-        self.assertEqual(default_data_key["mask"], "mask")
+        self.assertEqual(
+            default_data_key["excluded_mask"],
+            "excluded_mask",
+        )
 
     def test_optional_local_average(self):
         data = GridData.from_xyz(
