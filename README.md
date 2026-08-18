@@ -118,13 +118,14 @@ validation split.
 
 ## Experimental Fourier stability loss
 
-`FourierStabilityLoss` is an optional one-component regularizer for the local
-curvature of the complete intrinsic free energy. For every explicitly selected
-integer reciprocal-grid mode, it evaluates cosine and sine perturbations with
-zero density sum and applies a squared hinge to the symmetric finite-difference
-curvature. For a homogeneous fluid its dimensionless normalization approaches
-$1/S(k)$. The ideal-gas contribution is included; external-potential and
-reservoir terms need not be evaluated because their second differences vanish.
+`FourierStabilityLoss` is an optional regularizer for the local curvature of
+the complete intrinsic free energy. For every selected integer reciprocal-grid
+mode, it evaluates cosine and sine perturbations at fixed particle number and
+applies a squared hinge to the symmetric finite-difference curvature. For a
+homogeneous one-component fluid its dimensionless normalization approaches
+$1/S(k)$. In a mixture, each component is perturbed independently at fixed
+$N_a$. The ideal-gas contribution is included; external-potential and reservoir
+terms need not be evaluated because their second differences vanish.
 
 ```python
 from equicdft import FourierStabilityLoss, Loss, TensorLoss
@@ -141,23 +142,28 @@ loss = Loss(
             random_modes_per_field=1,
             relative_amplitude=0.05,
             minimum_curvature=0.0,
-            weight=1.0e-3,
+            weight=1.0,
         ),
     ]
 )
 ```
 
 Mode indices are lattice indices, not physical wavevectors; their physical
-values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. In random mode, each
-field independently samples the requested number of nonzero triplets inside
-the isotropically complete Nyquist sphere. A random triplet is not expanded to
-its cubic symmetry orbit. Its cost is four energy evaluations per field: two
-real phases and two perturbation signs, batched into one model call. Cubic-orbit
-expansion remains available for explicitly supplied fixed modes. Random
-sampling is active only during training by default, so validation checkpoint
-selection retains the original data objective. The loss is exploratory and is
-not enabled by default. Mixtures require a later component-coupled stability
-formulation rather than applying this scalar version independently.
+values are $\mathbf k=2\pi(n_x/L_x,n_y/L_y,n_z/L_z)$. For anisotropic grid
+spacings, feasible modes are filtered using these physical wavevectors and the
+largest isotropically complete Nyquist sphere. Each field independently samples
+the requested number of nonzero triplets. Symmetry-equivalent directions are
+not added automatically.
+
+For $M$ modes and $C$ present density components, the loss evaluates $4MC$
+perturbed fields: two real phases, two perturbation signs, and one independent
+fixed-$N_a$ direction per component. They are batched into one model call. The
+reported loss is averaged over all valid fields, modes, phases, and components,
+so its weight does not grow with $C$. This constrains the diagonal species
+curvatures, not coupled composition eigenmodes of a mixture. Random sampling is
+active only during training by default, so validation checkpoint selection
+retains the original data objective. The loss is exploratory and is not enabled
+by default.
 
 ## Data format
 

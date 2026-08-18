@@ -3,7 +3,14 @@ import unittest
 import torch
 from torch import nn
 
-from equicdft import FourierStabilityLoss, Loss, TensorLoss
+from equicdft import (
+    FourierStabilityLoss,
+    GridCACEModel,
+    LDAReadout,
+    Loss,
+    TensorLoss,
+)
+from equicdft.stability import _feasible_modes
 
 
 class _PredictionPenalty(nn.Module):
@@ -250,6 +257,10 @@ class TestFourierStabilityLoss(unittest.TestCase):
 
     def test_perturbations_preserve_particle_number(self):
         batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], 0.5 * batch["rho"]),
+            dim=-1,
+        )
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(modes=((1, 0, 0), (2, 0, 0)))
@@ -266,6 +277,81 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 rtol=0.0,
             )
         )
+
+    def test_multicomponent_loss_averages_independent_component_curvatures(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], 0.5 * batch["rho"]),
+            dim=-1,
+        )
+        model = _QuadraticExcessModel(-8.0).to(dtype=torch.float64)
+        outputs = model(batch)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+        )
+
+        value = term(outputs, batch, model=model)
+        value.backward()
+
+        # For this local quadratic functional, the two normalized component
+        # curvatures are 1 + rho_a * coefficient = -3 and -1. Their squared
+        # stability hinges therefore average to (9 + 1) / 2 = 5.
+        self.assertAlmostEqual(value.item(), 5.0, places=3)
+        self.assertIsNotNone(model.coefficient.grad)
+
+    def test_multicomponent_loss_integrates_with_grid_model(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], 0.5 * batch["rho"]),
+            dim=-1,
+        )
+        readout = LDAReadout(
+            mean_density=1.0,
+            n_types=2,
+            hidden_sizes=(),
+        ).to(dtype=torch.float64)
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(
+                torch.tensor([[-4.0, -4.0, 0.0]], dtype=torch.float64)
+            )
+            readout.mlp[-1].bias.zero_()
+        model = GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=[readout],
+            grid_spacing=1.0,
+            compute_c1=False,
+            free_energy_mode="beta",
+        ).to(dtype=torch.float64)
+        outputs = model(batch, compute_c1=False)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+        )
+
+        value = term(outputs, batch, model=model)
+        value.backward()
+
+        self.assertAlmostEqual(value.item(), 5.0, places=3)
+        self.assertTrue(torch.all(torch.isfinite(readout.mlp[-1].weight.grad)))
+
+    def test_absent_component_is_excluded_from_average(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], torch.zeros_like(batch["rho"])),
+            dim=-1,
+        )
+        model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
+        outputs = model(batch)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+        )
+
+        value = term(outputs, batch, model=model)
+
+        self.assertAlmostEqual(value.item(), 1.0, places=3)
 
     def test_loss_aggregator_supplies_model(self):
         batch = self._batch()
@@ -294,7 +380,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             model=model,
         )
         self.assertEqual(value.item(), 0.0)
-        with self.assertRaisesRegex(ValueError, "aliases to a constant"):
+        with self.assertRaisesRegex(ValueError, "Nyquist sphere"):
             FourierStabilityLoss(((8, 0, 0),))(
                 outputs,
                 batch,
@@ -321,47 +407,40 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(random_modes_per_field=3)
         torch.manual_seed(11)
 
-        modes, valid = term._select_modes(batch, batch["rho"])
+        modes = term._select_modes(batch, batch["rho"])
 
-        self.assertTrue(torch.all(valid.sum(dim=-1) == 3).item())
+        self.assertEqual(modes.shape, (2, 3, 3))
         scaled_squared_norm = torch.sum(
             (2.0 * modes.to(torch.float32) / n_grid) ** 2,
             dim=-1,
         )
         self.assertTrue(
-            torch.all(scaled_squared_norm[valid] <= 1.0 + 1.0e-6).item()
+            torch.all(scaled_squared_norm <= 1.0 + 1.0e-6).item()
         )
-        self.assertTrue(torch.all(torch.any(modes[valid] != 0, dim=-1)).item())
+        self.assertTrue(torch.all(torch.any(modes != 0, dim=-1)).item())
 
-    def test_cubic_orbit_expansion_includes_axis_equivalents(self):
-        n_grid = 8
-        positions = torch.tensor(
-            [
-                [x, y, z]
-                for x in range(n_grid)
-                for y in range(n_grid)
-                for z in range(n_grid)
-            ]
-        )
-        batch = {
-            "rho": torch.full((1, n_grid**3, 1), 0.5),
-            "temperature": torch.ones(1),
-            "grid_spacing": torch.ones(1, 3),
-            "grid_size": torch.tensor([[n_grid] * 3]),
-            "grid_positions": positions[None],
-        }
-        term = FourierStabilityLoss(
-            modes=((2, 0, 0),),
-            expand_cubic_orbits=True,
-        )
+    def test_anisotropic_spacing_uses_physical_nyquist_sphere(self):
+        modes = set(_feasible_modes((8, 8, 8), (0.5, 1.0, 1.0)))
 
-        modes, valid = term._select_modes(batch, batch["rho"])
-        selected = {tuple(mode) for mode in modes[0, valid[0]].tolist()}
-
-        self.assertEqual(
-            selected,
-            {(2, 0, 0), (0, 2, 0), (0, 0, 2)},
-        )
+        # The x direction has a larger axis-specific Nyquist limit, but the
+        # isotropically complete sphere is limited by y and z to k <= pi.
+        self.assertIn((2, 0, 0), modes)
+        self.assertNotIn((4, 0, 0), modes)
+        for mode in modes:
+            wavevector = torch.tensor(
+                [
+                    2.0 * torch.pi * index / (size * spacing)
+                    for index, size, spacing in zip(
+                        mode,
+                        (8, 8, 8),
+                        (0.5, 1.0, 1.0),
+                    )
+                ]
+            )
+            self.assertLessEqual(
+                torch.linalg.vector_norm(wavevector).item(),
+                torch.pi + 1.0e-6,
+            )
 
     def test_training_only_random_loss_is_zero_during_validation(self):
         batch = self._batch()
@@ -390,16 +469,10 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 modes=((1, 0, 0),),
                 random_modes_per_field=1,
             )
-        with self.assertRaisesRegex(ValueError, "cannot use"):
-            FourierStabilityLoss(
-                random_modes_per_field=1,
-                expand_cubic_orbits=True,
-            )
-
         batch = self._batch()
-        batch["rho"] = batch["rho"].expand(-1, -1, 2).clone()
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
-        with self.assertRaisesRegex(ValueError, "one density type"):
+        del batch["grid_size"]
+        with self.assertRaisesRegex(KeyError, "grid_size"):
             FourierStabilityLoss(((1, 0, 0),))(
                 model(batch),
                 batch,

@@ -139,11 +139,18 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(trainer.metrics[0].logs["train"]["prediction"], [])
         self.assertEqual(trainer.metrics[0].logs["valid"]["prediction"], [])
 
-    def test_model_dependent_loss_runs_in_training_and_validation(self):
+    def test_model_dependent_loss_runs_through_trainer(self):
         model = _QuadraticDictionaryFunctional()
         trainer = Trainer(
             model=model,
-            loss=Loss([FourierStabilityLoss(((1, 0, 0),))]),
+            loss=Loss(
+                [
+                    FourierStabilityLoss(
+                        ((1, 0, 0),),
+                        training_only=False,
+                    )
+                ]
+            ),
             optimizer_cls=torch.optim.SGD,
             optimizer_args={"lr": 0.01},
         )
@@ -159,6 +166,10 @@ class TestTrainer(unittest.TestCase):
         self.assertIn(
             "fourier_stability",
             history[0]["valid_losses"],
+        )
+        self.assertGreater(
+            history[0]["valid_losses"]["fourier_stability"],
+            0.0,
         )
         self.assertFalse(torch.equal(model.coefficient, initial_coefficient))
 
