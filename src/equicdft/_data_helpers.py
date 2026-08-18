@@ -6,6 +6,11 @@ import numpy as np
 import torch
 from ase import Atoms
 
+from ._argument_checks import (
+    nonnegative_integer as _strict_nonnegative_integer,
+    positive_integer as _strict_positive_integer,
+    positive_scalar as _strict_positive_scalar,
+)
 from .stencil import coarsen_grid, get_neighbor_indices
 
 
@@ -36,23 +41,23 @@ def normalize_grid_info(grid_info: Mapping[str, Any]) -> Dict[str, Any]:
             "unknown grid_info entries: {}".format(sorted(unknown_keys))
         )
 
-    cutoff_grid = nonnegative_integer(
+    cutoff_grid = _metadata_nonnegative_integer(
         grid_info["cutoff_grid"],
         "grid_info cutoff_grid",
     )
-    grid_spacing = normalize_grid_spacing(
+    grid_spacing = _metadata_grid_spacing(
         grid_info["grid_spacing"],
         "grid_info grid_spacing",
     )
-    n_types = positive_integer(
+    n_types = _metadata_positive_integer(
         grid_info["n_types"],
         "grid_info n_types",
     )
-    boltzmann_constant = positive_scalar(
+    boltzmann_constant = _metadata_positive_scalar(
         grid_info["boltzmann_constant"],
         "grid_info boltzmann_constant",
     )
-    thermal_wavelength = per_type_positive_values(
+    thermal_wavelength = _metadata_per_type_positive_values(
         grid_info["thermal_wavelength"],
         n_types,
         "grid_info thermal_wavelength",
@@ -115,7 +120,7 @@ def process_atoms(
     if grid_size_value is None:
         grid_size = grid_positions.max(axis=0) + 1
     else:
-        grid_size = normalize_grid_size(grid_size_value)
+        grid_size = _metadata_grid_size(grid_size_value)
     n_grid = int(np.prod(grid_size))
     if len(atoms) != n_grid:
         raise ValueError("frame does not contain one complete regular grid")
@@ -155,7 +160,7 @@ def process_atoms(
                 "rho and V_ext must contain the same number of columns"
             )
 
-    grid_spacing = normalize_grid_spacing(
+    grid_spacing = _metadata_grid_spacing(
         _required_source_value(
             atoms,
             data_key["grid_spacing"],
@@ -200,7 +205,7 @@ def process_atoms(
         if excluded_mask is None:
             excluded_mask = np.zeros(len(grid_positions), dtype=bool)
 
-    temperature = positive_scalar(
+    temperature = _metadata_positive_scalar(
         _required_source_value(
             atoms,
             data_key["temperature"],
@@ -244,12 +249,12 @@ def build_grid_data(
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
-    grid_size_values = normalize_grid_size(grid_size)
-    grid_spacing_values = normalize_grid_spacing(grid_spacing)
-    temperature_value = positive_scalar(temperature, "temperature")
-    n_type_values = positive_integer(n_types, "n_types")
-    cutoff_value = nonnegative_integer(cutoff_grid, "cutoff_grid")
-    boltzmann_value = positive_scalar(
+    grid_size_values = _metadata_grid_size(grid_size)
+    grid_spacing_values = _metadata_grid_spacing(grid_spacing)
+    temperature_value = _metadata_positive_scalar(temperature, "temperature")
+    n_type_values = _metadata_positive_integer(n_types, "n_types")
+    cutoff_value = _metadata_nonnegative_integer(cutoff_grid, "cutoff_grid")
+    boltzmann_value = _metadata_positive_scalar(
         boltzmann_constant,
         "boltzmann_constant",
     )
@@ -284,7 +289,7 @@ def build_grid_data(
         rho_values[excluded_mask_values] = 0.0
     wavelength_values = None
     if include_thermal_wavelength:
-        wavelength_values = per_type_positive_values(
+        wavelength_values = _metadata_per_type_positive_values(
             thermal_wavelength,
             n_type_values,
             "thermal_wavelength",
@@ -361,10 +366,13 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
         frame["beta_mu"] = missing_mu
 
 
-def normalize_grid_size(value: Any) -> np.ndarray:
-    """Return three positive integer grid dimensions."""
+def _metadata_grid_size(value: Any) -> np.ndarray:
+    """Coerce serialized metadata to three positive grid dimensions."""
 
-    raw = np.asarray(value, dtype=float).reshape(-1)
+    try:
+        raw = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError("grid_size must contain three values")
     if raw.size != 3:
         raise ValueError("grid_size must contain three values")
     grid_size = np.rint(raw).astype(np.int64)
@@ -373,13 +381,18 @@ def normalize_grid_size(value: Any) -> np.ndarray:
     return grid_size
 
 
-def normalize_grid_spacing(
+def _metadata_grid_spacing(
     value: Any,
     name: str = "grid_spacing",
 ) -> np.ndarray:
-    """Return one positive physical spacing for each Cartesian axis."""
+    """Coerce serialized metadata to one spacing per Cartesian axis."""
 
-    spacing = np.asarray(value, dtype=float).reshape(-1)
+    try:
+        spacing = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "{} must contain one or three finite positive values".format(name)
+        )
     if spacing.size == 1:
         spacing = np.repeat(spacing, 3)
     if (
@@ -393,47 +406,57 @@ def normalize_grid_spacing(
     return spacing
 
 
-def positive_integer(value: Any, name: str) -> int:
-    """Return one positive integer with a field-specific error."""
+def _metadata_scalar(value: Any, name: str) -> float:
+    """Unwrap one scalar value read from ASE or NumPy metadata."""
 
-    integer = nonnegative_integer(value, name)
-    if integer < 1:
-        raise ValueError("{} must be a positive integer".format(name))
-    return integer
-
-
-def nonnegative_integer(value: Any, name: str) -> int:
-    """Return one nonnegative integer with a field-specific error."""
-
-    values = np.asarray(value, dtype=float).reshape(-1)
-    if values.size != 1:
-        raise ValueError("{} must be a nonnegative integer".format(name))
-    integer = int(np.rint(values[0]))
-    if not np.isclose(values[0], integer) or integer < 0:
-        raise ValueError("{} must be a nonnegative integer".format(name))
-    return integer
-
-
-def positive_scalar(value: Any, name: str) -> float:
-    """Return one finite positive scalar with a field-specific error."""
-
-    values = np.asarray(value, dtype=float).reshape(-1)
+    try:
+        values = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError("{} must be a scalar".format(name))
     if values.size != 1:
         raise ValueError("{} must be a scalar".format(name))
-    scalar = float(values[0])
-    if not np.isfinite(scalar) or scalar <= 0.0:
-        raise ValueError("{} must be finite and positive".format(name))
-    return scalar
+    return float(values[0])
 
 
-def per_type_positive_values(
+def _metadata_positive_integer(value: Any, name: str) -> int:
+    """Coerce serialized scalar metadata to a positive integer."""
+
+    integer = _metadata_nonnegative_integer(value, name)
+    return _strict_positive_integer(integer, name)
+
+
+def _metadata_nonnegative_integer(value: Any, name: str) -> int:
+    """Coerce serialized scalar metadata to a nonnegative integer."""
+
+    scalar = _metadata_scalar(value, name)
+    if not np.isfinite(scalar):
+        raise ValueError("{} must be a nonnegative integer".format(name))
+    integer = int(np.rint(scalar))
+    if not np.isclose(scalar, integer):
+        raise ValueError("{} must be a nonnegative integer".format(name))
+    return _strict_nonnegative_integer(integer, name)
+
+
+def _metadata_positive_scalar(value: Any, name: str) -> float:
+    """Coerce serialized scalar metadata to a finite positive value."""
+
+    scalar = _metadata_scalar(value, name)
+    return _strict_positive_scalar(scalar, name)
+
+
+def _metadata_per_type_positive_values(
     value: Any,
     n_types: int,
     name: str,
 ) -> np.ndarray:
-    """Return one finite positive value per physical component."""
+    """Coerce metadata to one finite positive value per component."""
 
-    values = np.asarray(value, dtype=float).reshape(-1)
+    try:
+        values = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "{} must contain one positive value per type".format(name)
+        )
     if values.size == 1:
         values = np.repeat(values, n_types)
     if (

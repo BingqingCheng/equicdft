@@ -7,14 +7,15 @@ import numpy as np
 from ase import Atoms
 from ase.io import read
 
+from ._argument_checks import nonnegative_integer, positive_scalar
 from ._data_helpers import (
+    _metadata_grid_size,
+    _metadata_grid_spacing,
+    _metadata_positive_integer,
+    _metadata_positive_scalar,
     build_grid_data,
     harmonize_optional_targets,
     normalize_grid_info,
-    normalize_grid_size,
-    normalize_grid_spacing,
-    positive_integer,
-    positive_scalar,
     process_atoms,
     validate_frame_grid_info,
 )
@@ -124,6 +125,7 @@ class GridData(dict):
             cutoff_grid = resolved_grid_info["cutoff_grid"]
             boltzmann_constant = resolved_grid_info["boltzmann_constant"]
             thermal_wavelength = resolved_grid_info["thermal_wavelength"]
+        cutoff_grid = nonnegative_integer(cutoff_grid, "cutoff_grid")
         boltzmann_constant = positive_scalar(
             boltzmann_constant,
             "boltzmann_constant",
@@ -195,7 +197,7 @@ class GridData(dict):
         if grid_info is not None:
             resolved = normalize_grid_info(grid_info)
             if "grid_spacing" in values:
-                supplied_spacing = normalize_grid_spacing(
+                supplied_spacing = _metadata_grid_spacing(
                     values["grid_spacing"]
                 )
                 if not np.allclose(
@@ -206,7 +208,7 @@ class GridData(dict):
                         "values grid_spacing does not match grid_info"
                     )
             if "n_types" in values:
-                supplied_n_types = positive_integer(
+                supplied_n_types = _metadata_positive_integer(
                     values["n_types"],
                     "n_types",
                 )
@@ -219,6 +221,12 @@ class GridData(dict):
             cutoff_grid = resolved["cutoff_grid"]
             boltzmann_constant = resolved["boltzmann_constant"]
             thermal_wavelength = resolved["thermal_wavelength"]
+
+        cutoff_grid = nonnegative_integer(cutoff_grid, "cutoff_grid")
+        boltzmann_constant = positive_scalar(
+            boltzmann_constant,
+            "boltzmann_constant",
+        )
 
         allowed_keys = {
             "grid_size",
@@ -246,10 +254,10 @@ class GridData(dict):
                 "values is missing required field 'temperature'"
             )
 
-        grid_size = normalize_grid_size(values["grid_size"])
-        grid_spacing = normalize_grid_spacing(values["grid_spacing"])
-        temperature = positive_scalar(temperature, "temperature")
-        n_types = positive_integer(values["n_types"], "n_types")
+        grid_size = _metadata_grid_size(values["grid_size"])
+        grid_spacing = _metadata_grid_spacing(values["grid_spacing"])
+        temperature = _metadata_positive_scalar(temperature, "temperature")
+        n_types = _metadata_positive_integer(values["n_types"], "n_types")
         grid_positions = np.indices(
             tuple(grid_size),
             dtype=np.int64,

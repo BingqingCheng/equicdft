@@ -136,6 +136,32 @@ class TestGridData(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "grid_spacing"):
             GridData.from_xyz(self.path, grid_info=mismatched)
 
+    def test_grid_info_coerces_serialized_scalar_metadata(self):
+        grid_info = self._grid_info()
+        grid_info["cutoff_grid"] = np.asarray([1.0])
+        grid_info["n_types"] = np.asarray([1.0])
+        grid_info["boltzmann_constant"] = np.asarray([1.0])
+
+        data = GridData.from_xyz(self.path, grid_info=grid_info)[0]
+
+        self.assertEqual(data["n_types"].item(), 1)
+        self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
+
+    def test_public_scalar_arguments_are_strict(self):
+        with self.assertRaisesRegex(TypeError, "cutoff_grid"):
+            GridData.from_xyz(self.path, cutoff_grid=1.0)
+        with self.assertRaisesRegex(TypeError, "boltzmann_constant"):
+            GridData.from_xyz(self.path, boltzmann_constant=[1.0])
+
+        values = {
+            "grid_size": [2, 2, 2],
+            "grid_spacing": 0.5,
+            "temperature": 1.5,
+            "n_types": 1,
+        }
+        with self.assertRaisesRegex(TypeError, "cutoff_grid"):
+            GridData.from_dict(values, cutoff_grid=np.asarray([1]))
+
     def test_from_xyz_accepts_ordered_path_sequence(self):
         second_path = Path(self.temporary_directory.name) / "grid-second.extxyz"
         _write_grid(second_path, density_offset=100.25)
