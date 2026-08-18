@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from equicdft import Loss, Metrics, TensorLoss, Trainer
+from equicdft import FourierStabilityLoss, Loss, Metrics, TensorLoss, Trainer
 
 
 class _LinearDictionaryModel(nn.Module):
@@ -21,6 +21,26 @@ class _LinearDictionaryModel(nn.Module):
         return {"prediction": self.weight * batch["x"]}
 
 
+class _QuadraticDictionaryFunctional(nn.Module):
+    """Small functional for exercising model-dependent trainer losses."""
+
+    def __init__(self):
+        super().__init__()
+        self.coefficient = nn.Parameter(torch.tensor(-4.0))
+
+    def forward(self, batch, compute_c1=None):
+        rho = batch["rho"]
+        cell_volume = torch.prod(batch["grid_spacing"].to(rho), dim=-1)
+        return {
+            "beta_F_exc": (
+                0.5
+                * self.coefficient
+                * cell_volume
+                * torch.sum(rho.square(), dim=(-2, -1))
+            )
+        }
+
+
 def _dataset(values):
     return [
         {
@@ -29,6 +49,22 @@ def _dataset(values):
             "rho": torch.ones(1, 1),
         }
         for value in values
+    ]
+
+
+def _functional_dataset(n_fields=2):
+    n_grid = 8
+    return [
+        {
+            "rho": torch.full((n_grid, 1), 0.5),
+            "temperature": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+            "grid_size": torch.tensor([n_grid, 1, 1]),
+            "grid_positions": torch.tensor(
+                [[index, 0, 0] for index in range(n_grid)]
+            ),
+        }
+        for _ in range(n_fields)
     ]
 
 
@@ -102,6 +138,40 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("mae", history[0]["valid_metrics"]["target"])
         self.assertEqual(trainer.metrics[0].logs["train"]["prediction"], [])
         self.assertEqual(trainer.metrics[0].logs["valid"]["prediction"], [])
+
+    def test_model_dependent_loss_runs_through_trainer(self):
+        model = _QuadraticDictionaryFunctional()
+        trainer = Trainer(
+            model=model,
+            loss=Loss(
+                [
+                    FourierStabilityLoss(
+                        ((1, 0, 0),),
+                        training_only=False,
+                    )
+                ]
+            ),
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 0.01},
+        )
+        loader = DataLoader(_functional_dataset(), batch_size=2)
+        initial_coefficient = model.coefficient.detach().clone()
+
+        history = trainer.fit(loader, loader, epochs=1, verbose=False)
+
+        self.assertIn(
+            "fourier_stability",
+            history[0]["train_losses"],
+        )
+        self.assertIn(
+            "fourier_stability",
+            history[0]["valid_losses"],
+        )
+        self.assertGreater(
+            history[0]["valid_losses"]["fourier_stability"],
+            0.0,
+        )
+        self.assertFalse(torch.equal(model.coefficient, initial_coefficient))
 
     def test_optional_scheduler_steps_each_epoch(self):
         trainer = self._make_trainer(scheduler=True)

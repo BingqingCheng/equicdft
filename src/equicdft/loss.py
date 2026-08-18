@@ -119,13 +119,17 @@ class Loss(nn.Module):
         self,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return weighted named terms and their scalar sum as ``total``."""
 
         values = {}
         total = None
         for term in self.terms:
-            value = term(outputs, batch)
+            if getattr(term, "requires_model", False):
+                value = term(outputs, batch, model=model)
+            else:
+                value = term(outputs, batch)
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError(
                     "loss term '{}' must return one scalar tensor".format(
