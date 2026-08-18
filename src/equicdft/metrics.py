@@ -5,6 +5,11 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from ._argument_checks import (
+    boolean,
+    nonempty_string,
+    unique_strings,
+)
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 
@@ -147,30 +152,30 @@ class Metrics(nn.Module):
             else self.target_keys
         )
         default_target_name = self.target_keys[0]
-        self.prediction_key = _nonempty_string(
+        self.prediction_key = nonempty_string(
             default_target_name if prediction_key is None else prediction_key,
             "prediction_key",
         )
-        self.name = _nonempty_string(
+        self.name = nonempty_string(
             default_target_name if name is None else name,
             "name",
         )
         self.selection_mask_key = (
             None
             if selection_mask_key is None
-            else _nonempty_string(
+            else nonempty_string(
                 selection_mask_key,
                 "selection_mask_key",
             )
         )
-        self.metric_keys = _unique_strings(metric_keys, "metric_keys")
+        self.metric_keys = unique_strings(metric_keys, "metric_keys")
         unknown_metrics = set(self.metric_keys) - set(SUPPORTED_METRICS)
         if unknown_metrics:
             raise ValueError(
                 "unsupported metrics: {}".format(sorted(unknown_metrics))
             )
 
-        subset_names = _unique_strings(subsets, "subsets")
+        subset_names = unique_strings(subsets, "subsets")
         self.logs = {
             subset: {"prediction": [], "target": []}
             for subset in subset_names
@@ -209,6 +214,7 @@ class Metrics(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Return metrics over all recorded batches for one subset."""
 
+        clear = boolean(clear, "clear")
         self._require_subset(subset)
         if not self.logs[subset]["prediction"]:
             raise ValueError("no metric data recorded for subset '{}'".format(subset))
@@ -292,24 +298,3 @@ class Metrics(nn.Module):
                     tuple(self.logs),
                 )
             )
-
-
-def _nonempty_string(value: str, field: str) -> str:
-    """Return a nonempty string with a field-specific error."""
-
-    if not isinstance(value, str) or not value:
-        raise ValueError("{} must be a nonempty string".format(field))
-    return value
-
-
-def _unique_strings(values: Sequence[str], field: str) -> Tuple[str, ...]:
-    """Return a nonempty tuple of unique, nonempty strings."""
-
-    values = tuple(values)
-    if not values:
-        raise ValueError("{} must not be empty".format(field))
-    for value in values:
-        _nonempty_string(value, field)
-    if len(set(values)) != len(values):
-        raise ValueError("{} must contain unique values".format(field))
-    return values

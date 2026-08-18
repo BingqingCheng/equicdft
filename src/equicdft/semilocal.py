@@ -6,10 +6,14 @@ from typing import Dict, Optional, Sequence, Union
 import torch
 from torch import nn
 
-from ._nn import (
-    build_mlp,
+from ._argument_checks import (
+    nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
+    positive_scalar,
+)
+from ._nn import (
+    build_mlp,
     positive_scalar_tensor,
     validate_hidden_sizes,
 )
@@ -149,17 +153,15 @@ class GGAReadout(EnergyReadout):
         self.n_types = positive_integer(n_types, "n_types")
         n_features = optional_positive_integer(n_features, "n_features")
 
-        try:
-            minimum_coefficient = float(minimum_coefficient)
-            initial_coefficient = float(initial_coefficient)
-        except (TypeError, ValueError):
-            raise ValueError("GGA coefficients must be finite scalars")
-        if not math.isfinite(minimum_coefficient) or minimum_coefficient < 0.0:
-            raise ValueError("minimum_coefficient must be finite and nonnegative")
-        if (
-            not math.isfinite(initial_coefficient)
-            or initial_coefficient <= minimum_coefficient
-        ):
+        minimum_coefficient = nonnegative_scalar(
+            minimum_coefficient,
+            "minimum_coefficient",
+        )
+        initial_coefficient = positive_scalar(
+            initial_coefficient,
+            "initial_coefficient",
+        )
+        if initial_coefficient <= minimum_coefficient:
             raise ValueError(
                 "initial_coefficient must be finite and exceed the minimum"
             )

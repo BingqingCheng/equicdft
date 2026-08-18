@@ -363,9 +363,17 @@ class TestTrainer(unittest.TestCase):
                 Loss([TensorLoss("target", "prediction", "target")]),
                 checkpoint_interval=0,
             )
-        for invalid_patience in (0, -1, True, 1.5):
+        for invalid_patience in (0, -1):
             with self.subTest(invalid_patience=invalid_patience):
                 with self.assertRaises(ValueError):
+                    Trainer(
+                        _LinearDictionaryModel(),
+                        Loss([TensorLoss("target", "prediction", "target")]),
+                        early_stopping_patience=invalid_patience,
+                    )
+        for invalid_patience in (True, 1.5):
+            with self.subTest(invalid_patience=invalid_patience):
+                with self.assertRaises(TypeError):
                     Trainer(
                         _LinearDictionaryModel(),
                         Loss([TensorLoss("target", "prediction", "target")]),

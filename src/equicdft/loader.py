@@ -5,6 +5,12 @@ from typing import Dict, Iterator, Optional, Sequence, Tuple, Union
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from ._argument_checks import (
+    finite_scalar,
+    nonnegative_integer,
+    positive_integer,
+)
+
 
 LoaderResult = Dict[str, Union[DataLoader, float, None]]
 
@@ -71,7 +77,8 @@ def make_dataloaders(
         raise ValueError(
             "provide exactly one of valid_dataset and valid_fraction"
         )
-    _validate_loader_settings(batch_size, num_workers)
+    batch_size = positive_integer(batch_size, "batch_size")
+    num_workers = nonnegative_integer(num_workers, "num_workers")
     _require_nonempty(train_dataset, "train_dataset")
 
     statistics_datasets = [train_dataset]
@@ -137,10 +144,7 @@ def _random_split(
 ) -> Tuple[Subset, Subset]:
     """Return deterministic, disjoint train and validation subsets."""
 
-    try:
-        fraction = float(valid_fraction)
-    except (TypeError, ValueError):
-        raise ValueError("valid_fraction must be a number between zero and one")
+    fraction = finite_scalar(valid_fraction, "valid_fraction")
     if not 0.0 < fraction < 1.0:
         raise ValueError("valid_fraction must lie strictly between zero and one")
 
@@ -215,16 +219,3 @@ def _require_nonempty(dataset: Optional[Dataset], name: str) -> None:
 
     if dataset is None or len(dataset) == 0:
         raise ValueError("{} must contain at least one frame".format(name))
-
-
-def _validate_loader_settings(batch_size: int, num_workers: int) -> None:
-    """Validate the two integer DataLoader settings exposed by this module."""
-
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
-        raise ValueError("batch_size must be a positive integer")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be a positive integer")
-    if isinstance(num_workers, bool) or not isinstance(num_workers, int):
-        raise ValueError("num_workers must be a nonnegative integer")
-    if num_workers < 0:
-        raise ValueError("num_workers must be a nonnegative integer")

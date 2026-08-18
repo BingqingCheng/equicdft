@@ -18,6 +18,11 @@ import torch
 from torch import nn
 from torch.nn.parameter import UninitializedParameter
 
+from ._argument_checks import (
+    boolean,
+    optional_positive_integer,
+    positive_integer,
+)
 from ._trainer_io import (
     append_log_message,
     atomic_torch_save,
@@ -94,22 +99,15 @@ class Trainer(nn.Module):
             raise TypeError("model must be a torch.nn.Module")
         if not isinstance(loss, Loss):
             raise TypeError("loss must be a equicdft.Loss")
-        if (
-            not isinstance(checkpoint_interval, int)
-            or checkpoint_interval <= 0
-        ):
-            raise ValueError("checkpoint_interval must be a positive integer")
-        if not isinstance(save_best, bool):
-            raise TypeError("save_best must be a boolean")
-        if early_stopping_patience is not None:
-            if (
-                isinstance(early_stopping_patience, bool)
-                or not isinstance(early_stopping_patience, int)
-                or early_stopping_patience <= 0
-            ):
-                raise ValueError(
-                    "early_stopping_patience must be a positive integer or None"
-                )
+        checkpoint_interval = positive_integer(
+            checkpoint_interval,
+            "checkpoint_interval",
+        )
+        save_best = boolean(save_best, "save_best")
+        early_stopping_patience = optional_positive_integer(
+            early_stopping_patience,
+            "early_stopping_patience",
+        )
 
         metrics = list(metrics)
         if any(not isinstance(metric, Metrics) for metric in metrics):
@@ -162,12 +160,9 @@ class Trainer(nn.Module):
     ) -> List[Dict[str, Any]]:
         """Run complete train/validation epochs and return their history."""
 
-        if not isinstance(epochs, int) or epochs <= 0:
-            raise ValueError("epochs must be a positive integer")
-        if not isinstance(verbose, bool):
-            raise TypeError("verbose must be a boolean")
-        if not isinstance(print_interval, int) or print_interval <= 0:
-            raise ValueError("print_interval must be a positive integer")
+        epochs = positive_integer(epochs, "epochs")
+        verbose = boolean(verbose, "verbose")
+        print_interval = positive_integer(print_interval, "print_interval")
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization(train_loader)

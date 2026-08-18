@@ -1,13 +1,18 @@
 """Collected grid density-functional model."""
 
-import math
 from contextlib import nullcontext
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
+from ._argument_checks import (
+    boolean,
+    nonnegative_scalar,
+    optional_boolean,
+    positive_scalar,
+)
 from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout
 from .features import CartesianAFeatures
@@ -56,12 +61,9 @@ class GridCACEModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        if not isinstance(compute_c1, bool):
-            raise TypeError("compute_c1 must be a boolean")
-        if not isinstance(compute_c2, bool):
-            raise TypeError("compute_c2 must be a boolean")
-        if not isinstance(compute_local_mu, bool):
-            raise TypeError("compute_local_mu must be a boolean")
+        compute_c1 = boolean(compute_c1, "compute_c1")
+        compute_c2 = boolean(compute_c2, "compute_c2")
+        compute_local_mu = boolean(compute_local_mu, "compute_local_mu")
         if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
         if free_energy_mode not in ("beta", "physical"):
@@ -117,12 +119,7 @@ class GridCACEModel(nn.Module):
                 raise ValueError(
                     "readouts and local features must use the same mean_density"
                 )
-        try:
-            rho_min = float(rho_min)
-        except (TypeError, ValueError):
-            raise ValueError("rho_min must be a finite nonnegative scalar")
-        if not math.isfinite(rho_min) or rho_min < 0.0:
-            raise ValueError("rho_min must be a finite nonnegative scalar")
+        rho_min = nonnegative_scalar(rho_min, "rho_min")
 
         self.a_features = a_features
         self.b_features = b_features
@@ -162,20 +159,14 @@ class GridCACEModel(nn.Module):
         ):
             raise ValueError("mean_temperature must be a positive scalar")
 
-        if isinstance(boltzmann_constant, bool) or not isinstance(
+        boltzmann_constant = positive_scalar(
             boltzmann_constant,
-            Real,
-        ):
-            raise TypeError("boltzmann_constant must be a positive scalar")
+            "boltzmann_constant",
+        )
         boltzmann_constant_tensor = torch.as_tensor(
             boltzmann_constant,
             dtype=torch.get_default_dtype(),
         )
-        if (
-            not torch.isfinite(boltzmann_constant_tensor).item()
-            or boltzmann_constant_tensor.item() <= 0.0
-        ):
-            raise ValueError("boltzmann_constant must be finite and positive")
 
         thermal_wavelength_tensor = torch.as_tensor(
             thermal_wavelength,
@@ -379,14 +370,12 @@ class GridCACEModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
+        compute_c2 = optional_boolean(compute_c2, "compute_c2")
         if compute_c2 is None:
             compute_c2 = self.compute_c2
-        if not isinstance(compute_c2, bool):
-            raise TypeError("compute_c2 must be a boolean or None")
+        compute_c1 = optional_boolean(compute_c1, "compute_c1")
         if compute_c1 is None:
             compute_c1 = self.compute_c1
-        if not isinstance(compute_c1, bool):
-            raise TypeError("compute_c1 must be a boolean or None")
         compute_c1 = compute_c1 or compute_c2
 
         # A requested functional derivative requires gradient tracking even

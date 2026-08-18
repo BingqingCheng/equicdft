@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
+from ._argument_checks import boolean
 from .metrics import format_metric_value, metric_label
 
 
@@ -33,8 +34,7 @@ def append_log_message(
 
     if not isinstance(message, str):
         raise TypeError("message must be a string")
-    if not isinstance(display, bool):
-        raise TypeError("display must be a boolean")
+    display = boolean(display, "display")
     if display:
         print(message)
     if path is not None:

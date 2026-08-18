@@ -1,11 +1,12 @@
 """Differentiable reciprocal-space features of periodic density fields."""
 
 import math
-from numbers import Integral
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
+
+from ._argument_checks import positive_integer
 
 
 class ReciprocalFeatures(nn.Module):
@@ -74,11 +75,7 @@ class ReciprocalFeatures(nn.Module):
         ):
             raise ValueError("radial_exponents must contain positive values")
 
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
-            raise TypeError("n_types must be a positive integer")
-        n_types = int(n_types)
-        if n_types < 1:
-            raise ValueError("n_types must be a positive integer")
+        n_types = positive_integer(n_types, "n_types")
 
         if kernel not in self._KERNELS:
             raise ValueError("kernel must be one of {}".format(self._KERNELS))

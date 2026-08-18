@@ -6,12 +6,12 @@ integer spherical stencil constructed by :func:`equicdft.stencil.make_stencil`.
 """
 
 from itertools import combinations_with_replacement, permutations, product
-from numbers import Integral
 from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch import nn
 
+from ._argument_checks import positive_integer
 from .features import _make_powers
 
 
@@ -157,15 +157,11 @@ class CartesianBFeatures(nn.Module):
     def __init__(self, max_power: int, max_product_order: int = 3) -> None:
         super().__init__()
 
-        if isinstance(max_product_order, bool) or not isinstance(
+        max_product_order = positive_integer(
             max_product_order,
-            Integral,
-        ):
-            raise TypeError(
-                "max_product_order must be an integer between one and three"
-            )
-        max_product_order = int(max_product_order)
-        if max_product_order < 1 or max_product_order > 3:
+            "max_product_order",
+        )
+        if max_product_order > 3:
             raise ValueError("max_product_order must be between one and three")
 
         powers = _make_powers(max_power)

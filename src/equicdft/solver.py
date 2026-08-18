@@ -1,11 +1,17 @@
 """Evaluate learned grid functionals and minimize thermodynamic objectives."""
 
-import math
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
+from ._argument_checks import (
+    boolean,
+    finite_scalar,
+    nonnegative_scalar,
+    positive_integer,
+    positive_scalar,
+)
 from ._solver_numerics import (
     _component_tensor,
     _euler_residual,
@@ -207,37 +213,38 @@ class GridSolver:
 
         if method not in ("minimize", "euler"):
             raise ValueError("method must be 'minimize' or 'euler'")
-        beta_multiplier = float(beta_multiplier)
-        if not math.isfinite(beta_multiplier) or beta_multiplier < 0.0:
-            raise ValueError(
-                "beta_multiplier must be finite and nonnegative"
-            )
-        if not isinstance(max_iter, int) or max_iter <= 0:
-            raise ValueError("max_iter must be a positive integer")
-        tolerance_residual = float(tolerance_residual)
+        beta_multiplier = nonnegative_scalar(
+            beta_multiplier,
+            "beta_multiplier",
+        )
+        max_iter = positive_integer(max_iter, "max_iter")
+        tolerance_residual = positive_scalar(
+            tolerance_residual,
+            "tolerance_residual",
+        )
         if tolerance_rms_residual is not None:
-            tolerance_rms_residual = float(tolerance_rms_residual)
-        max_log_density_change = float(max_log_density_change)
-        if tolerance_residual <= 0.0:
-            raise ValueError("tolerance_residual must be positive")
-        if (
-            tolerance_rms_residual is not None
-            and tolerance_rms_residual <= 0.0
-        ):
-            raise ValueError("tolerance_rms_residual must be positive")
-        if max_log_density_change <= 0.0:
-            raise ValueError("max_log_density_change must be positive")
+            tolerance_rms_residual = positive_scalar(
+                tolerance_rms_residual,
+                "tolerance_rms_residual",
+            )
+        max_log_density_change = positive_scalar(
+            max_log_density_change,
+            "max_log_density_change",
+        )
         if method == "minimize":
-            step_size = float(step_size)
-            minimum_step_size = float(minimum_step_size)
-            line_search_factor = float(line_search_factor)
-            armijo_factor = float(armijo_factor)
-            if step_size <= 0.0:
-                raise ValueError("step_size must be positive")
-            if minimum_step_size <= 0.0 or minimum_step_size > step_size:
+            step_size = positive_scalar(step_size, "step_size")
+            minimum_step_size = positive_scalar(
+                minimum_step_size,
+                "minimum_step_size",
+            )
+            line_search_factor = finite_scalar(
+                line_search_factor,
+                "line_search_factor",
+            )
+            armijo_factor = finite_scalar(armijo_factor, "armijo_factor")
+            if minimum_step_size > step_size:
                 raise ValueError(
-                    "minimum_step_size must be positive and no larger than "
-                    "step_size"
+                    "minimum_step_size must be no larger than step_size"
                 )
             if not 0.0 < line_search_factor < 1.0:
                 raise ValueError(
@@ -248,22 +255,34 @@ class GridSolver:
                     "armijo_factor must be in the interval [0, 1)"
                 )
         else:
-            tolerance_change = float(tolerance_change)
-            mixing = float(mixing)
-            minimum_mixing = float(minimum_mixing)
-            maximum_mixing = float(maximum_mixing)
-            mixing_growth = float(mixing_growth)
-            mixing_backtrack_factor = float(mixing_backtrack_factor)
-            if tolerance_change <= 0.0:
-                raise ValueError("tolerance_change must be positive")
-            if not 0.0 < mixing <= 1.0:
+            tolerance_change = positive_scalar(
+                tolerance_change,
+                "tolerance_change",
+            )
+            mixing = positive_scalar(mixing, "mixing")
+            minimum_mixing = positive_scalar(
+                minimum_mixing,
+                "minimum_mixing",
+            )
+            maximum_mixing = positive_scalar(
+                maximum_mixing,
+                "maximum_mixing",
+            )
+            mixing_growth = positive_scalar(
+                mixing_growth,
+                "mixing_growth",
+            )
+            mixing_backtrack_factor = positive_scalar(
+                mixing_backtrack_factor,
+                "mixing_backtrack_factor",
+            )
+            if mixing > 1.0:
                 raise ValueError("mixing must be in the interval (0, 1]")
-            if not isinstance(adaptive_mixing, bool):
-                raise TypeError("adaptive_mixing must be a boolean")
+            adaptive_mixing = boolean(adaptive_mixing, "adaptive_mixing")
             if adaptive_mixing:
-                if not 0.0 < minimum_mixing <= mixing:
+                if minimum_mixing > mixing:
                     raise ValueError(
-                        "minimum_mixing must be positive and no larger than mixing"
+                        "minimum_mixing must be no larger than mixing"
                     )
                 if not mixing <= maximum_mixing <= 1.0:
                     raise ValueError(
@@ -335,10 +354,9 @@ class GridSolver:
         if residual_density_threshold is None:
             residual_density_threshold = 0.0
         else:
-            residual_density_threshold = float(residual_density_threshold)
-        if residual_density_threshold < 0.0:
-            raise ValueError(
-                "residual_density_threshold must be nonnegative"
+            residual_density_threshold = nonnegative_scalar(
+                residual_density_threshold,
+                "residual_density_threshold",
             )
 
         if initial_rho is None and "rho" in data:

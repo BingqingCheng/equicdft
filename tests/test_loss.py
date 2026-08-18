@@ -100,10 +100,12 @@ class TestTensorLoss(unittest.TestCase):
             term({"c1": torch.ones(2)}, {"c1": torch.zeros(2)})
 
     def test_weight_must_be_finite_and_nonnegative(self):
-        for weight in (-1.0, float("inf"), float("nan"), "invalid"):
+        for weight in (-1.0, float("inf"), float("nan")):
             with self.subTest(weight=weight):
                 with self.assertRaisesRegex(ValueError, "weight"):
                     TensorLoss("c1", "c1", "c1", weight=weight)
+        with self.assertRaisesRegex(TypeError, "weight"):
+            TensorLoss("c1", "c1", "c1", weight="invalid")
 
 
 class TestWeightedTensorLoss(unittest.TestCase):

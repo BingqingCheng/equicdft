@@ -6,12 +6,17 @@ additional kernel normalization. A purely polynomial representation can
 instead use one undamped radial channel.
 """
 
-from numbers import Integral
 from typing import Mapping, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
+from ._argument_checks import (
+    boolean,
+    nonnegative_integer,
+    optional_positive_integer,
+    positive_integer,
+)
 from .stencil import make_stencil
 
 
@@ -61,11 +66,7 @@ def _make_powers(max_power: int) -> torch.Tensor:
     ``1, x, y, z, x^2, xy, xz, y^2, yz, z^2``.
     """
 
-    if isinstance(max_power, bool) or not isinstance(max_power, Integral):
-        raise TypeError("max_power must be a nonnegative integer")
-    max_power = int(max_power)
-    if max_power < 0:
-        raise ValueError("max_power must be a nonnegative integer")
+    max_power = nonnegative_integer(max_power, "max_power")
 
     powers = []
     for total_power in range(max_power + 1):
@@ -170,38 +171,24 @@ class CartesianAFeatures(nn.Module):
         if radial_basis not in ("gaussian", "none"):
             raise ValueError("radial_basis must be 'gaussian' or 'none'")
 
-        if isinstance(n_radial_channels, bool) or not isinstance(
+        n_radial_channels = positive_integer(
             n_radial_channels,
-            Integral,
-        ):
-            raise TypeError("n_radial_channels must be a positive integer")
-        n_radial_channels = int(n_radial_channels)
-        if n_radial_channels < 1:
-            raise ValueError("n_radial_channels must be a positive integer")
-        if not isinstance(trainable_radial_exponents, bool):
-            raise TypeError("trainable_radial_exponents must be a boolean")
+            "n_radial_channels",
+        )
+        trainable_radial_exponents = boolean(
+            trainable_radial_exponents,
+            "trainable_radial_exponents",
+        )
         if not isinstance(coordinate_scaling, str):
             raise TypeError("coordinate_scaling must be 'none' or 'cutoff'")
         coordinate_scaling = coordinate_scaling.lower()
         if coordinate_scaling not in ("none", "cutoff"):
             raise ValueError("coordinate_scaling must be 'none' or 'cutoff'")
-        if not isinstance(separate_center, bool):
-            raise TypeError("separate_center must be a boolean")
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral):
-            raise TypeError("n_types must be a positive integer")
-        n_types = int(n_types)
-        if n_types < 1:
-            raise ValueError("n_types must be a positive integer")
+        separate_center = boolean(separate_center, "separate_center")
+        n_types = positive_integer(n_types, "n_types")
 
+        n_channels = optional_positive_integer(n_channels, "n_channels")
         if n_channels is not None:
-            if isinstance(n_channels, bool) or not isinstance(
-                n_channels,
-                Integral,
-            ):
-                raise TypeError("n_channels must be a positive integer or None")
-            n_channels = int(n_channels)
-            if n_channels < 1:
-                raise ValueError("n_channels must be a positive integer or None")
             if n_types == 1:
                 raise ValueError(
                     "channel mixing is disabled for one-component density fields"
@@ -438,17 +425,8 @@ class _AChannelMixing(nn.Module):
     def __init__(self, n_types: int, n_channels: int) -> None:
         super().__init__()
 
-        for name, value in (
-            ("n_types", n_types),
-            ("n_channels", n_channels),
-        ):
-            if isinstance(value, bool) or not isinstance(value, Integral):
-                raise TypeError("{} must be a positive integer".format(name))
-            if int(value) < 1:
-                raise ValueError("{} must be a positive integer".format(name))
-
-        self.n_types = int(n_types)
-        self.n_channels = int(n_channels)
+        self.n_types = positive_integer(n_types, "n_types")
+        self.n_channels = positive_integer(n_channels, "n_channels")
         self.weight = nn.Parameter(
             torch.empty(
                 self.n_channels,

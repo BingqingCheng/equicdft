@@ -6,6 +6,14 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from ._argument_checks import (
+    boolean,
+    finite_scalar,
+    nonempty_string,
+    nonnegative_integer,
+    nonnegative_scalar,
+)
+
 
 class FourierStabilityLoss(nn.Module):
     r"""Penalize negative fixed-particle-number Fourier curvature.
@@ -70,7 +78,7 @@ class FourierStabilityLoss(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.name = _validate_name(name)
+        self.name = nonempty_string(name, "name")
         if modes is None:
             integer_modes = torch.empty((0, 3), dtype=torch.long)
         else:
@@ -94,14 +102,10 @@ class FourierStabilityLoss(nn.Module):
             ):
                 raise ValueError("modes must not contain duplicates")
 
-        if (
-            isinstance(random_modes_per_field, bool)
-            or not isinstance(random_modes_per_field, int)
-            or random_modes_per_field < 0
-        ):
-            raise ValueError(
-                "random_modes_per_field must be a nonnegative integer"
-            )
+        random_modes_per_field = nonnegative_integer(
+            random_modes_per_field,
+            "random_modes_per_field",
+        )
         if modes is None and random_modes_per_field == 0:
             raise ValueError(
                 "supply modes or a positive random_modes_per_field"
@@ -110,10 +114,9 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError(
                 "random_modes_per_field must be zero when modes are supplied"
             )
-        if not isinstance(training_only, bool):
-            raise TypeError("training_only must be a boolean")
+        training_only = boolean(training_only, "training_only")
 
-        relative_amplitude = _finite_scalar(
+        relative_amplitude = finite_scalar(
             relative_amplitude,
             "relative_amplitude",
         )
@@ -123,11 +126,11 @@ class FourierStabilityLoss(nn.Module):
         self.relative_amplitude = relative_amplitude
         self.random_modes_per_field = random_modes_per_field
         self.training_only = training_only
-        self.minimum_curvature = _finite_nonnegative_scalar(
+        self.minimum_curvature = nonnegative_scalar(
             minimum_curvature,
             "minimum_curvature",
         )
-        self.weight = _finite_nonnegative_scalar(weight, "weight")
+        self.weight = nonnegative_scalar(weight, "weight")
         self.register_buffer("modes", integer_modes)
 
     def forward(
@@ -446,32 +449,3 @@ def _canonical_grid_mode(
     if first_nonzero < 0:
         canonical = [-component for component in canonical]
     return tuple(canonical)
-
-
-def _validate_name(name: str) -> str:
-    """Return a nonempty loss-term name."""
-
-    if not isinstance(name, str) or not name:
-        raise ValueError("name must be a nonempty string")
-    return name
-
-
-def _finite_scalar(value: float, name: str) -> float:
-    """Return a validated finite scalar."""
-
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("{} must be a finite scalar".format(name))
-    if not math.isfinite(value):
-        raise ValueError("{} must be a finite scalar".format(name))
-    return value
-
-
-def _finite_nonnegative_scalar(value: float, name: str) -> float:
-    """Return a validated finite nonnegative scalar."""
-
-    value = _finite_scalar(value, name)
-    if value < 0.0:
-        raise ValueError("{} must be a finite nonnegative scalar".format(name))
-    return value

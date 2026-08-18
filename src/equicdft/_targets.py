@@ -4,6 +4,8 @@ from typing import Dict, Sequence, Tuple, Union
 
 import torch
 
+from ._argument_checks import unique_strings
+
 
 TargetKeys = Union[str, Sequence[str]]
 
@@ -24,15 +26,7 @@ def normalize_target_keys(
                 field
             )
         )
-    if not values:
-        raise ValueError("{} must not be empty".format(field))
-    if any(not isinstance(key, str) or not key for key in values):
-        raise ValueError(
-            "{} must contain nonempty strings".format(field)
-        )
-    if len(set(values)) != len(values):
-        raise ValueError("{} must contain unique values".format(field))
-    return values
+    return unique_strings(values, field)
 
 
 def resolve_target(

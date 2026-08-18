@@ -1,11 +1,11 @@
 """Composable objectives for training grid density-functional models."""
 
-import math
 from typing import Dict, Optional, Sequence
 
 import torch
 from torch import nn
 
+from ._argument_checks import nonempty_string, nonnegative_scalar
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 
@@ -30,8 +30,11 @@ class TensorLoss(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.name = _validate_name(name)
-        self.prediction_key = _validate_key(prediction_key, "prediction_key")
+        self.name = nonempty_string(name, "loss term name")
+        self.prediction_key = nonempty_string(
+            prediction_key,
+            "prediction_key",
+        )
         self.target_keys = normalize_target_keys(target_key)
         self.target_key = (
             self.target_keys[0]
@@ -41,7 +44,7 @@ class TensorLoss(nn.Module):
         self.weights_key = (
             None
             if weights_key is None
-            else _validate_key(weights_key, "weights_key")
+            else nonempty_string(weights_key, "weights_key")
         )
         if loss_fn is None:
             loss_fn = nn.MSELoss(
@@ -51,7 +54,7 @@ class TensorLoss(nn.Module):
             raise TypeError("loss_fn must be a torch.nn.Module")
 
         self.loss_fn = loss_fn
-        self.weight = _finite_nonnegative_scalar(weight, "weight")
+        self.weight = nonnegative_scalar(weight, "weight")
 
     def forward(
         self,
@@ -107,7 +110,10 @@ class Loss(nn.Module):
         for term in terms:
             if not isinstance(term, nn.Module):
                 raise TypeError("every loss term must be a torch.nn.Module")
-            name = _validate_name(getattr(term, "name", None))
+            name = nonempty_string(
+                getattr(term, "name", None),
+                "loss term name",
+            )
             if name == "total":
                 raise ValueError("'total' is reserved for the aggregate loss")
             if name in names:
@@ -156,31 +162,3 @@ def _resolve_weights(
     raise KeyError(
         "batch and model outputs are missing weights '{}'".format(key)
     )
-
-
-def _validate_name(name: Optional[str]) -> str:
-    """Return a nonempty loss-term name."""
-
-    if not isinstance(name, str) or not name:
-        raise ValueError("loss term name must be a nonempty string")
-    return name
-
-
-def _validate_key(key: str, field: str) -> str:
-    """Return a nonempty prediction, target, or weights key."""
-
-    if not isinstance(key, str) or not key:
-        raise ValueError("{} must be a nonempty string".format(field))
-    return key
-
-
-def _finite_nonnegative_scalar(value: float, name: str) -> float:
-    """Return a validated finite nonnegative scalar."""
-
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("{} must be a finite nonnegative scalar".format(name))
-    if not math.isfinite(value) or value < 0.0:
-        raise ValueError("{} must be a finite nonnegative scalar".format(name))
-    return value

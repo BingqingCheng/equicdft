@@ -1,32 +1,15 @@
 """Small private helpers shared by neural-network readouts."""
 
-from numbers import Integral
 from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
-
-def positive_integer(value: int, name: str) -> int:
-    """Validate and return a positive integer."""
-
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError("{} must be a positive integer".format(name))
-    value = int(value)
-    if value < 1:
-        raise ValueError("{} must be a positive integer".format(name))
-    return value
-
-
-def optional_positive_integer(
-    value: Optional[int],
-    name: str,
-) -> Optional[int]:
-    """Validate an optional positive integer."""
-
-    if value is None:
-        return None
-    return positive_integer(value, name)
+from ._argument_checks import (
+    boolean,
+    optional_positive_integer,
+    positive_integer,
+)
 
 
 def validate_hidden_sizes(values: Sequence[int]) -> Tuple[int, ...]:
@@ -63,8 +46,7 @@ def build_mlp(
     input_size = optional_positive_integer(input_size, "input_size")
     hidden_sizes = validate_hidden_sizes(hidden_sizes)
     output_size = positive_integer(output_size, "output_size")
-    if not isinstance(zero_init, bool):
-        raise TypeError("zero_init must be a boolean")
+    zero_init = boolean(zero_init, "zero_init")
 
     layers = []
     width = input_size

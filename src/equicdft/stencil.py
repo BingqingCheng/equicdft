@@ -1,10 +1,11 @@
 """Geometry helpers for periodic neighborhoods on regular density grids."""
 
 from itertools import product
-from numbers import Integral
 from typing import Sequence, Tuple, Union
 
 import numpy as np
+
+from ._argument_checks import nonnegative_integer
 
 
 def make_stencil(cutoff_grid: int = 3) -> np.ndarray:
@@ -25,11 +26,7 @@ def make_stencil(cutoff_grid: int = 3) -> np.ndarray:
         Relative integer displacements with shape ``[n_neighbors, 3]``.
     """
 
-    if isinstance(cutoff_grid, bool) or not isinstance(cutoff_grid, Integral):
-        raise TypeError("cutoff_grid must be a nonnegative integer")
-    cutoff_grid = int(cutoff_grid)
-    if cutoff_grid < 0:
-        raise ValueError("cutoff_grid must be a nonnegative integer")
+    cutoff_grid = nonnegative_integer(cutoff_grid, "cutoff_grid")
 
     squared_cutoff = cutoff_grid**2
     offsets = [

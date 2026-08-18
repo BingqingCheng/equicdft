@@ -1,11 +1,15 @@
 """Local readout for invariant grid features."""
 
-import math
 from typing import Dict, Optional, Sequence
 
 import torch
 
-from ._nn import build_mlp, optional_positive_integer, positive_integer
+from ._argument_checks import (
+    finite_scalar,
+    optional_positive_integer,
+    positive_integer,
+)
+from ._nn import build_mlp
 from .energy import EnergyReadout
 from .reciprocal import ReciprocalFeatures
 
@@ -241,12 +245,10 @@ class LongRangeReadout(EnergyReadout):
             )
 
         if coulomb_amplitude is not None:
-            try:
-                coulomb_amplitude = float(coulomb_amplitude)
-            except (TypeError, ValueError):
-                raise ValueError("coulomb_amplitude must be a finite scalar")
-            if not math.isfinite(coulomb_amplitude):
-                raise ValueError("coulomb_amplitude must be a finite scalar")
+            coulomb_amplitude = finite_scalar(
+                coulomb_amplitude,
+                "coulomb_amplitude",
+            )
             amplitude_tensor = torch.tensor(
                 coulomb_amplitude,
                 dtype=torch.get_default_dtype(),
