@@ -1,5 +1,6 @@
 """Local readout for invariant grid features."""
 
+import math
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -177,6 +178,17 @@ class LongRangeReadout(EnergyReadout):
     zero_init
         If true, initialize the final coefficient layer to zero. This makes an
         attached long-range branch leave a pretrained local model unchanged.
+    charges
+        Optional fixed charge or valency of each density component. When
+        supplied, pair coefficients are constrained to ``A * q_i * q_j``.
+        With no ``coulomb_amplitude``, the state network learns the single
+        shared amplitude ``A``. Charge-factorized mode currently requires one
+        reciprocal kernel.
+    coulomb_amplitude
+        Optional fixed scalar ``A`` multiplying the charge products. It
+        requires ``charges``. When supplied, the long-range coefficients have
+        no trainable parameters. In a beta-free-energy Coulomb functional this
+        is the Bjerrum length expressed in the coordinate units.
     features
         Reciprocal feature module used by :meth:`energy`. It may be omitted
         when the readout is used only as a standalone coefficient contraction.
@@ -190,6 +202,8 @@ class LongRangeReadout(EnergyReadout):
         n_types: int = 1,
         hidden_sizes: Sequence[int] = (16, 16),
         zero_init: bool = True,
+        charges: Optional[Sequence[float]] = None,
+        coulomb_amplitude: Optional[float] = None,
         features: Optional[ReciprocalFeatures] = None,
     ) -> None:
         super().__init__()
@@ -198,6 +212,51 @@ class LongRangeReadout(EnergyReadout):
         self.n_types = positive_integer(n_types, "n_types")
         self.n_type_pairs = self.n_types * (self.n_types + 1) // 2
         self.n_state_features = 1 + self.n_types
+
+        if charges is None:
+            if coulomb_amplitude is not None:
+                raise ValueError("coulomb_amplitude requires charges")
+            charge_tensor = None
+            pair_charge_products = None
+        else:
+            charge_tensor = torch.as_tensor(
+                charges,
+                dtype=torch.get_default_dtype(),
+            ).detach().clone().reshape(-1)
+            if charge_tensor.shape != (self.n_types,):
+                raise ValueError("charges must contain one value per type")
+            if not torch.all(torch.isfinite(charge_tensor)).item():
+                raise ValueError("charges must be finite")
+            if self.n_kernels != 1:
+                raise ValueError(
+                    "charge-factorized long-range mode requires n_kernels=1"
+                )
+            pair_charge_products = torch.tensor(
+                [
+                    charge_tensor[first] * charge_tensor[second]
+                    for first in range(self.n_types)
+                    for second in range(first, self.n_types)
+                ],
+                dtype=charge_tensor.dtype,
+            )
+
+        if coulomb_amplitude is not None:
+            try:
+                coulomb_amplitude = float(coulomb_amplitude)
+            except (TypeError, ValueError):
+                raise ValueError("coulomb_amplitude must be a finite scalar")
+            if not math.isfinite(coulomb_amplitude):
+                raise ValueError("coulomb_amplitude must be a finite scalar")
+            amplitude_tensor = torch.tensor(
+                coulomb_amplitude,
+                dtype=torch.get_default_dtype(),
+            )
+        else:
+            amplitude_tensor = None
+
+        self.register_buffer("charges", charge_tensor)
+        self.register_buffer("pair_charge_products", pair_charge_products)
+        self.register_buffer("coulomb_amplitude", amplitude_tensor)
         if features is not None:
             if not isinstance(features, ReciprocalFeatures):
                 raise TypeError("features must be ReciprocalFeatures or None")
@@ -207,13 +266,20 @@ class LongRangeReadout(EnergyReadout):
                 raise ValueError("features and readout kernel counts differ")
         self.features = features
 
-        output_width = self.n_kernels * self.n_type_pairs
-        self.mlp = build_mlp(
-            self.n_state_features,
-            hidden_sizes,
-            output_width,
-            zero_init=zero_init,
-        )
+        if coulomb_amplitude is not None:
+            self.mlp = None
+        else:
+            output_width = (
+                self.n_kernels * self.n_type_pairs
+                if charges is None
+                else 1
+            )
+            self.mlp = build_mlp(
+                self.n_state_features,
+                hidden_sizes,
+                output_width,
+                zero_init=zero_init,
+            )
 
     def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""
@@ -223,9 +289,29 @@ class LongRangeReadout(EnergyReadout):
                 "state_features must end with normalized temperature and "
                 "one mean density per type"
             )
-        return self.mlp(state_features).reshape(
-            *state_features.shape[:-1],
-            self.n_kernels,
+        charges = getattr(self, "charges", None)
+        if charges is None:
+            return self.mlp(state_features).reshape(
+                *state_features.shape[:-1],
+                self.n_kernels,
+                self.n_type_pairs,
+            )
+
+        amplitude = getattr(self, "coulomb_amplitude", None)
+        if amplitude is None:
+            amplitude = self.mlp(state_features).reshape(
+                *state_features.shape[:-1],
+                1,
+                1,
+            )
+        else:
+            amplitude = amplitude.to(state_features).expand(
+                *state_features.shape[:-1],
+                1,
+                1,
+            )
+        return amplitude * self.pair_charge_products.to(state_features).view(
+            1,
             self.n_type_pairs,
         )
 

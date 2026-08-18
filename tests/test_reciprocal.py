@@ -170,6 +170,57 @@ class TestLongRangeReadout(unittest.TestCase):
 
         self.assertTrue(torch.equal(energy, torch.tensor([2.0, -3.0])))
 
+    def test_fixed_charge_factorized_coefficients(self):
+        readout = LongRangeReadout(
+            n_kernels=1,
+            n_types=2,
+            charges=(1.0, -1.0),
+            coulomb_amplitude=3.0,
+        )
+        state = torch.ones(2, 3)
+
+        coefficients = readout.coefficients(state)
+
+        expected = torch.tensor([3.0, -3.0, 3.0]).expand(2, 1, 3)
+        self.assertTrue(torch.equal(coefficients, expected))
+        self.assertIsNone(readout.mlp)
+        self.assertEqual(
+            sum(parameter.numel() for parameter in readout.parameters()),
+            0,
+        )
+
+    def test_charge_factorized_mode_learns_one_shared_amplitude(self):
+        readout = LongRangeReadout(
+            n_kernels=1,
+            n_types=2,
+            hidden_sizes=(),
+            zero_init=False,
+            charges=(2.0, -1.0),
+        )
+        with torch.no_grad():
+            readout.mlp[-1].weight.zero_()
+            readout.mlp[-1].bias.fill_(1.5)
+        state = torch.ones(2, 3)
+
+        coefficients = readout.coefficients(state)
+
+        expected = torch.tensor([6.0, -3.0, 1.5]).expand(2, 1, 3)
+        self.assertTrue(torch.equal(coefficients, expected))
+        coefficients.sum().backward()
+        self.assertIsNotNone(readout.mlp[-1].bias.grad)
+
+    def test_charge_factorized_arguments_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "requires charges"):
+            LongRangeReadout(n_kernels=1, coulomb_amplitude=1.0)
+        with self.assertRaisesRegex(ValueError, "one value per type"):
+            LongRangeReadout(n_kernels=1, n_types=2, charges=(1.0,))
+        with self.assertRaisesRegex(ValueError, "requires n_kernels=1"):
+            LongRangeReadout(
+                n_kernels=2,
+                n_types=2,
+                charges=(1.0, -1.0),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
