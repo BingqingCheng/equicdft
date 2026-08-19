@@ -29,10 +29,10 @@ class GridCACEModel(nn.Module):
 
     Every configured :class:`EnergyReadout` receives a shared context and
     returns one reduced free-energy contribution per field. With the default
-    ``free_energy_mode="physical"``, the sum is interpreted as
-    ``F_exc / (k_B * mean_temperature)`` and converted to ``beta_F_exc`` using
-    the input temperature. With ``free_energy_mode="beta"``, the sum is
-    interpreted directly as ``beta_F_exc``. The resulting
+    ``free_energy_mode="beta"``, the sum is interpreted directly as
+    ``beta_F_exc``. With ``free_energy_mode="physical"``, the sum is
+    interpreted as ``F_exc / (k_B * mean_temperature)`` and converted to
+    ``beta_F_exc`` using the input temperature. The resulting
     ``beta_F_exc`` is differentiated with respect to the complete density to
     obtain
     ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
@@ -62,7 +62,7 @@ class GridCACEModel(nn.Module):
         compute_c2: bool = False,
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
-        free_energy_mode: str = "physical",
+        free_energy_mode: str = "beta",
     ) -> None:
         super().__init__()
 

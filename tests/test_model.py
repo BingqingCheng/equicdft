@@ -451,7 +451,7 @@ class TestGridCACEModel(unittest.TestCase):
             free_energy_mode=free_energy_mode,
         )
 
-    def test_physical_free_energy_is_constructor_default(self):
+    def test_beta_free_energy_is_constructor_default(self):
         model = GridCACEModel(
             CartesianAFeatures(
                 mean_density=0.5,
@@ -464,7 +464,7 @@ class TestGridCACEModel(unittest.TestCase):
             grid_spacing=0.5,
         )
 
-        self.assertEqual(model.free_energy_mode, "physical")
+        self.assertEqual(model.free_energy_mode, "beta")
 
     def test_long_range_energy_is_combined_before_local_mu_derivative(self):
         model = self._make_model(

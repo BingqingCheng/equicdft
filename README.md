@@ -13,8 +13,8 @@ and local-chemical-potential objective as the current Lennard--Jones fits.
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
-excess free energy per particle $a_g^{\mathrm{exc}}$, the beta-energy
-convention used by the included example is
+excess free energy per particle $a_g^{\mathrm{exc}}$, the default beta-energy
+convention used by the model and the included example is
 
 $$
 \beta F_{\mathrm{exc}}[\rho,T]
@@ -105,6 +105,7 @@ The annotated example exposes the important options while using these defaults:
 | MLP hidden widths | 32, 16 with SiLU activations |
 | density scale | train+validation mean density |
 | temperature scale | train+validation mean temperature |
+| free-energy convention | directly learn $\beta F_{\mathrm{exc}}$ |
 | density mask | $\rho>10^{-3}$ |
 | batch size | 2 complete fields |
 | optimizer | Adam, learning rate $10^{-4}$ |
