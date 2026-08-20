@@ -411,6 +411,105 @@ class TestGridSolver(unittest.TestCase):
             torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
         )
 
+    def test_anderson_accelerates_euler_and_preserves_fixed_n(self):
+        target_rho = torch.tensor(
+            [[0.2], [0.3], [0.4], [0.5]],
+            dtype=torch.float64,
+        )
+        data = self._make_data(target_rho, include_mu=False)
+        particle_numbers = [target_rho.sum().item()]
+        options = {
+            "particle_numbers": particle_numbers,
+            "method": "euler",
+            "max_iter": 200,
+            "mixing": 0.05,
+            "minimum_mixing": 0.01,
+            "maximum_mixing": 0.4,
+            "mixing_growth": 1.2,
+            "tolerance_residual": 1.0e-8,
+            "tolerance_rms_residual": 1.0e-8,
+            "tolerance_change": 1.0e-12,
+        }
+
+        scalar = GridSolver(self._make_model()).solve(data, **options)
+        accelerated = GridSolver(self._make_model()).solve(
+            data,
+            anderson=True,
+            **options,
+        )
+
+        self.assertTrue(scalar["converged"])
+        self.assertTrue(accelerated["converged"])
+        self.assertLess(accelerated["n_iter"], scalar["n_iter"])
+        self.assertLess(
+            accelerated["n_evaluations"],
+            scalar["n_evaluations"],
+        )
+        self.assertTrue(torch.all(accelerated["rho"] > 0.0))
+        self.assertAlmostEqual(
+            accelerated["rho"].sum().item(),
+            particle_numbers[0],
+            places=12,
+        )
+        self.assertTrue(accelerated["solver_anderson"])
+        self.assertGreater(accelerated["anderson_attempts"], 0)
+        self.assertEqual(
+            accelerated["anderson_attempts"],
+            accelerated["anderson_accepted"]
+            + accelerated["anderson_rejected"],
+        )
+        self.assertEqual(
+            accelerated["anderson_resets"],
+            accelerated["anderson_rejected"],
+        )
+
+    def test_anderson_preserves_excluded_mask_and_density_cap(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"] = torch.tensor(
+            [[-3.0], [-0.5], [0.5], [3.0]],
+            dtype=torch.float64,
+        )
+        data["excluded_mask"] = torch.tensor(
+            [True, False, False, False]
+        )
+
+        result = GridSolver(self._make_model()).solve(
+            data,
+            initial_rho=torch.tensor(
+                [[0.0], [0.2], [0.5], [0.3]],
+                dtype=torch.float64,
+            ),
+            particle_numbers=[1.0],
+            method="euler",
+            anderson=True,
+            maximum_density=0.6,
+            max_iter=200,
+            tolerance_residual=1.0e-8,
+            tolerance_rms_residual=1.0e-8,
+            tolerance_change=1.0e-12,
+        )
+
+        self.assertEqual(result["rho"][0, 0].item(), 0.0)
+        self.assertLessEqual(result["rho"].max().item(), 0.6 + 1.0e-12)
+        self.assertAlmostEqual(result["rho"].sum().item(), 1.0, places=12)
+        self.assertTrue(torch.all(result["rho"][1:] > 0.0))
+
+    def test_anderson_options_are_validated_when_enabled(self):
+        invalid_options = (
+            {"anderson_history": 1},
+            {"anderson_regularization": -1.0},
+            {"anderson_damping": 0.0},
+            {"anderson_damping": 1.1},
+        )
+        for options in invalid_options:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    GridSolver(self._make_model()).solve(
+                        self._make_data(),
+                        anderson=True,
+                        **options,
+                    )
+
     def test_fixed_particle_number_density_cap_is_enforced(self):
         data = self._make_data(include_mu=False)
         data["V_ext"] = torch.tensor(

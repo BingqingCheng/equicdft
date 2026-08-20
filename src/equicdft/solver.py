@@ -165,6 +165,10 @@ class GridSolver:
         maximum_mixing: float = 0.2,
         mixing_growth: float = 1.1,
         mixing_backtrack_factor: float = 0.5,
+        anderson: bool = False,
+        anderson_history: int = 5,
+        anderson_regularization: float = 1.0e-8,
+        anderson_damping: float = 1.0,
         max_log_density_change: float = 2.0,
         residual_density_threshold: Optional[float] = None,
         maximum_density: Optional[
@@ -207,8 +211,17 @@ class GridSolver:
         iteration. By default, its mixing is increased after an improving
         density-weighted RMS residual and backtracked after a worsening
         trial. Set ``adaptive_mixing=False`` to use a fixed mixing value.
-        Both methods act directly on the supplied external field and use the
-        physical projected functional gradient as a convergence diagnostic.
+        ``anderson=True`` additionally forms a log-density Anderson trial from
+        recent fixed-point residuals. The accelerated trial is projected onto
+        the same accessibility, density-bound, and particle-number constraints
+        and is accepted only when neither its maximum nor its density-weighted
+        RMS physical Euler residual exceeds that of the scalar-mixed fallback.
+        A trial is attempted after each full history window. Rejected or
+        numerically singular trials leave the established scalar-mixing step
+        unchanged and reset the history.
+        Anderson mixing acts directly on the supplied external field and uses
+        the physical projected functional gradient as a convergence
+        diagnostic.
 
         ``tolerance_residual`` bounds the largest active-grid residual. When
         ``tolerance_rms_residual`` is supplied, its density-weighted RMS bound
@@ -284,6 +297,7 @@ class GridSolver:
             if mixing > 1.0:
                 raise ValueError("mixing must be in the interval (0, 1]")
             adaptive_mixing = boolean(adaptive_mixing, "adaptive_mixing")
+            anderson = boolean(anderson, "anderson")
             if adaptive_mixing:
                 if minimum_mixing > mixing:
                     raise ValueError(
@@ -298,6 +312,25 @@ class GridSolver:
                 if not 0.0 < mixing_backtrack_factor < 1.0:
                     raise ValueError(
                         "mixing_backtrack_factor must lie in the interval (0, 1)"
+                    )
+            if anderson:
+                anderson_history = positive_integer(
+                    anderson_history,
+                    "anderson_history",
+                )
+                if anderson_history < 2:
+                    raise ValueError("anderson_history must be at least two")
+                anderson_regularization = nonnegative_scalar(
+                    anderson_regularization,
+                    "anderson_regularization",
+                )
+                anderson_damping = positive_scalar(
+                    anderson_damping,
+                    "anderson_damping",
+                )
+                if anderson_damping > 1.0:
+                    raise ValueError(
+                        "anderson_damping must be no larger than one"
                     )
 
         data = self._move_data(data)
@@ -459,6 +492,10 @@ class GridSolver:
                     maximum_mixing=maximum_mixing,
                     mixing_growth=mixing_growth,
                     mixing_backtrack_factor=mixing_backtrack_factor,
+                    anderson=anderson,
+                    anderson_history=anderson_history,
+                    anderson_regularization=anderson_regularization,
+                    anderson_damping=anderson_damping,
                     max_log_density_change=max_log_density_change,
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
@@ -505,6 +542,11 @@ class GridSolver:
         result["line_search_failures"] = state["line_search_failures"]
         result["mixing_backtracks"] = state.get("mixing_backtracks", 0)
         result["final_mixing"] = state.get("final_mixing")
+        result["solver_anderson"] = state.get("solver_anderson", False)
+        result["anderson_attempts"] = state.get("anderson_attempts", 0)
+        result["anderson_accepted"] = state.get("anderson_accepted", 0)
+        result["anderson_rejected"] = state.get("anderson_rejected", 0)
+        result["anderson_resets"] = state.get("anderson_resets", 0)
         return result
 
     def _minimize(
@@ -685,6 +727,10 @@ class GridSolver:
         maximum_mixing: float,
         mixing_growth: float,
         mixing_backtrack_factor: float,
+        anderson: bool,
+        anderson_history: int,
+        anderson_regularization: float,
+        anderson_damping: float,
         max_log_density_change: float,
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
@@ -696,6 +742,12 @@ class GridSolver:
         n_iter = 0
         n_evaluations = 0
         mixing_backtracks = 0
+        anderson_attempts = 0
+        anderson_accepted = 0
+        anderson_rejected = 0
+        anderson_resets = 0
+        anderson_log_history = []
+        anderson_residual_history = []
         final_relative_change = float("inf")
         current_mixing = mixing
         current_data = dict(data)
@@ -767,6 +819,27 @@ class GridSolver:
                     / voxel_volume
                 )
 
+            if anderson:
+                target_log_density = torch.log(
+                    torch.clamp(
+                        target_rho,
+                        min=torch.finfo(target_rho.dtype).tiny,
+                    )
+                )
+                fixed_point_residual = (
+                    target_log_density - current_log_density
+                ).masked_fill(~accessible_mask[:, None], 0.0)
+                anderson_log_history.append(current_log_density.detach())
+                anderson_residual_history.append(
+                    fixed_point_residual.detach()
+                )
+                anderson_log_history = anderson_log_history[
+                    -anderson_history:
+                ]
+                anderson_residual_history = anderson_residual_history[
+                    -anderson_history:
+                ]
+
             trial_mixing = current_mixing
             while True:
                 next_rho = (
@@ -795,7 +868,7 @@ class GridSolver:
                     compute_c1=True,
                 )
                 n_evaluations += 1
-                _, _, _, trial_rms_residual = _euler_residual(
+                _, _, trial_max_residual, trial_rms_residual = _euler_residual(
                     next_rho,
                     trial_evaluation["c1"].detach(),
                     V_ext,
@@ -818,6 +891,98 @@ class GridSolver:
                     trial_mixing * mixing_backtrack_factor,
                 )
                 mixing_backtracks += 1
+
+            if (
+                anderson
+                and len(anderson_log_history) == anderson_history
+                and (n_iter + 1) % anderson_history == 0
+            ):
+                anderson_attempts += 1
+                try:
+                    weights = torch.where(
+                        accessible_mask[:, None],
+                        rho,
+                        torch.zeros_like(rho),
+                    )
+                    weights = weights / torch.sum(weights)
+                    candidate_log_density = _anderson_log_density_candidate(
+                        anderson_log_history,
+                        anderson_residual_history,
+                        weights,
+                        anderson_regularization,
+                        anderson_damping,
+                    )
+                    log_change = torch.clamp(
+                        candidate_log_density - current_log_density,
+                        min=-max_log_density_change,
+                        max=max_log_density_change,
+                    )
+                    candidate_rho = torch.exp(
+                        current_log_density + log_change
+                    ).masked_fill(~accessible_mask[:, None], 0.0)
+                    if fixed_N is not None:
+                        candidate_rho = _normalize_particle_numbers(
+                            candidate_rho,
+                            fixed_N,
+                            voxel_volume,
+                            maximum_density=maximum_density,
+                            accessible_mask=accessible_mask,
+                        )
+                    elif maximum_density is not None:
+                        candidate_rho = torch.minimum(
+                            candidate_rho,
+                            maximum_density[None, :],
+                        )
+
+                    candidate_data = dict(data)
+                    candidate_data["rho"] = candidate_rho.detach().clone()
+                    candidate_data["V_ext"] = V_ext
+                    candidate_evaluation = self.evaluate(
+                        candidate_data,
+                        compute_c1=True,
+                    )
+                    n_evaluations += 1
+                    (
+                        _,
+                        _,
+                        candidate_max_residual,
+                        candidate_rms_residual,
+                    ) = _euler_residual(
+                        candidate_rho,
+                        candidate_evaluation["c1"].detach(),
+                        V_ext,
+                        data["beta"],
+                        thermal_wavelength,
+                        mu,
+                        residual_density_threshold,
+                        maximum_density,
+                        accessible_mask,
+                    )
+                    candidate_objective = _thermodynamic_objective(
+                        candidate_evaluation,
+                        fixed_N is not None,
+                        voxel_volume,
+                        thermal_wavelength,
+                    )
+                    accept_anderson = (
+                        torch.all(torch.isfinite(candidate_rho)).item()
+                        and torch.isfinite(candidate_objective).item()
+                        and candidate_max_residual <= trial_max_residual
+                        and candidate_rms_residual <= trial_rms_residual
+                    )
+                except (RuntimeError, ValueError):
+                    accept_anderson = False
+
+                if accept_anderson:
+                    next_rho = candidate_rho
+                    trial_evaluation = candidate_evaluation
+                    trial_rms_residual = candidate_rms_residual
+                    anderson_accepted += 1
+                else:
+                    anderson_rejected += 1
+                    anderson_resets += 1
+                    anderson_log_history = anderson_log_history[-1:]
+                    anderson_residual_history = anderson_residual_history[-1:]
 
             relative_change = _maximum_relative_change(rho, next_rho)
             rho = next_rho.detach()
@@ -851,6 +1016,11 @@ class GridSolver:
             "line_search_failures": 0,
             "mixing_backtracks": mixing_backtracks,
             "final_mixing": current_mixing,
+            "solver_anderson": anderson,
+            "anderson_attempts": anderson_attempts,
+            "anderson_accepted": anderson_accepted,
+            "anderson_rejected": anderson_rejected,
+            "anderson_resets": anderson_resets,
         }
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -858,6 +1028,83 @@ class GridSolver:
             key: value.to(self.device) if torch.is_tensor(value) else value
             for key, value in data.items()
         }
+
+
+def _anderson_log_density_candidate(
+    log_density_history: Sequence[torch.Tensor],
+    residual_history: Sequence[torch.Tensor],
+    weights: torch.Tensor,
+    regularization: float,
+    damping: float,
+) -> torch.Tensor:
+    """Return a density-weighted constrained Anderson log-density trial."""
+
+    if len(log_density_history) != len(residual_history):
+        raise ValueError("Anderson density and residual history differ")
+    if len(log_density_history) < 2:
+        raise ValueError("Anderson acceleration requires two history entries")
+
+    residual_matrix = torch.stack(
+        [value.reshape(-1) for value in residual_history],
+        dim=1,
+    )
+    flattened_weights = weights.reshape(-1)
+    accumulation_dtype = (
+        torch.float64
+        if residual_matrix.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
+        else residual_matrix.dtype
+    )
+    residual_matrix = residual_matrix.to(accumulation_dtype)
+    flattened_weights = flattened_weights.to(accumulation_dtype)
+    gram = residual_matrix.mT @ (
+        flattened_weights[:, None] * residual_matrix
+    )
+    scale = torch.clamp(
+        torch.trace(gram) / len(log_density_history),
+        min=torch.finfo(accumulation_dtype).eps,
+    )
+    system = gram + regularization * scale * torch.eye(
+        len(log_density_history),
+        dtype=accumulation_dtype,
+        device=gram.device,
+    )
+    ones = torch.ones(
+        len(log_density_history),
+        dtype=accumulation_dtype,
+        device=gram.device,
+    )
+    coefficients = torch.linalg.solve(system, ones)
+    denominator = torch.sum(coefficients)
+    if (
+        not torch.all(torch.isfinite(coefficients)).item()
+        or not torch.isfinite(denominator).item()
+        or torch.abs(denominator).item()
+        <= torch.finfo(accumulation_dtype).eps
+    ):
+        raise RuntimeError("Anderson coefficient solve is singular")
+    coefficients = coefficients / denominator
+
+    candidates = torch.stack(
+        [
+            density + damping * residual
+            for density, residual in zip(
+                log_density_history,
+                residual_history,
+            )
+        ],
+        dim=0,
+    ).to(accumulation_dtype)
+    coefficient_shape = (len(log_density_history),) + (1,) * (
+        candidates.ndim - 1
+    )
+    return torch.sum(
+        coefficients.reshape(coefficient_shape) * candidates,
+        dim=0,
+    ).to(log_density_history[-1].dtype)
 
 
 def _module_device(module: nn.Module) -> torch.device:
