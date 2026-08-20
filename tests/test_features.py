@@ -14,7 +14,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             cutoff_grid=1,
             max_power=2,
             radial_basis="gaussian",
-            n_radial_channels=4,
+            radial_exponents=(0.5,),
             separate_center=False,
             trainable_radial_exponents=False,
         )
@@ -37,15 +37,9 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertTrue(torch.equal(module.powers, expected_powers))
         self.assertEqual(module.monomial_values.shape, (7, 10))
         self.assertTrue(
-            torch.allclose(
-                module.radial_exponents,
-                torch.tensor(
-                    [0.5, 1.0, 2.0, 4.0],
-                    dtype=module.radial_exponents.dtype,
-                ),
-            )
+            torch.equal(module.radial_exponents, torch.tensor([0.5]))
         )
-        self.assertNotIsInstance(module.log_radial_exponents, nn.Parameter)
+        self.assertFalse(hasattr(module, "log_radial_exponents"))
         self.assertEqual(module.mean_density.item(), 2.0)
         self.assertTrue(
             torch.equal(
@@ -70,32 +64,24 @@ class TestCartesianAFeatures(unittest.TestCase):
             }
         )
 
-        self.assertEqual(features.shape, (7, 4, 10, 1))
-        for radial_index, alpha in enumerate(
-            module.radial_exponents.tolist()
-        ):
-            radial_weight = math.exp(-alpha)
-            expected_scalar = (1.0 + 27.0 * radial_weight) / 2.0
-            expected_vector = -radial_weight / 2.0
+        self.assertEqual(features.shape, (7, 1, 10, 1))
+        # Evaluate the analytic reference in the module's float32 dtype so the
+        # comparison tests the formula rather than Python-double roundoff.
+        radial_weight = torch.exp(
+            torch.tensor(-0.5, dtype=module.monomial_values.dtype)
+        )
+        normalization = 1.0 + 6.0 * radial_weight
+        expected_scalar = (1.0 + 27.0 * radial_weight) / (
+            2.0 * normalization
+        )
+        expected_vector = -radial_weight / (2.0 * normalization)
+        self.assertAlmostEqual(
+            features[0, 0, 0, 0].item(), expected_scalar.item()
+        )
+        for component in (1, 2, 3):
             self.assertAlmostEqual(
-                features[0, radial_index, 0, 0].item(),
-                expected_scalar,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 1, 0].item(),
-                expected_vector,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 2, 0].item(),
-                expected_vector,
-                places=6,
-            )
-            self.assertAlmostEqual(
-                features[0, radial_index, 3, 0].item(),
-                expected_vector,
-                places=6,
+                features[0, 0, component, 0].item(),
+                expected_vector.item(),
             )
 
     def test_batched_data(self):
@@ -103,8 +89,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=2.0,
             cutoff_grid=0,
             max_power=0,
-            radial_basis="gaussian",
-            n_radial_channels=3,
             separate_center=False,
         )
         rho = torch.tensor(
@@ -119,24 +103,24 @@ class TestCartesianAFeatures(unittest.TestCase):
             }
         )
 
-        self.assertEqual(features.shape, (2, 1, 3, 1, 1))
+        self.assertEqual(features.shape, (2, 1, 1, 1, 1))
         self.assertTrue(
             torch.allclose(
                 features[:, 0, :, 0, 0],
                 torch.tensor(
-                    [[1.0, 1.0, 1.0], [1.5, 1.5, 1.5]],
+                    [[1.0], [1.5]],
                     dtype=features.dtype,
                 ),
             )
         )
 
-    def test_raw_gaussians_and_raw_integer_monomials(self):
+    def test_damping_and_raw_integer_monomials(self):
         module = CartesianAFeatures(
             mean_density=2.0,
             cutoff_grid=2,
             max_power=2,
             radial_basis="gaussian",
-            n_radial_channels=2,
+            radial_exponents=(0.5,),
             separate_center=False,
         )
 
@@ -166,16 +150,11 @@ class TestCartesianAFeatures(unittest.TestCase):
                 "local_density_index": local_density_index,
             }
         )
-        # For a uniform field equal to mean_density, A_000 is the unnormalized
-        # discrete mass of its Gaussian channel.
-        expected_mass = torch.exp(
-            -module.squared_distances[:, None]
-            * module.radial_exponents[None, :]
-        ).sum(dim=0)
+        # Unit-sum damping leaves the scalar feature of a uniform field at one.
         self.assertTrue(
             torch.allclose(
                 features[:, :, 0, 0],
-                expected_mass.expand(n_neighbors, -1),
+                torch.ones_like(features[:, :, 0, 0]),
             )
         )
 
@@ -200,6 +179,91 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertEqual(module.monomial_values[plus_two_z, 9].item(), 1.0)
         self.assertEqual(module.squared_distances[plus_two_z].item(), 4.0)
 
+    def test_discrete_sum_normalized_gaussian_matches_undamped_limit(self):
+        common = {
+            "mean_density": 2.0,
+            "cutoff_grid": 2,
+            "max_power": 2,
+            "separate_center": True,
+            "coordinate_scaling": "none",
+        }
+        damped = CartesianAFeatures(
+            **common,
+            radial_basis="gaussian",
+            radial_exponents=(1.0e-8,),
+        )
+        undamped = CartesianAFeatures(**common)
+        n_neighbors = damped.local_density_positions.shape[0]
+        rho = torch.arange(
+            1,
+            n_neighbors + 1,
+            dtype=damped.monomial_values.dtype,
+        ).reshape(n_neighbors, 1)
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(n_neighbors).repeat(
+                n_neighbors,
+                1,
+            ),
+        }
+
+        damped_features = damped(data)
+        undamped_features = undamped(data)
+
+        self.assertTrue(
+            torch.allclose(
+                damped_features,
+                undamped_features,
+                rtol=1.0e-5,
+                atol=1.0e-5,
+            )
+        )
+
+    def test_normalized_gaussian_scalar_is_one_for_uniform_density(self):
+        module = CartesianAFeatures(
+            mean_density=2.0,
+            cutoff_grid=2,
+            max_power=0,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+            trainable_radial_exponents=True,
+            separate_center=True,
+        )
+        n_neighbors = module.local_density_positions.shape[0]
+        rho = torch.full(
+            (n_neighbors, 1),
+            2.0,
+            dtype=module.monomial_values.dtype,
+        )
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(n_neighbors).repeat(
+                n_neighbors,
+                1,
+            ),
+        }
+
+        features = module(data)
+        self.assertTrue(
+            torch.allclose(
+                features[:, :, 0, 0],
+                torch.ones_like(features[:, :, 0, 0]),
+            )
+        )
+
+        nonuniform_rho = rho.clone()
+        nonuniform_rho[1] *= 2.0
+        module(
+            {
+                "rho": nonuniform_rho,
+                "local_density_index": data["local_density_index"],
+            }
+        ).sum().backward()
+        self.assertIsNotNone(module.log_radial_exponents.grad)
+        self.assertTrue(
+            torch.all(torch.isfinite(module.log_radial_exponents.grad))
+        )
+
     def test_coordinate_scaling_is_validated(self):
         with self.assertRaises(TypeError):
             CartesianAFeatures(
@@ -220,11 +284,11 @@ class TestCartesianAFeatures(unittest.TestCase):
             cutoff_grid=1,
             max_power=1,
             radial_basis="none",
-            n_radial_channels=1,
             separate_center=False,
         )
-        self.assertEqual(module.radial_basis, "none")
-        self.assertIsNone(module.radial_exponents)
+        self.assertTrue(
+            torch.equal(module.radial_exponents, torch.zeros(1))
+        )
         self.assertFalse(hasattr(module, "log_radial_exponents"))
 
         rho = torch.arange(
@@ -250,29 +314,12 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertEqual(features.shape, (7, 1, 4, 1))
         self.assertTrue(torch.allclose(features[0, 0], expected))
 
-    def test_undamped_polynomial_options_are_validated(self):
-        with self.assertRaises(ValueError):
+    def test_radial_exponent_options_are_validated(self):
+        with self.assertRaises(TypeError):
             CartesianAFeatures(
                 max_power=1,
                 mean_density=1.0,
-                radial_basis="none",
-                n_radial_channels=2,
-            )
-        with self.assertRaises(ValueError):
-            CartesianAFeatures(
-                max_power=1,
-                mean_density=1.0,
-                radial_basis="none",
-                n_radial_channels=1,
-                radial_exponents=(1.0,),
-            )
-        with self.assertRaises(ValueError):
-            CartesianAFeatures(
-                max_power=1,
-                mean_density=1.0,
-                radial_basis="none",
-                n_radial_channels=1,
-                trainable_radial_exponents=True,
+                radial_basis=True,
             )
         with self.assertRaises(ValueError):
             CartesianAFeatures(
@@ -280,6 +327,61 @@ class TestCartesianAFeatures(unittest.TestCase):
                 mean_density=1.0,
                 radial_basis="unknown",
             )
+        with self.assertRaises(TypeError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="gaussian",
+                radial_exponents=True,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="gaussian",
+                radial_exponents=0.1,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="gaussian",
+                radial_exponents=(),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                radial_basis="gaussian",
+                radial_exponents=(-0.1,),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                trainable_radial_exponents=True,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=1,
+                mean_density=1.0,
+                n_radial_channels=2,
+            )
+
+    def test_gaussian_defaults_to_one_exponent(self):
+        module = CartesianAFeatures(
+            max_power=0,
+            mean_density=1.0,
+            radial_basis="gaussian",
+        )
+
+        self.assertTrue(
+            torch.equal(
+                module.radial_exponents,
+                torch.tensor([0.125]),
+            )
+        )
+        self.assertFalse(module.trainable_radial_exponents)
 
     def test_polynomial_center_separated_defaults(self):
         module = CartesianAFeatures(
@@ -288,8 +390,9 @@ class TestCartesianAFeatures(unittest.TestCase):
             cutoff_grid=1,
         )
 
-        self.assertEqual(module.radial_basis, "none")
-        self.assertEqual(module.n_radial_channels, 1)
+        self.assertTrue(
+            torch.equal(module.radial_exponents, torch.zeros(1))
+        )
         self.assertFalse(module.trainable_radial_exponents)
         self.assertEqual(module.coordinate_scaling, "none")
         self.assertTrue(module.separate_center)
@@ -299,8 +402,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=2.0,
             cutoff_grid=1,
             max_power=1,
-            radial_basis="none",
-            n_radial_channels=1,
             separate_center=True,
         )
         rho = torch.arange(
@@ -334,8 +435,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=1,
             max_power=0,
-            radial_basis="none",
-            n_radial_channels=1,
             separate_center=False,
         )
         state_keys = set(module.state_dict())
@@ -355,6 +454,70 @@ class TestCartesianAFeatures(unittest.TestCase):
         actual = module(data)
         self.assertTrue(torch.allclose(actual, expected))
 
+    def test_trainable_channel_matches_normalized_damping_formula(self):
+        module = CartesianAFeatures(
+            mean_density=0.7,
+            cutoff_grid=3,
+            max_power=3,
+            radial_basis="gaussian",
+            radial_exponents=(0.125,),
+            trainable_radial_exponents=True,
+            coordinate_scaling="none",
+            separate_center=True,
+        )
+        n_neighbors = module.local_density_positions.shape[0]
+        rho = torch.linspace(
+            0.1,
+            1.3,
+            steps=n_neighbors,
+            dtype=module.monomial_values.dtype,
+        ).reshape(n_neighbors, 1)
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(n_neighbors).repeat(
+                n_neighbors,
+                1,
+            ),
+        }
+
+        actual = module(data)
+        actual_gradient = torch.autograd.grad(
+            actual.square().sum(),
+            module.log_radial_exponents,
+        )[0]
+
+        # Independent transcription of the normalized one-channel expression:
+        # raw integer monomials, excluded center, and alpha optimized in
+        # logarithmic form.
+        reference_log_alpha = torch.tensor(
+            math.log(0.125),
+            dtype=module.monomial_values.dtype,
+            requires_grad=True,
+        )
+        reference_weights = torch.exp(
+            -module.squared_distances * torch.exp(reference_log_alpha)
+        )
+        reference_weights = reference_weights * module.neighbor_mask
+        reference_weights = reference_weights / reference_weights.sum()
+        reference_basis = (
+            reference_weights[:, None] * module.monomial_values
+        )
+        reference = torch.einsum(
+            "jt,jk->kt",
+            rho / module.mean_density,
+            reference_basis,
+        )[None, None, :, :].expand(n_neighbors, -1, -1, -1)
+        reference_gradient = torch.autograd.grad(
+            reference.square().sum(),
+            reference_log_alpha,
+        )[0]
+
+        self.assertEqual(actual.shape, (n_neighbors, 1, 20, 1))
+        self.assertTrue(torch.allclose(actual, reference))
+        self.assertTrue(
+            torch.allclose(actual_gradient[0], reference_gradient)
+        )
+
     def test_mean_density_must_be_positive_scalar(self):
         with self.assertRaises(ValueError):
             CartesianAFeatures(max_power=0, mean_density=0.0)
@@ -367,7 +530,6 @@ class TestCartesianAFeatures(unittest.TestCase):
             cutoff_grid=1,
             max_power=1,
             radial_basis="gaussian",
-            n_radial_channels=2,
             radial_exponents=(0.05, 0.2),
             trainable_radial_exponents=True,
         )
@@ -375,9 +537,7 @@ class TestCartesianAFeatures(unittest.TestCase):
         self.assertTrue(
             torch.allclose(
                 module.radial_exponents.detach(),
-                torch.tensor(
-                    [0.05, 0.2], dtype=module.radial_exponents.dtype
-                ),
+                torch.tensor([0.05, 0.2]),
             )
         )
 
@@ -400,22 +560,24 @@ class TestCartesianAFeatures(unittest.TestCase):
             torch.all(torch.isfinite(module.log_radial_exponents.grad))
         )
 
-    def test_explicit_radial_exponents_are_validated(self):
+    def test_zero_radial_exponent_is_undamped(self):
+        module = CartesianAFeatures(
+            max_power=0,
+            mean_density=1.0,
+            radial_basis="gaussian",
+            radial_exponents=(0.0,),
+        )
+        self.assertTrue(
+            torch.equal(module.radial_exponents, torch.zeros(1))
+        )
+
+    def test_radial_exponent_must_be_finite(self):
         with self.assertRaises(ValueError):
             CartesianAFeatures(
                 max_power=0,
                 mean_density=1.0,
                 radial_basis="gaussian",
-                n_radial_channels=2,
-                radial_exponents=(0.1,),
-            )
-        with self.assertRaises(ValueError):
-            CartesianAFeatures(
-                max_power=0,
-                mean_density=1.0,
-                radial_basis="gaussian",
-                n_radial_channels=2,
-                radial_exponents=(0.1, 0.0),
+                radial_exponents=(float("nan"),),
             )
 class TestCartesianAFeatureChannelMixing(unittest.TestCase):
     def test_known_linear_map_and_shape(self):
@@ -423,7 +585,6 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=0,
             max_power=0,
-            n_radial_channels=1,
             separate_center=False,
             n_types=2,
             n_channels=3,
@@ -467,7 +628,6 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=0,
             max_power=2,
-            n_radial_channels=1,
             n_types=2,
             n_channels=4,
         )
@@ -517,7 +677,6 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
             mean_density=1.0,
             cutoff_grid=0,
             max_power=2,
-            n_radial_channels=1,
             n_types=2,
             n_channels=3,
         )

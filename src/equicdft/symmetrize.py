@@ -145,9 +145,8 @@ class CartesianBFeatures(nn.Module):
 
     Notes
     -----
-    Symmetrization acts only on the Cartesian-monomial dimension. Gaussian
-    radial channels and density/type channels remain separate, so input and
-    output shapes are
+    Symmetrization acts only on the Cartesian-monomial dimension. Radial and
+    density/type channels remain separate, so input and output shapes are
 
     ``A: [..., n_grid, n_radial_channels, n_monomials, n_channels]``
 

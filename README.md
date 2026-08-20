@@ -99,7 +99,7 @@ The annotated example exposes the important options while using these defaults:
 | local cutoff | 3 grid cells, $\lvert\mathbf q\rvert^2\leq 3^2$ |
 | Cartesian degree | $p=3$ |
 | invariant product order | $\nu=2$ |
-| radial channels | none (equal-weight polynomial moments) |
+| distance damping | none (equal-weight polynomial moments) |
 | center treatment | separate normalized center density |
 | energy readouts | LDA + local invariant readout |
 | MLP hidden widths | 32, 16 with SiLU activations |

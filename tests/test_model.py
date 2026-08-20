@@ -405,7 +405,6 @@ class TestGridCACEModel(unittest.TestCase):
             mean_density=0.5,
             cutoff_grid=1,
             max_power=2,
-            n_radial_channels=1,
         )
         b_features = CartesianBFeatures(max_power=2, max_product_order=3)
         readout = LocalReadout(
@@ -457,7 +456,6 @@ class TestGridCACEModel(unittest.TestCase):
                 mean_density=0.5,
                 cutoff_grid=1,
                 max_power=2,
-                n_radial_channels=1,
             ),
             CartesianBFeatures(max_power=2, max_product_order=3),
             [LocalReadout(n_types=1, hidden_sizes=(8,))],
@@ -997,7 +995,6 @@ class TestGridCACEModel(unittest.TestCase):
                     mean_density=0.5,
                     cutoff_grid=1,
                     max_power=2,
-                    n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
                 [LocalReadout(n_types=1)],
@@ -1011,7 +1008,6 @@ class TestGridCACEModel(unittest.TestCase):
                     mean_density=0.5,
                     cutoff_grid=1,
                     max_power=2,
-                    n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
                 [LocalReadout(n_types=1)],
@@ -1025,7 +1021,6 @@ class TestGridCACEModel(unittest.TestCase):
                     mean_density=0.5,
                     cutoff_grid=1,
                     max_power=2,
-                    n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
                 [LocalReadout(n_types=1)],
@@ -1039,7 +1034,6 @@ class TestGridCACEModel(unittest.TestCase):
                     mean_density=0.5,
                     cutoff_grid=1,
                     max_power=2,
-                    n_radial_channels=1,
                 ),
                 CartesianBFeatures(max_power=2, max_product_order=3),
                 [LocalReadout(n_types=1)],
@@ -1058,7 +1052,6 @@ class TestGridCACEModel(unittest.TestCase):
             mean_density=0.5,
             cutoff_grid=1,
             max_power=2,
-            n_radial_channels=1,
             n_types=2,
             n_channels=3,
         )
@@ -1089,8 +1082,6 @@ class TestGridCACEModel(unittest.TestCase):
             mean_density=0.5,
             cutoff_grid=1,
             max_power=1,
-            radial_basis="none",
-            n_radial_channels=1,
             separate_center=True,
         )
         b_features = CartesianBFeatures(
@@ -1106,9 +1097,7 @@ class TestGridCACEModel(unittest.TestCase):
         )
 
         outputs = model(data)
-        expected_input_width = (
-            a_features.n_radial_channels * b_features.n_features + 2
-        )
+        expected_input_width = b_features.n_features + 2
         self.assertEqual(readout.mlp[0].in_features, expected_input_width)
         self.assertEqual(outputs["c1"].shape, data["rho"].shape)
         outputs["c1"].square().mean().backward()

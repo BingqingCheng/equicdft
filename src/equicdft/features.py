@@ -1,9 +1,7 @@
 """Cartesian moment features for density fields on fixed integer grids.
 
-The angular basis uses integer stencil coordinates. The optional Gaussian
-radial basis is evaluated using squared integer-grid distances without an
-additional kernel normalization. A purely polynomial representation can
-instead use one undamped radial channel.
+The angular basis uses integer stencil coordinates. Optional Gaussian factors
+damp distant stencil points and provide one feature channel per exponent.
 """
 
 from typing import Mapping, Optional, Sequence, Union
@@ -18,6 +16,9 @@ from ._argument_checks import (
     positive_integer,
 )
 from .stencil import make_stencil
+
+
+DEFAULT_RADIAL_EXPONENTS = (0.125,)
 
 
 def _gather_local_density(
@@ -78,6 +79,46 @@ def _make_powers(max_power: int) -> torch.Tensor:
     return torch.tensor(powers, dtype=torch.long)
 
 
+def _prepare_radial_exponents(
+    radial_basis: str,
+    radial_exponents: Optional[Union[Sequence[float], torch.Tensor]],
+    trainable: bool,
+) -> torch.Tensor:
+    """Validate and return the initial radial damping exponents."""
+
+    if radial_basis == "none":
+        if radial_exponents is not None:
+            raise ValueError(
+                "radial_exponents are unavailable when radial_basis='none'"
+            )
+        if trainable:
+            raise ValueError(
+                "trainable_radial_exponents requires radial_basis='gaussian'"
+            )
+        return torch.zeros(1, dtype=torch.get_default_dtype())
+
+    if radial_exponents is None:
+        radial_exponents = DEFAULT_RADIAL_EXPONENTS
+    if isinstance(radial_exponents, bool):
+        raise TypeError("radial_exponents must be a one-dimensional sequence")
+
+    exponents = torch.as_tensor(
+        radial_exponents,
+        dtype=torch.get_default_dtype(),
+    ).detach().clone()
+    if exponents.ndim != 1:
+        raise ValueError("radial_exponents must be one-dimensional")
+    if exponents.numel() == 0:
+        raise ValueError("radial_exponents must not be empty")
+    if not torch.all(torch.isfinite(exponents)).item():
+        raise ValueError("radial_exponents must be finite")
+    if not torch.all(exponents >= 0.0).item():
+        raise ValueError("radial_exponents must be nonnegative")
+    if trainable and not torch.all(exponents > 0.0).item():
+        raise ValueError("trainable_radial_exponents must be positive")
+    return exponents
+
+
 class CartesianAFeatures(nn.Module):
     """Compute normalized Cartesian ``A`` features on a fixed stencil.
 
@@ -88,12 +129,16 @@ class CartesianAFeatures(nn.Module):
     ``* w[n, j] * x_j^a * y_j^b * z_j^c``,
 
     where ``j`` runs over the canonically ordered integer stencil. With
-    ``radial_basis="gaussian"``,
-    ``w[n, j] = exp(-alpha[n] * r_grid[j]^2)``. With
-    ``radial_basis="none"``, there is one channel with equal weight on all
-    included neighbors. When ``separate_center=True``, the central point is
-    excluded from every A channel and supplied directly to the local readout
-    by the model.
+    ``radial_basis="gaussian"``, the normalized weights are
+
+    ``w[n, j] = exp(-alpha[n] * |q_j|^2)``
+    ``/ sum_i exp(-alpha[n] * |q_i|^2)``.
+
+    With ``radial_basis="none"``, the module uses the same expression with one
+    fixed exponent ``alpha[0]=0``, exactly recovering the uniform normalized
+    polynomial moment. When ``separate_center=True``, the central point is
+    excluded from every normalized channel and supplied directly to the local
+    readout by the model.
     Grid-volume quadrature is deliberately left to the free-energy readout
     rather than included in these local descriptors.
 
@@ -105,29 +150,29 @@ class CartesianAFeatures(nn.Module):
     max_power
         Maximum total Cartesian power ``a + b + c``.
     radial_basis
-        Radial representation. ``"gaussian"`` uses Gaussian decay channels;
-        ``"none"`` uses one constant, discrete-sum-normalized channel.
-    n_radial_channels
-        Number of Gaussian radial channels. Their positive initial decay
-        coefficients are logarithmically spaced from 0.5 to 4.0 in inverse
-        squared grid units. Must equal one when ``radial_basis="none"``.
+        ``"none"`` selects uniform normalized weights. ``"gaussian"``
+        selects normalized exponential damping channels.
     radial_exponents
-        Optional positive initial decay coefficients ``alpha_n`` for the
-        Gaussian weights ``exp(-alpha_n * |q|**2)``. When supplied, its length
-        must equal ``n_radial_channels``. ``None`` retains the default
-        logarithmic sequence from 0.5 to 4.0.
+        Optional nonempty sequence of nonnegative damping coefficients
+        ``alpha_n`` in inverse squared grid units. Its length determines the
+        number of channels. For ``radial_basis="gaussian"``, ``None`` uses
+        one channel with ``alpha=0.125``. It is unavailable for
+        ``radial_basis="none"``, which always uses one fixed zero exponent.
+    n_radial_channels
+        Compatibility argument for the retained example script. Only ``1``
+        with ``radial_basis="none"`` is accepted; Gaussian channel count is
+        determined by ``radial_exponents``.
     trainable_radial_exponents
-        If ``True``, optimize the Gaussian decay coefficients. They are stored
-        in logarithmic form so that the resulting ``alpha`` values stay
-        positive. If ``False``, they remain fixed model buffers.
+        If ``True``, optimize positive ``radial_exponents`` in logarithmic
+        form. Zero exponents are allowed only when the list is fixed.
     coordinate_scaling
         Cartesian-coordinate convention used in the monomials. ``"none"``
         uses the raw integer stencil offsets. ``"cutoff"`` divides each
         coordinate by ``cutoff_grid``, keeping polynomial moments similarly
-        scaled when comparing different cutoffs. Gaussian radial distances
-        remain in raw squared grid units.
+        scaled when comparing different cutoffs. The damping distance remains
+        in raw squared grid units.
     separate_center
-        If ``True``, remove the zero offset from all neighbor channels. The
+        If ``True``, remove the zero offset from all neighbor moments. The
         model then concatenates the normalized central density to the
         invariant neighbor features exactly once.
     n_types
@@ -155,8 +200,10 @@ class CartesianAFeatures(nn.Module):
         mean_density: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
         radial_basis: str = "none",
-        n_radial_channels: int = 1,
-        radial_exponents: Optional[Sequence[float]] = None,
+        radial_exponents: Optional[
+            Union[Sequence[float], torch.Tensor]
+        ] = None,
+        n_radial_channels: Optional[int] = None,
         trainable_radial_exponents: bool = False,
         coordinate_scaling: str = "none",
         separate_center: bool = True,
@@ -170,11 +217,16 @@ class CartesianAFeatures(nn.Module):
         radial_basis = radial_basis.lower()
         if radial_basis not in ("gaussian", "none"):
             raise ValueError("radial_basis must be 'gaussian' or 'none'")
-
-        n_radial_channels = positive_integer(
-            n_radial_channels,
-            "n_radial_channels",
-        )
+        if n_radial_channels is not None:
+            n_radial_channels = positive_integer(
+                n_radial_channels,
+                "n_radial_channels",
+            )
+            if radial_basis != "none" or n_radial_channels != 1:
+                raise ValueError(
+                    "n_radial_channels is retained only as 1 with "
+                    "radial_basis='none'"
+                )
         trainable_radial_exponents = boolean(
             trainable_radial_exponents,
             "trainable_radial_exponents",
@@ -228,68 +280,32 @@ class CartesianAFeatures(nn.Module):
                 :, axis, None
             ].pow(powers[None, :, axis])
 
-        # Gaussian channel n uses R_n(q) = exp(-alpha_n * |q|**2). The
-        # explicit option makes the effective range a fitting choice rather
-        # than coupling it implicitly to the integer stencil cutoff. The
-        # undamped polynomial representation has exactly one radial channel
-        # and no radial parameters. Its constant weight is normalized by the
-        # stencil size so products of scalar moments remain well conditioned.
+        # Each factor exp(-alpha_n * |q|**2) changes only the relative emphasis
+        # of stencil points. Unit-sum normalization keeps every scalar moment
+        # on the same scale as the undamped neighborhood average. Trainable
+        # positive exponents are stored logarithmically.
         center_mask = squared_distances == 0
         neighbor_mask = ~center_mask if separate_center else torch.ones_like(
             center_mask
         )
+        initial_radial_exponents = _prepare_radial_exponents(
+            radial_basis,
+            radial_exponents,
+            trainable_radial_exponents,
+        )
 
-        if radial_basis == "gaussian":
-            if radial_exponents is None:
-                initial_radial_exponents = 2.0 ** torch.linspace(
-                    -1.0,
-                    2.0,
-                    steps=n_radial_channels,
-                    dtype=torch.get_default_dtype(),
-                )
-            else:
-                initial_radial_exponents = torch.as_tensor(
-                    radial_exponents,
-                    dtype=torch.get_default_dtype(),
-                ).detach().clone()
-                if initial_radial_exponents.ndim != 1:
-                    raise ValueError("radial_exponents must be one-dimensional")
-                if initial_radial_exponents.numel() != n_radial_channels:
-                    raise ValueError(
-                        "radial_exponents must contain n_radial_channels values"
-                    )
-                if not torch.all(
-                    torch.isfinite(initial_radial_exponents)
-                ).item():
-                    raise ValueError("radial_exponents must be finite")
-                if not torch.all(initial_radial_exponents > 0.0).item():
-                    raise ValueError("radial_exponents must be positive")
-            log_radial_exponents = torch.log(initial_radial_exponents)
-            if trainable_radial_exponents:
-                self.log_radial_exponents = nn.Parameter(log_radial_exponents)
-            else:
-                self.register_buffer(
-                    "log_radial_exponents",
-                    log_radial_exponents,
-                )
+        if radial_basis == "gaussian" and trainable_radial_exponents:
+            self.log_radial_exponents = nn.Parameter(
+                torch.log(initial_radial_exponents)
+            )
         else:
-            if n_radial_channels != 1:
-                raise ValueError(
-                    "n_radial_channels must equal one when radial_basis='none'"
-                )
-            if radial_exponents is not None:
-                raise ValueError(
-                    "radial_exponents are unavailable when radial_basis='none'"
-                )
-            if trainable_radial_exponents:
-                raise ValueError(
-                    "trainable_radial_exponents requires radial_basis='gaussian'"
-                )
-
+            self.register_buffer(
+                "fixed_radial_exponents",
+                initial_radial_exponents,
+            )
         self.cutoff_grid = int(cutoff_grid)
         self.max_power = int(max_power)
         self.radial_basis = radial_basis
-        self.n_radial_channels = n_radial_channels
         self.trainable_radial_exponents = trainable_radial_exponents
         self.coordinate_scaling = coordinate_scaling
         self.separate_center = separate_center
@@ -314,12 +330,21 @@ class CartesianAFeatures(nn.Module):
         self.register_buffer("neighbor_mask", neighbor_mask, persistent=False)
 
     @property
-    def radial_exponents(self) -> Optional[torch.Tensor]:
-        """Positive Gaussian decay coefficients, or ``None`` when undamped."""
+    def radial_exponents(self) -> torch.Tensor:
+        """Damping coefficients for all radial channels.
 
-        if self.radial_basis == "none":
-            return None
-        return torch.exp(self.log_radial_exponents)
+        The zero fallback keeps the retained undamped regression example
+        loadable; its checkpoint predates explicit radial-basis attributes.
+        """
+
+        if getattr(self, "trainable_radial_exponents", False):
+            return torch.exp(self.log_radial_exponents)
+        stored = self._buffers.get("fixed_radial_exponents")
+        if stored is not None:
+            return stored
+        if getattr(self, "radial_basis", "none") == "none":
+            return self.squared_distances.new_zeros(1)
+        raise RuntimeError("this Gaussian radial checkpoint is incompatible")
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
@@ -363,27 +388,18 @@ class CartesianAFeatures(nn.Module):
                 )
             )
 
-        # Gaussian values are recomputed because alpha may be trainable. The
-        # undamped representation deliberately assigns equal relative radial
-        # weight to the central and noncentral stencil points. Dividing by the
-        # stencil size makes its scalar moment a neighborhood average.
-        if self.radial_basis == "gaussian":
-            radial_values = torch.exp(
-                -self.squared_distances[:, None]
-                * self.radial_exponents[None, :]
-            )
-            if getattr(self, "separate_center", False):
-                radial_values = radial_values * self.neighbor_mask[:, None]
-        else:
-            radial_values = self.squared_distances.new_ones(
-                (self.squared_distances.shape[0], 1)
-            )
-            if getattr(self, "separate_center", False):
-                radial_values = radial_values * self.neighbor_mask[:, None]
-            radial_values = radial_values / torch.clamp(
-                torch.sum(radial_values),
-                min=1.0,
-            )
+        # This is the only radial path. alpha=0 produces the uniform polynomial
+        # channel, while positive alpha values damp distant stencil points.
+        radial_values = torch.exp(
+            -self.squared_distances[:, None]
+            * self.radial_exponents[None, :]
+        )
+        if getattr(self, "separate_center", False):
+            radial_values = radial_values * self.neighbor_mask[:, None]
+        radial_values = radial_values / torch.clamp(
+            torch.sum(radial_values, dim=0, keepdim=True),
+            min=torch.finfo(radial_values.dtype).tiny,
+        )
         basis_values = (
             radial_values[:, :, None] * self.monomial_values[:, None, :]
         )
@@ -405,7 +421,7 @@ class _AChannelMixing(nn.Module):
     """Internal learned map from physical A channels to latent channels.
 
     For each grid point, radial channel, and Cartesian component, this module
-    applies the same learned linear map
+    applies the same learned linear map.
 
     ``A_mixed[..., q] = sum_t weight[q, t] * A[..., t]``.
 

@@ -644,7 +644,7 @@ class TestGridData(unittest.TestCase):
             cutoff_grid=1,
             max_power=0,
             radial_basis="gaussian",
-            n_radial_channels=1,
+            radial_exponents=(0.5,),
             separate_center=False,
         )(batch)
         # Differentiate only the scalar environment centered at grid point 0.
