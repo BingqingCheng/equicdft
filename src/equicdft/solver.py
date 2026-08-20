@@ -763,6 +763,28 @@ class GridSolver:
         )
         objective_history.append(objective.detach().item())
 
+        def evaluate_trial(trial_rho: torch.Tensor):
+            trial_data = dict(data)
+            trial_data["rho"] = trial_rho.detach().clone()
+            trial_data["V_ext"] = V_ext
+            trial_evaluation = self.evaluate(trial_data, compute_c1=True)
+            _, _, trial_max_residual, trial_rms_residual = _euler_residual(
+                trial_rho,
+                trial_evaluation["c1"].detach(),
+                V_ext,
+                data["beta"],
+                thermal_wavelength,
+                mu,
+                residual_density_threshold,
+                maximum_density,
+                accessible_mask,
+            )
+            return (
+                trial_evaluation,
+                trial_max_residual,
+                trial_rms_residual,
+            )
+
         for _ in range(max_iter):
             c1 = evaluation["c1"].detach()
             _, _, max_residual, rms_residual = _euler_residual(
@@ -860,25 +882,12 @@ class GridSolver:
                         maximum_density[None, :],
                     )
 
-                trial_data = dict(data)
-                trial_data["rho"] = next_rho.detach().clone()
-                trial_data["V_ext"] = V_ext
-                trial_evaluation = self.evaluate(
-                    trial_data,
-                    compute_c1=True,
-                )
+                (
+                    trial_evaluation,
+                    trial_max_residual,
+                    trial_rms_residual,
+                ) = evaluate_trial(next_rho)
                 n_evaluations += 1
-                _, _, trial_max_residual, trial_rms_residual = _euler_residual(
-                    next_rho,
-                    trial_evaluation["c1"].detach(),
-                    V_ext,
-                    data["beta"],
-                    thermal_wavelength,
-                    mu,
-                    residual_density_threshold,
-                    maximum_density,
-                    accessible_mask,
-                )
 
                 if (
                     not adaptive_mixing
@@ -934,30 +943,12 @@ class GridSolver:
                             maximum_density[None, :],
                         )
 
-                    candidate_data = dict(data)
-                    candidate_data["rho"] = candidate_rho.detach().clone()
-                    candidate_data["V_ext"] = V_ext
-                    candidate_evaluation = self.evaluate(
-                        candidate_data,
-                        compute_c1=True,
-                    )
-                    n_evaluations += 1
                     (
-                        _,
-                        _,
+                        candidate_evaluation,
                         candidate_max_residual,
                         candidate_rms_residual,
-                    ) = _euler_residual(
-                        candidate_rho,
-                        candidate_evaluation["c1"].detach(),
-                        V_ext,
-                        data["beta"],
-                        thermal_wavelength,
-                        mu,
-                        residual_density_threshold,
-                        maximum_density,
-                        accessible_mask,
-                    )
+                    ) = evaluate_trial(candidate_rho)
+                    n_evaluations += 1
                     candidate_objective = _thermodynamic_objective(
                         candidate_evaluation,
                         fixed_N is not None,
@@ -1039,41 +1030,32 @@ def _anderson_log_density_candidate(
 ) -> torch.Tensor:
     """Return a density-weighted constrained Anderson log-density trial."""
 
-    if len(log_density_history) != len(residual_history):
+    history_size = len(log_density_history)
+    if history_size != len(residual_history):
         raise ValueError("Anderson density and residual history differ")
-    if len(log_density_history) < 2:
+    if history_size < 2:
         raise ValueError("Anderson acceleration requires two history entries")
 
+    accumulation_dtype = torch.float64
     residual_matrix = torch.stack(
-        [value.reshape(-1) for value in residual_history],
-        dim=1,
-    )
-    flattened_weights = weights.reshape(-1)
-    accumulation_dtype = (
-        torch.float64
-        if residual_matrix.dtype in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        )
-        else residual_matrix.dtype
-    )
-    residual_matrix = residual_matrix.to(accumulation_dtype)
-    flattened_weights = flattened_weights.to(accumulation_dtype)
+        residual_history,
+        dim=-1,
+    ).reshape(-1, history_size).to(accumulation_dtype)
+    flattened_weights = weights.reshape(-1).to(accumulation_dtype)
     gram = residual_matrix.mT @ (
         flattened_weights[:, None] * residual_matrix
     )
     scale = torch.clamp(
-        torch.trace(gram) / len(log_density_history),
+        torch.trace(gram) / history_size,
         min=torch.finfo(accumulation_dtype).eps,
     )
     system = gram + regularization * scale * torch.eye(
-        len(log_density_history),
+        history_size,
         dtype=accumulation_dtype,
         device=gram.device,
     )
     ones = torch.ones(
-        len(log_density_history),
+        history_size,
         dtype=accumulation_dtype,
         device=gram.device,
     )
@@ -1088,17 +1070,11 @@ def _anderson_log_density_candidate(
         raise RuntimeError("Anderson coefficient solve is singular")
     coefficients = coefficients / denominator
 
-    candidates = torch.stack(
-        [
-            density + damping * residual
-            for density, residual in zip(
-                log_density_history,
-                residual_history,
-            )
-        ],
-        dim=0,
+    candidates = (
+        torch.stack(log_density_history)
+        + damping * torch.stack(residual_history)
     ).to(accumulation_dtype)
-    coefficient_shape = (len(log_density_history),) + (1,) * (
+    coefficient_shape = (history_size,) + (1,) * (
         candidates.ndim - 1
     )
     return torch.sum(
