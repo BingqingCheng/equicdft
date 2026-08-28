@@ -15,49 +15,11 @@ from ._argument_checks import (
     optional_positive_integer,
     positive_integer,
 )
+from ._grid import gather_neighbors
 from .stencil import make_stencil
 
 
 DEFAULT_RADIAL_EXPONENTS = (0.125,)
-
-
-def _gather_local_density(
-    rho: torch.Tensor,
-    local_density_index: torch.Tensor,
-) -> torch.Tensor:
-    """Gather periodic environments from a live, possibly batched ``rho``."""
-
-    if rho.ndim < 2:
-        raise ValueError("rho must have shape [..., n_grid, n_types]")
-    if local_density_index.ndim != rho.ndim:
-        raise ValueError(
-            "local_density_index must have shape "
-            "[..., n_grid, n_neighbors]"
-        )
-    if local_density_index.shape[:-2] != rho.shape[:-2]:
-        raise ValueError("rho and local_density_index leading shapes must match")
-    if local_density_index.shape[-2] != rho.shape[-2]:
-        raise ValueError("rho and local_density_index grid sizes must match")
-    if local_density_index.dtype != torch.long:
-        raise TypeError("local_density_index must have dtype torch.long")
-
-    leading_shape = rho.shape[:-2]
-    n_grid = rho.shape[-2]
-    n_types = rho.shape[-1]
-    n_neighbors = local_density_index.shape[-1]
-
-    # Flatten only leading configuration/batch dimensions. torch.gather then
-    # selects the grid axis independently for every configuration and type.
-    rho_flat = rho.reshape(-1, n_grid, n_types)
-    index_flat = local_density_index.reshape(-1, n_grid * n_neighbors)
-    gather_index = index_flat.unsqueeze(-1).expand(-1, -1, n_types)
-    local_density = torch.gather(rho_flat, dim=1, index=gather_index)
-    return local_density.reshape(
-        *leading_shape,
-        n_grid,
-        n_neighbors,
-        n_types,
-    )
 
 
 def _make_powers(max_power: int) -> torch.Tensor:
@@ -311,6 +273,7 @@ class CartesianAFeatures(nn.Module):
         self.separate_center = separate_center
         self.n_types = n_types
         self.n_channels = n_channels
+        self.n_radial_channels = int(initial_radial_exponents.numel())
         self.n_output_channels = n_types if n_channels is None else n_channels
         self.channel_mixing = (
             None
@@ -346,6 +309,27 @@ class CartesianAFeatures(nn.Module):
             return self.squared_distances.new_zeros(1)
         raise RuntimeError("this Gaussian radial checkpoint is incompatible")
 
+    def stencil_basis(self) -> torch.Tensor:
+        """Return the shared stencil basis with shape ``[J, N, K]``.
+
+        ``J`` is the number of stencil points, ``N`` the number of radial
+        channels, and ``K`` the number of Cartesian monomials. The same basis
+        is used to construct the initial density moments and every subsequent
+        message-passing moment.
+        """
+
+        radial_values = torch.exp(
+            -self.squared_distances[:, None]
+            * self.radial_exponents[None, :]
+        )
+        if getattr(self, "separate_center", False):
+            radial_values = radial_values * self.neighbor_mask[:, None]
+        radial_values = radial_values / torch.clamp(
+            torch.sum(radial_values, dim=0, keepdim=True),
+            min=torch.finfo(radial_values.dtype).tiny,
+        )
+        return radial_values[:, :, None] * self.monomial_values[:, None, :]
+
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
@@ -370,7 +354,7 @@ class CartesianAFeatures(nn.Module):
             ``n_channels`` when mixing is enabled.
         """
 
-        local_density = _gather_local_density(
+        local_density = gather_neighbors(
             data["rho"],
             data["local_density_index"],
         )
@@ -388,29 +372,13 @@ class CartesianAFeatures(nn.Module):
                 )
             )
 
-        # This is the only radial path. alpha=0 produces the uniform polynomial
-        # channel, while positive alpha values damp distant stencil points.
-        radial_values = torch.exp(
-            -self.squared_distances[:, None]
-            * self.radial_exponents[None, :]
-        )
-        if getattr(self, "separate_center", False):
-            radial_values = radial_values * self.neighbor_mask[:, None]
-        radial_values = radial_values / torch.clamp(
-            torch.sum(radial_values, dim=0, keepdim=True),
-            min=torch.finfo(radial_values.dtype).tiny,
-        )
-        basis_values = (
-            radial_values[:, :, None] * self.monomial_values[:, None, :]
-        )
-
         # Contract only the neighbor axis. Grid points, radial channels,
         # monomials, component channels, and leading batch dimensions remain
         # separate.
         features = torch.einsum(
             "...gjt,jnk->...gnkt",
             local_density / self.mean_density,
-            basis_values,
+            self.stencil_basis(),
         )
         if self.channel_mixing is not None:
             features = self.channel_mixing(features)

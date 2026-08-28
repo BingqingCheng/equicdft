@@ -3,6 +3,7 @@
 from .data import GridData, default_data_key
 from .energy import EnergyReadout
 from .features import CartesianAFeatures
+from .interaction import BChiMessage
 from .loader import make_dataloaders
 from .loss import Loss, TensorLoss
 from .metrics import Metrics
@@ -22,6 +23,7 @@ __all__ = [
     "CartesianAFeatures",
     "CartesianBFeatures",
     "BulkReadout",
+    "BChiMessage",
     "GridData",
     "GridCACEModel",
     "GridSolver",

@@ -1,8 +1,58 @@
 """Small tensor helpers for regular three-dimensional grids."""
 
+import math
 from typing import Optional
 
 import torch
+
+
+def gather_neighbors(
+    values: torch.Tensor,
+    neighbor_index: torch.Tensor,
+) -> torch.Tensor:
+    """Gather periodic neighborhoods of a grid-aligned tensor.
+
+    ``values`` has shape ``[..., n_grid, *feature_shape]`` and the integer
+    neighbor table has shape ``[..., n_grid, n_neighbors]``. The returned
+    tensor has shape ``[..., n_grid, n_neighbors, *feature_shape]``.
+    """
+
+    if neighbor_index.ndim < 2:
+        raise ValueError(
+            "neighbor_index must have shape [..., n_grid, n_neighbors]"
+        )
+    if neighbor_index.dtype != torch.long:
+        raise TypeError("neighbor_index must have dtype torch.long")
+
+    n_leading = neighbor_index.ndim - 2
+    if values.ndim <= n_leading:
+        raise ValueError(
+            "values must have shape [..., n_grid, *feature_shape]"
+        )
+    leading_shape = neighbor_index.shape[:-2]
+    if values.shape[:n_leading] != leading_shape:
+        raise ValueError("values and neighbor_index leading shapes must match")
+    n_grid = neighbor_index.shape[-2]
+    if values.shape[n_leading] != n_grid:
+        raise ValueError("values and neighbor_index grid sizes must match")
+
+    feature_shape = values.shape[n_leading + 1 :]
+    n_features = math.prod(feature_shape) if feature_shape else 1
+    n_neighbors = neighbor_index.shape[-1]
+
+    # Flatten leading field dimensions and trailing feature dimensions around
+    # the grid axis. torch.gather then selects the grid axis independently for
+    # every field and feature.
+    values_flat = values.reshape(-1, n_grid, n_features)
+    index_flat = neighbor_index.reshape(-1, n_grid * n_neighbors)
+    gather_index = index_flat.unsqueeze(-1).expand(-1, -1, n_features)
+    local_values = torch.gather(values_flat, dim=1, index=gather_index)
+    return local_values.reshape(
+        *leading_shape,
+        n_grid,
+        n_neighbors,
+        *feature_shape,
+    )
 
 
 def grid_spacing_tensor(

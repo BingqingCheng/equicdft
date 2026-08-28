@@ -21,6 +21,7 @@ from ._grid import (
 from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout
 from .features import CartesianAFeatures
+from .interaction import BChiMessage
 from .symmetrize import CartesianBFeatures
 
 
@@ -63,6 +64,7 @@ class GridCACEModel(nn.Module):
         compute_local_mu: bool = False,
         rho_min: float = 0.0,
         free_energy_mode: str = "beta",
+        message_layers: Optional[Sequence[BChiMessage]] = None,
     ) -> None:
         super().__init__()
 
@@ -80,6 +82,36 @@ class GridCACEModel(nn.Module):
             raise ValueError(
                 "a_features and b_features must be supplied together"
             )
+        if message_layers is None:
+            messages = []
+        elif isinstance(message_layers, BChiMessage):
+            raise TypeError(
+                "message_layers must be a sequence of BChiMessage modules"
+            )
+        else:
+            messages = list(message_layers)
+        if not all(isinstance(module, BChiMessage) for module in messages):
+            raise TypeError("every message layer must be a BChiMessage module")
+        if messages and a_features is None:
+            raise ValueError(
+                "a_features and b_features are required by message_layers"
+            )
+        for module in messages:
+            expected = (
+                a_features.n_radial_channels,
+                b_features.n_features,
+                a_features.n_output_channels,
+            )
+            actual = (
+                module.n_radial_channels,
+                module.n_invariant_features,
+                module.n_channels,
+            )
+            if actual != expected:
+                raise ValueError(
+                    "message layer dimensions {} do not match local feature "
+                    "dimensions {}".format(actual, expected)
+                )
         if isinstance(readout, EnergyReadout):
             raise TypeError(
                 "readout must be a sequence of EnergyReadout modules"
@@ -128,6 +160,7 @@ class GridCACEModel(nn.Module):
 
         self.a_features = a_features
         self.b_features = b_features
+        self.message_layers = nn.ModuleList(messages)
         self.readout = nn.ModuleList(readouts)
         self.compute_c1 = compute_c1 or compute_c2
         self.compute_c2 = compute_c2
@@ -336,6 +369,31 @@ class GridCACEModel(nn.Module):
             raise IndexError("c2 reference type index is out of bounds")
         return reference_grid, reference_type
 
+    def _local_invariant_features(
+        self,
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return flattened and concatenated ``[B0, B1, ...]`` features."""
+
+        A = self.a_features(data)
+        B = self.b_features(A)
+        levels = [B.flatten(start_dim=-3)]
+
+        # getattr keeps full-model checkpoints saved before message passing
+        # loadable as ordinary zero-message models.
+        messages = getattr(self, "message_layers", ())
+        if messages:
+            stencil_basis = self.a_features.stencil_basis()
+            for message in messages:
+                A = message(
+                    B,
+                    data["local_density_index"],
+                    stencil_basis,
+                )
+                B = self.b_features(A)
+                levels.append(B.flatten(start_dim=-3))
+        return torch.cat(levels, dim=-1)
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -387,12 +445,7 @@ class GridCACEModel(nn.Module):
             if any(
                 item.requires_local_features for item in self.readout
             ):
-                # Construct the shared invariant local representation once.
-                # When requested, the normalized center density is supplied
-                # explicitly and excluded from every neighbor A channel.
-                A = self.a_features(data)
-                B = self.b_features(A)
-                B_flat = B.flatten(start_dim=-3)
+                B_flat = self._local_invariant_features(data)
                 temperature_feature = normalized_temperature[
                     ..., None, None
                 ].expand(*B_flat.shape[:-1], 1)

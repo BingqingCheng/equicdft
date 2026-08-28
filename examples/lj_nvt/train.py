@@ -28,6 +28,9 @@ from equicdft import (
     make_dataloaders,
 )
 
+# Optional message passing used in the commented example below:
+# from equicdft import BChiMessage
+
 
 HERE = Path(__file__).resolve().parent
 
@@ -143,6 +146,24 @@ def main():
         max_product_order=args.max_product_order,
     )
 
+    # Optional one-layer B-chi message passing is disabled in this example.
+    # Before enabling it, replace the undamped radial settings above with
+    #
+    #     radial_basis="gaussian",
+    #     radial_exponents=(0.125,),
+    #     trainable_radial_exponents=True,
+    #
+    # and remove ``n_radial_channels=1``. The initial and message features then
+    # share the same trainable Gaussian exponent.
+    # message_layers = [
+    #     BChiMessage(
+    #         n_invariant_features=b_features.n_features,
+    #         n_radial_channels=a_features.n_radial_channels,
+    #         n_channels=a_features.n_output_channels,
+    #         hidden_sizes=(32, 16),
+    #     )
+    # ]
+
     # The scalar functional is the sum of two extensive contributions:
     # a density-only LDA baseline and a local invariant many-neighbor
     # correction. Both MLPs use smooth SiLU activations internally.
@@ -168,6 +189,7 @@ def main():
         # The selected protocol learns beta*F_exc directly. The model also
         # supports free_energy_mode="physical" for F_exc/(k_B*T_reference).
         free_energy_mode="beta",
+        # message_layers=message_layers,
     ).to(device)
 
     # NVT fields have no known reservoir mu. At equilibrium beta*mu_local is
