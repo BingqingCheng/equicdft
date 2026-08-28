@@ -173,6 +173,54 @@ class TestBChiMessage(unittest.TestCase):
         self.assertTrue(torch.isfinite(derivative).all())
         self.assertGreater(derivative.abs().item(), 0.0)
 
+    def test_message_can_own_an_independent_radial_exponent(self):
+        data = _grid_data(shape=(3, 3, 3))
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25,),
+            trainable_radial_exponents=True,
+            separate_center=False,
+        )
+        message = BChiMessage(
+            1,
+            1,
+            1,
+            hidden_sizes=(),
+            radial_exponents=(1.0,),
+            trainable_radial_exponents=True,
+        )
+        with torch.no_grad():
+            message.mlp[0].weight.fill_(1.0)
+            message.mlp[0].bias.zero_()
+        B = torch.arange(27, dtype=torch.get_default_dtype()).reshape(
+            27, 1, 1, 1
+        )
+
+        message_basis = a_features.stencil_basis(message.radial_exponents)
+        A_next = message(B, data["local_density_index"], message_basis)
+        derivative = torch.autograd.grad(
+            A_next[0, 0, 1, 0],
+            message.log_radial_exponents,
+        )[0]
+
+        self.assertFalse(
+            torch.allclose(message_basis, a_features.stencil_basis())
+        )
+        self.assertTrue(torch.isfinite(derivative).all())
+        self.assertGreater(derivative.abs().item(), 0.0)
+
+    def test_trainable_message_radial_requires_initial_values(self):
+        with self.assertRaisesRegex(ValueError, "requires radial_exponents"):
+            BChiMessage(
+                1,
+                1,
+                1,
+                trainable_radial_exponents=True,
+            )
+
     def test_invariant_output_commutes_with_cubic_grid_symmetry(self):
         torch.manual_seed(7)
         shape = (5, 5, 5)
@@ -326,6 +374,41 @@ class TestMessagePassingModel(unittest.TestCase):
 
         self.assertEqual(outputs["c2"].shape, data["rho"].shape)
         self.assertTrue(torch.all(torch.isfinite(outputs["c2"])))
+
+    def test_two_layers_have_independent_weights_and_radial_exponents(self):
+        def messages(a_features, b_features):
+            return [
+                BChiMessage(
+                    b_features.n_features,
+                    a_features.n_radial_channels,
+                    a_features.n_output_channels,
+                    hidden_sizes=(6,),
+                    radial_exponents=(exponent,),
+                    trainable_radial_exponents=True,
+                )
+                for exponent in (0.5, 1.0)
+            ]
+
+        model = self._make_model(messages)
+        data = _grid_data(shape=(3, 3, 3))
+        outputs = model(data)
+        outputs["c1"].square().mean().backward()
+
+        first, second = model.message_layers
+        self.assertIsNot(first.mlp[0].weight, second.mlp[0].weight)
+        self.assertNotEqual(
+            first.mlp[0].weight.data_ptr(),
+            second.mlp[0].weight.data_ptr(),
+        )
+        self.assertIsNot(
+            first.log_radial_exponents,
+            second.log_radial_exponents,
+        )
+        self.assertIsNotNone(first.log_radial_exponents.grad)
+        self.assertIsNotNone(second.log_radial_exponents.grad)
+        self.assertGreater(first.log_radial_exponents.grad.abs().item(), 0.0)
+        self.assertGreater(second.log_radial_exponents.grad.abs().item(), 0.0)
+        self.assertIsNotNone(model.a_features.log_radial_exponents.grad)
 
     def test_empty_message_list_preserves_default_state_and_output(self):
         no_argument = self._make_model(lambda _a, _b: None)

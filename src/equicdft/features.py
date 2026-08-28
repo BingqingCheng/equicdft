@@ -22,6 +22,25 @@ from .stencil import make_stencil
 DEFAULT_RADIAL_EXPONENTS = (0.125,)
 
 
+def _cartesian_stencil_basis(
+    squared_distances: torch.Tensor,
+    monomial_values: torch.Tensor,
+    radial_exponents: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return normalized radial-Cartesian values with shape ``[J, N, K]``."""
+
+    radial_values = torch.exp(
+        -squared_distances[:, None] * radial_exponents[None, :]
+    )
+    radial_values = radial_values * neighbor_mask[:, None]
+    radial_values = radial_values / torch.clamp(
+        torch.sum(radial_values, dim=0, keepdim=True),
+        min=torch.finfo(radial_values.dtype).tiny,
+    )
+    return radial_values[:, :, None] * monomial_values[:, None, :]
+
+
 def _make_powers(max_power: int) -> torch.Tensor:
     """Enumerate ``(a, b, c)`` by increasing total Cartesian power.
 
@@ -41,7 +60,7 @@ def _make_powers(max_power: int) -> torch.Tensor:
     return torch.tensor(powers, dtype=torch.long)
 
 
-def _prepare_radial_exponents(
+def prepare_radial_exponents(
     radial_basis: str,
     radial_exponents: Optional[Union[Sequence[float], torch.Tensor]],
     trainable: bool,
@@ -250,7 +269,7 @@ class CartesianAFeatures(nn.Module):
         neighbor_mask = ~center_mask if separate_center else torch.ones_like(
             center_mask
         )
-        initial_radial_exponents = _prepare_radial_exponents(
+        initial_radial_exponents = prepare_radial_exponents(
             radial_basis,
             radial_exponents,
             trainable_radial_exponents,
@@ -309,26 +328,36 @@ class CartesianAFeatures(nn.Module):
             return self.squared_distances.new_zeros(1)
         raise RuntimeError("this Gaussian radial checkpoint is incompatible")
 
-    def stencil_basis(self) -> torch.Tensor:
-        """Return the shared stencil basis with shape ``[J, N, K]``.
+    def stencil_basis(
+        self,
+        radial_exponents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return a radial-Cartesian basis with shape ``[J, N, K]``.
 
         ``J`` is the number of stencil points, ``N`` the number of radial
-        channels, and ``K`` the number of Cartesian monomials. The same basis
-        is used to construct the initial density moments and every subsequent
-        message-passing moment.
+        channels, and ``K`` the number of Cartesian monomials. By default the
+        module's own exponents are used. Message layers may supply independent
+        exponents while reusing this fixed stencil geometry.
         """
 
-        radial_values = torch.exp(
-            -self.squared_distances[:, None]
-            * self.radial_exponents[None, :]
+        if radial_exponents is None:
+            radial_exponents = self.radial_exponents
+        return _cartesian_stencil_basis(
+            self.squared_distances,
+            self.monomial_values,
+            radial_exponents,
+            self.stencil_neighbor_mask(),
         )
+
+    def stencil_neighbor_mask(self) -> torch.Tensor:
+        """Return the center-inclusion mask, including legacy fallback."""
+
+        stored = self._buffers.get("neighbor_mask")
+        if stored is not None:
+            return stored
         if getattr(self, "separate_center", False):
-            radial_values = radial_values * self.neighbor_mask[:, None]
-        radial_values = radial_values / torch.clamp(
-            torch.sum(radial_values, dim=0, keepdim=True),
-            min=torch.finfo(radial_values.dtype).tiny,
-        )
-        return radial_values[:, :, None] * self.monomial_values[:, None, :]
+            return self.squared_distances != 0
+        return torch.ones_like(self.squared_distances, dtype=torch.bool)
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.

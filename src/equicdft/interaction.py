@@ -1,13 +1,14 @@
 """Finite-range message passing between invariant grid environments."""
 
-from typing import Sequence
+from typing import Optional, Sequence, Union
 
 import torch
 from torch import nn
 
-from ._argument_checks import positive_integer
+from ._argument_checks import boolean, positive_integer
 from ._grid import gather_neighbors
 from ._nn import build_mlp
+from .features import prepare_radial_exponents
 
 
 class BChiMessage(nn.Module):
@@ -18,8 +19,7 @@ class BChiMessage(nn.Module):
 
     ``g_i^t = h_t(B_i^t) - h_t(0)``.
 
-    The gates are then convolved with the same radial-Cartesian stencil basis
-    used for the initial density features,
+    The gates are then convolved with a radial-Cartesian stencil basis,
 
     ``A_i^(t+1)[n,k,c] = sum_j Phi[j,n,k] g_(i+j)^t[n,c]``.
 
@@ -45,6 +45,13 @@ class BChiMessage(nn.Module):
     hidden_sizes
         Width of each gate-network hidden layer. An empty sequence gives a
         linear gate.
+    radial_exponents
+        Optional damping exponents owned by this message layer. ``None``
+        retains the initial ``CartesianAFeatures`` basis exactly. Supplying a
+        sequence gives this layer an independent radial basis while retaining
+        the same fixed stencil geometry and Cartesian monomials.
+    trainable_radial_exponents
+        Optimize the layer-owned positive exponents in logarithmic form.
     """
 
     def __init__(
@@ -53,6 +60,10 @@ class BChiMessage(nn.Module):
         n_radial_channels: int,
         n_channels: int,
         hidden_sizes: Sequence[int] = (32, 16),
+        radial_exponents: Optional[
+            Union[Sequence[float], torch.Tensor]
+        ] = None,
+        trainable_radial_exponents: bool = False,
     ) -> None:
         super().__init__()
 
@@ -65,6 +76,37 @@ class BChiMessage(nn.Module):
             "n_radial_channels",
         )
         self.n_channels = positive_integer(n_channels, "n_channels")
+        trainable_radial_exponents = boolean(
+            trainable_radial_exponents,
+            "trainable_radial_exponents",
+        )
+        if radial_exponents is None:
+            if trainable_radial_exponents:
+                raise ValueError(
+                    "trainable_radial_exponents requires radial_exponents"
+                )
+            self.independent_radial_basis = False
+        else:
+            initial_radial_exponents = prepare_radial_exponents(
+                "gaussian",
+                radial_exponents,
+                trainable_radial_exponents,
+            )
+            if initial_radial_exponents.numel() != self.n_radial_channels:
+                raise ValueError(
+                    "radial_exponents length must match n_radial_channels"
+                )
+            if trainable_radial_exponents:
+                self.log_radial_exponents = nn.Parameter(
+                    torch.log(initial_radial_exponents)
+                )
+            else:
+                self.register_buffer(
+                    "fixed_radial_exponents",
+                    initial_radial_exponents,
+                )
+            self.independent_radial_basis = True
+        self.trainable_radial_exponents = trainable_radial_exponents
         self.n_input_features = (
             self.n_radial_channels
             * self.n_invariant_features
@@ -76,6 +118,16 @@ class BChiMessage(nn.Module):
             hidden_sizes=hidden_sizes,
             output_size=self.n_output_features,
         )
+
+    @property
+    def radial_exponents(self) -> Optional[torch.Tensor]:
+        """Return layer-owned exponents, or ``None`` for the shared basis."""
+
+        if not getattr(self, "independent_radial_basis", False):
+            return None
+        if getattr(self, "trainable_radial_exponents", False):
+            return torch.exp(self.log_radial_exponents)
+        return self.fixed_radial_exponents
 
     def forward(
         self,

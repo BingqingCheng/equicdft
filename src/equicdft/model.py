@@ -383,8 +383,14 @@ class GridCACEModel(nn.Module):
         # loadable as ordinary zero-message models.
         messages = getattr(self, "message_layers", ())
         if messages:
-            stencil_basis = self.a_features.stencil_basis()
+            shared_basis = self.a_features.stencil_basis()
             for message in messages:
+                radial_exponents = message.radial_exponents
+                stencil_basis = (
+                    shared_basis
+                    if radial_exponents is None
+                    else self.a_features.stencil_basis(radial_exponents)
+                )
                 A = message(
                     B,
                     data["local_density_index"],
