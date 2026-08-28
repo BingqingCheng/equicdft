@@ -153,15 +153,19 @@ def main():
     #     radial_exponents=(0.125,),
     #     trainable_radial_exponents=True,
     #
-    # and remove ``n_radial_channels=1``. The initial and message features then
-    # share the same trainable Gaussian exponent.
+    # and remove ``n_radial_channels=1``. The initial feature basis and every
+    # message layer below start from the same numerical exponent but optimize
+    # separate parameters.
     # message_layers = [
     #     BChiMessage(
     #         n_invariant_features=b_features.n_features,
     #         n_radial_channels=a_features.n_radial_channels,
     #         n_channels=a_features.n_output_channels,
     #         hidden_sizes=(32, 16),
+    #         radial_exponents=(0.125,),
+    #         trainable_radial_exponents=True,
     #     )
+    #     for _ in range(1)
     # ]
 
     # The scalar functional is the sum of two extensive contributions:
