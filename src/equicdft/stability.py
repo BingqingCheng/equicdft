@@ -20,25 +20,30 @@ from .energy import density_weighted_integral
 class FourierStabilityLoss(nn.Module):
     r"""Penalize negative fixed-particle-number Fourier curvature.
 
-    For each nonzero integer reciprocal-grid mode, cosine and sine directions
-    are constructed on the periodic grid. Each density component is perturbed
-    independently according to
+    For each nonzero integer reciprocal-grid mode, cosine and sine waves are
+    constructed on the periodic grid. A fixed-number base direction is built
+    for each density component according to
 
     ``delta_rho_a = epsilon * rho_a * (wave - <wave>_rho_a)``,
 
-    so the particle number of that component is unchanged while every other
-    component is held fixed. Symmetric evaluations at ``rho +/- delta_rho``
-    estimate the projected curvature of the total intrinsic dimensionless free
-    energy ``beta * (F_id + F_exc)``. External-potential and reservoir terms
-    are linear in density and therefore cancel from the second difference.
+    so the particle number of every component is unchanged. The selected
+    mixture mode either keeps these component directions separate or combines
+    them. Symmetric evaluations at ``rho +/- delta_rho`` estimate the projected
+    curvature of the total intrinsic dimensionless free energy
+    ``beta * (F_id + F_exc)``. External-potential and reservoir terms are
+    linear in density and therefore cancel from the second difference.
 
     For a homogeneous one-component fluid, the normalized curvature tends to
 
     ``rho * delta^2(beta*F) / (DeltaV * sum(delta_rho**2)) = 1 / S(k)``.
 
-    For mixtures, the loss averages the independently perturbed component
-    directions. It constrains diagonal species curvatures but not coupled
-    composition eigenmodes of the full component-space Hessian.
+    For mixtures, ``mixture_mode`` selects the component-space direction.
+    ``"independent"`` averages independently perturbed physical components,
+    ``"total_density"`` perturbs every component in phase, and ``"charge"``
+    weights the component perturbations by explicit charges. The latter two
+    modes probe coupled directions of the component-space Hessian. For a
+    symmetric binary mixture with equal component densities and charges
+    ``(+1, -1)``, they are the number-number and charge-charge directions.
 
     Parameters
     ----------
@@ -58,12 +63,20 @@ class FourierStabilityLoss(nn.Module):
         unstable directions.
     weight
         Nonnegative multiplier applied after averaging the squared hinge over
-        fields, modes, real phases, and density components.
+        fields, modes, real phases, and selected mixture directions.
     training_only
         Return an exact zero during evaluation. This keeps validation model
         selection tied to the data objective rather than a random regularizer.
     name
         Unique name used by :class:`equicdft.loss.Loss`.
+    mixture_mode
+        Component-space perturbation. It must be ``"independent"``,
+        ``"total_density"``, or ``"charge"``. The default preserves the
+        original independent-component behavior.
+    charges
+        Explicit finite charge weight for every density component. Required
+        only by ``mixture_mode="charge"``. A common scale is immaterial because
+        the weights are normalized by their largest absolute value.
     """
 
     requires_model = True
@@ -77,6 +90,8 @@ class FourierStabilityLoss(nn.Module):
         weight: float = 1.0,
         training_only: bool = True,
         name: str = "fourier_stability",
+        mixture_mode: str = "independent",
+        charges: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -117,6 +132,29 @@ class FourierStabilityLoss(nn.Module):
                 "random_modes_per_field must be zero when modes are supplied"
             )
         training_only = boolean(training_only, "training_only")
+        mixture_mode = nonempty_string(mixture_mode, "mixture_mode")
+        if mixture_mode not in ("independent", "total_density", "charge"):
+            raise ValueError(
+                "mixture_mode must be 'independent', 'total_density', or "
+                "'charge'"
+            )
+        if mixture_mode == "charge":
+            if charges is None:
+                raise ValueError("charges are required for charge mixture_mode")
+            charge_tensor = torch.as_tensor(
+                charges,
+                dtype=torch.get_default_dtype(),
+            ).detach().clone().reshape(-1)
+            if charge_tensor.numel() == 0:
+                raise ValueError("charges must not be empty")
+            if not torch.all(torch.isfinite(charge_tensor)).item():
+                raise ValueError("charges must be finite")
+            if not torch.any(charge_tensor != 0.0).item():
+                raise ValueError("charges must contain a nonzero value")
+        else:
+            if charges is not None:
+                raise ValueError("charges require charge mixture_mode")
+            charge_tensor = None
 
         relative_amplitude = finite_scalar(
             relative_amplitude,
@@ -128,12 +166,14 @@ class FourierStabilityLoss(nn.Module):
         self.relative_amplitude = relative_amplitude
         self.random_modes_per_field = random_modes_per_field
         self.training_only = training_only
+        self.mixture_mode = mixture_mode
         self.minimum_curvature = nonnegative_scalar(
             minimum_curvature,
             "minimum_curvature",
         )
         self.weight = nonnegative_scalar(weight, "weight")
         self.register_buffer("modes", integer_modes)
+        self.register_buffer("charges", charge_tensor)
 
     def forward(
         self,
@@ -224,7 +264,7 @@ class FourierStabilityLoss(nn.Module):
         )
         valid = valid_directions & (perturbation_norm > 1.0e-12)
         if not torch.any(valid).item():
-            raise ValueError("batch contains no valid component-mode direction")
+            raise ValueError("batch contains no valid mixture-mode direction")
         hinge = torch.relu(
             self.minimum_curvature - normalized_curvature
         ).square()
@@ -236,7 +276,7 @@ class FourierStabilityLoss(nn.Module):
         rho: torch.Tensor,
         modes: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return componentwise fixed-number directions, validity, and density."""
+        """Return fixed-number mixture directions, validity, and density."""
 
         n_fields, n_grid, n_types = rho.shape
         positions = batch["grid_positions"].to(rho)
@@ -276,20 +316,9 @@ class FourierStabilityLoss(nn.Module):
         )
         component_directions = rho[:, None, :, :] * relative_direction
 
-        # Introduce a direction axis for the perturbed component while keeping
-        # all other density components exactly fixed.
-        identity = torch.eye(n_types, device=rho.device, dtype=rho.dtype)
-        directions = torch.einsum(
-            "bdgc,ct->bdcgt",
-            component_directions,
-            identity,
-        ).flatten(start_dim=1, end_dim=2)
-        valid = valid.flatten(start_dim=1, end_dim=2)
-        mean_densities = (
-            (total_density / n_grid)[:, None, :]
-            .expand(-1, waves.shape[1], -1)
-            .reshape(n_fields, -1)
-        )
+        component_mean_densities = total_density / n_grid
+        mixture_weights = self._mixture_weights(n_types, rho)
+        active_components = torch.abs(mixture_weights) > 0.0
 
         valid_by_mode = valid.reshape(
             n_fields,
@@ -297,12 +326,71 @@ class FourierStabilityLoss(nn.Module):
             2,
             n_types,
         ).any(dim=2)
-        invalid_present = component_present[:, None, :] & ~valid_by_mode
+        required_components = (
+            component_present
+            & active_components.any(dim=0)[None, :]
+        )
+        invalid_present = required_components[:, None, :] & ~valid_by_mode
         if torch.any(invalid_present).item():
             raise ValueError(
                 "a requested mode aliases to a constant for a present component"
             )
+
+        directions = (
+            component_directions[:, :, None, :, :]
+            * mixture_weights[None, None, :, None, :]
+        ).flatten(start_dim=1, end_dim=2)
+        valid = (
+            valid[:, :, None, :]
+            & active_components[None, None, :, :]
+        ).any(dim=-1).flatten(start_dim=1, end_dim=2)
+
+        # This effective density makes the normalized ideal-gas curvature
+        # equal to one for a homogeneous mixture and is invariant to a common
+        # rescaling of a row of mixture weights.
+        squared_weights = mixture_weights.square()
+        effective_density = torch.einsum(
+            "mc,bc->bm",
+            squared_weights,
+            component_mean_densities.square(),
+        ) / torch.clamp(
+            torch.einsum(
+                "mc,bc->bm",
+                squared_weights,
+                component_mean_densities,
+            ),
+            min=1.0e-12,
+        )
+        mean_densities = effective_density[:, None, :].expand(
+            -1,
+            waves.shape[1],
+            -1,
+        ).flatten(start_dim=1, end_dim=2)
         return directions.detach(), valid, mean_densities.detach()
+
+    def _mixture_weights(
+        self,
+        n_types: int,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return one component-weight row per mixture direction."""
+
+        if self.mixture_mode == "independent":
+            return torch.eye(
+                n_types,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+        if self.mixture_mode == "total_density":
+            return torch.ones(
+                (1, n_types),
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+        if self.charges.shape != (n_types,):
+            raise ValueError("charges must contain one value per density type")
+        charges = self.charges.to(reference)
+        return (charges / torch.amax(torch.abs(charges)))[None, :]
 
     def _select_modes(
         self,
