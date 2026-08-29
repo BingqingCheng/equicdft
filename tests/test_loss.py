@@ -45,6 +45,30 @@ class _QuadraticExcessModel(nn.Module):
         }
 
 
+class _CoupledQuadraticExcessModel(nn.Module):
+    """Analytic mixture functional with an explicit component Hessian."""
+
+    def __init__(self, matrix):
+        super().__init__()
+        self.matrix = nn.Parameter(torch.as_tensor(matrix, dtype=torch.float64))
+
+    def forward(self, data, compute_c1=None):
+        rho = data["rho"]
+        volume_element = voxel_volume(data["grid_spacing"].to(rho))
+        return {
+            "beta_F_exc": (
+                0.5
+                * volume_element
+                * torch.einsum(
+                    "...gi,ij,...gj->...",
+                    rho,
+                    self.matrix.to(rho),
+                    rho,
+                )
+            )
+        }
+
+
 class TestTensorLoss(unittest.TestCase):
     def test_weighted_loss_and_gradient(self):
         prediction = torch.tensor([1.0, 3.0], requires_grad=True)
@@ -303,6 +327,92 @@ class TestFourierStabilityLoss(unittest.TestCase):
         self.assertAlmostEqual(value.item(), 5.0, places=3)
         self.assertIsNotNone(model.coefficient.grad)
 
+    def test_total_density_and_charge_construct_coupled_directions(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
+        modes = torch.tensor([[[1, 0, 0]]])
+
+        total_directions, total_valid, _ = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            mixture_mode="total_density",
+        )._directions(batch, batch["rho"], modes)
+        charge_directions, charge_valid, _ = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            mixture_mode="charge",
+            charges=(1.0, -1.0),
+        )._directions(batch, batch["rho"], modes)
+
+        self.assertEqual(total_directions.shape, (1, 2, 8, 2))
+        self.assertEqual(charge_directions.shape, (1, 2, 8, 2))
+        self.assertTrue(torch.equal(total_valid, charge_valid))
+        self.assertTrue(torch.all(total_valid).item())
+        self.assertTrue(
+            torch.allclose(
+                total_directions[..., 0],
+                total_directions[..., 1],
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                charge_directions[..., 0],
+                -charge_directions[..., 1],
+            )
+        )
+
+    def test_charge_mode_detects_unstable_coupled_charge_curvature(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+        outputs = model(batch)
+
+        independent = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+            mixture_mode="independent",
+        )(outputs, batch, model=model)
+        total_density = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+            mixture_mode="total_density",
+        )(outputs, batch, model=model)
+        charge = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+            mixture_mode="charge",
+            charges=(1.0, -1.0),
+        )(outputs, batch, model=model)
+
+        self.assertEqual(independent.item(), 0.0)
+        self.assertEqual(total_density.item(), 0.0)
+        self.assertGreater(charge.item(), 0.2)
+
+    def test_coupled_modes_preserve_every_component_particle_number(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], 0.5 * batch["rho"]), dim=-1)
+        reference_sum = batch["rho"].sum(dim=-2)
+
+        for mixture_mode, charges in (
+            ("total_density", None),
+            ("charge", (2.0, -1.0)),
+        ):
+            with self.subTest(mixture_mode=mixture_mode):
+                model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+                term = FourierStabilityLoss(
+                    modes=((1, 0, 0),),
+                    mixture_mode=mixture_mode,
+                    charges=charges,
+                )
+                term(model(batch), batch, model=model)
+                perturbed_sums = model.last_rho.sum(dim=-2)
+                self.assertTrue(
+                    torch.allclose(
+                        perturbed_sums,
+                        reference_sum[:, None, :].expand_as(perturbed_sums),
+                        atol=1.0e-12,
+                        rtol=0.0,
+                    )
+                )
+
     def test_multicomponent_loss_integrates_with_grid_model(self):
         batch = self._batch()
         batch["rho"] = torch.cat(
@@ -472,6 +582,31 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 modes=((1, 0, 0),),
                 random_modes_per_field=1,
             )
+        with self.assertRaisesRegex(ValueError, "mixture_mode"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="unknown",
+            )
+        with self.assertRaisesRegex(ValueError, "required"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="charge",
+            )
+        with self.assertRaisesRegex(ValueError, "require charge"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="total_density",
+                charges=(1.0,),
+            )
+        with self.assertRaisesRegex(ValueError, "one value per density type"):
+            term = FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="charge",
+                charges=(1.0, -1.0),
+            )
+            batch = self._batch()
+            model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+            term(model(batch), batch, model=model)
         batch = self._batch()
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
         del batch["grid_size"]
