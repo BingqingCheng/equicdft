@@ -55,6 +55,10 @@ class FourierStabilityLoss(nn.Module):
         Number of distinct reciprocal triplets sampled per field. Feasible
         modes lie inside the physically isotropic Nyquist sphere. It must be
         zero when explicit ``modes`` are supplied.
+    wavevector_range
+        Optional inclusive ``(minimum, maximum)`` magnitude used to restrict
+        random mode sampling. Values use the reciprocal units implied by
+        ``grid_spacing``. It cannot be combined with explicit ``modes``.
     relative_amplitude
         Maximum pointwise fractional change of the perturbed component after
         its fixed-number projection. It must lie strictly between zero and one.
@@ -92,6 +96,7 @@ class FourierStabilityLoss(nn.Module):
         name: str = "fourier_stability",
         mixture_mode: str = "independent",
         charges: Optional[Sequence[float]] = None,
+        wavevector_range: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -131,6 +136,42 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError(
                 "random_modes_per_field must be zero when modes are supplied"
             )
+        if wavevector_range is None:
+            selected_wavevector_range = None
+        else:
+            if modes is not None:
+                raise ValueError(
+                    "wavevector_range cannot be combined with explicit modes"
+                )
+            try:
+                wavevector_limits = tuple(wavevector_range)
+            except TypeError as error:
+                raise ValueError(
+                    "wavevector_range must contain two values"
+                ) from error
+            if len(wavevector_limits) != 2:
+                raise ValueError("wavevector_range must contain two values")
+            minimum_wavevector = finite_scalar(
+                wavevector_limits[0],
+                "wavevector_range minimum",
+            )
+            maximum_wavevector = finite_scalar(
+                wavevector_limits[1],
+                "wavevector_range maximum",
+            )
+            if (
+                minimum_wavevector < 0.0
+                or maximum_wavevector <= 0.0
+                or minimum_wavevector > maximum_wavevector
+            ):
+                raise ValueError(
+                    "wavevector_range must satisfy 0 <= minimum <= maximum "
+                    "and maximum > 0"
+                )
+            selected_wavevector_range = (
+                minimum_wavevector,
+                maximum_wavevector,
+            )
         training_only = boolean(training_only, "training_only")
         mixture_mode = nonempty_string(mixture_mode, "mixture_mode")
         if mixture_mode not in ("independent", "total_density", "charge"):
@@ -165,6 +206,7 @@ class FourierStabilityLoss(nn.Module):
 
         self.relative_amplitude = relative_amplitude
         self.random_modes_per_field = random_modes_per_field
+        self.wavevector_range = selected_wavevector_range
         self.training_only = training_only
         self.mixture_mode = mixture_mode
         self.minimum_curvature = nonnegative_scalar(
@@ -430,9 +472,30 @@ class FourierStabilityLoss(nn.Module):
                         "a requested mode lies outside the isotropic Nyquist sphere"
                     )
             else:
+                if self.wavevector_range is not None:
+                    box_lengths = tuple(
+                        axis_size * axis_spacing
+                        for axis_size, axis_spacing in zip(size, spacing)
+                    )
+                    minimum_wavevector, maximum_wavevector = (
+                        self.wavevector_range
+                    )
+                    candidates = [
+                        mode
+                        for mode in candidates
+                        if minimum_wavevector
+                        <= _wavevector_magnitude(mode, box_lengths)
+                        <= maximum_wavevector
+                    ]
                 if self.random_modes_per_field > len(candidates):
+                    selection_scope = (
+                        " in wavevector_range"
+                        if self.wavevector_range is not None
+                        else ""
+                    )
                     raise ValueError(
                         "random_modes_per_field exceeds the feasible modes"
+                        + selection_scope
                     )
                 indices = torch.randperm(len(candidates))[
                     : self.random_modes_per_field
@@ -526,6 +589,20 @@ def _feasible_modes(
                 if squared_wavevector <= maximum_squared:
                     feasible.add(_canonical_grid_mode(mode, grid_size))
     return sorted(feasible)
+
+
+def _wavevector_magnitude(
+    mode: Sequence[int],
+    box_lengths: Sequence[float],
+) -> float:
+    """Return the physical reciprocal-space magnitude of an integer mode."""
+
+    return math.sqrt(
+        sum(
+            (2.0 * math.pi * component / length) ** 2
+            for component, length in zip(mode, box_lengths)
+        )
+    )
 
 
 def _canonical_grid_mode(

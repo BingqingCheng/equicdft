@@ -532,6 +532,37 @@ class TestFourierStabilityLoss(unittest.TestCase):
         )
         self.assertTrue(torch.all(torch.any(modes != 0, dim=-1)).item())
 
+    def test_random_triplets_can_be_restricted_by_wavevector_range(self):
+        n_grid = 8
+        positions = torch.tensor(
+            [
+                [x, y, z]
+                for x in range(n_grid)
+                for y in range(n_grid)
+                for z in range(n_grid)
+            ]
+        )
+        batch = {
+            "rho": torch.full((2, n_grid**3, 1), 0.5),
+            "temperature": torch.ones(2),
+            "grid_spacing": torch.ones(2, 3),
+            "grid_size": torch.tensor([[n_grid] * 3] * 2),
+            "grid_positions": positions[None].expand(2, -1, -1),
+        }
+        term = FourierStabilityLoss(
+            random_modes_per_field=3,
+            wavevector_range=(1.5, 1.6),
+        )
+        torch.manual_seed(11)
+
+        modes = term._select_modes(batch, batch["rho"])
+        wavevectors = 2.0 * torch.pi * modes.to(torch.float32) / n_grid
+        magnitudes = torch.linalg.vector_norm(wavevectors, dim=-1)
+
+        self.assertEqual(modes.shape, (2, 3, 3))
+        self.assertTrue(torch.all(magnitudes >= 1.5).item())
+        self.assertTrue(torch.all(magnitudes <= 1.6).item())
+
     def test_anisotropic_spacing_uses_physical_nyquist_sphere(self):
         modes = set(_feasible_modes((8, 8, 8), (0.5, 1.0, 1.0)))
 
@@ -582,6 +613,34 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 modes=((1, 0, 0),),
                 random_modes_per_field=1,
             )
+        for wavevector_range in (
+            1.0,
+            (),
+            (1.0,),
+            (0.0, 1.0, 2.0),
+            (-1.0, 2.0),
+            (2.0, 1.0),
+            (0.0, 0.0),
+            (0.0, float("inf")),
+        ):
+            with self.subTest(wavevector_range=wavevector_range):
+                with self.assertRaisesRegex(ValueError, "wavevector_range"):
+                    FourierStabilityLoss(
+                        random_modes_per_field=1,
+                        wavevector_range=wavevector_range,
+                    )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                wavevector_range=(0.5, 1.5),
+            )
+        with self.assertRaisesRegex(ValueError, "wavevector_range"):
+            term = FourierStabilityLoss(
+                random_modes_per_field=1,
+                wavevector_range=(0.1, 0.2),
+            )
+            batch = self._batch()
+            term._select_modes(batch, batch["rho"])
         with self.assertRaisesRegex(ValueError, "mixture_mode"):
             FourierStabilityLoss(
                 modes=((1, 0, 0),),
