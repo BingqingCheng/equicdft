@@ -386,10 +386,14 @@ class GridCACEModel(nn.Module):
             shared_basis = self.a_features.stencil_basis()
             for message in messages:
                 radial_exponents = message.radial_exponents
+                radial_centers = message.radial_centers
                 stencil_basis = (
                     shared_basis
                     if radial_exponents is None
-                    else self.a_features.stencil_basis(radial_exponents)
+                    else self.a_features.stencil_basis(
+                        radial_exponents,
+                        radial_centers,
+                    )
                 )
                 A = message(
                     B,

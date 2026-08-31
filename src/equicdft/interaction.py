@@ -8,7 +8,7 @@ from torch import nn
 from ._argument_checks import boolean, positive_integer
 from ._grid import gather_neighbors
 from ._nn import build_mlp
-from .features import prepare_radial_exponents
+from .features import prepare_radial_centers, prepare_radial_exponents
 
 
 class BChiMessage(nn.Module):
@@ -52,6 +52,12 @@ class BChiMessage(nn.Module):
         the same fixed stencil geometry and Cartesian monomials.
     trainable_radial_exponents
         Optimize the layer-owned positive exponents in logarithmic form.
+    radial_centers
+        Optional layer-owned Gaussian centers in grid units. ``None`` uses
+        zero centers when ``radial_exponents`` are supplied and otherwise
+        shares the complete initial basis.
+    trainable_radial_centers
+        Optimize layer-owned centers directly. The default is ``False``.
     """
 
     def __init__(
@@ -64,6 +70,10 @@ class BChiMessage(nn.Module):
             Union[Sequence[float], torch.Tensor]
         ] = None,
         trainable_radial_exponents: bool = False,
+        radial_centers: Optional[
+            Union[Sequence[float], torch.Tensor]
+        ] = None,
+        trainable_radial_centers: bool = False,
     ) -> None:
         super().__init__()
 
@@ -80,10 +90,18 @@ class BChiMessage(nn.Module):
             trainable_radial_exponents,
             "trainable_radial_exponents",
         )
+        trainable_radial_centers = boolean(
+            trainable_radial_centers,
+            "trainable_radial_centers",
+        )
         if radial_exponents is None:
             if trainable_radial_exponents:
                 raise ValueError(
                     "trainable_radial_exponents requires radial_exponents"
+                )
+            if radial_centers is not None or trainable_radial_centers:
+                raise ValueError(
+                    "radial_centers require layer-owned radial_exponents"
                 )
             self.independent_radial_basis = False
         else:
@@ -96,6 +114,11 @@ class BChiMessage(nn.Module):
                 raise ValueError(
                     "radial_exponents length must match n_radial_channels"
                 )
+            initial_radial_centers = prepare_radial_centers(
+                "gaussian",
+                radial_centers,
+                self.n_radial_channels,
+            )
             if trainable_radial_exponents:
                 self.log_radial_exponents = nn.Parameter(
                     torch.log(initial_radial_exponents)
@@ -105,8 +128,19 @@ class BChiMessage(nn.Module):
                     "fixed_radial_exponents",
                     initial_radial_exponents,
                 )
+            if trainable_radial_centers:
+                self.learned_radial_centers = nn.Parameter(
+                    initial_radial_centers
+                )
+            else:
+                self.register_buffer(
+                    "fixed_radial_centers",
+                    initial_radial_centers,
+                    persistent=False,
+                )
             self.independent_radial_basis = True
         self.trainable_radial_exponents = trainable_radial_exponents
+        self.trainable_radial_centers = trainable_radial_centers
         self.n_input_features = (
             self.n_radial_channels
             * self.n_invariant_features
@@ -128,6 +162,19 @@ class BChiMessage(nn.Module):
         if getattr(self, "trainable_radial_exponents", False):
             return torch.exp(self.log_radial_exponents)
         return self.fixed_radial_exponents
+
+    @property
+    def radial_centers(self) -> Optional[torch.Tensor]:
+        """Return layer-owned centers, or ``None`` for the shared basis."""
+
+        if not getattr(self, "independent_radial_basis", False):
+            return None
+        if getattr(self, "trainable_radial_centers", False):
+            return self.learned_radial_centers
+        stored = self._buffers.get("fixed_radial_centers")
+        if stored is not None:
+            return stored
+        return torch.zeros_like(self.radial_exponents)
 
     def forward(
         self,

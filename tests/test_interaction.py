@@ -212,6 +212,85 @@ class TestBChiMessage(unittest.TestCase):
         self.assertTrue(torch.isfinite(derivative).all())
         self.assertGreater(derivative.abs().item(), 0.0)
 
+    def test_message_can_own_radial_centers(self):
+        data = _grid_data(shape=(3, 3, 3))
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25,),
+            separate_center=False,
+        )
+        message = BChiMessage(
+            1,
+            1,
+            1,
+            hidden_sizes=(),
+            radial_exponents=(1.0,),
+            radial_centers=(0.5,),
+        )
+        with torch.no_grad():
+            message.mlp[0].weight.fill_(1.0)
+            message.mlp[0].bias.zero_()
+        B = torch.arange(27, dtype=torch.get_default_dtype()).reshape(
+            27, 1, 1, 1
+        )
+
+        message_basis = a_features.stencil_basis(
+            message.radial_exponents,
+            message.radial_centers,
+        )
+        A_next = message(B, data["local_density_index"], message_basis)
+
+        self.assertTrue(torch.isfinite(A_next).all())
+        self.assertTrue(
+            torch.equal(message.radial_centers, torch.tensor([0.5]))
+        )
+        self.assertNotIn("fixed_radial_centers", message.state_dict())
+
+    def test_message_can_train_independent_radial_centers(self):
+        rng_state = torch.random.get_rng_state()
+        data = _grid_data(shape=(3, 3, 3))
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25,),
+            separate_center=False,
+        )
+        message = BChiMessage(
+            1,
+            1,
+            1,
+            hidden_sizes=(),
+            radial_exponents=(1.0,),
+            radial_centers=(0.5,),
+            trainable_radial_centers=True,
+        )
+        with torch.no_grad():
+            message.mlp[0].weight.fill_(1.0)
+            message.mlp[0].bias.zero_()
+        B = torch.arange(27, dtype=torch.get_default_dtype()).reshape(
+            27, 1, 1, 1
+        )
+
+        basis = a_features.stencil_basis(
+            message.radial_exponents,
+            message.radial_centers,
+        )
+        output = message(B, data["local_density_index"], basis)
+        gradient = torch.autograd.grad(
+            output[0, 0, 1, 0],
+            message.learned_radial_centers,
+        )[0]
+        torch.random.set_rng_state(rng_state)
+
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(gradient.abs().item(), 0.0)
+        self.assertIn("learned_radial_centers", message.state_dict())
+
     def test_trainable_message_radial_requires_initial_values(self):
         with self.assertRaisesRegex(ValueError, "requires radial_exponents"):
             BChiMessage(

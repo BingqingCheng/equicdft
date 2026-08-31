@@ -381,7 +381,158 @@ class TestCartesianAFeatures(unittest.TestCase):
                 torch.tensor([0.125]),
             )
         )
+        self.assertTrue(
+            torch.equal(module.radial_centers, torch.zeros(1))
+        )
         self.assertFalse(module.trainable_radial_exponents)
+        self.assertFalse(module.trainable_radial_centers)
+
+    def test_zero_centers_exactly_preserve_original_gaussian_basis(self):
+        module = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=3,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+            separate_center=True,
+        )
+
+        old_radial_values = torch.exp(
+            -module.squared_distances[:, None]
+            * module.radial_exponents[None, :]
+        )
+        old_radial_values = (
+            old_radial_values * module.neighbor_mask[:, None]
+        )
+        old_radial_values = old_radial_values / old_radial_values.sum(
+            dim=0,
+            keepdim=True,
+        )
+        old_basis = (
+            old_radial_values[:, :, None]
+            * module.monomial_values[:, None, :]
+        )
+
+        self.assertTrue(torch.equal(module.stencil_basis(), old_basis))
+
+    def test_radial_centers_shift_gaussian_shells(self):
+        module = CartesianAFeatures(
+            max_power=0,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(1.0, 1.0),
+            radial_centers=(0.0, 2.0),
+            separate_center=False,
+        )
+        basis = module.stencil_basis()[:, :, 0]
+        center = module.squared_distances == 0
+        radius_two = module.squared_distances == 4
+
+        self.assertGreater(basis[center, 0].mean(), basis[radius_two, 0].mean())
+        self.assertLess(basis[center, 1].mean(), basis[radius_two, 1].mean())
+        self.assertTrue(
+            torch.equal(module.radial_centers, torch.tensor([0.0, 2.0]))
+        )
+        self.assertFalse(module.radial_centers.requires_grad)
+
+    def test_radial_center_options_are_validated(self):
+        common = dict(
+            max_power=0,
+            mean_density=1.0,
+            radial_basis="gaussian",
+            radial_exponents=(0.1, 0.2),
+        )
+        with self.assertRaises(TypeError):
+            CartesianAFeatures(**common, radial_centers=True)
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(**common, radial_centers=(0.0,))
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(**common, radial_centers=(0.0, float("nan")))
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(**common, radial_centers=(0.0, -0.1))
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=0,
+                mean_density=1.0,
+                radial_centers=(0.0,),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=0,
+                mean_density=1.0,
+                trainable_radial_centers=True,
+            )
+
+    def test_trainable_radial_centers_receive_gradients(self):
+        module = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.2, 0.5),
+            radial_centers=(0.0, 1.0),
+            trainable_radial_centers=True,
+            separate_center=False,
+        )
+        n_neighbors = module.local_density_positions.shape[0]
+        rho = torch.linspace(0.1, 1.2, n_neighbors).reshape(-1, 1)
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(n_neighbors).repeat(
+                n_neighbors,
+                1,
+            ),
+        }
+
+        module(data).square().sum().backward()
+
+        self.assertIsInstance(module.learned_radial_centers, nn.Parameter)
+        self.assertIs(module.radial_centers, module.learned_radial_centers)
+        self.assertIsNotNone(module.learned_radial_centers.grad)
+        self.assertTrue(
+            torch.all(torch.isfinite(module.learned_radial_centers.grad))
+        )
+        self.assertGreater(module.learned_radial_centers.grad.abs().sum(), 0.0)
+        self.assertIn("learned_radial_centers", module.state_dict())
+    def test_old_zero_center_state_dict_loads_strictly(self):
+        source = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+        )
+        legacy_state = source.state_dict()
+        self.assertNotIn("fixed_radial_centers", legacy_state)
+        restored = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+        )
+
+        restored.load_state_dict(legacy_state, strict=True)
+
+        self.assertTrue(
+            torch.equal(restored.radial_centers, torch.zeros(2))
+        )
+
+    def test_old_full_model_object_defaults_to_zero_centers(self):
+        module = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125,),
+        )
+        expected = module.stencil_basis()
+
+        del module._buffers["fixed_radial_centers"]
+
+        self.assertTrue(torch.equal(module.radial_centers, torch.zeros(1)))
+        self.assertTrue(torch.equal(module.stencil_basis(), expected))
 
     def test_polynomial_center_separated_defaults(self):
         module = CartesianAFeatures(

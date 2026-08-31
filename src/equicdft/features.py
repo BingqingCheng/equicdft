@@ -26,12 +26,19 @@ def _cartesian_stencil_basis(
     squared_distances: torch.Tensor,
     monomial_values: torch.Tensor,
     radial_exponents: torch.Tensor,
+    radial_centers: torch.Tensor,
     neighbor_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Return normalized radial-Cartesian values with shape ``[J, N, K]``."""
 
+    distances = torch.sqrt(squared_distances)
+    centered_squared_distances = (
+        squared_distances[:, None]
+        - 2.0 * distances[:, None] * radial_centers[None, :]
+        + radial_centers[None, :].square()
+    ).clamp_min(0.0)
     radial_values = torch.exp(
-        -squared_distances[:, None] * radial_exponents[None, :]
+        -centered_squared_distances * radial_exponents[None, :]
     )
     radial_values = radial_values * neighbor_mask[:, None]
     radial_values = radial_values / torch.clamp(
@@ -100,6 +107,45 @@ def prepare_radial_exponents(
     return exponents
 
 
+def prepare_radial_centers(
+    radial_basis: str,
+    radial_centers: Optional[Union[Sequence[float], torch.Tensor]],
+    n_radial_channels: int,
+) -> torch.Tensor:
+    """Validate and return Gaussian centers ``u`` in grid units."""
+
+    if radial_basis == "none":
+        if radial_centers is not None:
+            raise ValueError(
+                "radial_centers are unavailable when radial_basis='none'"
+            )
+        return torch.zeros(1, dtype=torch.get_default_dtype())
+
+    if radial_centers is None:
+        return torch.zeros(
+            n_radial_channels,
+            dtype=torch.get_default_dtype(),
+        )
+    if isinstance(radial_centers, bool):
+        raise TypeError("radial_centers must be a one-dimensional sequence")
+
+    centers = torch.as_tensor(
+        radial_centers,
+        dtype=torch.get_default_dtype(),
+    ).detach().clone()
+    if centers.ndim != 1:
+        raise ValueError("radial_centers must be one-dimensional")
+    if centers.numel() != n_radial_channels:
+        raise ValueError(
+            "radial_centers length must match radial_exponents length"
+        )
+    if not torch.all(torch.isfinite(centers)).item():
+        raise ValueError("radial_centers must be finite")
+    if not torch.all(centers >= 0.0).item():
+        raise ValueError("radial_centers must be nonnegative")
+    return centers
+
+
 class CartesianAFeatures(nn.Module):
     """Compute normalized Cartesian ``A`` features on a fixed stencil.
 
@@ -112,8 +158,8 @@ class CartesianAFeatures(nn.Module):
     where ``j`` runs over the canonically ordered integer stencil. With
     ``radial_basis="gaussian"``, the normalized weights are
 
-    ``w[n, j] = exp(-alpha[n] * |q_j|^2)``
-    ``/ sum_i exp(-alpha[n] * |q_i|^2)``.
+    ``w[n, j] = exp(-alpha[n] * (|q_j| - u[n])^2)``
+    ``/ sum_i exp(-alpha[n] * (|q_i| - u[n])^2)``.
 
     With ``radial_basis="none"``, the module uses the same expression with one
     fixed exponent ``alpha[0]=0``, exactly recovering the uniform normalized
@@ -146,6 +192,17 @@ class CartesianAFeatures(nn.Module):
     trainable_radial_exponents
         If ``True``, optimize positive ``radial_exponents`` in logarithmic
         form. Zero exponents are allowed only when the list is fixed.
+    radial_centers
+        Optional Gaussian centers ``u_n`` in grid units. Its length must
+        match ``radial_exponents``. ``None`` uses zero for every channel,
+        exactly retaining the original zero-centered Gaussian basis. It is
+        unavailable for ``radial_basis="none"``. A center ``u`` corresponds
+        to physical radius ``u * grid_spacing``; ``coordinate_scaling`` does
+        not alter this radial convention.
+    trainable_radial_centers
+        If ``True``, optimize the Gaussian centers directly. The default is
+        ``False``. Initial centers must be nonnegative, but their optimized
+        values are unconstrained.
     coordinate_scaling
         Cartesian-coordinate convention used in the monomials. ``"none"``
         uses the raw integer stencil offsets. ``"cutoff"`` divides each
@@ -190,6 +247,10 @@ class CartesianAFeatures(nn.Module):
         separate_center: bool = True,
         n_types: int = 1,
         n_channels: Optional[int] = None,
+        radial_centers: Optional[
+            Union[Sequence[float], torch.Tensor]
+        ] = None,
+        trainable_radial_centers: bool = False,
     ) -> None:
         super().__init__()
 
@@ -212,6 +273,14 @@ class CartesianAFeatures(nn.Module):
             trainable_radial_exponents,
             "trainable_radial_exponents",
         )
+        trainable_radial_centers = boolean(
+            trainable_radial_centers,
+            "trainable_radial_centers",
+        )
+        if radial_basis == "none" and trainable_radial_centers:
+            raise ValueError(
+                "trainable_radial_centers requires radial_basis='gaussian'"
+            )
         if not isinstance(coordinate_scaling, str):
             raise TypeError("coordinate_scaling must be 'none' or 'cutoff'")
         coordinate_scaling = coordinate_scaling.lower()
@@ -261,10 +330,11 @@ class CartesianAFeatures(nn.Module):
                 :, axis, None
             ].pow(powers[None, :, axis])
 
-        # Each factor exp(-alpha_n * |q|**2) changes only the relative emphasis
-        # of stencil points. Unit-sum normalization keeps every scalar moment
-        # on the same scale as the undamped neighborhood average. Trainable
-        # positive exponents are stored logarithmically.
+        # Each factor exp(-alpha_n * (|q| - u_n)**2) changes only the relative
+        # emphasis of stencil points. Unit-sum normalization keeps every scalar
+        # moment on the same scale as the undamped neighborhood average.
+        # Trainable positive exponents are stored logarithmically; centers are
+        # fixed architecture parameters.
         center_mask = squared_distances == 0
         neighbor_mask = ~center_mask if separate_center else torch.ones_like(
             center_mask
@@ -273,6 +343,11 @@ class CartesianAFeatures(nn.Module):
             radial_basis,
             radial_exponents,
             trainable_radial_exponents,
+        )
+        initial_radial_centers = prepare_radial_centers(
+            radial_basis,
+            radial_centers,
+            int(initial_radial_exponents.numel()),
         )
 
         if radial_basis == "gaussian" and trainable_radial_exponents:
@@ -284,10 +359,21 @@ class CartesianAFeatures(nn.Module):
                 "fixed_radial_exponents",
                 initial_radial_exponents,
             )
+        if radial_basis == "gaussian" and trainable_radial_centers:
+            self.learned_radial_centers = nn.Parameter(
+                initial_radial_centers
+            )
+        elif radial_basis == "gaussian":
+            self.register_buffer(
+                "fixed_radial_centers",
+                initial_radial_centers,
+                persistent=False,
+            )
         self.cutoff_grid = int(cutoff_grid)
         self.max_power = int(max_power)
         self.radial_basis = radial_basis
         self.trainable_radial_exponents = trainable_radial_exponents
+        self.trainable_radial_centers = trainable_radial_centers
         self.coordinate_scaling = coordinate_scaling
         self.separate_center = separate_center
         self.n_types = n_types
@@ -328,9 +414,21 @@ class CartesianAFeatures(nn.Module):
             return self.squared_distances.new_zeros(1)
         raise RuntimeError("this Gaussian radial checkpoint is incompatible")
 
+    @property
+    def radial_centers(self) -> torch.Tensor:
+        """Gaussian centers, with a zero fallback for older checkpoints."""
+
+        if getattr(self, "trainable_radial_centers", False):
+            return self.learned_radial_centers
+        stored = self._buffers.get("fixed_radial_centers")
+        if stored is not None:
+            return stored
+        return torch.zeros_like(self.radial_exponents)
+
     def stencil_basis(
         self,
         radial_exponents: Optional[torch.Tensor] = None,
+        radial_centers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return a radial-Cartesian basis with shape ``[J, N, K]``.
 
@@ -342,10 +440,17 @@ class CartesianAFeatures(nn.Module):
 
         if radial_exponents is None:
             radial_exponents = self.radial_exponents
+        if radial_centers is None:
+            radial_centers = self.radial_centers
+        if radial_centers.shape != radial_exponents.shape:
+            raise ValueError(
+                "radial_centers shape must match radial_exponents shape"
+            )
         return _cartesian_stencil_basis(
             self.squared_distances,
             self.monomial_values,
             radial_exponents,
+            radial_centers,
             self.stencil_neighbor_mask(),
         )
 
