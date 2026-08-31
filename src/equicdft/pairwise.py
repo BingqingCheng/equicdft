@@ -73,7 +73,7 @@ class PairwiseReadout(EnergyReadout):
     def __init__(
         self,
         cutoff_grid: int,
-        n_types: int = 1,
+        n_types: int,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = True,
     ) -> None:

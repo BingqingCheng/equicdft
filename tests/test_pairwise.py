@@ -118,11 +118,13 @@ class TestPairwiseReadout(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            PairwiseReadout(cutoff_grid=1)
+            PairwiseReadout(cutoff_grid=1, n_types=2)
         with self.assertRaises(TypeError):
-            PairwiseReadout(cutoff_grid=True)
+            PairwiseReadout(cutoff_grid=True, n_types=2)
         with self.assertRaises(TypeError):
-            PairwiseReadout(cutoff_grid=2, zero_init=1)
+            PairwiseReadout(cutoff_grid=2)
+        with self.assertRaises(TypeError):
+            PairwiseReadout(cutoff_grid=2, n_types=2, zero_init=1)
 
     def test_zero_initialization_is_exact_and_has_no_self_kernel(self):
         readout = PairwiseReadout(cutoff_grid=2, n_types=2)
