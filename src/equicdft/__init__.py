@@ -8,6 +8,7 @@ from .loader import make_dataloaders
 from .loss import Loss, TensorLoss
 from .metrics import Metrics
 from .model import GridCACEModel
+from .pairwise import PairwiseReadout
 from .readout import BulkReadout, LocalReadout, LongRangeReadout
 from .reciprocal import ReciprocalFeatures
 from .semilocal import (
@@ -35,6 +36,7 @@ __all__ = [
     "LongRangeReadout",
     "Loss",
     "Metrics",
+    "PairwiseReadout",
     "ReciprocalFeatures",
     "TensorLoss",
     "Trainer",

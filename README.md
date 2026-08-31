@@ -29,6 +29,12 @@ features are passed to a local neural readout. An optional LDA readout supplies
 the density-only baseline; all enabled readout energies are summed before any
 derivative is taken.
 
+An optional finite-range pairwise readout learns one isotropic kernel for each
+unique density-component pair. Its neural network receives normalized grid
+distance and temperature, a quintic envelope smoothly cuts the kernel off,
+and the zero-displacement self term is excluded. The periodic pair sum is
+evaluated by FFT convolution without constructing gathered pair densities.
+
 The first direct correlation follows from the discrete functional derivative
 
 $$
@@ -239,7 +245,8 @@ reciprocal kernels with nonperiodic boundary conditions.
 
 - `data.py`, `stencil.py`: complete fields and periodic neighborhoods
 - `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
-- `readout.py`, `lda.py`, `gga.py`: composable free-energy contributions
+- `readout.py`, `semilocal.py`: local and state-dependent contributions
+- `pairwise.py`: finite-range distance-dependent pair contribution
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
 - `loss.py`: composable training objectives
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
@@ -265,8 +272,9 @@ python -m examples.lj_paper_v1_regression.solve
 ## Scope
 
 Implemented capabilities include multicomponent density tensors, optional LDA,
-GGA, and reciprocal-space readouts, first direct correlations, selected rows of
-the second direct correlation, supervised or latent chemical-potential
-training, and fixed $N$/fixed $\mu$ equilibrium solves. The compact example
-uses the validated short-range LDA + Cartesian-invariant model and does not
-enable GGA, reciprocal-space terms, or direct $c^{(2)}$ supervision.
+GGA, finite-range pairwise, and reciprocal-space readouts, first direct
+correlations, selected rows of the second direct correlation, supervised or
+latent chemical-potential training, and fixed $N$/fixed $\mu$ equilibrium
+solves. The compact example uses the validated short-range LDA +
+Cartesian-invariant model and does not enable GGA, pairwise, reciprocal-space,
+or direct $c^{(2)}$ supervision.

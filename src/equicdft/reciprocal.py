@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
-from ._grid import grid_spacing_tensor, voxel_volume
+from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
 
 
 class ReciprocalFeatures(nn.Module):
@@ -120,7 +120,7 @@ class ReciprocalFeatures(nn.Module):
                 "rho must have shape [..., n_grid, n_types] with the "
                 "configured n_types"
             )
-        nx, ny, nz = self._common_grid_size(grid_size, rho.shape[:-2])
+        nx, ny, nz = common_grid_size(grid_size, rho.shape[:-2])
         if nx * ny * nz != rho.shape[-2]:
             raise ValueError("grid_size product does not match rho n_grid")
         spacing = self._spacing(grid_spacing, rho)
@@ -239,25 +239,6 @@ class ReciprocalFeatures(nn.Module):
             values,
             torch.zeros_like(values),
         )
-
-    @staticmethod
-    def _common_grid_size(
-        grid_size: torch.Tensor,
-        leading_shape: torch.Size,
-    ) -> Tuple[int, int, int]:
-        """Validate that a batch uses one common regular-grid shape."""
-
-        sizes = torch.as_tensor(grid_size).detach().reshape(-1, 3)
-        if sizes.shape[0] not in (1, math.prod(leading_shape)):
-            raise ValueError("grid_size leading shape must match rho")
-        rounded = torch.round(sizes).to(dtype=torch.long)
-        if not torch.allclose(sizes.to(dtype=torch.float64), rounded.to(torch.float64)):
-            raise ValueError("grid_size values must be integers")
-        if torch.any(rounded <= 0).item():
-            raise ValueError("grid_size values must be positive")
-        if not torch.all(rounded == rounded[0]).item():
-            raise ValueError("all fields in one batch must share grid_size")
-        return tuple(int(value) for value in rounded[0].cpu().tolist())
 
     @staticmethod
     def _spacing(
