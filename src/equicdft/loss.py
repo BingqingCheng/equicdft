@@ -5,7 +5,15 @@ from typing import Dict, Optional, Sequence
 import torch
 from torch import nn
 
-from ._argument_checks import nonempty_string, nonnegative_scalar
+from ._argument_checks import finite_scalar, nonempty_string, nonnegative_scalar
+from ._fourier import (
+    average_fourier_phases,
+    fourier_directions,
+    normalized_directions,
+    projected_fourier_curvature,
+    validate_explicit_modes,
+    validate_uniform_response,
+)
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 
@@ -95,6 +103,172 @@ class TensorLoss(nn.Module):
                 raise ValueError("weights must have a positive sum")
             value = torch.sum(weights * value) / total_weight
         return self.weight * value
+
+
+class FourierResponseLoss(nn.Module):
+    r"""Fit projected homogeneous Fourier curvatures to response data.
+
+    Each batch item is one homogeneous, periodic, unmasked state. Integer mode
+    triplets are read from ``modes_key``. Symmetric fixed-number perturbations
+    evaluate ``beta * (F_id + F_exc)`` along each component-space direction;
+    valid cosine and sine estimates are averaged before comparison with the
+    target. A one-component target is ``1/S(k)``. Mixture targets must project
+    the full inverse response matrix using the same direction convention.
+    """
+
+    requires_model = True
+
+    def __init__(
+        self,
+        directions: Sequence[Sequence[float]],
+        modes_key: str = "fourier_modes",
+        target_key: str = "fourier_curvature",
+        scale_key: Optional[str] = None,
+        weights_key: Optional[str] = None,
+        relative_amplitude: float = 0.01,
+        loss_fn: Optional[nn.Module] = None,
+        weight: float = 1.0,
+        name: str = "fourier_response",
+    ) -> None:
+        super().__init__()
+
+        relative_amplitude = finite_scalar(
+            relative_amplitude,
+            "relative_amplitude",
+        )
+        if not 0.0 < relative_amplitude < 1.0:
+            raise ValueError("relative_amplitude must lie in (0, 1)")
+        if loss_fn is None:
+            loss_fn = nn.SmoothL1Loss(reduction="none")
+        if not isinstance(loss_fn, nn.Module):
+            raise TypeError("loss_fn must be a torch.nn.Module")
+
+        self.name = nonempty_string(name, "name")
+        self.modes_key = nonempty_string(modes_key, "modes_key")
+        self.target_key = nonempty_string(target_key, "target_key")
+        self.scale_key = _optional_key(scale_key, "scale_key")
+        self.weights_key = _optional_key(weights_key, "weights_key")
+        self.relative_amplitude = relative_amplitude
+        self.loss_fn = loss_fn
+        self.weight = nonnegative_scalar(weight, "weight")
+        self.register_buffer("directions", normalized_directions(directions))
+
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
+        """Return the weighted projected-response loss."""
+
+        if model is None:
+            raise ValueError("FourierResponseLoss requires the model")
+        rho = validate_uniform_response(
+            outputs,
+            batch,
+            n_types=self.directions.shape[-1],
+        )
+        modes = validate_explicit_modes(
+            batch,
+            rho,
+            _required_batch_value(batch, self.modes_key),
+        )
+        directions, valid, mean_densities = fourier_directions(
+            batch,
+            rho,
+            modes,
+            self.directions.to(rho),
+        )
+        curvature, valid = projected_fourier_curvature(
+            model=model,
+            outputs=outputs,
+            batch=batch,
+            rho=rho,
+            directions=directions,
+            valid_directions=valid,
+            mean_densities=mean_densities,
+            relative_amplitude=self.relative_amplitude,
+        )
+        prediction, valid = average_fourier_phases(
+            curvature,
+            valid,
+            n_modes=modes.shape[1],
+            n_directions=self.directions.shape[0],
+        )
+        target = _response_tensor(batch, self.target_key, prediction)
+        if self.scale_key is not None:
+            scale = _response_tensor(
+                batch,
+                self.scale_key,
+                prediction,
+                positive=True,
+            )
+            prediction = prediction / scale
+            target = target / scale
+
+        element_loss = self.loss_fn(prediction, target)
+        if (
+            not isinstance(element_loss, torch.Tensor)
+            or element_loss.shape != target.shape
+        ):
+            raise ValueError("loss_fn must return one value per response target")
+        if not torch.all(torch.isfinite(element_loss)).item():
+            raise ValueError("loss_fn returned nonfinite values")
+
+        element_weight = valid.to(element_loss)
+        if self.weights_key is not None:
+            element_weight = element_weight * _response_tensor(
+                batch,
+                self.weights_key,
+                prediction,
+                nonnegative=True,
+            )
+        total_weight = element_weight.sum()
+        if total_weight.item() <= 0.0:
+            raise ValueError("response weights must have a positive valid sum")
+        return self.weight * torch.sum(element_loss * element_weight) / total_weight
+
+
+def _response_tensor(
+    batch: Dict[str, torch.Tensor],
+    key: str,
+    reference: torch.Tensor,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> torch.Tensor:
+    """Return one finite response tensor with the prediction shape."""
+
+    value = torch.as_tensor(_required_batch_value(batch, key)).detach().to(
+        reference
+    )
+    if value.shape != reference.shape:
+        raise ValueError(
+            "{} must have shape [n_fields, n_modes, n_directions]".format(key)
+        )
+    if not torch.all(torch.isfinite(value)).item():
+        raise ValueError("{} must be finite".format(key))
+    if positive and torch.any(value <= 0.0).item():
+        raise ValueError("{} values must be positive".format(key))
+    if nonnegative and torch.any(value < 0.0).item():
+        raise ValueError("{} values must be nonnegative".format(key))
+    return value
+
+
+def _optional_key(value: Optional[str], name: str) -> Optional[str]:
+    """Validate an optional batch key."""
+
+    return None if value is None else nonempty_string(value, name)
+
+
+def _required_batch_value(
+    batch: Dict[str, torch.Tensor],
+    key: str,
+) -> torch.Tensor:
+    """Return one required batch value."""
+
+    if key not in batch:
+        raise KeyError("batch is missing '{}'".format(key))
+    return batch[key]
 
 
 class Loss(nn.Module):

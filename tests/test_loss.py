@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    FourierResponseLoss,
     FourierStabilityLoss,
     GridCACEModel,
     LDAReadout,
@@ -67,6 +68,13 @@ class _CoupledQuadraticExcessModel(nn.Module):
                 )
             )
         }
+
+
+class _TargetValueLoss(nn.Module):
+    """Return the supplied target elementwise to isolate loss reduction."""
+
+    def forward(self, prediction, target):
+        return target
 
 
 class TestTensorLoss(unittest.TestCase):
@@ -675,6 +683,188 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 batch,
                 model=model,
             )
+
+
+class TestFourierResponseLoss(unittest.TestCase):
+    @staticmethod
+    def _batch(dtype=torch.float64, n_types=1, n_modes=2):
+        batch = TestFourierStabilityLoss._batch(dtype=dtype)
+        if n_types == 2:
+            batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
+        modes = ((1, 0, 0), (2, 0, 0))[:n_modes]
+        batch["fourier_modes"] = torch.tensor([modes])
+        return batch
+
+    def test_ideal_gas_matches_unit_inverse_response(self):
+        batch = self._batch()
+        batch["fourier_curvature"] = torch.ones((1, 2, 1), dtype=torch.float64)
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            relative_amplitude=1.0e-4,
+        )
+
+        value = term(model(batch), batch, model=model)
+
+        self.assertLess(
+            value.item(),
+            10.0 * torch.finfo(torch.float64).eps,
+        )
+
+    def test_response_mismatch_is_penalized_and_differentiable(self):
+        batch = self._batch(n_modes=1)
+        batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)
+        model = _QuadraticExcessModel(2.0).to(dtype=torch.float64)
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            relative_amplitude=1.0e-4,
+        )
+
+        value = term(model(batch), batch, model=model)
+        value.backward()
+
+        # K = 1 + rho * coefficient = 2. Smooth L1(2, 1) = 0.5.
+        self.assertAlmostEqual(value.item(), 0.5, places=6)
+        self.assertIsNotNone(model.coefficient.grad)
+        self.assertNotEqual(model.coefficient.grad.item(), 0.0)
+
+    def test_mixture_number_and_charge_targets_use_full_hessian(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        batch["fourier_curvature"] = torch.tensor(
+            [[[2.5, -0.5]]],
+            dtype=torch.float64,
+        )
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+        term = FourierResponseLoss(
+            directions=((1.0, 1.0), (1.0, -1.0)),
+            relative_amplitude=1.0e-4,
+        )
+
+        value = term(model(batch), batch, model=model)
+
+        self.assertLess(
+            value.item(),
+            10.0 * torch.finfo(torch.float64).eps,
+        )
+
+    def test_direction_common_scale_is_immaterial(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        batch["fourier_curvature"] = torch.tensor(
+            [[[2.5]]],
+            dtype=torch.float64,
+        )
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+
+        unit = FourierResponseLoss(
+            directions=((1.0, 1.0),),
+            relative_amplitude=1.0e-4,
+        )(
+            model(batch), batch, model=model
+        )
+        scaled = FourierResponseLoss(
+            directions=((7.0, 7.0),),
+            relative_amplitude=1.0e-4,
+        )(
+            model(batch), batch, model=model
+        )
+
+        self.assertAlmostEqual(unit.item(), scaled.item(), places=15)
+
+    def test_scale_and_element_weights_are_applied_before_reduction(self):
+        batch = self._batch()
+        batch["fourier_curvature"] = torch.tensor(
+            [[[1.0], [8.0]]],
+            dtype=torch.float64,
+        )
+        batch["response_scale"] = torch.tensor(
+            [[[1.0], [2.0]]],
+            dtype=torch.float64,
+        )
+        batch["response_weight"] = torch.tensor(
+            [[[1.0], [3.0]]],
+            dtype=torch.float64,
+        )
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            scale_key="response_scale",
+            weights_key="response_weight",
+            loss_fn=_TargetValueLoss(),
+            relative_amplitude=1.0e-4,
+        )
+
+        value = term(model(batch), batch, model=model)
+
+        # The custom element loss returns scaled targets 1 and 4. Their
+        # weighted mean is (1 + 3*4) / 4.
+        self.assertAlmostEqual(value.item(), 3.25, places=12)
+
+    def test_nyquist_uses_the_single_nonaliased_real_phase(self):
+        batch = self._batch(dtype=torch.float64, n_modes=1)
+        batch["fourier_modes"] = torch.tensor([[[4, 0, 0]]])
+        batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+
+        value = FourierResponseLoss(
+            directions=((1.0,),),
+            relative_amplitude=1.0e-4,
+        )(
+            model(batch), batch, model=model
+        )
+
+        self.assertLess(
+            value.item(),
+            10.0 * torch.finfo(torch.float64).eps,
+        )
+
+    def test_loss_aggregator_supplies_model(self):
+        batch = self._batch(n_modes=1)
+        batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)
+        model = _QuadraticExcessModel(2.0).to(dtype=torch.float64)
+        loss = Loss(
+            [
+                FourierResponseLoss(
+                    directions=((1.0,),),
+                    relative_amplitude=1.0e-4,
+                    weight=2.0,
+                )
+            ]
+        )
+
+        values = loss(model(batch), batch, model=model)
+
+        self.assertEqual(list(values), ["fourier_response", "total"])
+        self.assertAlmostEqual(values["total"].item(), 1.0, places=6)
+
+    def test_configuration_and_batch_contract_are_validated(self):
+        for directions in ((), ((0.0,),), ((float("nan"),),)):
+            with self.subTest(directions=directions):
+                with self.assertRaises(ValueError):
+                    FourierResponseLoss(directions=directions)
+        with self.assertRaisesRegex(ValueError, "relative_amplitude"):
+            FourierResponseLoss(((1.0,),), relative_amplitude=0.0)
+        with self.assertRaisesRegex(TypeError, "loss_fn"):
+            FourierResponseLoss(((1.0,),), loss_fn=lambda x, y: x - y)
+
+        batch = self._batch(n_modes=1)
+        batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierResponseLoss(((1.0,),))
+
+        nonuniform = {key: value.clone() for key, value in batch.items()}
+        nonuniform["rho"][0, 0, 0] = 0.6
+        with self.assertRaisesRegex(ValueError, "spatially uniform"):
+            term(model(nonuniform), nonuniform, model=model)
+
+        zero_mode = {key: value.clone() for key, value in batch.items()}
+        zero_mode["fourier_modes"].zero_()
+        with self.assertRaisesRegex(ValueError, "zero mode"):
+            term(model(zero_mode), zero_mode, model=model)
+
+        wrong_target = {key: value.clone() for key, value in batch.items()}
+        wrong_target["fourier_curvature"] = torch.ones((1, 1))
+        with self.assertRaisesRegex(ValueError, "n_directions"):
+            term(model(wrong_target), wrong_target, model=model)
 
 
 class TestLossAggregation(unittest.TestCase):

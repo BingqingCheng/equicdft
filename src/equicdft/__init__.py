@@ -5,7 +5,7 @@ from .energy import EnergyReadout
 from .features import CartesianAFeatures
 from .interaction import BChiMessage
 from .loader import make_dataloaders
-from .loss import Loss, TensorLoss
+from .loss import FourierResponseLoss, Loss, TensorLoss
 from .metrics import Metrics
 from .model import GridCACEModel
 from .pairwise import PairwiseReadout
@@ -30,6 +30,7 @@ __all__ = [
     "GridSolver",
     "GGAReadout",
     "EnergyReadout",
+    "FourierResponseLoss",
     "FourierStabilityLoss",
     "LocalReadout",
     "LDAReadout",

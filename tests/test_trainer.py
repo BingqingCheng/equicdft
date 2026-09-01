@@ -9,7 +9,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from equicdft import FourierStabilityLoss, Loss, Metrics, TensorLoss, Trainer
+from equicdft import (
+    FourierResponseLoss,
+    FourierStabilityLoss,
+    Loss,
+    Metrics,
+    TensorLoss,
+    Trainer,
+)
 from equicdft._grid import voxel_volume
 
 
@@ -170,6 +177,38 @@ class TestTrainer(unittest.TestCase):
         )
         self.assertGreater(
             history[0]["valid_losses"]["fourier_stability"],
+            0.0,
+        )
+        self.assertFalse(torch.equal(model.coefficient, initial_coefficient))
+
+    def test_fourier_response_loss_runs_through_trainer(self):
+        dataset = _functional_dataset()
+        for frame in dataset:
+            frame["fourier_modes"] = torch.tensor([[1, 0, 0]])
+            frame["fourier_curvature"] = torch.ones((1, 1))
+        model = _QuadraticDictionaryFunctional()
+        trainer = Trainer(
+            model=model,
+            loss=Loss(
+                [
+                    FourierResponseLoss(
+                        directions=((1.0,),),
+                        relative_amplitude=1.0e-3,
+                    )
+                ]
+            ),
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 0.01},
+        )
+        loader = DataLoader(dataset, batch_size=2)
+        initial_coefficient = model.coefficient.detach().clone()
+
+        history = trainer.fit(loader, loader, epochs=1, verbose=False)
+
+        self.assertIn("fourier_response", history[0]["train_losses"])
+        self.assertIn("fourier_response", history[0]["valid_losses"])
+        self.assertGreater(
+            history[0]["valid_losses"]["fourier_response"],
             0.0,
         )
         self.assertFalse(torch.equal(model.coefficient, initial_coefficient))

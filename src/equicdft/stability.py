@@ -1,6 +1,5 @@
 """Physics-based stability objectives for learned density functionals."""
 
-import math
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -13,8 +12,13 @@ from ._argument_checks import (
     nonnegative_integer,
     nonnegative_scalar,
 )
-from ._grid import voxel_volume
-from .energy import density_weighted_integral
+from ._fourier import (
+    canonical_grid_mode as _canonical_grid_mode,
+    feasible_modes as _feasible_modes,
+    fourier_directions as _fourier_directions,
+    projected_fourier_curvature as _normalized_fourier_curvature,
+    wavevector_magnitude as _wavevector_magnitude,
+)
 
 
 class FourierStabilityLoss(nn.Module):
@@ -259,52 +263,16 @@ class FourierStabilityLoss(nn.Module):
             rho,
             modes,
         )
-        delta_rho = self.relative_amplitude * directions
-        rho_plus = rho[:, None, :, :] + delta_rho
-        rho_minus = rho[:, None, :, :] - delta_rho
-
-        # |delta_rho_a / rho_a| < 1 for the selected component. Vacuum points
-        # have exactly zero perturbation.
-        if torch.any(rho_plus < -1.0e-7).item() or torch.any(
-            rho_minus < -1.0e-7
-        ).item():
-            raise RuntimeError("Fourier perturbation produced negative density")
-
-        n_directions = directions.shape[1]
-        perturbed_rho = torch.cat((rho_plus, rho_minus), dim=1)
-        perturbed_batch = self._expand_batch(batch, perturbed_rho)
-        perturbed_outputs = model(perturbed_batch, compute_c1=False)
-        if "beta_F_exc" not in perturbed_outputs:
-            raise KeyError("model outputs are missing 'beta_F_exc'")
-
-        volume_element = voxel_volume(batch["grid_spacing"].to(rho))
-        reference_energy = (
-            self._ideal_free_energy(rho, volume_element)
-            + outputs["beta_F_exc"]
+        normalized_curvature, valid = _normalized_fourier_curvature(
+            model=model,
+            outputs=outputs,
+            batch=batch,
+            rho=rho,
+            directions=directions,
+            valid_directions=valid_directions,
+            mean_densities=mean_densities,
+            relative_amplitude=self.relative_amplitude,
         )
-        perturbed_energy = (
-            self._ideal_free_energy(
-                perturbed_rho,
-                volume_element[:, None].expand(-1, 2 * n_directions),
-            )
-            + perturbed_outputs["beta_F_exc"]
-        )
-        plus_energy = perturbed_energy[:, :n_directions]
-        minus_energy = perturbed_energy[:, n_directions:]
-        second_difference = (
-            plus_energy + minus_energy - 2.0 * reference_energy[:, None]
-        )
-
-        perturbation_norm = volume_element[:, None] * torch.sum(
-            delta_rho.square(),
-            dim=(-2, -1),
-        )
-        normalized_curvature = (
-            mean_densities
-            * second_difference
-            / torch.clamp(perturbation_norm, min=1.0e-12)
-        )
-        valid = valid_directions & (perturbation_norm > 1.0e-12)
         if not torch.any(valid).item():
             raise ValueError("batch contains no valid mixture-mode direction")
         hinge = torch.relu(
@@ -320,95 +288,9 @@ class FourierStabilityLoss(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return fixed-number mixture directions, validity, and density."""
 
-        n_fields, n_grid, n_types = rho.shape
-        positions = batch["grid_positions"].to(rho)
-        grid_size = batch["grid_size"].to(rho)
-        if positions.shape != (n_fields, n_grid, 3):
-            raise ValueError(
-                "grid_positions must have shape [n_fields, n_grid, 3]"
-            )
-        if grid_size.shape != (n_fields, 3):
-            raise ValueError("grid_size must have shape [n_fields, 3]")
-        if modes.ndim != 3 or modes.shape[0] != n_fields or modes.shape[2] != 3:
-            raise ValueError("modes must have shape [n_fields, n_modes, 3]")
-
-        phase = 2.0 * torch.pi * torch.sum(
-            positions[:, None, :, :]
-            * modes.to(rho)[:, :, None, :]
-            / grid_size[:, None, None, :],
-            dim=-1,
-        )
-        waves = torch.stack((torch.cos(phase), torch.sin(phase)), dim=2)
-        waves = waves.flatten(start_dim=1, end_dim=2)
-
-        total_density = torch.sum(rho, dim=-2)
-        component_present = total_density > 1.0e-12
-        weighted_mean = torch.sum(
-            rho[:, None, :, :] * waves[..., None],
-            dim=-2,
-        ) / torch.clamp(total_density[:, None, :], min=1.0e-12)
-        relative_direction = waves[..., None] - weighted_mean[:, :, None, :]
-        relative_norm = torch.amax(torch.abs(relative_direction), dim=-2)
-        # A sine at an even-grid Nyquist mode is analytically zero but may be
-        # of order 1e-6 in float32 after evaluating sin(pi*n).
-        valid = (relative_norm > 1.0e-5) & component_present[:, None, :]
-        relative_direction = relative_direction / torch.clamp(
-            relative_norm[:, :, None, :],
-            min=1.0e-12,
-        )
-        component_directions = rho[:, None, :, :] * relative_direction
-
-        component_mean_densities = total_density / n_grid
+        n_types = rho.shape[-1]
         mixture_weights = self._mixture_weights(n_types, rho)
-        active_components = torch.abs(mixture_weights) > 0.0
-
-        valid_by_mode = valid.reshape(
-            n_fields,
-            modes.shape[1],
-            2,
-            n_types,
-        ).any(dim=2)
-        required_components = (
-            component_present
-            & active_components.any(dim=0)[None, :]
-        )
-        invalid_present = required_components[:, None, :] & ~valid_by_mode
-        if torch.any(invalid_present).item():
-            raise ValueError(
-                "a requested mode aliases to a constant for a present component"
-            )
-
-        directions = (
-            component_directions[:, :, None, :, :]
-            * mixture_weights[None, None, :, None, :]
-        ).flatten(start_dim=1, end_dim=2)
-        valid = (
-            valid[:, :, None, :]
-            & active_components[None, None, :, :]
-        ).any(dim=-1).flatten(start_dim=1, end_dim=2)
-
-        # This effective density makes the normalized ideal-gas curvature
-        # equal to one for a homogeneous mixture and is invariant to a common
-        # rescaling of a row of mixture weights.
-        squared_weights = mixture_weights.square()
-        effective_density = torch.einsum(
-            "mc,bc->bm",
-            squared_weights,
-            component_mean_densities.square(),
-        ) / torch.clamp(
-            torch.einsum(
-                "mc,bc->bm",
-                squared_weights,
-                component_mean_densities,
-            ),
-            min=1.0e-12,
-        )
-        mean_densities = effective_density[:, None, :].expand(
-            -1,
-            waves.shape[1],
-            -1,
-        ).flatten(start_dim=1, end_dim=2)
-        return directions.detach(), valid, mean_densities.detach()
+        return _fourier_directions(batch, rho, modes, mixture_weights)
 
     def _mixture_weights(
         self,
@@ -506,117 +388,3 @@ class FourierStabilityLoss(nn.Module):
             )
 
         return torch.stack(selected_by_field).to(device=rho.device)
-
-    @staticmethod
-    def _expand_batch(
-        batch: Dict[str, torch.Tensor],
-        rho: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Insert the perturbation axis into every field-wise batch tensor."""
-
-        n_fields, n_perturbations = rho.shape[:2]
-        expanded = {}
-        for key, value in batch.items():
-            if key == "rho":
-                expanded[key] = rho
-            elif (
-                torch.is_tensor(value)
-                and value.ndim > 0
-                and value.shape[0] == n_fields
-            ):
-                expanded[key] = value.detach().unsqueeze(1).expand(
-                    n_fields,
-                    n_perturbations,
-                    *value.shape[1:]
-                )
-            else:
-                expanded[key] = value
-        return expanded
-
-    @staticmethod
-    def _ideal_free_energy(
-        rho: torch.Tensor,
-        voxel_volume: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return discrete ``beta*F_id``; omitted linear terms cancel."""
-
-        positive = rho > 0.0
-        safe_density = torch.where(positive, rho, torch.ones_like(rho))
-        per_particle = torch.where(
-            positive,
-            torch.log(safe_density) - 1.0,
-            torch.zeros_like(rho),
-        )
-        return density_weighted_integral(
-            rho,
-            per_particle,
-            voxel_volume,
-        )
-
-
-def _feasible_modes(
-    grid_size: Sequence[int],
-    grid_spacing: Sequence[float],
-) -> Sequence[Tuple[int, int, int]]:
-    """Return unique modes inside the physical isotropic Nyquist sphere."""
-
-    if len(grid_size) != 3 or any(size <= 0 for size in grid_size):
-        raise ValueError("grid_size must contain three positive integers")
-    if (
-        len(grid_spacing) != 3
-        or any(not math.isfinite(spacing) for spacing in grid_spacing)
-        or any(spacing <= 0.0 for spacing in grid_spacing)
-    ):
-        raise ValueError("grid_spacing must contain three positive values")
-
-    box_lengths = [
-        size * spacing for size, spacing in zip(grid_size, grid_spacing)
-    ]
-    isotropic_nyquist = min(math.pi / spacing for spacing in grid_spacing)
-    maximum_squared = isotropic_nyquist**2 * (1.0 + 1.0e-12)
-    half_sizes = [size // 2 for size in grid_size]
-    feasible = set()
-    for nx in range(-half_sizes[0], half_sizes[0] + 1):
-        for ny in range(-half_sizes[1], half_sizes[1] + 1):
-            for nz in range(-half_sizes[2], half_sizes[2] + 1):
-                mode = (nx, ny, nz)
-                if mode == (0, 0, 0):
-                    continue
-                squared_wavevector = sum(
-                    (2.0 * math.pi * component / length) ** 2
-                    for component, length in zip(mode, box_lengths)
-                )
-                if squared_wavevector <= maximum_squared:
-                    feasible.add(_canonical_grid_mode(mode, grid_size))
-    return sorted(feasible)
-
-
-def _wavevector_magnitude(
-    mode: Sequence[int],
-    box_lengths: Sequence[float],
-) -> float:
-    """Return the physical reciprocal-space magnitude of an integer mode."""
-
-    return math.sqrt(
-        sum(
-            (2.0 * math.pi * component / length) ** 2
-            for component, length in zip(mode, box_lengths)
-        )
-    )
-
-
-def _canonical_grid_mode(
-    mode: Sequence[int],
-    grid_size: Sequence[int],
-) -> Tuple[int, int, int]:
-    """Remove Nyquist-sign and global-sign duplicates of a real Fourier mode."""
-
-    canonical = []
-    for component, size in zip(mode, grid_size):
-        if size % 2 == 0 and abs(component) == size // 2:
-            component = abs(component)
-        canonical.append(component)
-    first_nonzero = next(component for component in canonical if component != 0)
-    if first_nonzero < 0:
-        canonical = [-component for component in canonical]
-    return tuple(canonical)

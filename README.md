@@ -201,6 +201,72 @@ every coarse block is either entirely accessible or entirely excluded;
 partially accessible coarse voxels require an explicit accessible-volume
 representation and are rejected.
 
+## Homogeneous Fourier-response training
+
+`FourierResponseLoss` supervises the projected curvature of the total
+intrinsic dimensionless free energy at homogeneous periodic states. It uses
+the same symmetric, fixed-particle-number finite difference as
+`FourierStabilityLoss`, but compares the result with response targets instead
+of applying a positivity hinge. For a one-component fluid its target is
+$1/S(k)$.
+
+The file-format-specific conversion from a measured structure-factor matrix
+to projected inverse-response targets belongs in the application workflow.
+EquiCDFT consumes only explicit tensors. One response state can be constructed
+without a response-specific dataset class:
+
+```python
+import torch
+from equicdft import FourierResponseLoss, GridData, Loss
+
+state = GridData.from_dict(
+    {
+        "grid_size": (32, 32, 32),
+        "grid_spacing": 0.25,
+        "temperature": 1.0,
+        "n_types": 2,
+    },
+    cutoff_grid=3,
+    boltzmann_constant=1.0,
+)
+state["rho"] = torch.tensor([0.2, 0.2]).expand(32**3, -1).clone()
+state["fourier_modes"] = torch.tensor([[1, 0, 0], [1, 1, 0]])
+state["fourier_curvature"] = torch.tensor(
+    [
+        [1.0 / S_NN_100, 1.0 / S_ZZ_100],
+        [1.0 / S_NN_110, 1.0 / S_ZZ_110],
+    ]
+)
+state["fourier_curvature_scale"] = torch.tensor(
+    [[sigma_NN_100, sigma_ZZ_100], [sigma_NN_110, sigma_ZZ_110]]
+)
+
+loss = Loss(
+    [
+        FourierResponseLoss(
+            directions=((1.0, 1.0), (1.0, -1.0)),
+            scale_key="fourier_curvature_scale",
+            relative_amplitude=0.01,
+        )
+    ]
+)
+```
+
+Here the simple reciprocals are valid because number and charge are symmetry
+eigenchannels and the supplied $S_{NN}$ and $S_{ZZ}$ convention has ideal-gas
+limit one. A general mixture must first construct and invert its full response
+matrix, then project it using the same direction and normalization convention
+as the loss. Targets have per-item shape `[n_modes, n_directions]`; PyTorch's
+default collation adds the leading field dimension. Optional positive scales
+and nonnegative element weights have the same shape.
+
+Response states must be spatially uniform, periodic, and unmasked. Mode
+triplets are integer reciprocal-grid indices and must lie inside the physical
+isotropic Nyquist sphere. The loss averages the valid cosine and sine estimates
+for each mode. It does not shell-average, interpolate, extrapolate, regularize,
+or invert structure factors; those scientifically consequential operations
+must be recorded when the target tensors are prepared.
+
 ## Inference and equilibrium solution
 
 A saved full model can be loaded without reconstructing the architecture:
@@ -248,7 +314,8 @@ reciprocal kernels with nonperiodic boundary conditions.
 - `readout.py`, `semilocal.py`: local and state-dependent contributions
 - `pairwise.py`: finite-range distance-dependent pair contribution
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
-- `loss.py`: composable training objectives
+- `loss.py`, `stability.py`: composable response and stability objectives
+- `_fourier.py`: shared Fourier modes, projections, and curvature evaluation
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support
