@@ -462,7 +462,7 @@ class GridCACEModel(nn.Module):
                 feature_blocks = []
                 if getattr(self.a_features, "separate_center", False):
                     feature_blocks.append(
-                        rho
+                        self.a_features.transform_density(rho)
                         / self.mean_density.to(
                             device=rho.device,
                             dtype=rho.dtype,

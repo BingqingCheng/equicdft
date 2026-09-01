@@ -730,132 +730,170 @@ class TestCartesianAFeatures(unittest.TestCase):
                 radial_basis="gaussian",
                 radial_exponents=(float("nan"),),
             )
-class TestCartesianAFeatureChannelMixing(unittest.TestCase):
-    def test_known_linear_map_and_shape(self):
+class TestCartesianAFeatureDensityTransform(unittest.TestCase):
+    @staticmethod
+    def _single_grid_data(rho):
+        return {
+            "rho": rho,
+            "local_density_index": torch.zeros((1, 1), dtype=torch.long),
+        }
+
+    def test_fixed_transform_replaces_physical_density_channels(self):
+        weights = ((0.5, 0.5), (-0.5, 0.5))
         module = CartesianAFeatures(
             mean_density=1.0,
             cutoff_grid=0,
             max_power=0,
             separate_center=False,
             n_types=2,
-            n_channels=3,
+            density_transform=weights,
+            trainable_density_transform=False,
         )
-        with torch.no_grad():
-            module.channel_mixing.weight.copy_(
-                torch.tensor(
-                    [[1.0, 0.0], [0.0, 1.0], [2.0, -1.0]],
-                    dtype=module.monomial_values.dtype,
-                )
-            )
+        rho = torch.tensor([[1.0, 3.0]], requires_grad=True)
 
-        rho = torch.tensor(
-            [[1.0, 3.0]],
-            dtype=module.monomial_values.dtype,
-        )
-        mixed = module(
-            {
-                "rho": rho,
-                "local_density_index": torch.zeros(
-                    (1, 1),
-                    dtype=torch.long,
-                ),
-            }
-        )
+        features = module(self._single_grid_data(rho))
 
-        self.assertEqual(mixed.shape, (1, 1, 1, 3))
+        self.assertEqual(features.shape, (1, 1, 1, 2))
+        self.assertTrue(
+            torch.allclose(features, torch.tensor([[[[2.0, 1.0]]]]))
+        )
         self.assertTrue(
             torch.allclose(
-                mixed,
-                torch.tensor(
-                    [[[[1.0, 3.0, -1.0]]]],
-                    dtype=mixed.dtype,
-                ),
+                module.transform_density(rho),
+                torch.tensor([[2.0, 1.0]]),
             )
         )
-        self.assertEqual(module.n_output_channels, 3)
+        self.assertFalse(module.density_transform.weight.requires_grad)
+        self.assertEqual(module.n_channels, 2)
+        self.assertEqual(module.n_output_channels, 2)
 
-    def test_mixing_commutes_with_cubic_symmetry(self):
+        number_gradient = torch.autograd.grad(
+            features[..., 0].sum(), rho, retain_graph=True
+        )[0]
+        charge_gradient = torch.autograd.grad(features[..., 1].sum(), rho)[0]
+        self.assertTrue(
+            torch.allclose(number_gradient, torch.tensor([[0.5, 0.5]]))
+        )
+        self.assertTrue(
+            torch.allclose(charge_gradient, torch.tensor([[-0.5, 0.5]]))
+        )
+
+    def test_transform_is_applied_before_cartesian_moments(self):
         module = CartesianAFeatures(
-            mean_density=1.0,
-            cutoff_grid=0,
+            mean_density=0.7,
+            cutoff_grid=1,
             max_power=2,
             n_types=2,
-            n_channels=4,
+            density_transform=((1.0, 1.0), (-1.0, 1.0)),
+            trainable_density_transform=False,
         )
-        symmetrizer = CartesianBFeatures(
-            max_power=2,
-            max_product_order=3,
-        )
-        A = torch.randn(
-            2,
-            3,
-            10,
-            2,
-            dtype=module.monomial_values.dtype,
+        n_grid = module.local_density_positions.shape[0]
+        rho = torch.linspace(0.2, 1.6, 2 * n_grid).reshape(n_grid, 2)
+        index = torch.arange(n_grid).repeat(n_grid, 1)
+
+        actual = module({"rho": rho, "local_density_index": index})
+        transformed_density = module.transform_density(rho)
+        local_density = transformed_density[index]
+        expected = torch.einsum(
+            "gjt,jnk->gnkt",
+            local_density / module.mean_density,
+            module.stencil_basis(),
         )
 
-        mixed = module.channel_mixing(A)
-        reference = symmetrizer(mixed)
-        for index_map, sign_map in zip(
-            symmetrizer.component_indices,
-            symmetrizer.component_signs,
-        ):
-            sign_shape = [1] * A.ndim
-            sign_shape[-2] = sign_map.shape[0]
-            transformed = (
-                A.index_select(-2, index_map) * sign_map.view(sign_shape)
-            )
+        self.assertTrue(torch.allclose(actual, expected))
 
-            # Mixing physical channels commutes with the signed permutation of
-            # Cartesian components, and the subsequent B features are invariant.
-            transformed_mixed = module.channel_mixing(transformed)
-            expected_mixed = (
-                mixed.index_select(-2, index_map) * sign_map.view(sign_shape)
-            )
-            self.assertTrue(
-                torch.allclose(transformed_mixed, expected_mixed, atol=1.0e-6)
-            )
-            self.assertTrue(
-                torch.allclose(
-                    symmetrizer(transformed_mixed),
-                    reference,
-                    atol=1.0e-6,
-                )
-            )
-
-    def test_inputs_and_weights_receive_gradients(self):
+    def test_explicit_transform_can_be_trainable(self):
         module = CartesianAFeatures(
             mean_density=1.0,
             cutoff_grid=0,
-            max_power=2,
+            max_power=0,
+            separate_center=False,
+            n_types=2,
+            density_transform=((0.5, 0.5), (-0.5, 0.5)),
+            trainable_density_transform=True,
+        )
+        rho = torch.tensor([[1.0, 3.0]], requires_grad=True)
+
+        module(self._single_grid_data(rho)).square().sum().backward()
+
+        self.assertTrue(module.density_transform.weight.requires_grad)
+        self.assertIsNotNone(module.density_transform.weight.grad)
+        self.assertIsNotNone(rho.grad)
+        self.assertTrue(torch.all(torch.isfinite(rho.grad)))
+        self.assertTrue(
+            torch.all(torch.isfinite(module.density_transform.weight.grad))
+        )
+
+    def test_n_channels_retains_random_trainable_transform(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=0,
+            max_power=0,
             n_types=2,
             n_channels=3,
         )
-        A = torch.randn(
-            2,
-            4,
-            10,
-            2,
-            dtype=module.monomial_values.dtype,
-            requires_grad=True,
-        )
-        module.channel_mixing(A).square().sum().backward()
 
-        self.assertIsNotNone(A.grad)
-        self.assertIsNotNone(module.channel_mixing.weight.grad)
-        self.assertTrue(torch.all(torch.isfinite(A.grad)))
-        self.assertTrue(
-            torch.all(torch.isfinite(module.channel_mixing.weight.grad))
-        )
+        self.assertEqual(module.density_transform.weight.shape, (3, 2))
+        self.assertTrue(module.density_transform.weight.requires_grad)
+        self.assertEqual(module.n_output_channels, 3)
 
-    def test_one_component_disables_channel_mixing(self):
+    def test_transform_defaults_to_physical_density_channels(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=0,
+            max_power=0,
+            n_types=2,
+        )
+        rho = torch.tensor([[1.0, 3.0]])
+
+        self.assertIsNone(module.density_transform)
+        self.assertIs(module.transform_density(rho), rho)
+        self.assertEqual(module.n_output_channels, 2)
+
+        del module.density_transform
+        self.assertIs(module.transform_density(rho), rho)
+
+    def test_transform_arguments_are_validated(self):
+        invalid_weights = (
+            (0.5, 0.5),
+            ((0.5,),),
+            ((),),
+            ((0.5, float("nan")),),
+        )
+        for weights in invalid_weights:
+            with self.subTest(weights=weights):
+                with self.assertRaises((TypeError, ValueError)):
+                    CartesianAFeatures(
+                        mean_density=1.0,
+                        max_power=0,
+                        n_types=2,
+                        density_transform=weights,
+                    )
+        with self.assertRaisesRegex(ValueError, "number of rows"):
+            CartesianAFeatures(
+                mean_density=1.0,
+                max_power=0,
+                n_types=2,
+                n_channels=3,
+                density_transform=((0.5, 0.5), (-0.5, 0.5)),
+            )
+        with self.assertRaises(TypeError):
+            CartesianAFeatures(
+                mean_density=1.0,
+                max_power=0,
+                n_types=2,
+                n_channels=2,
+                trainable_density_transform="yes",
+            )
+
+    def test_one_component_disables_density_transform(self):
         module = CartesianAFeatures(
             mean_density=1.0,
             cutoff_grid=0,
             max_power=0,
             n_types=1,
         )
-        self.assertIsNone(module.channel_mixing)
+        self.assertIsNone(module.density_transform)
         self.assertEqual(module.n_output_channels, 1)
 
         with self.assertRaises(ValueError):
@@ -864,7 +902,7 @@ class TestCartesianAFeatureChannelMixing(unittest.TestCase):
                 cutoff_grid=0,
                 max_power=0,
                 n_types=1,
-                n_channels=2,
+                density_transform=((1.0,),),
             )
 
 

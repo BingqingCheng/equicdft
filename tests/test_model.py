@@ -1072,9 +1072,46 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 2))
         outputs["c1"].square().mean().backward()
-        mixing_gradient = model.a_features.channel_mixing.weight.grad
+        mixing_gradient = model.a_features.density_transform.weight.grad
         self.assertIsNotNone(mixing_gradient)
         self.assertTrue(torch.all(torch.isfinite(mixing_gradient)))
+
+    def test_transformed_density_replaces_direct_center_descriptors(self):
+        data = self._make_data()
+        data["rho"] = torch.cat(
+            (data["rho"], 0.5 * data["rho"]),
+            dim=-1,
+        )
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=1,
+            max_power=1,
+            separate_center=True,
+            n_types=2,
+            density_transform=((0.5, 0.5),),
+            trainable_density_transform=False,
+        )
+        b_features = CartesianBFeatures(
+            max_power=1,
+            max_product_order=1,
+        )
+        readout = LocalReadout(n_types=2, hidden_sizes=(8,))
+        model = GridCACEModel(
+            a_features,
+            b_features,
+            [readout],
+            grid_spacing=0.5,
+        )
+
+        outputs = model(data)
+
+        expected_input_width = 1 + b_features.n_features + 1
+        self.assertEqual(readout.mlp[0].in_features, expected_input_width)
+        self.assertEqual(outputs["c1"].shape, data["rho"].shape)
+        gradient = torch.autograd.grad(
+            outputs["c1"].square().mean(), data["rho"]
+        )[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
 
     def test_separate_center_is_added_once_to_local_readout(self):
         data = self._make_data()

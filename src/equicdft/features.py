@@ -216,9 +216,24 @@ class CartesianAFeatures(nn.Module):
     n_types
         Number of physical density components in the input field.
     n_channels
-        Number of latent output channels after learned component mixing.
-        ``None`` retains the physical component channels. Mixing is available
-        only when ``n_types`` is greater than one.
+        Number of output density channels after a pointwise linear transform.
+        When ``density_transform`` is omitted, this retains the
+        original Xavier-initialized learned transform. ``None`` retains the
+        physical density channels unless explicit transform weights are
+        supplied.
+    density_transform
+        Optional matrix with shape ``[n_channels, n_types]``. Before any
+        neighborhood gathering or Cartesian-moment construction, physical
+        density channels are replaced by ``rho_transformed[..., q] =
+        sum_t weights[q, t] * rho[..., t]``. The transformed densities replace
+        the physical channels in both the neighborhood moments and direct
+        center descriptors. Negative and rectangular transforms are allowed.
+        The number of rows determines ``n_channels`` when it is omitted.
+    trainable_density_transform
+        Whether a configured density transform is optimized. The default is
+        ``True``, retaining the existing learned ``n_channels`` behavior.
+        Set it to ``False`` with explicit ``density_transform`` weights for a
+        fixed physical basis such as number and charge densities.
     mean_density
         Positive scalar used for scale-only density normalization. For fitting,
         set this to the precomputed mean density of the training split. It is
@@ -251,6 +266,10 @@ class CartesianAFeatures(nn.Module):
             Union[Sequence[float], torch.Tensor]
         ] = None,
         trainable_radial_centers: bool = False,
+        density_transform: Optional[
+            Union[Sequence[Sequence[float]], torch.Tensor]
+        ] = None,
+        trainable_density_transform: bool = True,
     ) -> None:
         super().__init__()
 
@@ -288,13 +307,47 @@ class CartesianAFeatures(nn.Module):
             raise ValueError("coordinate_scaling must be 'none' or 'cutoff'")
         separate_center = boolean(separate_center, "separate_center")
         n_types = positive_integer(n_types, "n_types")
-
-        n_channels = optional_positive_integer(n_channels, "n_channels")
-        if n_channels is not None:
-            if n_types == 1:
+        trainable_density_transform = boolean(
+            trainable_density_transform,
+            "trainable_density_transform",
+        )
+        if density_transform is None:
+            transform_weights = None
+        else:
+            transform_weights = torch.as_tensor(
+                density_transform,
+                dtype=torch.get_default_dtype(),
+            ).detach().clone()
+            if transform_weights.ndim != 2:
                 raise ValueError(
-                    "channel mixing is disabled for one-component density fields"
+                    "density_transform must be a two-dimensional "
+                    "matrix"
                 )
+            if transform_weights.shape[0] == 0:
+                raise ValueError(
+                    "density_transform must contain at least one row"
+                )
+            if transform_weights.shape[1] != n_types:
+                raise ValueError(
+                    "density_transform must contain one column per "
+                    "physical density type"
+                )
+            if not torch.all(torch.isfinite(transform_weights)).item():
+                raise ValueError("density_transform must be finite")
+        n_channels = optional_positive_integer(n_channels, "n_channels")
+        if transform_weights is not None:
+            inferred_channels = int(transform_weights.shape[0])
+            if n_channels is None:
+                n_channels = inferred_channels
+            elif n_channels != inferred_channels:
+                raise ValueError(
+                    "n_channels must equal the number of rows in "
+                    "density_transform"
+                )
+        if n_channels is not None and n_types == 1:
+            raise ValueError(
+                "density transforms are disabled for one-component fields"
+            )
 
         mean_density_tensor = torch.as_tensor(
             mean_density,
@@ -378,14 +431,17 @@ class CartesianAFeatures(nn.Module):
         self.separate_center = separate_center
         self.n_types = n_types
         self.n_channels = n_channels
+        self.trainable_density_transform = trainable_density_transform
         self.n_radial_channels = int(initial_radial_exponents.numel())
         self.n_output_channels = n_types if n_channels is None else n_channels
-        self.channel_mixing = (
+        self.density_transform = (
             None
             if n_channels is None
-            else _AChannelMixing(
+            else _DensityMixing(
                 n_types=n_types,
                 n_channels=n_channels,
+                weights=transform_weights,
+                trainable=trainable_density_transform,
             )
         )
         self.register_buffer("local_density_positions", local_density_positions)
@@ -464,6 +520,22 @@ class CartesianAFeatures(nn.Module):
             return self.squared_distances != 0
         return torch.ones_like(self.squared_distances, dtype=torch.bool)
 
+    def transform_density(self, rho: torch.Tensor) -> torch.Tensor:
+        """Return the physical or configured transformed density channels.
+
+        The transform is pointwise and remains connected to ``rho`` for
+        functional derivatives.
+        """
+
+        if rho.ndim < 2 or rho.shape[-1] != self.n_types:
+            raise ValueError(
+                "rho must have shape [..., n_grid, n_types] with the "
+                "configured number of physical density types"
+            )
+        if self.n_channels is None:
+            return rho
+        return self.density_transform(rho)
+
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
@@ -488,17 +560,11 @@ class CartesianAFeatures(nn.Module):
             ``n_channels`` when mixing is enabled.
         """
 
+        descriptor_density = self.transform_density(data["rho"])
         local_density = gather_neighbors(
-            data["rho"],
+            descriptor_density,
             data["local_density_index"],
         )
-        if local_density.shape[-1] != self.n_types:
-            raise ValueError(
-                "rho has {} type channels but CartesianAFeatures expects {}".format(
-                    local_density.shape[-1],
-                    self.n_types,
-                )
-            )
         if local_density.shape[-2] != self.monomial_values.shape[0]:
             raise ValueError(
                 "local_density neighbor count does not match cutoff_grid={}".format(
@@ -514,60 +580,59 @@ class CartesianAFeatures(nn.Module):
             local_density / self.mean_density,
             self.stencil_basis(),
         )
-        if self.channel_mixing is not None:
-            features = self.channel_mixing(features)
         return features
 
 
-class _AChannelMixing(nn.Module):
-    """Internal learned map from physical A channels to latent channels.
+class _DensityMixing(nn.Module):
+    """Internal pointwise map from physical to descriptor densities.
 
-    For each grid point, radial channel, and Cartesian component, this module
-    applies the same learned linear map.
+    ``rho_mixed[..., q] = sum_t weight[q, t] * rho[..., t]``.
 
-    ``A_mixed[..., q] = sum_t weight[q, t] * A[..., t]``.
-
-    Here ``t`` labels the physical components of the density field and ``q``
-    labels latent channels. Mixing only the final channel axis means that the
-    operation commutes with rotations and reflections of the Cartesian
-    component axis. Consequently, ``A_mixed`` can be passed directly to
-    :class:`equicdft.symmetrize.CartesianBFeatures`.
+    Here ``t`` labels physical density components and ``q`` labels descriptor
+    density channels. The map acts independently at every spatial point, so
+    spatial rotations and reflections are unaffected.
 
     Notes
     -----
-    The map intentionally has no additive bias. A constant bias applied to
-    odd Cartesian components would not transform equivariantly under axis
-    reflections.
+    The map intentionally has no additive bias, so an empty voxel remains
+    empty after the transform.
     """
 
-    def __init__(self, n_types: int, n_channels: int) -> None:
+    def __init__(
+        self,
+        n_types: int,
+        n_channels: int,
+        weights: Optional[torch.Tensor] = None,
+        trainable: bool = True,
+    ) -> None:
         super().__init__()
 
         self.n_types = positive_integer(n_types, "n_types")
         self.n_channels = positive_integer(n_channels, "n_channels")
-        self.weight = nn.Parameter(
-            torch.empty(
+        if weights is None:
+            initial_weights = torch.empty(
                 self.n_channels,
                 self.n_types,
                 dtype=torch.get_default_dtype(),
             )
-        )
-        nn.init.xavier_uniform_(self.weight)
+            nn.init.xavier_uniform_(initial_weights)
+        else:
+            initial_weights = weights.detach().clone()
+        self.weight = nn.Parameter(initial_weights, requires_grad=trainable)
 
-    def forward(self, A: torch.Tensor) -> torch.Tensor:
-        """Return ``A`` with its final physical-type axis linearly mixed."""
+    def forward(self, rho: torch.Tensor) -> torch.Tensor:
+        """Return ``rho`` with its physical-type axis linearly transformed."""
 
-        if A.ndim < 4:
+        if rho.ndim < 2:
             raise ValueError(
-                "A must have shape "
-                "[..., n_grid, n_radial_channels, n_monomials, n_types]"
+                "rho must have shape [..., n_grid, n_types]"
             )
-        if A.shape[-1] != self.n_types:
+        if rho.shape[-1] != self.n_types:
             raise ValueError(
-                "A has {} type channels but this module expects {}".format(
-                    A.shape[-1],
+                "rho has {} type channels but this module expects {}".format(
+                    rho.shape[-1],
                     self.n_types,
                 )
             )
 
-        return torch.einsum("...t,qt->...q", A, self.weight)
+        return torch.einsum("...t,qt->...q", rho, self.weight)
