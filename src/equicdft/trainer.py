@@ -217,7 +217,7 @@ class Trainer(nn.Module):
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization(train_loader)
-        start_epoch = len(self.history) + 1
+        start_epoch = self._next_epoch()
 
         if self._early_stopping_reached():
             self.log_message(
@@ -279,6 +279,7 @@ class Trainer(nn.Module):
         ] = None,
         verbose: bool = True,
         print_interval: int = 1,
+        record_initial_validation: bool = False,
     ) -> List[Dict[str, Any]]:
         """Jointly optimize multiple data streams without mixing datasets.
 
@@ -288,9 +289,15 @@ class Trainer(nn.Module):
         constants or callables of the one-based epoch number. Validation is
         evaluated separately for every stream; the weighted sum of validation
         totals drives the configured scheduler and ordinary ``best.pt``.
+        If requested, the untrained validation result is first recorded as
+        epoch 0, using stream-weight callables evaluated at zero.
         """
 
         epochs = positive_integer(epochs, "epochs")
+        record_initial_validation = boolean(
+            record_initial_validation,
+            "record_initial_validation",
+        )
         verbose = boolean(verbose, "verbose")
         print_interval = positive_integer(print_interval, "print_interval")
         streams = self._configure_streams(streams)
@@ -309,16 +316,23 @@ class Trainer(nn.Module):
             streams[0].train_loader,
             model_kwargs=streams[0].model_kwargs,
         )
-        start_epoch = len(self.history) + 1
+        if record_initial_validation and not self.history:
+            self._record_stream_baseline(
+                streams,
+                self._resolve_stream_weights(
+                    streams,
+                    weight_specification,
+                    epoch=0,
+                ),
+                verbose,
+            )
+        start_epoch = self._next_epoch()
         for epoch in range(start_epoch, start_epoch + epochs):
-            weights = {
-                stream.name: self._stream_weight(
-                    weight_specification.get(stream.name, 1.0),
-                    epoch,
-                    stream.name,
-                )
-                for stream in streams
-            }
+            weights = self._resolve_stream_weights(
+                streams,
+                weight_specification,
+                epoch,
+            )
             train_by_stream = self._run_training_streams(streams, weights)
             valid_by_stream = {
                 stream.name: self._run_stream_loader(
@@ -381,6 +395,42 @@ class Trainer(nn.Module):
             )
             for stream in streams
         }
+
+    def _record_stream_baseline(
+        self,
+        streams: Sequence[TrainingStream],
+        weights: Mapping[str, float],
+        verbose: bool,
+    ) -> None:
+        """Append validation-only epoch 0 before the first optimizer update."""
+
+        evaluated = {
+            stream.name: self._run_stream_loader(
+                stream,
+                subset="valid",
+                training=False,
+            )
+            for stream in streams
+        }
+        valid_losses, valid_metrics = self._flatten_stream_results(
+            evaluated,
+            weights,
+        )
+        record = {
+            "epoch": 0,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "stream_weights": weights,
+            "train_losses": {},
+            "valid_losses": valid_losses,
+            "train_metrics": {},
+            "valid_metrics": valid_metrics,
+        }
+        self.history.append(record)
+        self._write_history_csv()
+        if verbose:
+            self.log_message(
+                "Untrained validation baseline\n" + format_record(record)
+            )
 
     def save_checkpoint(
         self,
@@ -506,9 +556,14 @@ class Trainer(nn.Module):
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
             raise ValueError("checkpoint epoch must be a positive integer")
         history = checkpoint["history"]
-        if not isinstance(history, list) or len(history) != epoch:
+        if not isinstance(history, list):
+            raise ValueError("checkpoint history must be a list")
+        history_epochs = [record.get("epoch") for record in history]
+        expected_epochs = list(range(1, epoch + 1))
+        if history_epochs not in (expected_epochs, [0] + expected_epochs):
             raise ValueError(
-                "checkpoint history length must equal its completed epoch"
+                "checkpoint history must contain epochs 1 through its "
+                "completed epoch, with at most one leading epoch 0 baseline"
             )
         self.history = history
 
@@ -516,7 +571,9 @@ class Trainer(nn.Module):
             self.best_valid_loss = float(checkpoint["best_valid_loss"])
         else:
             self.best_valid_loss = min(
-                record["valid_losses"]["total"] for record in history
+                record["valid_losses"]["total"]
+                for record in history
+                if record["epoch"] > 0
             )
         if "epochs_without_improvement" in checkpoint:
             self.epochs_without_improvement = int(
@@ -526,6 +583,8 @@ class Trainer(nn.Module):
             best_loss = math.inf
             epochs_without_improvement = 0
             for record in history:
+                if record["epoch"] == 0:
+                    continue
                 valid_loss = record["valid_losses"]["total"]
                 if valid_loss < best_loss:
                     best_loss = valid_loss
@@ -745,6 +804,26 @@ class Trainer(nn.Module):
     ) -> float:
         value = specification(epoch) if callable(specification) else specification
         return nonnegative_scalar(value, "{} stream weight".format(name))
+
+    def _resolve_stream_weights(
+        self,
+        streams: Sequence[TrainingStream],
+        specifications: Mapping[
+            str,
+            Union[float, Callable[[int], float]],
+        ],
+        epoch: int,
+    ) -> Dict[str, float]:
+        """Evaluate all stream-weight specifications for one epoch."""
+
+        return {
+            stream.name: self._stream_weight(
+                specifications.get(stream.name, 1.0),
+                epoch,
+                stream.name,
+            )
+            for stream in streams
+        }
 
     def _run_training_streams(
         self,
@@ -1005,5 +1084,10 @@ class Trainer(nn.Module):
             for parameter in list(self.model.parameters())
             + list(self.loss.parameters())
         )
+
+    def _next_epoch(self) -> int:
+        """Return the next positive training epoch after optional epoch 0."""
+
+        return self.history[-1]["epoch"] + 1 if self.history else 1
 
     _format_record = staticmethod(format_record)

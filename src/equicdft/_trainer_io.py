@@ -4,7 +4,7 @@ import csv
 from datetime import datetime
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -74,27 +74,44 @@ def _flatten_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "epoch": record["epoch"],
         "learning_rate": record["learning_rate"],
     }
-    for loss_name in record["train_losses"]:
+    loss_names = _ordered_union(
+        record["train_losses"],
+        record["valid_losses"],
+    )
+    for loss_name in loss_names:
         column_name = _column_name(loss_name)
         for subset in ("train", "valid"):
-            row["{}_loss_{}".format(subset, column_name)] = record[
-                "{}_losses".format(subset)
-            ][loss_name]
+            values = record["{}_losses".format(subset)]
+            if loss_name in values:
+                row["{}_loss_{}".format(subset, column_name)] = values[
+                    loss_name
+                ]
 
-    for collection_name, train_values in record["train_metrics"].items():
+    collection_names = _ordered_union(
+        record["train_metrics"],
+        record["valid_metrics"],
+    )
+    for collection_name in collection_names:
         collection_column = _column_name(collection_name)
-        for metric_name in train_values:
+        metric_names = _ordered_union(
+            record["train_metrics"].get(collection_name, {}),
+            record["valid_metrics"].get(collection_name, {}),
+        )
+        for metric_name in metric_names:
             metric_column = _column_name(metric_name)
             for subset in ("train", "valid"):
-                row[
-                    "{}_{}_{}".format(
-                        subset,
-                        collection_column,
-                        metric_column,
-                    )
-                ] = record["{}_metrics".format(subset)][collection_name][
-                    metric_name
-                ]
+                values = record["{}_metrics".format(subset)].get(
+                    collection_name,
+                    {},
+                )
+                if metric_name in values:
+                    row[
+                        "{}_{}_{}".format(
+                            subset,
+                            collection_column,
+                            metric_column,
+                        )
+                    ] = values[metric_name]
     return row
 
 
@@ -113,6 +130,16 @@ def _column_name(name: str) -> str:
     return "".join(characters).strip("_")
 
 
+def _ordered_union(*collections: Iterable[str]) -> List[str]:
+    """Return unique strings in first-occurrence order."""
+
+    return list(
+        dict.fromkeys(
+            value for collection in collections for value in collection
+        )
+    )
+
+
 def format_record(record: Dict[str, Any]) -> str:
     """Format one readable, terminal-safe multi-line epoch summary."""
 
@@ -123,31 +150,58 @@ def format_record(record: Dict[str, Any]) -> str:
         )
     ]
 
+    available_losses = _ordered_union(
+        record["train_losses"],
+        record["valid_losses"],
+    )
     loss_names = ["total"] + [
-        name for name in record["train_losses"] if name != "total"
+        name for name in available_losses if name != "total"
     ]
     loss_rows = []
     for subset in ("train", "valid"):
         values = record["{}_losses".format(subset)]
-        loss_rows.append(
-            [subset] + ["{:.6e}".format(values[name]) for name in loss_names]
-        )
+        if values:
+            loss_rows.append(
+                [subset]
+                + [
+                    (
+                        "{:.6e}".format(values[name])
+                        if name in values
+                        else "-"
+                    )
+                    for name in loss_names
+                ]
+            )
     lines.extend(
         ["", _format_table("Losses", ["subset"] + loss_names, loss_rows)]
     )
 
-    for collection_name, train_values in record["train_metrics"].items():
-        metric_names = list(train_values)
+    collection_names = _ordered_union(
+        record["train_metrics"],
+        record["valid_metrics"],
+    )
+    for collection_name in collection_names:
+        metric_names = _ordered_union(
+            record["train_metrics"].get(collection_name, {}),
+            record["valid_metrics"].get(collection_name, {}),
+        )
         metric_rows = []
         for subset in ("train", "valid"):
-            values = record["{}_metrics".format(subset)][collection_name]
-            metric_rows.append(
-                [subset]
-                + [
-                    format_metric_value(name, values[name])
-                    for name in metric_names
-                ]
+            values = record["{}_metrics".format(subset)].get(
+                collection_name
             )
+            if values is not None:
+                metric_rows.append(
+                    [subset]
+                    + [
+                        (
+                            format_metric_value(name, values[name])
+                            if name in values
+                            else "-"
+                        )
+                        for name in metric_names
+                    ]
+                )
         lines.extend(
             [
                 "",

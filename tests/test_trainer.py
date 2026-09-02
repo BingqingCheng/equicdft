@@ -325,6 +325,81 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(completed, 1)
         self.assertEqual([row["epoch"] for row in resumed.history], [1, 2])
 
+    def test_stream_baseline_is_printed_recorded_and_resumable(self):
+        def build(directory):
+            loss = Loss(
+                [TensorLoss("target", "prediction", "target")]
+            )
+            stream = TrainingStream(
+                "field",
+                DataLoader(_dataset([1, 2]), batch_size=1),
+                DataLoader(_dataset([3]), batch_size=1),
+                loss,
+                metrics=(
+                    Metrics(
+                        "target",
+                        prediction_key="prediction",
+                        metric_keys=("rmse",),
+                        subsets=("train", "valid"),
+                    ),
+                ),
+            )
+            return (
+                Trainer(
+                    _LinearDictionaryModel(),
+                    loss,
+                    optimizer_cls=torch.optim.SGD,
+                    optimizer_args={"lr": 0.001},
+                    checkpoint_dir=Path(directory) / "checkpoints",
+                    log_dir=Path(directory) / "logs",
+                ),
+                (stream,),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trainer, streams = build(temporary_directory)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                history = trainer.fit_streams(
+                    streams,
+                    epochs=1,
+                    stream_weights={"field": lambda epoch: epoch / 10.0},
+                    record_initial_validation=True,
+                    verbose=True,
+                )
+            with (Path(temporary_directory) / "logs/history.csv").open(
+                newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            checkpoint = torch.load(
+                Path(temporary_directory) / "checkpoints/last.pt"
+            )
+
+            resumed, resumed_streams = build(temporary_directory)
+            completed = resumed.load_stream_checkpoint(
+                Path(temporary_directory) / "checkpoints/last.pt",
+                resumed_streams,
+            )
+
+        baseline = history[0]
+        self.assertEqual(baseline["epoch"], 0)
+        self.assertEqual(baseline["stream_weights"], {"field": 0.0})
+        self.assertEqual(baseline["train_losses"], {})
+        self.assertIn("field/target", baseline["valid_metrics"])
+        self.assertIn("Untrained validation baseline", output.getvalue())
+        self.assertEqual([row["epoch"] for row in rows], ["0", "1"])
+        self.assertEqual(rows[0]["train_field_target_rmse"], "")
+        self.assertNotEqual(rows[0]["valid_field_target_rmse"], "")
+        self.assertEqual(
+            [record["epoch"] for record in checkpoint["history"]],
+            [0, 1],
+        )
+        self.assertEqual(completed, 1)
+        self.assertEqual(
+            [record["epoch"] for record in resumed.history],
+            [0, 1],
+        )
+
     def test_response_stream_reuses_loss_details_for_metrics(self):
         dataset = _functional_dataset()
         for frame in dataset:
