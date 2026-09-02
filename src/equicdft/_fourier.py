@@ -19,6 +19,7 @@ def projected_fourier_curvature(
     valid_directions: torch.Tensor,
     mean_densities: torch.Tensor,
     relative_amplitude: float,
+    perturbations_per_forward: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Evaluate normalized total intrinsic curvature along fixed directions."""
 
@@ -31,29 +32,35 @@ def projected_fourier_curvature(
         raise RuntimeError("Fourier perturbation produced negative density")
 
     n_directions = directions.shape[1]
-    perturbed_rho = torch.cat((rho_plus, rho_minus), dim=1)
-    perturbed_outputs = model(
-        _expand_batch(batch, perturbed_rho),
-        compute_c1=False,
-    )
-    if "beta_F_exc" not in perturbed_outputs:
-        raise KeyError("model outputs are missing 'beta_F_exc'")
-
+    perturbed_rho = torch.stack((rho_plus, rho_minus), dim=2).flatten(1, 2)
     volume_element = voxel_volume(batch["grid_spacing"].to(rho))
     reference_energy = (
         _ideal_free_energy(rho, volume_element) + outputs["beta_F_exc"]
     )
-    perturbed_energy = (
-        _ideal_free_energy(
-            perturbed_rho,
-            volume_element[:, None].expand(-1, 2 * n_directions),
+    chunk_size = perturbations_per_forward or perturbed_rho.shape[1]
+    energy_chunks = []
+    for start in range(0, perturbed_rho.shape[1], chunk_size):
+        chunk = perturbed_rho[:, start:start + chunk_size]
+        perturbed_outputs = model(
+            _expand_batch(batch, chunk),
+            compute_c1=False,
         )
-        + perturbed_outputs["beta_F_exc"]
+        if "beta_F_exc" not in perturbed_outputs:
+            raise KeyError("model outputs are missing 'beta_F_exc'")
+        energy_chunks.append(
+            _ideal_free_energy(
+                chunk,
+                volume_element[:, None].expand(-1, chunk.shape[1]),
+            )
+            + perturbed_outputs["beta_F_exc"]
+        )
+    perturbed_energy = torch.cat(energy_chunks, dim=1).reshape(
+        rho.shape[0],
+        n_directions,
+        2,
     )
     second_difference = (
-        perturbed_energy[:, :n_directions]
-        + perturbed_energy[:, n_directions:]
-        - 2.0 * reference_energy[:, None]
+        perturbed_energy.sum(dim=2) - 2.0 * reference_energy[:, None]
     )
     perturbation_norm = volume_element[:, None] * torch.sum(
         delta_rho.square(),
@@ -168,14 +175,15 @@ def fourier_directions(
 def average_fourier_phases(
     curvature: torch.Tensor,
     valid: torch.Tensor,
-    n_modes: int,
-    n_directions: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Average valid cosine and sine curvatures for each target."""
 
-    shape = (curvature.shape[0], n_modes, 2, n_directions)
-    curvature = curvature.reshape(shape)
-    valid = valid.reshape(shape)
+    if curvature.ndim != 4 or curvature.shape[2] != 2:
+        raise ValueError(
+            "curvature must have shape [field, mode, phase, direction]"
+        )
+    if valid.shape != curvature.shape:
+        raise ValueError("valid and curvature must have the same shape")
     phase_count = valid.sum(dim=2)
     prediction = torch.sum(curvature * valid.to(curvature), dim=2)
     prediction = prediction / torch.clamp(phase_count, min=1)
@@ -198,12 +206,13 @@ def normalized_directions(
     return (value / scale).detach().clone()
 
 
-def validate_uniform_response(
+def validate_response(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     n_types: int,
+    require_uniform: bool = False,
 ) -> torch.Tensor:
-    """Return a validated homogeneous, periodic, unmasked response density."""
+    """Return a validated density for a projected Fourier response."""
 
     if "beta_F_exc" not in outputs:
         raise KeyError("model outputs are missing 'beta_F_exc'")
@@ -228,13 +237,33 @@ def validate_uniform_response(
         raise ValueError("rho must be nonnegative")
     if outputs["beta_F_exc"].shape != rho.shape[:-2]:
         raise ValueError("beta_F_exc must contain one value per field")
-    spatial_range = torch.amax(rho, dim=-2) - torch.amin(rho, dim=-2)
-    spatial_scale = torch.clamp(torch.amax(rho, dim=-2), min=1.0)
-    if torch.any(spatial_range > 1.0e-7 * spatial_scale).item():
-        raise ValueError("Fourier response rho must be spatially uniform")
-    if "excluded_mask" in batch and torch.any(batch["excluded_mask"]).item():
-        raise ValueError("Fourier response batches must not exclude grid points")
+    if require_uniform:
+        spatial_range = torch.amax(rho, dim=-2) - torch.amin(rho, dim=-2)
+        spatial_scale = torch.clamp(torch.amax(rho, dim=-2), min=1.0)
+        if torch.any(spatial_range > 1.0e-7 * spatial_scale).item():
+            raise ValueError("Fourier response rho must be spatially uniform")
+        if "excluded_mask" in batch and torch.any(
+            batch["excluded_mask"]
+        ).item():
+            raise ValueError(
+                "homogeneous Fourier response batches must not exclude grid points"
+            )
     return rho
+
+
+def validate_uniform_response(
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    n_types: int,
+) -> torch.Tensor:
+    """Return a validated homogeneous, periodic, unmasked response density."""
+
+    return validate_response(
+        outputs,
+        batch,
+        n_types=n_types,
+        require_uniform=True,
+    )
 
 
 def validate_explicit_modes(

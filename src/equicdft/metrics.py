@@ -298,3 +298,176 @@ class Metrics(nn.Module):
                     tuple(self.logs),
                 )
             )
+
+
+class FourierResponseMetrics(nn.Module):
+    """Accumulate projected-curvature and diagonal-response diagnostics.
+
+    The input to :meth:`update_metrics` is the dictionary returned by
+    :meth:`equicdft.FourierResponseLoss.evaluate`. Curvature metrics use the
+    supplied response weights. ``S`` diagnostics report ``1 / K`` separately
+    for each projected direction and therefore describe diagonal projected
+    responses, not an inversion of a full coupled response matrix.
+    """
+
+    requires_loss_details = True
+
+    def __init__(
+        self,
+        direction_names: Sequence[str],
+        name: str = "fourier_response",
+        subsets: Sequence[str] = ("train", "valid", "test"),
+    ) -> None:
+        super().__init__()
+
+        self.name = nonempty_string(name, "name")
+        self.direction_names = unique_strings(
+            direction_names,
+            "direction_names",
+        )
+        subset_names = unique_strings(subsets, "subsets")
+        self.logs = {
+            subset: {
+                key: []
+                for key in (
+                    "prediction",
+                    "target",
+                    "scale",
+                    "element_weight",
+                    "element_loss",
+                )
+            }
+            for subset in subset_names
+        }
+
+    def update_metrics(
+        self,
+        subset: str,
+        details: Dict[str, torch.Tensor],
+    ) -> None:
+        """Append one detached response-loss evaluation."""
+
+        self._require_subset(subset)
+        required = set(self.logs[subset])
+        missing = required - set(details)
+        if missing:
+            raise KeyError(
+                "response details are missing: {}".format(sorted(missing))
+            )
+        n_directions = len(self.direction_names)
+        reference_shape = None
+        for key in required:
+            value = details[key]
+            if not torch.is_tensor(value):
+                raise TypeError("response detail '{}' must be a tensor".format(key))
+            if value.ndim < 1 or value.shape[-1] != n_directions:
+                raise ValueError(
+                    "response details must end with n_directions={}".format(
+                        n_directions
+                    )
+                )
+            if reference_shape is None:
+                reference_shape = value.shape
+            elif value.shape != reference_shape:
+                raise ValueError("all response details must have the same shape")
+            if not torch.all(torch.isfinite(value)).item():
+                raise ValueError("response details must be finite")
+            self.logs[subset][key].append(
+                value.detach().reshape(-1, n_directions).cpu().clone()
+            )
+
+    def retrieve_metrics(
+        self,
+        subset: str,
+        clear: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Return globally weighted response metrics for one subset."""
+
+        clear = boolean(clear, "clear")
+        self._require_subset(subset)
+        if not self.logs[subset]["prediction"]:
+            raise ValueError("no metric data recorded for subset '{}'".format(subset))
+        values = {
+            key: torch.cat(items, dim=0)
+            for key, items in self.logs[subset].items()
+        }
+        prediction = values["prediction"]
+        target = values["target"]
+        scale = values["scale"]
+        weight = values["element_weight"]
+        element_loss = values["element_loss"]
+        if torch.any(weight < 0.0).item():
+            raise ValueError("element_weight must be nonnegative")
+        total_weight = weight.sum()
+        if total_weight.item() <= 0.0:
+            raise ValueError("element_weight must have a positive sum")
+
+        result = {"loss": torch.sum(weight * element_loss) / total_weight}
+        for channel, label in enumerate(self.direction_names):
+            channel_weight = weight[:, channel]
+            valid = channel_weight > 0.0
+            denominator = channel_weight.sum()
+            if denominator.item() <= 0.0:
+                raise ValueError(
+                    "direction '{}' has no positive response weight".format(label)
+                )
+            error = prediction[:, channel] - target[:, channel]
+            result["K_{}_rmse".format(label)] = torch.sqrt(
+                torch.sum(channel_weight * error.square()) / denominator
+            )
+            relative_error = error / scale[:, channel]
+            result["K_{}_relative_rmse_percent".format(label)] = 100.0 * torch.sqrt(
+                torch.sum(channel_weight * relative_error.square()) / denominator
+            )
+
+            positive = valid & (prediction[:, channel] > 0.0)
+            result["K_{}_nonpositive".format(label)] = torch.sum(
+                valid & ~positive
+            )
+            result["S_{}_positive_fraction".format(label)] = (
+                channel_weight[positive].sum() / denominator
+            )
+            positive_weight = channel_weight[positive]
+            positive_denominator = positive_weight.sum()
+            if positive_denominator.item() > 0.0:
+                predicted_s = 1.0 / prediction[positive, channel]
+                target_s = 1.0 / target[positive, channel]
+                s_error = predicted_s - target_s
+                result["S_{}_rmse_positive".format(label)] = torch.sqrt(
+                    torch.sum(positive_weight * s_error.square())
+                    / positive_denominator
+                )
+                result[
+                    "S_{}_relative_rmse_positive_percent".format(label)
+                ] = 100.0 * torch.sqrt(
+                    torch.sum(
+                        positive_weight * (s_error / target_s).square()
+                    )
+                    / positive_denominator
+                )
+            else:
+                nan = torch.tensor(float("nan"))
+                result["S_{}_rmse_positive".format(label)] = nan
+                result[
+                    "S_{}_relative_rmse_positive_percent".format(label)
+                ] = nan
+
+        if clear:
+            self.clear_metrics(subset)
+        return result
+
+    def clear_metrics(self, subset: str) -> None:
+        """Discard all recorded response batches for one subset."""
+
+        self._require_subset(subset)
+        for key in self.logs[subset]:
+            self.logs[subset][key] = []
+
+    def _require_subset(self, subset: str) -> None:
+        if subset not in self.logs:
+            raise KeyError(
+                "unknown metric subset '{}'; choose from {}".format(
+                    subset,
+                    tuple(self.logs),
+                )
+            )

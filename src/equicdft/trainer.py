@@ -1,12 +1,15 @@
 """Training orchestration for grid density-functional models."""
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -20,6 +23,8 @@ from torch.nn.parameter import UninitializedParameter
 
 from ._argument_checks import (
     boolean,
+    nonempty_string,
+    nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
 )
@@ -30,7 +35,43 @@ from ._trainer_io import (
     write_history_csv,
 )
 from .loss import Loss
-from .metrics import Metrics
+
+
+@dataclass
+class TrainingStream:
+    """One data/loss/metric stream in a joint optimization.
+
+    ``batches_per_step`` controls how many batches from this stream contribute
+    to one optimizer update. Their losses are averaged before applying the
+    stream weight. ``model_kwargs`` makes response-only forwards such as
+    ``compute_c1=False`` explicit without mutating persistent model flags.
+    """
+
+    name: str
+    train_loader: Iterable[Dict[str, torch.Tensor]]
+    valid_loader: Iterable[Dict[str, torch.Tensor]]
+    loss: Loss
+    metrics: Sequence[nn.Module] = ()
+    batches_per_step: int = 1
+    model_kwargs: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        self.name = nonempty_string(self.name, "stream name")
+        if not isinstance(self.loss, Loss):
+            raise TypeError("stream loss must be a equicdft.Loss")
+        self.metrics = tuple(self.metrics)
+        for metric in self.metrics:
+            if not isinstance(metric, nn.Module):
+                raise TypeError("stream metrics must be torch modules")
+            nonempty_string(getattr(metric, "name", None), "metric name")
+        metric_names = [metric.name for metric in self.metrics]
+        if len(set(metric_names)) != len(metric_names):
+            raise ValueError("metric collection names must be unique per stream")
+        self.batches_per_step = positive_integer(
+            self.batches_per_step,
+            "batches_per_step",
+        )
+        self.model_kwargs = dict(self.model_kwargs or {})
 
 
 class Trainer(nn.Module):
@@ -81,7 +122,7 @@ class Trainer(nn.Module):
         self,
         model: nn.Module,
         loss: Loss,
-        metrics: Sequence[Metrics] = (),
+        metrics: Sequence[nn.Module] = (),
         optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_args: Optional[Dict[str, Any]] = None,
         scheduler_cls: Optional[Type[Any]] = None,
@@ -110,8 +151,14 @@ class Trainer(nn.Module):
         )
 
         metrics = list(metrics)
-        if any(not isinstance(metric, Metrics) for metric in metrics):
-            raise TypeError("metrics must contain only equicdft.Metrics")
+        if any(not isinstance(metric, nn.Module) for metric in metrics):
+            raise TypeError("metrics must contain only torch modules")
+        for metric in metrics:
+            for method in ("update_metrics", "retrieve_metrics", "clear_metrics"):
+                if not callable(getattr(metric, method, None)):
+                    raise TypeError(
+                        "every metric must define {}".format(method)
+                    )
         metric_names = [metric.name for metric in metrics]
         if len(set(metric_names)) != len(metric_names):
             raise ValueError("metric collection names must be unique")
@@ -148,6 +195,10 @@ class Trainer(nn.Module):
         self.best_valid_loss = math.inf
         self.epochs_without_improvement = 0
         self._train_loader_generator = None
+        self.stream_losses = nn.ModuleDict()
+        self.stream_metrics = nn.ModuleDict()
+        self._streams = ()
+        self._stream_loader_generators = {}
         self.to(self.device)
 
     def fit(
@@ -219,6 +270,118 @@ class Trainer(nn.Module):
 
         return self.history
 
+    def fit_streams(
+        self,
+        streams: Sequence[TrainingStream],
+        epochs: int,
+        stream_weights: Optional[
+            Mapping[str, Union[float, Callable[[int], float]]]
+        ] = None,
+        verbose: bool = True,
+        print_interval: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Jointly optimize multiple data streams without mixing datasets.
+
+        Every stream is consumed exactly once per epoch. At each optimizer
+        update, up to ``batches_per_step`` batches are drawn from every still
+        active stream and averaged within that stream. Stream weights may be
+        constants or callables of the one-based epoch number. Validation is
+        evaluated separately for every stream; the weighted sum of validation
+        totals drives the configured scheduler and ordinary ``best.pt``.
+        """
+
+        epochs = positive_integer(epochs, "epochs")
+        verbose = boolean(verbose, "verbose")
+        print_interval = positive_integer(print_interval, "print_interval")
+        streams = self._configure_streams(streams)
+        weight_specification = dict(stream_weights or {})
+        unknown_weights = set(weight_specification) - {
+            stream.name for stream in streams
+        }
+        if unknown_weights:
+            raise KeyError(
+                "stream_weights contains unknown streams: {}".format(
+                    sorted(unknown_weights)
+                )
+            )
+
+        self._initialize_optimization(
+            streams[0].train_loader,
+            model_kwargs=streams[0].model_kwargs,
+        )
+        start_epoch = len(self.history) + 1
+        for epoch in range(start_epoch, start_epoch + epochs):
+            weights = {
+                stream.name: self._stream_weight(
+                    weight_specification.get(stream.name, 1.0),
+                    epoch,
+                    stream.name,
+                )
+                for stream in streams
+            }
+            train_by_stream = self._run_training_streams(streams, weights)
+            valid_by_stream = {
+                stream.name: self._run_stream_loader(
+                    stream,
+                    subset="valid",
+                    training=False,
+                )
+                for stream in streams
+            }
+            train_losses, train_metrics = self._flatten_stream_results(
+                train_by_stream,
+                weights,
+            )
+            valid_losses, valid_metrics = self._flatten_stream_results(
+                valid_by_stream,
+                weights,
+            )
+            record = {
+                "epoch": epoch,
+                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                "stream_weights": weights,
+                "train_losses": train_losses,
+                "valid_losses": valid_losses,
+                "train_metrics": train_metrics,
+                "valid_metrics": valid_metrics,
+            }
+            self.history.append(record)
+            self._step_scheduler(valid_losses["total"])
+            self._write_epoch_checkpoints(record)
+            self._write_history_csv()
+            if verbose and epoch % print_interval == 0:
+                self.log_message(format_record(record))
+            if self._early_stopping_reached():
+                self.log_message(
+                    "Early stopping at epoch {} after {} epochs without "
+                    "validation-loss improvement.".format(
+                        epoch,
+                        self.epochs_without_improvement,
+                    ),
+                    display=verbose,
+                )
+                break
+        return self.history
+
+    def evaluate_streams(
+        self,
+        streams: Sequence[TrainingStream],
+        subset: str = "valid",
+    ) -> Dict[str, Tuple[Dict[str, float], Dict[str, Dict[str, float]]]]:
+        """Evaluate named streams independently without optimizer updates."""
+
+        streams = self._configure_streams(streams)
+        if subset not in ("train", "valid"):
+            raise ValueError("subset must be 'train' or 'valid'")
+        return {
+            stream.name: self._run_stream_loader(
+                stream,
+                subset=subset,
+                training=False,
+            )
+            for stream in streams
+        }
+
     def save_checkpoint(
         self,
         path: Union[str, Path],
@@ -231,6 +394,10 @@ class Trainer(nn.Module):
             "epoch": record["epoch"],
             "model_state_dict": self.model.state_dict(),
             "loss_state_dict": self.loss.state_dict(),
+            "stream_loss_state_dict": (
+                self.stream_losses.state_dict() if self._streams else None
+            ),
+            "stream_names": [stream.name for stream in self._streams],
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": (
                 None if self.scheduler is None else self.scheduler.state_dict()
@@ -250,6 +417,12 @@ class Trainer(nn.Module):
                 if self._train_loader_generator is not None
                 else None
             ),
+            "stream_loader_generator_states": {
+                name: (
+                    generator.get_state() if generator is not None else None
+                )
+                for name, generator in self._stream_loader_generators.items()
+            },
         }
         atomic_torch_save(checkpoint, Path(path).expanduser())
 
@@ -257,6 +430,7 @@ class Trainer(nn.Module):
         self,
         path: Union[str, Path],
         train_loader: Iterable[Dict[str, torch.Tensor]],
+        model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Restore a complete training state and return its completed epoch.
 
@@ -273,7 +447,7 @@ class Trainer(nn.Module):
             )
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
-        self._initialize_optimization(train_loader)
+        self._initialize_optimization(train_loader, model_kwargs=model_kwargs)
         checkpoint = torch.load(
             str(checkpoint_path),
             map_location=self.device,
@@ -300,6 +474,19 @@ class Trainer(nn.Module):
 
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
+        stream_loss_state = checkpoint.get("stream_loss_state_dict")
+        if stream_loss_state is not None:
+            expected_names = checkpoint.get("stream_names", [])
+            actual_names = [stream.name for stream in self._streams]
+            if expected_names != actual_names:
+                raise ValueError(
+                    "checkpoint stream names do not match configured streams"
+                )
+            self.stream_losses.load_state_dict(stream_loss_state, strict=True)
+        elif self._streams:
+            raise ValueError(
+                "checkpoint has no stream-loss state for configured streams"
+            )
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._move_optimizer_state_to_device()
 
@@ -361,11 +548,47 @@ class Trainer(nn.Module):
                 )
             self._train_loader_generator.set_state(loader_state.cpu())
 
+        stream_loader_states = checkpoint.get(
+            "stream_loader_generator_states",
+            {},
+        )
+        for name, state in stream_loader_states.items():
+            if name not in self._stream_loader_generators:
+                raise ValueError(
+                    "checkpoint contains an unknown stream loader '{}'".format(name)
+                )
+            generator = self._stream_loader_generators[name]
+            if state is not None:
+                if generator is None:
+                    raise ValueError(
+                        "checkpoint contains a loader state for stream '{}', "
+                        "but its current loader has no generator".format(name)
+                    )
+                generator.set_state(state.cpu())
+
         for metric in self.metrics:
             for subset in metric.logs:
                 metric.clear_metrics(subset)
+        for metrics in self.stream_metrics.values():
+            for metric in metrics:
+                for subset in metric.logs:
+                    metric.clear_metrics(subset)
         self._write_history_csv()
         return epoch
+
+    def load_stream_checkpoint(
+        self,
+        path: Union[str, Path],
+        streams: Sequence[TrainingStream],
+    ) -> int:
+        """Restore a joint-stream checkpoint using the same stream layout."""
+
+        streams = self._configure_streams(streams)
+        return self.load_checkpoint(
+            path,
+            train_loader=streams[0].train_loader,
+            model_kwargs=streams[0].model_kwargs,
+        )
 
     def log_message(self, message: str, display: bool = True) -> None:
         """Print a message and append it to the human-readable training log."""
@@ -375,6 +598,7 @@ class Trainer(nn.Module):
     def _initialize_optimization(
         self,
         train_loader: Iterable[Dict[str, torch.Tensor]],
+        model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Materialize lazy parameters and construct optimizer/scheduler."""
 
@@ -390,13 +614,23 @@ class Trainer(nn.Module):
             was_training = self.model.training
             self.model.eval()
             with torch.no_grad():
-                self.model(first_batch)
+                self.model(first_batch, **dict(model_kwargs or {}))
             self.model.train(was_training)
 
         # Loss modules may later contain trainable nuisance parameters, such
         # as latent chemical-potential offsets, so optimize them with the model.
         parameters = list(self.model.parameters()) + list(self.loss.parameters())
-        self.optimizer = self.optimizer_cls(parameters, **self.optimizer_args)
+        parameters.extend(self.stream_losses.parameters())
+        unique_parameters = []
+        seen = set()
+        for parameter in parameters:
+            if id(parameter) not in seen:
+                unique_parameters.append(parameter)
+                seen.add(id(parameter))
+        self.optimizer = self.optimizer_cls(
+            unique_parameters,
+            **self.optimizer_args,
+        )
         if self.scheduler_cls is not None:
             self.scheduler = self.scheduler_cls(
                 self.optimizer,
@@ -424,9 +658,19 @@ class Trainer(nn.Module):
                     self.optimizer.zero_grad(set_to_none=True)
 
                 outputs = self.model(batch)
-                loss_values = self.loss(outputs, batch, model=self.model)
+                loss_values, loss_details = self.loss.evaluate(
+                    outputs,
+                    batch,
+                    model=self.model,
+                )
                 for metric in self.metrics:
-                    metric.update_metrics(subset, outputs, batch)
+                    if getattr(metric, "requires_loss_details", False):
+                        metric.update_metrics(
+                            subset,
+                            loss_details[metric.name],
+                        )
+                    else:
+                        metric.update_metrics(subset, outputs, batch)
 
                 if training:
                     loss_values["total"].backward()
@@ -456,6 +700,228 @@ class Trainer(nn.Module):
             for metric in self.metrics
         }
         return losses, metric_values
+
+    def _configure_streams(
+        self,
+        streams: Sequence[TrainingStream],
+    ) -> Tuple[TrainingStream, ...]:
+        """Validate and register a stable set of training streams."""
+
+        streams = tuple(streams)
+        if not streams:
+            raise ValueError("fit_streams requires at least one stream")
+        if any(not isinstance(stream, TrainingStream) for stream in streams):
+            raise TypeError("streams must contain only TrainingStream objects")
+        names = [stream.name for stream in streams]
+        if len(set(names)) != len(names):
+            raise ValueError("stream names must be unique")
+        if self.optimizer is not None and tuple(names) != tuple(
+            stream.name for stream in self._streams
+        ):
+            raise ValueError("configured streams cannot change after optimization")
+        if not self._streams:
+            self.stream_losses = nn.ModuleDict(
+                {stream.name: stream.loss for stream in streams}
+            )
+            self.stream_metrics = nn.ModuleDict(
+                {
+                    stream.name: nn.ModuleList(stream.metrics)
+                    for stream in streams
+                }
+            )
+            self._streams = streams
+            self._stream_loader_generators = {
+                stream.name: getattr(stream.train_loader, "generator", None)
+                for stream in streams
+            }
+            self.to(self.device)
+        return self._streams
+
+    @staticmethod
+    def _stream_weight(
+        specification: Union[float, Callable[[int], float]],
+        epoch: int,
+        name: str,
+    ) -> float:
+        value = specification(epoch) if callable(specification) else specification
+        return nonnegative_scalar(value, "{} stream weight".format(name))
+
+    def _run_training_streams(
+        self,
+        streams: Sequence[TrainingStream],
+        weights: Mapping[str, float],
+    ) -> Dict[str, Tuple[Dict[str, float], Dict[str, Dict[str, float]]]]:
+        """Consume every training stream once with joint optimizer updates."""
+
+        if not any(weight > 0.0 for weight in weights.values()):
+            raise ValueError("at least one training stream must have positive weight")
+        self.model.train(True)
+        for stream in streams:
+            stream.loss.train(True)
+        iterators = {stream.name: iter(stream.train_loader) for stream in streams}
+        active = {stream.name for stream in streams}
+        loss_sums = {stream.name: {} for stream in streams}
+        field_counts = {stream.name: 0 for stream in streams}
+
+        while active:
+            groups = {}
+            for stream in streams:
+                if stream.name not in active:
+                    continue
+                batches = []
+                for _ in range(stream.batches_per_step):
+                    try:
+                        batches.append(next(iterators[stream.name]))
+                    except StopIteration:
+                        active.remove(stream.name)
+                        break
+                if batches:
+                    groups[stream.name] = batches
+            if not groups:
+                break
+
+            self.optimizer.zero_grad(set_to_none=True)
+            for stream in streams:
+                batches = groups.get(stream.name, ())
+                for batch in batches:
+                    batch = self._move_batch(batch)
+                    outputs = self.model(batch, **stream.model_kwargs)
+                    losses, details = stream.loss.evaluate(
+                        outputs,
+                        batch,
+                        model=self.model,
+                    )
+                    self._update_stream_metrics(
+                        stream,
+                        "train",
+                        outputs,
+                        batch,
+                        details,
+                    )
+                    (
+                        weights[stream.name]
+                        * losses["total"]
+                        / len(batches)
+                    ).backward()
+                    n_fields = int(batch["rho"].shape[0])
+                    for loss_name, value in losses.items():
+                        loss_sums[stream.name][loss_name] = (
+                            loss_sums[stream.name].get(loss_name, 0.0)
+                            + value.detach().item() * n_fields
+                        )
+                    field_counts[stream.name] += n_fields
+            self.optimizer.step()
+
+        results = {}
+        for stream in streams:
+            n_fields = field_counts[stream.name]
+            if n_fields == 0:
+                raise ValueError(
+                    "train loader for stream '{}' is empty".format(stream.name)
+                )
+            losses = {
+                name: value / n_fields
+                for name, value in loss_sums[stream.name].items()
+            }
+            metrics = self._retrieve_stream_metrics(stream, "train")
+            results[stream.name] = (losses, metrics)
+        return results
+
+    def _run_stream_loader(
+        self,
+        stream: TrainingStream,
+        subset: str,
+        training: bool,
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        """Evaluate one named stream without combining its statistics."""
+
+        self.model.train(training)
+        stream.loss.train(training)
+        loss_sums = {}
+        n_fields = 0
+        gradient_context = torch.enable_grad() if training else torch.no_grad()
+        loader = stream.train_loader if training else stream.valid_loader
+        with gradient_context:
+            for batch in loader:
+                batch = self._move_batch(batch)
+                outputs = self.model(batch, **stream.model_kwargs)
+                losses, details = stream.loss.evaluate(
+                    outputs,
+                    batch,
+                    model=self.model,
+                )
+                self._update_stream_metrics(
+                    stream,
+                    subset,
+                    outputs,
+                    batch,
+                    details,
+                )
+                n_batch_fields = int(batch["rho"].shape[0])
+                for name, value in losses.items():
+                    loss_sums[name] = loss_sums.get(name, 0.0) + (
+                        value.detach().item() * n_batch_fields
+                    )
+                n_fields += n_batch_fields
+        if n_fields == 0:
+            raise ValueError(
+                "{} loader for stream '{}' is empty".format(subset, stream.name)
+            )
+        losses = {name: value / n_fields for name, value in loss_sums.items()}
+        return losses, self._retrieve_stream_metrics(stream, subset)
+
+    def _update_stream_metrics(
+        self,
+        stream: TrainingStream,
+        subset: str,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        details: Dict[str, Dict[str, torch.Tensor]],
+    ) -> None:
+        for metric in self.stream_metrics[stream.name]:
+            if getattr(metric, "requires_loss_details", False):
+                if metric.name not in details:
+                    raise KeyError(
+                        "metric '{}' has no matching loss details".format(
+                            metric.name
+                        )
+                    )
+                metric.update_metrics(subset, details[metric.name])
+            else:
+                metric.update_metrics(subset, outputs, batch)
+
+    def _retrieve_stream_metrics(
+        self,
+        stream: TrainingStream,
+        subset: str,
+    ) -> Dict[str, Dict[str, float]]:
+        return {
+            metric.name: {
+                name: value.item()
+                for name, value in metric.retrieve_metrics(subset).items()
+            }
+            for metric in self.stream_metrics[stream.name]
+        }
+
+    @staticmethod
+    def _flatten_stream_results(
+        results: Mapping[
+            str,
+            Tuple[Dict[str, float], Dict[str, Dict[str, float]]],
+        ],
+        weights: Mapping[str, float],
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        losses = {}
+        metrics = {}
+        total = 0.0
+        for stream_name, (stream_losses, stream_metrics) in results.items():
+            total += weights[stream_name] * stream_losses["total"]
+            for name, value in stream_losses.items():
+                losses["{}/{}".format(stream_name, name)] = value
+            for name, values in stream_metrics.items():
+                metrics["{}/{}".format(stream_name, name)] = values
+        losses["total"] = total
+        return losses, metrics
 
     def _step_scheduler(self, valid_loss: float) -> None:
         """Advance an optional scheduler using its expected calling style."""

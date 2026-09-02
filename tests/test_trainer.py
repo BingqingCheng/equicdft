@@ -11,11 +11,13 @@ from torch.utils.data import DataLoader
 
 from equicdft import (
     FourierResponseLoss,
+    FourierResponseMetrics,
     FourierStabilityLoss,
     Loss,
     Metrics,
     TensorLoss,
     Trainer,
+    TrainingStream,
 )
 from equicdft._grid import voxel_volume
 
@@ -212,6 +214,150 @@ class TestTrainer(unittest.TestCase):
             0.0,
         )
         self.assertFalse(torch.equal(model.coefficient, initial_coefficient))
+
+    def test_multiple_streams_keep_losses_and_metrics_separate(self):
+        model = _LinearDictionaryModel()
+        first_loss = Loss(
+            [TensorLoss("target", "prediction", "target")]
+        )
+        second_loss = Loss(
+            [TensorLoss("target", "prediction", "target")]
+        )
+        streams = [
+            TrainingStream(
+                name="field",
+                train_loader=DataLoader(_dataset([1, 2, 3, 4]), batch_size=1),
+                valid_loader=DataLoader(_dataset([5, 6]), batch_size=1),
+                loss=first_loss,
+                metrics=(
+                    Metrics(
+                        "target",
+                        prediction_key="prediction",
+                        metric_keys=("rmse",),
+                        subsets=("train", "valid"),
+                    ),
+                ),
+                batches_per_step=2,
+            ),
+            TrainingStream(
+                name="response",
+                train_loader=DataLoader(_dataset([7, 8]), batch_size=1),
+                valid_loader=DataLoader(_dataset([9]), batch_size=1),
+                loss=second_loss,
+                metrics=(
+                    Metrics(
+                        "target",
+                        prediction_key="prediction",
+                        metric_keys=("rmse",),
+                        subsets=("train", "valid"),
+                    ),
+                ),
+            ),
+        ]
+        trainer = Trainer(
+            model=model,
+            loss=first_loss,
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 0.001},
+        )
+
+        history = trainer.fit_streams(
+            streams,
+            epochs=2,
+            stream_weights={"response": lambda epoch: 0.25 * epoch},
+            verbose=False,
+        )
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["stream_weights"]["field"], 1.0)
+        self.assertEqual(history[1]["stream_weights"]["response"], 0.5)
+        self.assertIn("field/target", history[0]["train_losses"])
+        self.assertIn("response/target", history[0]["valid_losses"])
+        self.assertIn("field/target", history[0]["train_metrics"])
+        self.assertIn("response/target", history[0]["valid_metrics"])
+        self.assertFalse(torch.equal(model.weight, torch.tensor(0.0)))
+
+    def test_multiple_stream_checkpoint_can_resume(self):
+        def build(checkpoint_dir):
+            model = _LinearDictionaryModel()
+            field_loss = Loss(
+                [TensorLoss("target", "prediction", "target")]
+            )
+            response_loss = Loss(
+                [TensorLoss("target", "prediction", "target")]
+            )
+            streams = (
+                TrainingStream(
+                    "field",
+                    DataLoader(_dataset([1, 2]), batch_size=1),
+                    DataLoader(_dataset([3]), batch_size=1),
+                    field_loss,
+                ),
+                TrainingStream(
+                    "response",
+                    DataLoader(_dataset([4]), batch_size=1),
+                    DataLoader(_dataset([5]), batch_size=1),
+                    response_loss,
+                ),
+            )
+            return (
+                Trainer(
+                    model,
+                    field_loss,
+                    optimizer_cls=torch.optim.SGD,
+                    optimizer_args={"lr": 0.001},
+                    checkpoint_dir=checkpoint_dir,
+                ),
+                streams,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trainer, streams = build(temporary_directory)
+            trainer.fit_streams(streams, epochs=1, verbose=False)
+
+            resumed, resumed_streams = build(temporary_directory)
+            completed = resumed.load_stream_checkpoint(
+                Path(temporary_directory) / "last.pt",
+                resumed_streams,
+            )
+            resumed.fit_streams(resumed_streams, epochs=1, verbose=False)
+
+        self.assertEqual(completed, 1)
+        self.assertEqual([row["epoch"] for row in resumed.history], [1, 2])
+
+    def test_response_stream_reuses_loss_details_for_metrics(self):
+        dataset = _functional_dataset()
+        for frame in dataset:
+            frame["fourier_modes"] = torch.tensor([[1, 0, 0]])
+            frame["fourier_curvature"] = torch.ones((1, 1))
+            frame["fourier_scale"] = torch.ones((1, 1))
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            scale_key="fourier_scale",
+            relative_amplitude=1.0e-3,
+        )
+        loss = Loss([term])
+        loader = DataLoader(dataset, batch_size=2)
+        stream = TrainingStream(
+            "response",
+            loader,
+            loader,
+            loss,
+            metrics=(
+                FourierResponseMetrics(
+                    ("density",),
+                    subsets=("train", "valid"),
+                ),
+            ),
+            model_kwargs={"compute_c1": False},
+        )
+        trainer = Trainer(_QuadraticDictionaryFunctional(), loss)
+
+        evaluated = trainer.evaluate_streams((stream,))
+
+        response_metrics = evaluated["response"][1]["fourier_response"]
+        self.assertIn("K_density_rmse", response_metrics)
+        self.assertIn("S_density_relative_rmse_positive_percent", response_metrics)
 
     def test_optional_scheduler_steps_each_epoch(self):
         trainer = self._make_trainer(scheduler=True)

@@ -1,19 +1,19 @@
 """Composable objectives for training grid density-functional models."""
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
-from ._argument_checks import finite_scalar, nonempty_string, nonnegative_scalar
+from ._argument_checks import (
+    nonempty_string,
+    nonnegative_scalar,
+)
 from ._fourier import (
     average_fourier_phases,
-    fourier_directions,
     normalized_directions,
-    projected_fourier_curvature,
-    validate_explicit_modes,
-    validate_uniform_response,
 )
+from .response import FourierResponse
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 
@@ -117,6 +117,7 @@ class FourierResponseLoss(nn.Module):
     """
 
     requires_model = True
+    provides_details = True
 
     def __init__(
         self,
@@ -126,18 +127,13 @@ class FourierResponseLoss(nn.Module):
         scale_key: Optional[str] = None,
         weights_key: Optional[str] = None,
         relative_amplitude: float = 0.01,
+        perturbations_per_forward: Optional[int] = None,
         loss_fn: Optional[nn.Module] = None,
         weight: float = 1.0,
         name: str = "fourier_response",
     ) -> None:
         super().__init__()
 
-        relative_amplitude = finite_scalar(
-            relative_amplitude,
-            "relative_amplitude",
-        )
-        if not 0.0 < relative_amplitude < 1.0:
-            raise ValueError("relative_amplitude must lie in (0, 1)")
         if loss_fn is None:
             loss_fn = nn.SmoothL1Loss(reduction="none")
         if not isinstance(loss_fn, nn.Module):
@@ -148,7 +144,11 @@ class FourierResponseLoss(nn.Module):
         self.target_key = nonempty_string(target_key, "target_key")
         self.scale_key = _optional_key(scale_key, "scale_key")
         self.weights_key = _optional_key(weights_key, "weights_key")
-        self.relative_amplitude = relative_amplitude
+        self.response = FourierResponse(
+            relative_amplitude=relative_amplitude,
+            perturbations_per_forward=perturbations_per_forward,
+            require_uniform=True,
+        )
         self.loss_fn = loss_fn
         self.weight = nonnegative_scalar(weight, "weight")
         self.register_buffer("directions", normalized_directions(directions))
@@ -161,41 +161,37 @@ class FourierResponseLoss(nn.Module):
     ) -> torch.Tensor:
         """Return the weighted projected-response loss."""
 
+        return self.evaluate(outputs, batch, model=model)["loss"]
+
+    def evaluate(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return the loss and raw response tensors from one evaluation.
+
+        ``prediction`` and ``target`` retain physical curvature units, while
+        ``element_weight`` includes validity and optional user weights.  This
+        lets training and validation code report response metrics without
+        repeating the expensive perturbed model evaluations.
+        """
+
         if model is None:
             raise ValueError("FourierResponseLoss requires the model")
-        rho = validate_uniform_response(
-            outputs,
-            batch,
-            n_types=self.directions.shape[-1],
-        )
-        modes = validate_explicit_modes(
-            batch,
-            rho,
-            _required_batch_value(batch, self.modes_key),
-        )
-        directions, valid, mean_densities = fourier_directions(
-            batch,
-            rho,
-            modes,
-            self.directions.to(rho),
-        )
-        curvature, valid = projected_fourier_curvature(
+        modes = _required_batch_value(batch, self.modes_key)
+        curvature, valid = self.response(
             model=model,
-            outputs=outputs,
             batch=batch,
-            rho=rho,
-            directions=directions,
-            valid_directions=valid,
-            mean_densities=mean_densities,
-            relative_amplitude=self.relative_amplitude,
+            modes=modes,
+            directions=self.directions,
+            outputs=outputs,
         )
-        prediction, valid = average_fourier_phases(
-            curvature,
-            valid,
-            n_modes=modes.shape[1],
-            n_directions=self.directions.shape[0],
-        )
+        prediction, valid = average_fourier_phases(curvature, valid)
         target = _response_tensor(batch, self.target_key, prediction)
+        raw_prediction = prediction
+        raw_target = target
+        scale = torch.ones_like(prediction)
         if self.scale_key is not None:
             scale = _response_tensor(
                 batch,
@@ -226,7 +222,19 @@ class FourierResponseLoss(nn.Module):
         total_weight = element_weight.sum()
         if total_weight.item() <= 0.0:
             raise ValueError("response weights must have a positive valid sum")
-        return self.weight * torch.sum(element_loss * element_weight) / total_weight
+        value = (
+            self.weight
+            * torch.sum(element_loss * element_weight)
+            / total_weight
+        )
+        return {
+            "loss": value,
+            "element_loss": self.weight * element_loss,
+            "prediction": raw_prediction,
+            "target": raw_target,
+            "scale": scale,
+            "element_weight": element_weight,
+        }
 
 
 def _response_tensor(
@@ -303,10 +311,42 @@ class Loss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Return weighted named terms and their scalar sum as ``total``."""
 
+        values, _ = self.evaluate(outputs, batch, model=model)
+        return values
+
+    def evaluate(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
+    ) -> Tuple[
+        Dict[str, torch.Tensor],
+        Dict[str, Dict[str, torch.Tensor]],
+    ]:
+        """Return scalar terms and optional reusable term details.
+
+        Terms defining an ``evaluate`` method may return a mapping containing
+        their scalar ``loss`` and diagnostic tensors. Ordinary scalar terms
+        retain the exact existing calling convention.
+        """
+
         values = {}
+        details = {}
         total = None
         for term in self.terms:
-            if getattr(term, "requires_model", False):
+            if getattr(term, "provides_details", False):
+                if getattr(term, "requires_model", False):
+                    term_details = term.evaluate(outputs, batch, model=model)
+                else:
+                    term_details = term.evaluate(outputs, batch)
+                if not isinstance(term_details, dict) or "loss" not in term_details:
+                    raise ValueError(
+                        "loss term '{}' evaluate must return a mapping with "
+                        "'loss'".format(term.name)
+                    )
+                value = term_details["loss"]
+                details[term.name] = term_details
+            elif getattr(term, "requires_model", False):
                 value = term(outputs, batch, model=model)
             else:
                 value = term(outputs, batch)
@@ -319,7 +359,7 @@ class Loss(nn.Module):
             values[term.name] = value
             total = value if total is None else total + value
         values["total"] = total
-        return values
+        return values, details
 
 
 def _resolve_weights(

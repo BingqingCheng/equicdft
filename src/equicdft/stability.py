@@ -1,6 +1,6 @@
 """Physics-based stability objectives for learned density functionals."""
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 import torch
 from torch import nn
@@ -15,10 +15,9 @@ from ._argument_checks import (
 from ._fourier import (
     canonical_grid_mode as _canonical_grid_mode,
     feasible_modes as _feasible_modes,
-    fourier_directions as _fourier_directions,
-    projected_fourier_curvature as _normalized_fourier_curvature,
     wavevector_magnitude as _wavevector_magnitude,
 )
+from .response import FourierResponse
 
 
 class FourierStabilityLoss(nn.Module):
@@ -209,6 +208,7 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("relative_amplitude must lie in (0, 1)")
 
         self.relative_amplitude = relative_amplitude
+        self.response = FourierResponse(relative_amplitude=relative_amplitude)
         self.random_modes_per_field = random_modes_per_field
         self.wavevector_range = selected_wavevector_range
         self.training_only = training_only
@@ -258,20 +258,13 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("beta_F_exc must contain one value per field")
 
         modes = self._select_modes(batch, rho)
-        directions, valid_directions, mean_densities = self._directions(
-            batch,
-            rho,
-            modes,
-        )
-        normalized_curvature, valid = _normalized_fourier_curvature(
+        mixture_weights = self._mixture_weights(rho.shape[-1], rho)
+        normalized_curvature, valid = self.response(
             model=model,
-            outputs=outputs,
             batch=batch,
-            rho=rho,
-            directions=directions,
-            valid_directions=valid_directions,
-            mean_densities=mean_densities,
-            relative_amplitude=self.relative_amplitude,
+            modes=modes,
+            directions=mixture_weights,
+            outputs=outputs,
         )
         if not torch.any(valid).item():
             raise ValueError("batch contains no valid mixture-mode direction")
@@ -279,18 +272,6 @@ class FourierStabilityLoss(nn.Module):
             self.minimum_curvature - normalized_curvature
         ).square()
         return self.weight * torch.sum(hinge * valid.to(hinge)) / valid.sum()
-
-    def _directions(
-        self,
-        batch: Dict[str, torch.Tensor],
-        rho: torch.Tensor,
-        modes: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return fixed-number mixture directions, validity, and density."""
-
-        n_types = rho.shape[-1]
-        mixture_weights = self._mixture_weights(n_types, rho)
-        return _fourier_directions(batch, rho, modes, mixture_weights)
 
     def _mixture_weights(
         self,

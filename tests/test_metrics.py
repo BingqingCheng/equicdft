@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from equicdft import Metrics
+from equicdft import FourierResponseMetrics, Metrics
 from equicdft.metrics import compute_metric
 from equicdft.metrics import format_metric_value, metric_label
 
@@ -242,6 +242,60 @@ class TestMetrics(unittest.TestCase):
             Metrics("c1", metric_keys=("mae", "mae"))
         with self.assertRaisesRegex(ValueError, "subsets"):
             Metrics("c1", subsets=())
+
+
+class TestFourierResponseMetrics(unittest.TestCase):
+    @staticmethod
+    def _details():
+        prediction = torch.tensor([[[2.0, 4.0]], [[-1.0, 8.0]]])
+        target = torch.tensor([[[1.0, 2.0]], [[1.0, 4.0]]])
+        scale = target.clone()
+        weight = torch.tensor([[[1.0, 1.0]], [[0.0, 2.0]]])
+        scaled_error = (prediction - target) / scale
+        element_loss = torch.where(
+            scaled_error.abs() < 1.0,
+            0.5 * scaled_error.square(),
+            scaled_error.abs() - 0.5,
+        )
+        return {
+            "prediction": prediction,
+            "target": target,
+            "scale": scale,
+            "element_weight": weight,
+            "element_loss": element_loss,
+        }
+
+    def test_reports_weighted_curvature_and_response_metrics(self):
+        metrics = FourierResponseMetrics(
+            ("number", "charge"),
+            subsets=("valid",),
+        )
+        metrics.update_metrics("valid", self._details())
+
+        values = metrics.retrieve_metrics("valid")
+
+        self.assertAlmostEqual(values["loss"].item(), 0.5)
+        self.assertAlmostEqual(values["K_number_rmse"].item(), 1.0)
+        self.assertAlmostEqual(
+            values["K_charge_rmse"].item(),
+            (12.0 ** 0.5),
+            places=6,
+        )
+        self.assertEqual(values["K_number_nonpositive"].item(), 0)
+        self.assertEqual(values["K_charge_nonpositive"].item(), 0)
+        self.assertAlmostEqual(
+            values["S_number_positive_fraction"].item(), 1.0
+        )
+        self.assertEqual(metrics.logs["valid"]["prediction"], [])
+
+    def test_details_and_subset_are_validated(self):
+        metrics = FourierResponseMetrics(("number", "charge"))
+        details = self._details()
+        details.pop("scale")
+        with self.assertRaisesRegex(KeyError, "missing"):
+            metrics.update_metrics("train", details)
+        with self.assertRaisesRegex(KeyError, "subset"):
+            metrics.update_metrics("unknown", self._details())
 
 
 if __name__ == "__main__":

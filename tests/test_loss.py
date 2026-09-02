@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    FourierResponse,
     FourierResponseLoss,
     FourierStabilityLoss,
     GridCACEModel,
@@ -338,34 +339,19 @@ class TestFourierStabilityLoss(unittest.TestCase):
     def test_total_density_and_charge_construct_coupled_directions(self):
         batch = self._batch()
         batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
-        modes = torch.tensor([[[1, 0, 0]]])
 
-        total_directions, total_valid, _ = FourierStabilityLoss(
+        total = FourierStabilityLoss(
             modes=((1, 0, 0),),
             mixture_mode="total_density",
-        )._directions(batch, batch["rho"], modes)
-        charge_directions, charge_valid, _ = FourierStabilityLoss(
+        )._mixture_weights(2, batch["rho"])
+        charge = FourierStabilityLoss(
             modes=((1, 0, 0),),
             mixture_mode="charge",
             charges=(1.0, -1.0),
-        )._directions(batch, batch["rho"], modes)
+        )._mixture_weights(2, batch["rho"])
 
-        self.assertEqual(total_directions.shape, (1, 2, 8, 2))
-        self.assertEqual(charge_directions.shape, (1, 2, 8, 2))
-        self.assertTrue(torch.equal(total_valid, charge_valid))
-        self.assertTrue(torch.all(total_valid).item())
-        self.assertTrue(
-            torch.allclose(
-                total_directions[..., 0],
-                total_directions[..., 1],
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                charge_directions[..., 0],
-                -charge_directions[..., 1],
-            )
-        )
+        self.assertTrue(torch.equal(total, torch.tensor([[1.0, 1.0]])))
+        self.assertTrue(torch.equal(charge, torch.tensor([[1.0, -1.0]])))
 
     def test_charge_mode_detects_unstable_coupled_charge_curvature(self):
         batch = self._batch()
@@ -747,6 +733,49 @@ class TestFourierResponseLoss(unittest.TestCase):
             10.0 * torch.finfo(torch.float64).eps,
         )
 
+    def test_shared_response_returns_phase_resolved_curvature(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+        response = FourierResponse(relative_amplitude=1.0e-4)
+
+        curvature, valid = response(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            directions=torch.tensor(
+                ((1.0, 1.0), (1.0, -1.0)),
+                dtype=torch.float64,
+            ),
+            outputs=model(batch),
+        )
+
+        self.assertEqual(curvature.shape, (1, 1, 2, 2))
+        self.assertTrue(torch.all(valid).item())
+        expected = torch.tensor((2.5, -0.5), dtype=torch.float64)
+        self.assertTrue(
+            torch.allclose(curvature[0, 0], expected.expand(2, -1))
+        )
+
+    def test_perturbations_can_be_evaluated_in_small_forward_chunks(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        batch["fourier_curvature"] = torch.tensor(
+            [[[2.5, -0.5]]],
+            dtype=torch.float64,
+        )
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+
+        unchunked = FourierResponseLoss(
+            directions=((1.0, 1.0), (1.0, -1.0)),
+            relative_amplitude=1.0e-4,
+        )(model(batch), batch, model=model)
+        chunked = FourierResponseLoss(
+            directions=((1.0, 1.0), (1.0, -1.0)),
+            relative_amplitude=1.0e-4,
+            perturbations_per_forward=2,
+        )(model(batch), batch, model=model)
+
+        self.assertAlmostEqual(chunked.item(), unchunked.item(), places=15)
+
     def test_direction_common_scale_is_immaterial(self):
         batch = self._batch(n_types=2, n_modes=1)
         batch["fourier_curvature"] = torch.tensor(
@@ -799,6 +828,33 @@ class TestFourierResponseLoss(unittest.TestCase):
         # weighted mean is (1 + 3*4) / 4.
         self.assertAlmostEqual(value.item(), 3.25, places=12)
 
+    def test_evaluate_exposes_raw_responses_without_recomputation(self):
+        batch = self._batch(n_modes=1)
+        batch["fourier_curvature"] = torch.tensor(
+            [[[1.0]]], dtype=torch.float64
+        )
+        batch["response_scale"] = torch.tensor(
+            [[[4.0]]], dtype=torch.float64
+        )
+        batch["response_weight"] = torch.tensor(
+            [[[3.0]]], dtype=torch.float64
+        )
+        model = _QuadraticExcessModel(2.0).to(dtype=torch.float64)
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            scale_key="response_scale",
+            weights_key="response_weight",
+            relative_amplitude=1.0e-4,
+        )
+
+        details = term.evaluate(model(batch), batch, model=model)
+
+        self.assertAlmostEqual(details["loss"].item(), 0.03125, places=6)
+        self.assertAlmostEqual(details["prediction"].item(), 2.0, places=6)
+        self.assertAlmostEqual(details["target"].item(), 1.0, places=12)
+        self.assertAlmostEqual(details["scale"].item(), 4.0, places=12)
+        self.assertAlmostEqual(details["element_weight"].item(), 3.0, places=12)
+
     def test_nyquist_uses_the_single_nonaliased_real_phase(self):
         batch = self._batch(dtype=torch.float64, n_modes=1)
         batch["fourier_modes"] = torch.tensor([[[4, 0, 0]]])
@@ -845,6 +901,8 @@ class TestFourierResponseLoss(unittest.TestCase):
             FourierResponseLoss(((1.0,),), relative_amplitude=0.0)
         with self.assertRaisesRegex(TypeError, "loss_fn"):
             FourierResponseLoss(((1.0,),), loss_fn=lambda x, y: x - y)
+        with self.assertRaisesRegex(ValueError, "perturbations_per_forward"):
+            FourierResponseLoss(((1.0,),), perturbations_per_forward=0)
 
         batch = self._batch(n_modes=1)
         batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)

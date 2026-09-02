@@ -8,7 +8,12 @@ from ase import Atoms
 from ase.io import read, write
 from torch.utils.data import DataLoader
 
-from equicdft import CartesianAFeatures, GridData, default_data_key
+from equicdft import (
+    CartesianAFeatures,
+    FourierResponseData,
+    GridData,
+    default_data_key,
+)
 
 
 def _write_grid(
@@ -823,6 +828,78 @@ class TestGridData(unittest.TestCase):
             data[0]["local_density_positions"],
             data[1]["local_density_positions"],
         )
+
+
+class TestFourierResponseData(unittest.TestCase):
+    @staticmethod
+    def _template():
+        return GridData.from_dict(
+            {
+                "grid_size": [4, 1, 1],
+                "grid_spacing": [0.5, 0.5, 0.5],
+                "n_types": 2,
+                "temperature": 1.0,
+            },
+            cutoff_grid=1,
+            boltzmann_constant=1.0,
+        )
+
+    def test_builds_homogeneous_fields_and_preserves_selected_order(self):
+        data = FourierResponseData(
+            template=self._template(),
+            density=[[0.1, 0.2], [0.3, 0.4]],
+            modes=[[1, 0, 0], [1, 1, 0]],
+            curvature=[[2.0, 3.0], [4.0, 5.0]],
+            scale=[[1.0, 2.0], [2.0, 4.0]],
+            weight=[[1.0, 1.0], [0.5, 2.0]],
+            indices=[1, 0],
+        )
+
+        self.assertEqual(len(data), 2)
+        frame = data[0]
+        self.assertEqual(frame["rho"].shape, (4, 2))
+        self.assertTrue(
+            torch.allclose(frame["rho"], torch.tensor([[0.3, 0.4]] * 4))
+        )
+        self.assertEqual(frame["fourier_modes"].shape, (1, 3))
+        self.assertEqual(frame["fourier_curvature"].shape, (1, 2))
+        self.assertEqual(frame["fourier_scale"].shape, (1, 2))
+        self.assertEqual(frame["fourier_weight"].shape, (1, 2))
+
+    def test_response_shapes_and_values_are_validated(self):
+        template = self._template()
+        with self.assertRaisesRegex(ValueError, "density"):
+            FourierResponseData(template, [0.2], [[1, 0, 0]], [[1.0]])
+        with self.assertRaisesRegex(ValueError, "n_types"):
+            FourierResponseData(
+                template,
+                [[0.2]],
+                [[1, 0, 0]],
+                [[1.0]],
+            )
+        with self.assertRaisesRegex(ValueError, "curvature"):
+            FourierResponseData(
+                template,
+                [[0.2, 0.2]],
+                [[1, 0, 0]],
+                [[[1.0], [2.0]]],
+            )
+        with self.assertRaisesRegex(ValueError, "scale"):
+            FourierResponseData(
+                template,
+                [[0.2, 0.2]],
+                [[1, 0, 0]],
+                [[1.0]],
+                scale=[[0.0]],
+            )
+        with self.assertRaisesRegex(IndexError, "indices"):
+            FourierResponseData(
+                template,
+                [[0.2, 0.2]],
+                [[1, 0, 0]],
+                [[1.0]],
+                indices=[1],
+            )
 
 
 if __name__ == "__main__":
