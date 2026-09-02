@@ -31,6 +31,17 @@ class _LinearDictionaryModel(nn.Module):
         return {"prediction": self.weight * batch["x"]}
 
 
+class _RecordingLinearDictionaryModel(_LinearDictionaryModel):
+    def __init__(self):
+        super().__init__()
+        self.training_values = []
+
+    def forward(self, batch):
+        if self.training:
+            self.training_values.extend(batch["x"].flatten().tolist())
+        return super().forward(batch)
+
+
 class _QuadraticDictionaryFunctional(nn.Module):
     """Small functional for exercising model-dependent trainer losses."""
 
@@ -276,6 +287,54 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("field/target", history[0]["train_metrics"])
         self.assertIn("response/target", history[0]["valid_metrics"])
         self.assertFalse(torch.equal(model.weight, torch.tensor(0.0)))
+
+    def test_shorter_stream_can_cycle_to_noncycling_epoch_length(self):
+        model = _RecordingLinearDictionaryModel()
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        streams = (
+            TrainingStream(
+                "field",
+                DataLoader(_dataset([1, 2, 3, 4, 5]), batch_size=1),
+                DataLoader(_dataset([6]), batch_size=1),
+                loss,
+                batches_per_step=2,
+            ),
+            TrainingStream(
+                "response",
+                DataLoader(_dataset([10, 11]), batch_size=1),
+                DataLoader(_dataset([12]), batch_size=1),
+                loss,
+                cycle=True,
+            ),
+        )
+        trainer = Trainer(
+            model,
+            loss,
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 0.001},
+        )
+
+        trainer.fit_streams(streams, epochs=1, verbose=False)
+
+        self.assertEqual(
+            model.training_values,
+            [1.0, 2.0, 10.0, 3.0, 4.0, 11.0, 5.0, 10.0],
+        )
+
+    def test_at_least_one_training_stream_must_not_cycle(self):
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        loader = DataLoader(_dataset([1]), batch_size=1)
+        stream = TrainingStream(
+            "response",
+            loader,
+            loader,
+            loss,
+            cycle=True,
+        )
+        trainer = Trainer(_LinearDictionaryModel(), loss)
+
+        with self.assertRaisesRegex(ValueError, "cycle=False"):
+            trainer.fit_streams((stream,), epochs=1, verbose=False)
 
     def test_multiple_stream_checkpoint_can_resume(self):
         def build(checkpoint_dir):

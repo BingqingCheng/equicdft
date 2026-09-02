@@ -43,7 +43,9 @@ class TrainingStream:
 
     ``batches_per_step`` controls how many batches from this stream contribute
     to one optimizer update. Their losses are averaged before applying the
-    stream weight. ``model_kwargs`` makes response-only forwards such as
+    stream weight. A stream with ``cycle=True`` is restarted when exhausted
+    and follows the epoch length set by the non-cycling streams. Validation is
+    always single-pass. ``model_kwargs`` makes response-only forwards such as
     ``compute_c1=False`` explicit without mutating persistent model flags.
     """
 
@@ -54,6 +56,7 @@ class TrainingStream:
     metrics: Sequence[nn.Module] = ()
     batches_per_step: int = 1
     model_kwargs: Optional[Dict[str, Any]] = None
+    cycle: bool = False
 
     def __post_init__(self) -> None:
         self.name = nonempty_string(self.name, "stream name")
@@ -72,6 +75,7 @@ class TrainingStream:
             "batches_per_step",
         )
         self.model_kwargs = dict(self.model_kwargs or {})
+        self.cycle = boolean(self.cycle, "cycle")
 
 
 class Trainer(nn.Module):
@@ -283,12 +287,14 @@ class Trainer(nn.Module):
     ) -> List[Dict[str, Any]]:
         """Jointly optimize multiple data streams without mixing datasets.
 
-        Every stream is consumed exactly once per epoch. At each optimizer
-        update, up to ``batches_per_step`` batches are drawn from every still
-        active stream and averaged within that stream. Stream weights may be
-        constants or callables of the one-based epoch number. Validation is
-        evaluated separately for every stream; the weighted sum of validation
-        totals drives the configured scheduler and ordinary ``best.pt``.
+        Non-cycling streams are consumed exactly once per epoch. At each
+        optimizer update, up to ``batches_per_step`` batches are drawn from
+        every still-active non-cycling stream and every cycling stream. Cycling
+        streams restart as needed until the non-cycling streams are exhausted.
+        Losses are averaged within each stream. Stream weights may be constants
+        or callables of the one-based epoch number. Validation is evaluated
+        exactly once for every stream; the weighted sum of validation totals
+        drives the configured scheduler and ordinary ``best.pt``.
         If requested, the untrained validation result is first recorded as
         epoch 0, using stream-weight callables evaluated at zero.
         """
@@ -774,6 +780,10 @@ class Trainer(nn.Module):
         names = [stream.name for stream in streams]
         if len(set(names)) != len(names):
             raise ValueError("stream names must be unique")
+        if all(stream.cycle for stream in streams):
+            raise ValueError(
+                "at least one training stream must have cycle=False"
+            )
         if self.optimizer is not None and tuple(names) != tuple(
             stream.name for stream in self._streams
         ):
@@ -830,7 +840,7 @@ class Trainer(nn.Module):
         streams: Sequence[TrainingStream],
         weights: Mapping[str, float],
     ) -> Dict[str, Tuple[Dict[str, float], Dict[str, Dict[str, float]]]]:
-        """Consume every training stream once with joint optimizer updates."""
+        """Run joint updates, cycling opted-in streams to the epoch length."""
 
         if not any(weight > 0.0 for weight in weights.values()):
             raise ValueError("at least one training stream must have positive weight")
@@ -838,14 +848,17 @@ class Trainer(nn.Module):
         for stream in streams:
             stream.loss.train(True)
         iterators = {stream.name: iter(stream.train_loader) for stream in streams}
-        active = {stream.name for stream in streams}
+        active = {stream.name for stream in streams if not stream.cycle}
         loss_sums = {stream.name: {} for stream in streams}
         field_counts = {stream.name: 0 for stream in streams}
 
         while active:
             groups = {}
+            # Non-cycling streams define the epoch length. Gather them first so
+            # cycling streams never create an extra update after the last
+            # ordinary stream is exhausted.
             for stream in streams:
-                if stream.name not in active:
+                if stream.cycle or stream.name not in active:
                     continue
                 batches = []
                 for _ in range(stream.batches_per_step):
@@ -858,6 +871,26 @@ class Trainer(nn.Module):
                     groups[stream.name] = batches
             if not groups:
                 break
+
+            for stream in streams:
+                if not stream.cycle:
+                    continue
+                batches = []
+                for _ in range(stream.batches_per_step):
+                    try:
+                        batch = next(iterators[stream.name])
+                    except StopIteration:
+                        iterators[stream.name] = iter(stream.train_loader)
+                        try:
+                            batch = next(iterators[stream.name])
+                        except StopIteration as error:
+                            raise ValueError(
+                                "cycling train loader for stream '{}' is empty".format(
+                                    stream.name
+                                )
+                            ) from error
+                    batches.append(batch)
+                groups[stream.name] = batches
 
             self.optimizer.zero_grad(set_to_none=True)
             for stream in streams:
