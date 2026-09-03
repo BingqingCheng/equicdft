@@ -4,13 +4,65 @@ import numpy as np
 import torch
 
 from equicdft._grid import (
+    gather_neighbors,
     grid_spacing_tensor,
+    periodic_stencil_convolution,
     require_matching_grid_spacing,
     voxel_volume,
 )
+from equicdft.stencil import get_neighbor_indices
 
 
 class TestGridGeometry(unittest.TestCase):
+    def test_periodic_convolution_matches_shuffled_neighbor_gather(self):
+        torch.manual_seed(17)
+        shape = (3, 4, 5)
+        canonical_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+        generator = np.random.default_rng(17)
+        positions = []
+        neighbor_indices = []
+        for _ in range(2):
+            field_positions = canonical_positions[
+                generator.permutation(len(canonical_positions))
+            ]
+            neighbor_index, stencil_positions = get_neighbor_indices(
+                field_positions,
+                cutoff_grid=2,
+            )
+            positions.append(field_positions)
+            neighbor_indices.append(neighbor_index)
+        values = torch.randn(
+            2,
+            len(canonical_positions),
+            2,
+            3,
+            dtype=torch.float64,
+        )
+        basis = torch.randn(
+            len(stencil_positions),
+            2,
+            4,
+            dtype=torch.float64,
+        )
+        indices = torch.tensor(np.stack(neighbor_indices))
+
+        expected = torch.einsum(
+            "bgjnc,jnk->bgnkc",
+            gather_neighbors(values, indices),
+            basis,
+        )
+        actual = periodic_stencil_convolution(
+            values,
+            basis,
+            torch.tensor(np.stack(positions)),
+            torch.tensor(shape).expand(2, -1),
+            torch.tensor(stencil_positions),
+        )
+
+        self.assertTrue(
+            torch.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+        )
+
     def test_scalar_spacing_expands_to_cubic_voxels(self):
         spacing = grid_spacing_tensor(0.5)
 

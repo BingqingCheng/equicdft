@@ -187,6 +187,31 @@ stencil geometry from `a_features`, but its degree-dependent `N -> M`
 transform is independent. Multiple message layers own distinct neural and
 radial-transform parameters.
 
+### Low-memory periodic convolution
+
+The established message contraction explicitly gathers a tensor with shape
+`[..., G, J, N, C]`. Large grids and stencils can instead select a
+mathematically equivalent grouped three-dimensional convolution (up to
+floating-point operation order):
+
+```python
+message = BChiMessage(
+    n_invariant_features=b_features.n_features,
+    n_radial_channels=4,
+    n_channels=a_features.n_output_channels,
+    hidden_sizes=(32, 16),
+    convolution_backend="conv3d",
+)
+```
+
+This execution option changes neither learned parameters nor `state_dict`
+keys. A reconstructed model must select it explicitly; whole-object saves
+retain it, while legacy whole objects use the class default `"gather"`. It
+scatters the spherical stencil into its enclosing dense Cartesian kernel and
+uses periodic cross-correlation, avoiding the explicit neighbor tensor. The
+convolution backend is intended for complete regular periodic grids and may
+trade additional arithmetic on zero kernel entries for lower peak memory.
+
 ## Charge-factorized reciprocal readouts
 
 `LongRangeReadout` can constrain pair coefficients to a known charge-product
@@ -458,6 +483,8 @@ functional or convergence criterion.
 
 ## Implementation map
 
+- `_grid.py`: regular-grid validation, neighborhood gathers, and the optional
+  periodic stencil convolution
 - `_radial.py`: radial formulas, validation, discrete conditioning, and
   pre-invariant transforms
 - `features.py`: Cartesian feature ownership, density transforms, and radial

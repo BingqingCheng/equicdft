@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from ._argument_checks import boolean, positive_integer
-from ._grid import gather_neighbors
+from ._grid import gather_neighbors, periodic_stencil_convolution
 from ._nn import build_mlp
 from ._radial import (
     _RadialTransform,
@@ -74,7 +74,15 @@ class BChiMessage(nn.Module):
     n_radial_functions
         Number of fixed primitive Bessel functions before the message-owned
         transform. Required only when ``radial_basis="bessel"``.
+    convolution_backend
+        ``"gather"`` retains the established explicit-neighborhood
+        contraction. ``"conv3d"`` evaluates the same periodic stencil as a
+        grouped dense convolution without materializing ``[G, J, N, C]``.
     """
+
+    # A class default keeps whole-object models saved before this execution
+    # option loadable without a migration hook or an extra state-dict key.
+    convolution_backend: str = "gather"
 
     def __init__(
         self,
@@ -92,6 +100,7 @@ class BChiMessage(nn.Module):
         trainable_radial_centers: bool = False,
         radial_basis: Optional[str] = None,
         n_radial_functions: Optional[int] = None,
+        convolution_backend: str = "gather",
     ) -> None:
         super().__init__()
 
@@ -221,6 +230,12 @@ class BChiMessage(nn.Module):
                 "n_radial_functions requires radial_basis='bessel'"
             )
         self.radial_basis = resolved_radial_basis
+        if not isinstance(convolution_backend, str):
+            raise TypeError("convolution_backend must be 'gather' or 'conv3d'")
+        convolution_backend = convolution_backend.lower()
+        if convolution_backend not in ("gather", "conv3d"):
+            raise ValueError("convolution_backend must be 'gather' or 'conv3d'")
+        self.convolution_backend = convolution_backend
         self.trainable_radial_exponents = trainable_radial_exponents
         self.trainable_radial_centers = trainable_radial_centers
         self.n_input_features = (
@@ -330,17 +345,67 @@ class BChiMessage(nn.Module):
             )
         return transform(basis, a_features.powers)
 
+    def _apply_stencil(
+        self,
+        gates: torch.Tensor,
+        local_density_index: torch.Tensor,
+        stencil_basis: torch.Tensor,
+        *,
+        grid_positions: Optional[torch.Tensor],
+        grid_size: Optional[torch.Tensor],
+        stencil_positions: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply the configured periodic stencil contraction."""
+
+        if self.convolution_backend == "conv3d":
+            if (
+                grid_positions is None
+                or grid_size is None
+                or stencil_positions is None
+            ):
+                raise ValueError(
+                    "conv3d messages require grid_positions, grid_size, "
+                    "and stencil_positions"
+                )
+            return periodic_stencil_convolution(
+                gates,
+                stencil_basis,
+                grid_positions,
+                grid_size,
+                stencil_positions,
+            )
+        if self.convolution_backend != "gather":
+            raise RuntimeError(
+                "convolution_backend must be 'gather' or 'conv3d'"
+            )
+        if stencil_basis.shape[0] != local_density_index.shape[-1]:
+            raise ValueError(
+                "stencil_basis neighbor count does not match "
+                "local_density_index"
+            )
+        local_gates = gather_neighbors(gates, local_density_index)
+        return torch.einsum(
+            "...gjnc,jnk->...gnkc",
+            local_gates,
+            stencil_basis,
+        )
+
     def forward(
         self,
         B: torch.Tensor,
         local_density_index: torch.Tensor,
         stencil_basis: torch.Tensor,
+        *,
+        grid_positions: Optional[torch.Tensor] = None,
+        grid_size: Optional[torch.Tensor] = None,
+        stencil_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return ``A^(t+1)`` with shape ``[..., G, N, K, C]``.
 
         ``B`` must have shape ``[..., G, N, Q, C]`` and ``stencil_basis`` must
         have shape ``[J, N, K]``. The periodic neighbor table has shape
-        ``[..., G, J]``.
+        ``[..., G, J]``. The ``"conv3d"`` backend additionally requires the
+        complete grid coordinates, grid size, and matching stencil offsets.
         """
 
         if B.ndim < 4:
@@ -367,11 +432,6 @@ class BChiMessage(nn.Module):
             raise ValueError(
                 "stencil_basis radial channels do not match this message layer"
             )
-        if stencil_basis.shape[0] != local_density_index.shape[-1]:
-            raise ValueError(
-                "stencil_basis neighbor count does not match local_density_index"
-            )
-
         flat_B = B.flatten(start_dim=-3)
         zero_B = flat_B.new_zeros(self.n_input_features)
         gates = self.mlp(flat_B) - self.mlp(zero_B)
@@ -380,10 +440,11 @@ class BChiMessage(nn.Module):
             self.n_radial_channels,
             self.n_channels,
         )
-        local_gates = gather_neighbors(gates, local_density_index)
-
-        return torch.einsum(
-            "...gjnc,jnk->...gnkc",
-            local_gates,
+        return self._apply_stencil(
+            gates,
+            local_density_index,
             stencil_basis,
+            grid_positions=grid_positions,
+            grid_size=grid_size,
+            stencil_positions=stencil_positions,
         )

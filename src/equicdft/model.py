@@ -393,6 +393,9 @@ class GridCACEModel(nn.Module):
                     B,
                     data["local_density_index"],
                     stencil_basis,
+                    grid_positions=data.get("grid_positions"),
+                    grid_size=data.get("grid_size"),
+                    stencil_positions=self.a_features.local_density_positions,
                 )
                 B = self.b_features(A)
                 levels.append(B.flatten(start_dim=-3))

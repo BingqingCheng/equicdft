@@ -4,6 +4,7 @@ import math
 from typing import Optional, Tuple
 
 import torch
+from torch.nn import functional as F
 
 
 def common_grid_size(
@@ -74,6 +75,283 @@ def gather_neighbors(
         n_grid,
         n_neighbors,
         *feature_shape,
+    )
+
+
+def _integer_tensor(
+    values: torch.Tensor,
+    name: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return integer-valued geometry as a long tensor."""
+
+    tensor = torch.as_tensor(values, device=device)
+    if tensor.dtype == torch.bool or tensor.is_complex():
+        raise TypeError(f"{name} must be integer-valued")
+    if not tensor.is_floating_point():
+        return tensor.to(dtype=torch.long)
+    rounded = torch.round(tensor).to(dtype=torch.long)
+    if not torch.allclose(
+        tensor.to(dtype=torch.float64),
+        rounded.to(dtype=torch.float64),
+        rtol=0.0,
+        atol=1.0e-8,
+    ):
+        raise ValueError(f"{name} must be integer-valued")
+    return rounded
+
+
+def _ravel_grid_indices(
+    positions: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Return C-order flat indices for three-dimensional coordinates."""
+
+    return (
+        (positions[..., 0] * grid_shape[1] + positions[..., 1])
+        * grid_shape[2]
+        + positions[..., 2]
+    )
+
+
+def _flat_grid_positions(
+    grid_positions: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    leading_shape: torch.Size,
+    device: torch.device,
+) -> Tuple[torch.Tensor, bool]:
+    """Return validated C-order indices and whether rows are canonical."""
+
+    n_grid = math.prod(grid_shape)
+    positions = _integer_tensor(grid_positions, "grid_positions", device)
+    if positions.shape == (n_grid, 3):
+        positions = positions.reshape(1, n_grid, 3).expand(
+            math.prod(leading_shape) if leading_shape else 1,
+            -1,
+            -1,
+        )
+    elif positions.shape == (*leading_shape, n_grid, 3):
+        positions = positions.reshape(-1, n_grid, 3)
+    else:
+        raise ValueError(
+            "grid_positions must have shape [n_grid, 3] or "
+            "[..., n_grid, 3] matching values"
+        )
+    sizes = positions.new_tensor(grid_shape)
+    if torch.any(positions < 0).item() or torch.any(positions >= sizes).item():
+        raise ValueError("grid_positions are outside grid_size")
+    flat = _ravel_grid_indices(positions, grid_shape)
+    canonical = torch.arange(n_grid, device=device).expand_as(flat)
+    rows_are_canonical = torch.equal(flat, canonical)
+    if (
+        not rows_are_canonical
+        and not torch.equal(torch.sort(flat, dim=-1).values, canonical)
+    ):
+        raise ValueError(
+            "grid_positions must contain one complete regular grid"
+        )
+    return flat, rows_are_canonical
+
+
+def _dense_stencil_weight(
+    stencil_basis: torch.Tensor,
+    offsets: torch.Tensor,
+    n_channels: int,
+) -> Tuple[
+    torch.Tensor,
+    Tuple[int, int, int],
+    Tuple[int, int, int],
+]:
+    """Scatter a sparse stencil into grouped-convolution weights."""
+
+    n_neighbors, n_radial, n_monomials = stencil_basis.shape
+    minimum_offsets = tuple(
+        int(value)
+        for value in offsets.min(dim=0).values.detach().cpu().tolist()
+    )
+    maximum_offsets = tuple(
+        int(value)
+        for value in offsets.max(dim=0).values.detach().cpu().tolist()
+    )
+    kernel_shape = tuple(
+        maximum - minimum + 1
+        for minimum, maximum in zip(minimum_offsets, maximum_offsets)
+    )
+    kernel_coordinates = offsets - offsets.new_tensor(minimum_offsets)
+    kernel_flat = _ravel_grid_indices(kernel_coordinates, kernel_shape)
+    dense_basis = stencil_basis.new_zeros(
+        n_radial,
+        n_monomials,
+        math.prod(kernel_shape),
+    ).scatter_add(
+        2,
+        kernel_flat.reshape(1, 1, n_neighbors).expand(
+            n_radial,
+            n_monomials,
+            -1,
+        ),
+        stencil_basis.permute(1, 2, 0),
+    )
+    weight = dense_basis.reshape(
+        n_radial,
+        n_monomials,
+        *kernel_shape,
+    )[:, None].expand(
+        n_radial,
+        n_channels,
+        n_monomials,
+        *kernel_shape,
+    ).reshape(
+        n_radial * n_channels * n_monomials,
+        1,
+        *kernel_shape,
+    )
+    return weight, minimum_offsets, maximum_offsets
+
+
+def _periodic_extend_grid(
+    values: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    minimum_offsets: Tuple[int, int, int],
+    maximum_offsets: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Extend three grid axes by modular indexing for periodic convolution."""
+
+    for axis, (size, minimum, maximum) in enumerate(
+        zip(grid_shape, minimum_offsets, maximum_offsets),
+        start=2,
+    ):
+        periodic_index = torch.arange(
+            minimum,
+            size + maximum,
+            device=values.device,
+        ).remainder(size)
+        values = values.index_select(axis, periodic_index)
+    return values
+
+
+def periodic_stencil_convolution(
+    values: torch.Tensor,
+    stencil_basis: torch.Tensor,
+    grid_positions: torch.Tensor,
+    grid_size: torch.Tensor,
+    stencil_positions: torch.Tensor,
+) -> torch.Tensor:
+    r"""Contract a periodic stencil without materializing neighborhoods.
+
+    ``values`` has shape ``[..., G, N, C]``, ``stencil_basis`` has shape
+    ``[J, N, K]``, and ``stencil_positions`` gives the corresponding integer
+    offsets as ``[J, 3]``. The result is
+
+    ``output[i,n,k,c] = sum_j basis[j,n,k] values[i+s_j,n,c]``
+
+    with shape ``[..., G, N, K, C]``. A grouped three-dimensional
+    cross-correlation evaluates the same sum while avoiding the much larger
+    explicit ``[..., G, J, N, C]`` neighbor tensor. Arbitrary complete input
+    row order is preserved through ``grid_positions``.
+    """
+
+    if values.ndim < 3:
+        raise ValueError("values must have shape [..., G, N, C]")
+    if stencil_basis.ndim != 3:
+        raise ValueError("stencil_basis must have shape [J, N, K]")
+    leading_shape = values.shape[:-3]
+    n_grid, n_radial, n_channels = values.shape[-3:]
+    n_neighbors, basis_radial, n_monomials = stencil_basis.shape
+    if basis_radial != n_radial:
+        raise ValueError(
+            "stencil_basis radial channels do not match values"
+        )
+    offsets = _integer_tensor(
+        stencil_positions,
+        "stencil_positions",
+        values.device,
+    )
+    if offsets.ndim != 2 or offsets.shape[-1] != 3:
+        raise ValueError("stencil_positions must have shape [J, 3]")
+    if offsets.shape[0] != n_neighbors:
+        raise ValueError(
+            "stencil_positions and stencil_basis counts must match"
+        )
+    grid_shape = common_grid_size(grid_size, leading_shape)
+    if math.prod(grid_shape) != n_grid:
+        raise ValueError("grid_size product must match the values grid axis")
+
+    flat_positions, rows_are_canonical = _flat_grid_positions(
+        grid_positions,
+        grid_shape,
+        leading_shape,
+        values.device,
+    )
+    n_fields = math.prod(leading_shape) if leading_shape else 1
+    values_flat = values.reshape(n_fields, n_grid, n_radial, n_channels)
+    if rows_are_canonical:
+        canonical_values = values_flat
+    else:
+        scatter_index = flat_positions[..., None, None].expand_as(values_flat)
+        canonical_values = torch.zeros_like(values_flat).scatter(
+            1,
+            scatter_index,
+            values_flat,
+        )
+
+    # Each (radial, channel) pair is an independent convolution group. The K
+    # Cartesian components are its outputs. conv3d is cross-correlation, so
+    # stencil offsets are scattered without reversal.
+    weight, minimum_offsets, maximum_offsets = _dense_stencil_weight(
+        stencil_basis,
+        offsets,
+        n_channels,
+    )
+
+    grid_values = canonical_values.reshape(
+        n_fields,
+        *grid_shape,
+        n_radial,
+        n_channels,
+    ).permute(0, 4, 5, 1, 2, 3).reshape(
+        n_fields,
+        n_radial * n_channels,
+        *grid_shape,
+    )
+    grid_values = _periodic_extend_grid(
+        grid_values,
+        grid_shape,
+        minimum_offsets,
+        maximum_offsets,
+    )
+
+    convolved = F.conv3d(
+        grid_values,
+        weight,
+        groups=n_radial * n_channels,
+    )
+    canonical_output = convolved.reshape(
+        n_fields,
+        n_radial,
+        n_channels,
+        n_monomials,
+        *grid_shape,
+    ).permute(0, 4, 5, 6, 1, 3, 2).reshape(
+        n_fields,
+        n_grid,
+        n_radial,
+        n_monomials,
+        n_channels,
+    )
+    if rows_are_canonical:
+        output = canonical_output
+    else:
+        gather_index = flat_positions[..., None, None, None].expand_as(
+            canonical_output
+        )
+        output = torch.gather(canonical_output, 1, gather_index)
+    return output.reshape(
+        *leading_shape,
+        n_grid,
+        n_radial,
+        n_monomials,
+        n_channels,
     )
 
 
