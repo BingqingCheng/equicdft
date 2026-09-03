@@ -112,6 +112,7 @@ class GridCACEModel(nn.Module):
                     "message layer dimensions {} do not match local feature "
                     "dimensions {}".format(actual, expected)
                 )
+            module._bind_bessel_basis(a_features)
         if isinstance(readout, EnergyReadout):
             raise TypeError(
                 "readout must be a sequence of EnergyReadout modules"
@@ -385,15 +386,9 @@ class GridCACEModel(nn.Module):
         if messages:
             shared_basis = self.a_features.stencil_basis()
             for message in messages:
-                radial_exponents = message.radial_exponents
-                radial_centers = message.radial_centers
-                stencil_basis = (
-                    shared_basis
-                    if radial_exponents is None
-                    else self.a_features.stencil_basis(
-                        radial_exponents,
-                        radial_centers,
-                    )
+                stencil_basis = message._stencil_basis(
+                    self.a_features,
+                    shared_basis,
                 )
                 A = message(
                     B,

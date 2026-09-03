@@ -110,6 +110,7 @@ def whiten_radial_cartesian_basis(
     primitive_basis = (
         radial_values[:, :, None] * monomial_values[:, None, :]
     )
+    primitive_basis = primitive_basis * neighbor_mask[:, None, None]
     total_degrees = powers.sum(dim=-1)
     max_power = int(total_degrees.max().item())
     conditioned_blocks = []

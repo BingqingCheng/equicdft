@@ -1,3 +1,4 @@
+import io
 import unittest
 
 import numpy as np
@@ -42,8 +43,17 @@ def _transform_cubic_field(values, shape):
     return transformed.reshape(values.shape)
 
 
+def _load_whole_model(serialized):
+    """Load a test model across pre- and post-weights-only PyTorch APIs."""
+
+    try:
+        return torch.load(serialized, weights_only=False)
+    except TypeError:
+        return torch.load(serialized)
+
+
 class TestBChiMessage(unittest.TestCase):
-    def test_zero_invariant_field_gives_exactly_zero_message(self):
+    def test_zero_invariant_field_gives_numerically_zero_message(self):
         data = _grid_data(shape=(3, 3, 3))
         a_features = CartesianAFeatures(
             mean_density=1.0,
@@ -73,7 +83,31 @@ class TestBChiMessage(unittest.TestCase):
             a_features.stencil_basis(),
         )
 
-        self.assertTrue(torch.equal(A_next, torch.zeros_like(A_next)))
+        self.assertTrue(
+            torch.allclose(
+                A_next,
+                torch.zeros_like(A_next),
+                rtol=0.0,
+                atol=2.0e-8,
+            )
+        )
+
+    def test_zero_invariant_field_retains_gate_jacobian(self):
+        message = BChiMessage(1, 1, 1, hidden_sizes=())
+        with torch.no_grad():
+            message.mlp[0].weight.fill_(2.0)
+            message.mlp[0].bias.fill_(0.7)
+        B = torch.zeros(1, 1, 1, 1, requires_grad=True)
+
+        output = message(
+            B,
+            torch.zeros(1, 1, dtype=torch.long),
+            torch.ones(1, 1, 1),
+        )
+        derivative = torch.autograd.grad(output.sum(), B)[0]
+
+        self.assertTrue(torch.allclose(output, torch.zeros_like(output)))
+        self.assertTrue(torch.equal(derivative, torch.full_like(B, 2.0)))
 
     def test_linear_gate_matches_direct_periodic_convolution(self):
         data = _grid_data(shape=(3, 3, 3))
@@ -300,6 +334,85 @@ class TestBChiMessage(unittest.TestCase):
                 trainable_radial_exponents=True,
             )
 
+    def test_bessel_message_arguments_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "n_radial_functions is required"):
+            BChiMessage(1, 1, 1, radial_basis="bessel")
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            BChiMessage(
+                1,
+                2,
+                1,
+                radial_basis="bessel",
+                n_radial_functions=1,
+            )
+        with self.assertRaisesRegex(ValueError, "exponents are unavailable"):
+            BChiMessage(
+                1,
+                1,
+                1,
+                radial_exponents=(0.5,),
+                radial_basis="bessel",
+                n_radial_functions=1,
+            )
+        with self.assertRaisesRegex(ValueError, "requires radial_basis"):
+            BChiMessage(1, 1, 1, n_radial_functions=1)
+
+    def test_legacy_message_state_keys_are_unchanged(self):
+        shared = BChiMessage(1, 1, 1, hidden_sizes=())
+        gaussian = BChiMessage(
+            1,
+            1,
+            1,
+            hidden_sizes=(),
+            radial_exponents=(0.5,),
+        )
+
+        self.assertEqual(
+            set(shared.state_dict()),
+            {"mlp.0.weight", "mlp.0.bias"},
+        )
+        self.assertEqual(
+            set(gaussian.state_dict()),
+            {"fixed_radial_exponents", "mlp.0.weight", "mlp.0.bias"},
+        )
+
+    def test_message_objects_without_radial_basis_attribute_still_run(self):
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.5,),
+        )
+        b_features = CartesianBFeatures(1, 2)
+        data = _grid_data(shape=(3, 3, 3))
+        for exponents in (None, (1.0,)):
+            with self.subTest(exponents=exponents):
+                message = BChiMessage(
+                    b_features.n_features,
+                    1,
+                    1,
+                    hidden_sizes=(4,),
+                    radial_exponents=exponents,
+                )
+                model = GridCACEModel(
+                    a_features=a_features,
+                    b_features=b_features,
+                    readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
+                    grid_spacing=1.0,
+                    message_layers=[message],
+                )
+                expected = model(data)["beta_F_exc"].detach().clone()
+
+                del message.radial_basis
+                serialized = io.BytesIO()
+                torch.save(model, serialized)
+                serialized.seek(0)
+                restored = _load_whole_model(serialized)
+                actual = restored(data)["beta_F_exc"]
+
+                self.assertTrue(torch.equal(actual, expected))
+
     def test_invariant_output_commutes_with_cubic_grid_symmetry(self):
         torch.manual_seed(7)
         shape = (5, 5, 5)
@@ -475,6 +588,136 @@ class TestBChiMessage(unittest.TestCase):
         self.assertEqual(actual.shape, (33, 2, 4))
         self.assertTrue(torch.equal(actual, gaussian.stencil_basis()))
 
+    def test_independent_bessel_message_has_own_transform(self):
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        )
+        b_features = CartesianBFeatures(1, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            2,
+            1,
+            hidden_sizes=(),
+            radial_basis="bessel",
+            n_radial_functions=3,
+        )
+        GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
+            grid_spacing=1.0,
+            message_layers=[message],
+        )
+
+        basis = message._stencil_basis(
+            a_features,
+            a_features.stencil_basis(),
+        )
+
+        self.assertEqual(basis.shape, (33, 2, 4))
+        self.assertIsNone(message.radial_exponents)
+        self.assertIsNone(message.radial_centers)
+        self.assertTrue(
+            torch.equal(
+                basis,
+                message.fixed_bessel_stencil_basis[:, :2],
+            )
+        )
+        self.assertEqual(message.radial_transform.weight.shape, (2, 3, 2))
+        self.assertIn("fixed_bessel_stencil_basis", message.state_dict())
+        self.assertIn("bessel_gram_eigenvalues", message.state_dict())
+        self.assertIn("radial_transform.weight", message.state_dict())
+
+    def test_independent_bessel_message_bypasses_initial_transform(self):
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="bessel",
+            n_radial_functions=3,
+            n_radial_channels=2,
+        )
+        b_features = CartesianBFeatures(1, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            2,
+            1,
+            radial_basis="bessel",
+            n_radial_functions=3,
+        )
+        GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
+            grid_spacing=1.0,
+            message_layers=[message],
+        )
+        before = message._stencil_basis(
+            a_features,
+            a_features.stencil_basis(),
+        ).detach().clone()
+        initial_before = a_features.stencil_basis().detach().clone()
+
+        with torch.no_grad():
+            a_features.radial_transform.weight.add_(0.2)
+
+        after = message._stencil_basis(
+            a_features,
+            a_features.stencil_basis(),
+        )
+        self.assertTrue(torch.equal(before, after))
+        self.assertFalse(
+            torch.equal(initial_before, a_features.stencil_basis())
+        )
+
+    def test_independent_bessel_message_preserves_cubic_symmetry(self):
+        torch.manual_seed(23)
+        shape = (5, 5, 5)
+        data = _grid_data(shape=shape, cutoff_grid=2)
+        a_features = CartesianAFeatures(
+            mean_density=0.7,
+            cutoff_grid=2,
+            max_power=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        )
+        b_features = CartesianBFeatures(2, 2)
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+            grid_spacing=1.0,
+            compute_c1=True,
+            message_layers=[
+                BChiMessage(
+                    b_features.n_features,
+                    2,
+                    1,
+                    hidden_sizes=(5,),
+                    radial_basis="bessel",
+                    n_radial_functions=3,
+                )
+            ],
+        )
+        transformed_data = dict(data)
+        transformed_data["rho"] = _transform_cubic_field(data["rho"], shape)
+
+        result = model(data)["c1"]
+        transformed_result = model(transformed_data)["c1"]
+
+        self.assertTrue(
+            torch.allclose(
+                transformed_result,
+                _transform_cubic_field(result, shape),
+                rtol=3.0e-5,
+                atol=3.0e-6,
+            )
+        )
+
     def test_batched_message_matches_individual_fields(self):
         data = _grid_data(shape=(3, 3, 3))
         a_features = CartesianAFeatures(
@@ -607,6 +850,281 @@ class TestMessagePassingModel(unittest.TestCase):
         gradient = model.a_features.radial_transform.weight.grad
         self.assertIsNotNone(gradient)
         self.assertTrue(torch.all(torch.isfinite(gradient)))
+
+    def test_independent_bessel_message_has_finite_derivatives(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        )
+        b_features = CartesianBFeatures(2, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            a_features.n_radial_channels,
+            a_features.n_output_channels,
+            hidden_sizes=(6,),
+            radial_basis="bessel",
+            n_radial_functions=3,
+        )
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+            grid_spacing=1.0,
+            compute_c1=True,
+            compute_c2=True,
+            message_layers=[message],
+        )
+        data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
+
+        outputs = model(data, c2_reference=(0, 0))
+
+        self.assertTrue(torch.all(torch.isfinite(outputs["beta_F_exc"])))
+        self.assertTrue(torch.all(torch.isfinite(outputs["c1"])))
+        self.assertTrue(torch.all(torch.isfinite(outputs["c2"])))
+        outputs["c1"].square().mean().backward()
+        gradient = message.radial_transform.weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertGreater(gradient.abs().sum(), 0.0)
+
+    def test_rpm_scale_bessel_message_shape_is_finite(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.2,
+            cutoff_grid=6,
+            max_power=3,
+            radial_basis="bessel",
+            n_radial_functions=6,
+            n_radial_channels=4,
+            separate_center=True,
+            n_types=2,
+        )
+        b_features = CartesianBFeatures(3, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            4,
+            2,
+            radial_basis="bessel",
+            n_radial_functions=6,
+        )
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=2, hidden_sizes=(8,))],
+            grid_spacing=0.125,
+            compute_c1=True,
+            message_layers=[message],
+        )
+        data = _grid_data(shape=(3, 3, 3), cutoff_grid=6)
+        data["rho"] = torch.rand(27, 2) + 0.1
+        data["grid_spacing"] = torch.full((3,), 0.125)
+
+        outputs = model(data)
+
+        self.assertEqual(message.radial_transform.weight.shape, (4, 6, 4))
+        self.assertEqual(outputs["c1"].shape, (27, 2))
+        self.assertTrue(torch.all(torch.isfinite(outputs["c1"])))
+
+    def test_two_bessel_messages_have_independent_transforms(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        )
+        b_features = CartesianBFeatures(1, 2)
+        messages = [
+            BChiMessage(
+                b_features.n_features,
+                2,
+                1,
+                hidden_sizes=(4,),
+                radial_basis="bessel",
+                n_radial_functions=3,
+            )
+            for _ in range(2)
+        ]
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+            grid_spacing=1.0,
+            compute_c1=True,
+            message_layers=messages,
+        )
+        data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
+
+        model(data)["c1"].square().mean().backward()
+
+        first, second = model.message_layers
+        self.assertIsNot(
+            first.radial_transform.weight,
+            second.radial_transform.weight,
+        )
+        self.assertNotEqual(
+            first.radial_transform.weight.data_ptr(),
+            second.radial_transform.weight.data_ptr(),
+        )
+        for message in (first, second):
+            gradient = message.radial_transform.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.all(torch.isfinite(gradient)))
+            self.assertGreater(gradient.abs().sum(), 0.0)
+
+    def test_independent_bessel_message_strict_state_round_trip(self):
+        def make_model():
+            a_features = CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=2,
+                max_power=1,
+                radial_basis="gaussian",
+                radial_exponents=(0.25, 1.0),
+            )
+            b_features = CartesianBFeatures(1, 2)
+            return GridCACEModel(
+                a_features=a_features,
+                b_features=b_features,
+                readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+                grid_spacing=1.0,
+                compute_c1=True,
+                message_layers=[
+                    BChiMessage(
+                        b_features.n_features,
+                        2,
+                        1,
+                        hidden_sizes=(4,),
+                        radial_basis="bessel",
+                        n_radial_functions=3,
+                    )
+                ],
+            )
+
+        torch.manual_seed(19)
+        original = make_model()
+        data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
+        expected = original(data)["c1"].detach().clone()
+        state = original.state_dict()
+
+        restored = make_model()
+        restored.load_state_dict(state, strict=True)
+        actual = restored(data)["c1"]
+
+        self.assertTrue(torch.equal(actual, expected))
+
+        serialized = io.BytesIO()
+        torch.save(original, serialized)
+        serialized.seek(0)
+        whole_model = _load_whole_model(serialized)
+        self.assertTrue(torch.equal(whole_model(data)["c1"], expected))
+
+    def test_rank_deficient_bessel_message_is_rejected_when_bound(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=1,
+            max_power=0,
+            separate_center=True,
+        )
+        b_features = CartesianBFeatures(0, 1)
+        message = BChiMessage(
+            b_features.n_features,
+            1,
+            1,
+            radial_basis="bessel",
+            n_radial_functions=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "no active stencil points"):
+            GridCACEModel(
+                a_features=a_features,
+                b_features=b_features,
+                readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
+                grid_spacing=1.0,
+                message_layers=[message],
+            )
+
+    def test_bessel_message_rejects_incompatible_rebinding(self):
+        first_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=1,
+        )
+        second_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=3,
+            max_power=1,
+        )
+        message = BChiMessage(
+            1,
+            1,
+            1,
+            radial_basis="bessel",
+            n_radial_functions=2,
+        )
+        message._bind_bessel_basis(first_features)
+
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            message._bind_bessel_basis(second_features)
+
+    def test_bessel_message_binding_respects_existing_double_dtype(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        ).double()
+        b_features = CartesianBFeatures(1, 2).double()
+        message = BChiMessage(
+            b_features.n_features,
+            2,
+            1,
+            radial_basis="bessel",
+            n_radial_functions=3,
+        ).double()
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(4,)).double()],
+            grid_spacing=1.0,
+            compute_c1=True,
+            message_layers=[message],
+        )
+        data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
+        for key in ("rho", "grid_spacing", "temperature", "beta"):
+            data[key] = data[key].double()
+
+        output = model(data)["c1"]
+
+        self.assertEqual(
+            message.fixed_bessel_stencil_basis.dtype,
+            torch.float64,
+        )
+        self.assertEqual(message.radial_transform.weight.dtype, torch.float64)
+        self.assertTrue(torch.all(torch.isfinite(output)))
+
+    def test_bessel_message_rebind_after_dtype_conversion_is_idempotent(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=1,
+        )
+        message = BChiMessage(
+            1,
+            1,
+            1,
+            radial_basis="bessel",
+            n_radial_functions=2,
+        )
+        message._bind_bessel_basis(a_features)
+        message.double()
+        a_features.double()
+
+        message._bind_bessel_basis(a_features)
+
+        self.assertEqual(message.radial_transform.weight.dtype, torch.float64)
 
     def test_two_layers_have_independent_weights_and_radial_exponents(self):
         def messages(a_features, b_features):

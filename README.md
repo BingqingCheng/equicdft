@@ -164,7 +164,24 @@ continues to accept only its compatibility value `n_radial_channels=1`.
 
 A message-passing layer without its own radial parameters shares this
 transformed basis. A layer with explicit `radial_exponents` continues to use
-an independent Gaussian basis and bypasses the initial transform.
+an independent Gaussian basis and bypasses the initial transform. A message
+can instead own a conditioned Bessel basis and an independent transform:
+
+```python
+message = BChiMessage(
+    n_invariant_features=b_features.n_features,
+    n_radial_channels=4,       # transformed channels M
+    n_channels=a_features.n_output_channels,
+    radial_basis="bessel",
+    n_radial_functions=6,      # fixed primitives N >= M
+)
+```
+
+The message uses the cutoff, center mask, Cartesian monomials, and stencil
+geometry of `a_features`. Its fixed primitive basis is conditioned once when
+`GridCACEModel` is constructed. Its own degree-dependent `N -> M` transform
+is then applied on every forward pass before the message convolution and the
+next invariant products. Bessel frequencies remain fixed.
 
 ## Data format
 

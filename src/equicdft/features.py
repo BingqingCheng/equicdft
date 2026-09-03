@@ -1,6 +1,6 @@
 """Cartesian moment features for density fields on fixed integer grids."""
 
-from typing import Mapping, Optional, Sequence, Union
+from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -40,6 +40,33 @@ def _cartesian_stencil_basis(
         neighbor_mask,
     )
     return radial_values[:, :, None] * monomial_values[:, None, :]
+
+
+def _conditioned_bessel_stencil_basis(
+    squared_distances: torch.Tensor,
+    monomial_values: torch.Tensor,
+    powers: torch.Tensor,
+    cutoff_grid: int,
+    neighbor_mask: torch.Tensor,
+    n_radial_functions: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return conditioned Bessel values and their discrete Gram spectra."""
+
+    radial_values = bessel_radial_values(
+        squared_distances,
+        n_radial_functions,
+        cutoff_grid,
+        neighbor_mask,
+    )
+    support = neighbor_mask & (
+        squared_distances < float(cutoff_grid) ** 2
+    )
+    return whiten_radial_cartesian_basis(
+        radial_values,
+        monomial_values,
+        powers,
+        support,
+    )
 
 
 def _make_powers(max_power: int) -> torch.Tensor:
@@ -186,8 +213,9 @@ class CartesianAFeatures(nn.Module):
     radial_exponents
         Optional nonempty sequence of nonnegative damping coefficients
         ``alpha_n`` in inverse squared grid units. Its length determines the
-        number of channels. For ``radial_basis="gaussian"``, ``None`` uses
-        one channel with ``alpha=0.125``. It is unavailable for
+        number of primitive functions; ``n_radial_channels`` may subsequently
+        reduce the output count. For ``radial_basis="gaussian"``, ``None``
+        uses one primitive with ``alpha=0.125``. It is unavailable for
         ``radial_basis="none"``, which always uses one fixed zero exponent,
         and for ``radial_basis="bessel"``.
     n_radial_channels
@@ -441,21 +469,14 @@ class CartesianAFeatures(nn.Module):
 
         if radial_basis == "bessel":
             radial_function_count = int(n_radial_functions)
-            bessel_values = bessel_radial_values(
-                squared_distances,
-                radial_function_count,
-                int(cutoff_grid),
-                neighbor_mask,
-            )
-            bessel_support = neighbor_mask & (
-                squared_distances < float(cutoff_grid) ** 2
-            )
             bessel_basis, bessel_gram_eigenvalues = (
-                whiten_radial_cartesian_basis(
-                    bessel_values,
+                _conditioned_bessel_stencil_basis(
+                    squared_distances,
                     monomial_values,
                     powers,
-                    bessel_support,
+                    int(cutoff_grid),
+                    neighbor_mask,
+                    radial_function_count,
                 )
             )
         else:
@@ -640,6 +661,21 @@ class CartesianAFeatures(nn.Module):
         if radial_transform is not None:
             basis = radial_transform(basis, self.powers)
         return basis
+
+    def _bessel_stencil_basis(
+        self,
+        n_radial_functions: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build a conditioned Bessel basis on this feature geometry."""
+
+        return _conditioned_bessel_stencil_basis(
+            self.squared_distances,
+            self.monomial_values,
+            self.powers,
+            self.cutoff_grid,
+            self.stencil_neighbor_mask(),
+            n_radial_functions,
+        )
 
     def stencil_neighbor_mask(self) -> torch.Tensor:
         """Return the center-inclusion mask, including legacy fallback."""

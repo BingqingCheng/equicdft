@@ -51,7 +51,9 @@ class TestRadialValues(unittest.TestCase):
             dtype=torch.float64,
         )
 
-        self.assertTrue(torch.allclose(actual, expected, atol=1.0e-14))
+        self.assertTrue(
+            torch.allclose(actual, expected, rtol=0.0, atol=1.0e-14)
+        )
         self.assertTrue(torch.equal(actual[-1], torch.zeros(2)))
 
         masked = bessel_radial_values(
@@ -113,6 +115,38 @@ class TestRadialConditioning(unittest.TestCase):
 
         self.assertEqual(eigenvalues.shape, (4, 2))
         self.assertTrue(torch.all(eigenvalues > 0.0).item())
+        expected_eigenvalues = torch.tensor(
+            [
+                [3.00707839982836, 14.2948805321535],
+                [1.20665721918500, 8.97083018508661],
+                [0.65984982727415, 6.95540181314234],
+                [0.424172705517784, 5.85373747658564],
+            ],
+            dtype=torch.float64,
+        )
+        self.assertTrue(
+            torch.allclose(
+                eigenvalues,
+                expected_eigenvalues,
+                rtol=0.0,
+                atol=1.0e-12,
+            )
+        )
+
+    def test_conditioning_zeroes_rows_outside_the_mask(self):
+        radial = torch.tensor([[99.0], [1.0], [2.0]], dtype=torch.float64)
+        monomials = torch.ones(3, 1, dtype=torch.float64)
+        powers = torch.zeros(1, 3, dtype=torch.long)
+        support = torch.tensor([False, True, True])
+
+        basis, _ = whiten_radial_cartesian_basis(
+            radial,
+            monomials,
+            powers,
+            support,
+        )
+
+        self.assertTrue(torch.equal(basis[0], torch.zeros_like(basis[0])))
 
     def test_rank_deficient_basis_is_rejected(self):
         radial, monomials, powers, support = self._basis_inputs(2, 4, 0)

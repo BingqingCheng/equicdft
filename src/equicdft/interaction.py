@@ -8,6 +8,7 @@ from torch import nn
 from ._argument_checks import boolean, positive_integer
 from ._grid import gather_neighbors
 from ._nn import build_mlp
+from ._radial import _RadialTransform
 from .features import prepare_radial_centers, prepare_radial_exponents
 
 
@@ -58,6 +59,18 @@ class BChiMessage(nn.Module):
         shares the complete initial basis.
     trainable_radial_centers
         Optimize layer-owned centers directly. The default is ``False``.
+    radial_basis
+        Optional explicit radial-basis selection. ``None`` preserves the
+        established behavior: the initial ``CartesianAFeatures`` basis is
+        shared when ``radial_exponents`` is absent, and an independent
+        Gaussian basis is used when exponents are supplied. Explicit
+        ``"shared"``, ``"gaussian"``, and ``"bessel"`` selections are also
+        accepted; explicit Gaussian mode requires exponents. Bessel mode gives
+        this message an independently transformed, conditioned basis on the
+        initial feature geometry.
+    n_radial_functions
+        Number of fixed primitive Bessel functions before the message-owned
+        transform. Required only when ``radial_basis="bessel"``.
     """
 
     def __init__(
@@ -74,6 +87,8 @@ class BChiMessage(nn.Module):
             Union[Sequence[float], torch.Tensor]
         ] = None,
         trainable_radial_centers: bool = False,
+        radial_basis: Optional[str] = None,
+        n_radial_functions: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -94,7 +109,33 @@ class BChiMessage(nn.Module):
             trainable_radial_centers,
             "trainable_radial_centers",
         )
-        if radial_exponents is None:
+        if radial_basis is None:
+            resolved_radial_basis = (
+                "shared" if radial_exponents is None else "gaussian"
+            )
+        else:
+            if not isinstance(radial_basis, str):
+                raise TypeError(
+                    "radial_basis must be 'bessel', 'gaussian', "
+                    "'shared', or None"
+                )
+            resolved_radial_basis = radial_basis.lower()
+            if resolved_radial_basis not in (
+                "bessel",
+                "gaussian",
+                "shared",
+            ):
+                raise ValueError(
+                    "radial_basis must be 'bessel', 'gaussian', "
+                    "'shared', or None"
+                )
+
+        if resolved_radial_basis == "shared":
+            if radial_exponents is not None:
+                raise ValueError(
+                    "radial_exponents are unavailable when "
+                    "radial_basis='shared'"
+                )
             if trainable_radial_exponents:
                 raise ValueError(
                     "trainable_radial_exponents requires radial_exponents"
@@ -104,7 +145,11 @@ class BChiMessage(nn.Module):
                     "radial_centers require layer-owned radial_exponents"
                 )
             self.independent_radial_basis = False
-        else:
+        elif resolved_radial_basis == "gaussian":
+            if radial_exponents is None:
+                raise ValueError(
+                    "radial_basis='gaussian' requires radial_exponents"
+                )
             initial_radial_exponents = prepare_radial_exponents(
                 "gaussian",
                 radial_exponents,
@@ -139,6 +184,40 @@ class BChiMessage(nn.Module):
                     persistent=False,
                 )
             self.independent_radial_basis = True
+        else:
+            if radial_exponents is not None or trainable_radial_exponents:
+                raise ValueError(
+                    "Gaussian radial exponents are unavailable when "
+                    "radial_basis='bessel'"
+                )
+            if radial_centers is not None or trainable_radial_centers:
+                raise ValueError(
+                    "Gaussian radial centers are unavailable when "
+                    "radial_basis='bessel'"
+                )
+            if n_radial_functions is None:
+                raise ValueError(
+                    "n_radial_functions is required when "
+                    "radial_basis='bessel'"
+                )
+            self.n_radial_functions = positive_integer(
+                n_radial_functions,
+                "n_radial_functions",
+            )
+            if self.n_radial_channels > self.n_radial_functions:
+                raise ValueError(
+                    "n_radial_channels must not exceed "
+                    "n_radial_functions"
+                )
+            self.independent_radial_basis = True
+        if (
+            resolved_radial_basis != "bessel"
+            and n_radial_functions is not None
+        ):
+            raise ValueError(
+                "n_radial_functions requires radial_basis='bessel'"
+            )
+        self.radial_basis = resolved_radial_basis
         self.trainable_radial_exponents = trainable_radial_exponents
         self.trainable_radial_centers = trainable_radial_centers
         self.n_input_features = (
@@ -155,9 +234,9 @@ class BChiMessage(nn.Module):
 
     @property
     def radial_exponents(self) -> Optional[torch.Tensor]:
-        """Return layer-owned exponents, or ``None`` for the shared basis."""
+        """Return Gaussian exponents, or ``None`` for shared/Bessel bases."""
 
-        if not getattr(self, "independent_radial_basis", False):
+        if self._radial_basis_kind() != "gaussian":
             return None
         if getattr(self, "trainable_radial_exponents", False):
             return torch.exp(self.log_radial_exponents)
@@ -165,9 +244,9 @@ class BChiMessage(nn.Module):
 
     @property
     def radial_centers(self) -> Optional[torch.Tensor]:
-        """Return layer-owned centers, or ``None`` for the shared basis."""
+        """Return Gaussian centers, or ``None`` for shared/Bessel bases."""
 
-        if not getattr(self, "independent_radial_basis", False):
+        if self._radial_basis_kind() != "gaussian":
             return None
         if getattr(self, "trainable_radial_centers", False):
             return self.learned_radial_centers
@@ -175,6 +254,78 @@ class BChiMessage(nn.Module):
         if stored is not None:
             return stored
         return torch.zeros_like(self.radial_exponents)
+
+    def _radial_basis_kind(self) -> str:
+        """Return the basis kind, including legacy whole-object fallback."""
+
+        stored = getattr(self, "radial_basis", None)
+        if stored is not None:
+            return stored
+        if getattr(self, "independent_radial_basis", False):
+            return "gaussian"
+        return "shared"
+
+    def _bind_bessel_basis(self, a_features: nn.Module) -> None:
+        """Bind an independent Bessel basis to the model's grid geometry."""
+
+        if self._radial_basis_kind() != "bessel":
+            return
+        build_basis = getattr(a_features, "_bessel_stencil_basis", None)
+        if build_basis is None:
+            raise TypeError(
+                "Bessel message layers require CartesianAFeatures geometry"
+            )
+        geometry_signature = (
+            int(a_features.cutoff_grid),
+            int(a_features.max_power),
+            str(getattr(a_features, "coordinate_scaling", "none")),
+            bool(getattr(a_features, "separate_center", False)),
+        )
+        stored_basis = self._buffers.get("fixed_bessel_stencil_basis")
+        transform = self._modules.get("radial_transform")
+        if stored_basis is not None:
+            if (
+                getattr(self, "_bessel_geometry_signature", None)
+                != geometry_signature
+                or transform is None
+            ):
+                raise ValueError(
+                    "Bessel message layer is already bound to an "
+                    "incompatible feature geometry"
+                )
+            return
+        basis, eigenvalues = build_basis(self.n_radial_functions)
+        self.register_buffer("fixed_bessel_stencil_basis", basis)
+        self.register_buffer("bessel_gram_eigenvalues", eigenvalues)
+        self.radial_transform = _RadialTransform(
+            max_power=a_features.max_power,
+            n_radial_functions=self.n_radial_functions,
+            n_radial_channels=self.n_radial_channels,
+        ).to(device=basis.device, dtype=basis.dtype)
+        self._bessel_geometry_signature = geometry_signature
+
+    def _stencil_basis(
+        self,
+        a_features: nn.Module,
+        shared_basis: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the shared, Gaussian, or message-owned Bessel stencil."""
+
+        radial_basis = self._radial_basis_kind()
+        if radial_basis == "shared":
+            return shared_basis
+        if radial_basis == "gaussian":
+            return a_features.stencil_basis(
+                self.radial_exponents,
+                self.radial_centers,
+            )
+        basis = self._buffers.get("fixed_bessel_stencil_basis")
+        transform = self._modules.get("radial_transform")
+        if basis is None or transform is None:
+            raise RuntimeError(
+                "Bessel message layer has not been bound to feature geometry"
+            )
+        return transform(basis, a_features.powers)
 
     def forward(
         self,
