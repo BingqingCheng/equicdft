@@ -56,6 +56,35 @@ def projected_fourier_curvature(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Evaluate normalized total intrinsic curvature along fixed directions."""
 
+    second_difference, perturbation_norm = _symmetric_energy_difference(
+        model=model,
+        outputs=outputs,
+        batch=batch,
+        rho=rho,
+        directions=directions,
+        relative_amplitude=relative_amplitude,
+        perturbations_per_forward=perturbations_per_forward,
+    )
+    curvature = (
+        mean_densities
+        * second_difference
+        / torch.clamp(perturbation_norm, min=1.0e-12)
+    )
+    valid = valid_directions & (perturbation_norm > 1.0e-12)
+    return curvature, valid
+
+
+def _symmetric_energy_difference(
+    model: nn.Module,
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    rho: torch.Tensor,
+    directions: torch.Tensor,
+    relative_amplitude: float,
+    perturbations_per_forward: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return central energy differences and squared perturbation norms."""
+
     delta_rho = relative_amplitude * directions
     rho_plus = rho[:, None, :, :] + delta_rho
     rho_minus = rho[:, None, :, :] - delta_rho
@@ -104,13 +133,99 @@ def projected_fourier_curvature(
         delta_rho.square(),
         dim=(-2, -1),
     )
-    curvature = (
-        mean_densities
-        * second_difference
-        / torch.clamp(perturbation_norm, min=1.0e-12)
+    return second_difference, perturbation_norm
+
+
+def fourier_curvature_matrix(
+    model: nn.Module,
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    rho: torch.Tensor,
+    modes: torch.Tensor,
+    relative_amplitude: float,
+    perturbations_per_forward: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Return the ideal-metric component Hessian for every real mode.
+
+    The returned matrix has shape ``[field, mode, phase, type, type]``.
+    For a homogeneous mixture it is the dimensionless inverse OZ response
+    ``I - sqrt(R) c(k) sqrt(R)``. Around an inhomogeneous density it is the
+    component Hessian projected onto the selected real Fourier perturbations;
+    cosine-sine and inter-mode Hessian blocks are not included. Pair
+    polarization adds numerical cancellation, so matrix applications should
+    check convergence with respect to ``relative_amplitude``.
+    """
+
+    component_directions, active = component_fourier_directions(
+        batch,
+        rho,
+        modes,
     )
-    valid = valid_directions & (perturbation_norm > 1.0e-12)
-    return curvature, valid
+    n_fields, n_real_modes, _, n_types = component_directions.shape
+    identity = torch.eye(n_types, device=rho.device, dtype=rho.dtype)
+    pair_indices = torch.triu_indices(
+        n_types,
+        n_types,
+        offset=1,
+        device=rho.device,
+    )
+    pair_weights = (
+        identity[pair_indices[0]] + identity[pair_indices[1]]
+    )
+    weights = torch.cat((identity, pair_weights), dim=0)
+    directions = (
+        component_directions[:, :, None, :, :]
+        * weights[None, None, :, None, :]
+    ).flatten(start_dim=1, end_dim=2)
+
+    second_difference, _ = _symmetric_energy_difference(
+        model=model,
+        outputs=outputs,
+        batch=batch,
+        rho=rho,
+        directions=directions,
+        relative_amplitude=relative_amplitude,
+        perturbations_per_forward=perturbations_per_forward,
+    )
+    quadratic_forms = second_difference.reshape(
+        n_fields,
+        n_real_modes,
+        weights.shape[0],
+    ) / relative_amplitude**2
+    diagonal = quadratic_forms[..., :n_types]
+    matrix = torch.diag_embed(diagonal)
+    pair_values = 0.5 * (
+        quadratic_forms[..., n_types:]
+        - diagonal[..., pair_indices[0]]
+        - diagonal[..., pair_indices[1]]
+    )
+    matrix[..., pair_indices[0], pair_indices[1]] = pair_values
+    matrix[..., pair_indices[1], pair_indices[0]] = pair_values
+
+    volume_element = voxel_volume(batch["grid_spacing"].to(rho))
+    density = rho[:, None, :, :]
+    ideal_integrand = torch.where(
+        density > 0.0,
+        component_directions.square()
+        / torch.clamp(density, min=torch.finfo(rho.dtype).tiny),
+        torch.zeros_like(component_directions),
+    )
+    ideal_norm = (
+        volume_element[:, None, None] * ideal_integrand.sum(dim=-2)
+    )
+    active = active & (ideal_norm > 1.0e-12)
+    scale = torch.sqrt(
+        ideal_norm[..., :, None] * ideal_norm[..., None, :]
+    )
+    matrix = matrix / torch.clamp(scale, min=1.0e-12)
+    active_matrix = active[..., :, None] & active[..., None, :]
+    matrix = torch.where(active_matrix, matrix, torch.zeros_like(matrix))
+
+    shape = (n_fields, modes.shape[1], 2)
+    return (
+        matrix.reshape(*shape, n_types, n_types),
+        active.reshape(*shape, n_types),
+    )
 
 
 def fourier_directions(
@@ -122,48 +237,19 @@ def fourier_directions(
     """Return fixed-number Fourier directions, validity, and density scale."""
 
     n_fields, n_grid, n_types = rho.shape
-    positions = batch["grid_positions"].to(rho)
-    grid_size = batch["grid_size"].to(rho)
-    if positions.shape != (n_fields, n_grid, 3):
-        raise ValueError(
-            "grid_positions must have shape [n_fields, n_grid, 3]"
-        )
-    if grid_size.shape != (n_fields, 3):
-        raise ValueError("grid_size must have shape [n_fields, 3]")
-    if modes.ndim != 3 or modes.shape[0] != n_fields or modes.shape[2] != 3:
-        raise ValueError("modes must have shape [n_fields, n_modes, 3]")
+    component_directions, valid_component = component_fourier_directions(
+        batch,
+        rho,
+        modes,
+    )
+    total_density = torch.sum(rho, dim=-2)
+    component_present = total_density > 1.0e-12
+
+    mixture_weights = mixture_weights.to(rho)
     if mixture_weights.ndim != 2 or mixture_weights.shape[1] != n_types:
         raise ValueError(
             "mixture weights must have shape [n_directions, n_types]"
         )
-
-    phase = 2.0 * torch.pi * torch.sum(
-        positions[:, None, :, :]
-        * modes.to(rho)[:, :, None, :]
-        / grid_size[:, None, None, :],
-        dim=-1,
-    )
-    waves = torch.stack((torch.cos(phase), torch.sin(phase)), dim=2)
-    waves = waves.flatten(start_dim=1, end_dim=2)
-
-    total_density = torch.sum(rho, dim=-2)
-    component_present = total_density > 1.0e-12
-    weighted_mean = torch.sum(
-        rho[:, None, :, :] * waves[..., None],
-        dim=-2,
-    ) / torch.clamp(total_density[:, None, :], min=1.0e-12)
-    relative_direction = waves[..., None] - weighted_mean[:, :, None, :]
-    relative_norm = torch.amax(torch.abs(relative_direction), dim=-2)
-    valid_component = (
-        (relative_norm > 1.0e-5) & component_present[:, None, :]
-    )
-    relative_direction = relative_direction / torch.clamp(
-        relative_norm[:, :, None, :],
-        min=1.0e-12,
-    )
-    component_directions = rho[:, None, :, :] * relative_direction
-
-    mixture_weights = mixture_weights.to(rho)
     active_components = torch.abs(mixture_weights) > 0.0
     valid_by_mode = valid_component.reshape(
         n_fields,
@@ -204,10 +290,57 @@ def fourier_directions(
     )
     mean_densities = effective_density[:, None, :].expand(
         -1,
-        waves.shape[1],
+        component_directions.shape[1],
         -1,
     ).flatten(start_dim=1, end_dim=2)
     return directions.detach(), valid, mean_densities.detach()
+
+
+def component_fourier_directions(
+    batch: Dict[str, torch.Tensor],
+    rho: torch.Tensor,
+    modes: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return one fixed-number real Fourier direction per component."""
+
+    n_fields, n_grid, n_types = rho.shape
+    positions = batch["grid_positions"].to(rho)
+    grid_size = batch["grid_size"].to(rho)
+    if positions.shape != (n_fields, n_grid, 3):
+        raise ValueError(
+            "grid_positions must have shape [n_fields, n_grid, 3]"
+        )
+    if grid_size.shape != (n_fields, 3):
+        raise ValueError("grid_size must have shape [n_fields, 3]")
+    if modes.ndim != 3 or modes.shape[0] != n_fields or modes.shape[2] != 3:
+        raise ValueError("modes must have shape [n_fields, n_modes, 3]")
+
+    phase = 2.0 * torch.pi * torch.sum(
+        positions[:, None, :, :]
+        * modes.to(rho)[:, :, None, :]
+        / grid_size[:, None, None, :],
+        dim=-1,
+    )
+    waves = torch.stack((torch.cos(phase), torch.sin(phase)), dim=2)
+    waves = waves.flatten(start_dim=1, end_dim=2)
+
+    total_density = torch.sum(rho, dim=-2)
+    component_present = total_density > 1.0e-12
+    weighted_mean = torch.sum(
+        rho[:, None, :, :] * waves[..., None],
+        dim=-2,
+    ) / torch.clamp(total_density[:, None, :], min=1.0e-12)
+    relative_direction = waves[..., None] - weighted_mean[:, :, None, :]
+    relative_norm = torch.amax(torch.abs(relative_direction), dim=-2)
+    valid_component = (
+        (relative_norm > 1.0e-5) & component_present[:, None, :]
+    )
+    relative_direction = relative_direction / torch.clamp(
+        relative_norm[:, :, None, :],
+        min=1.0e-12,
+    )
+    component_directions = rho[:, None, :, :] * relative_direction
+    return component_directions.detach(), valid_component
 
 
 def average_fourier_phases(

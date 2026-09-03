@@ -380,6 +380,70 @@ class TestFourierStabilityLoss(unittest.TestCase):
         self.assertEqual(total_density.item(), 0.0)
         self.assertGreater(charge.item(), 0.2)
 
+    def test_full_matrix_detects_instability_missed_by_fixed_directions(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
+        # Including the ideal term, this produces K=[[4.6,1.5],[1.5,0.4]].
+        # Its physical-component, number, and charge diagonal projections are
+        # all positive, but its determinant is negative.
+        model = _CoupledQuadraticExcessModel([[7.2, 3.0], [3.0, -1.2]])
+        outputs = model(batch)
+        common = {
+            "modes": ((1, 0, 0),),
+            "relative_amplitude": 2.0**-10,
+        }
+
+        independent = FourierStabilityLoss(
+            **common,
+            mixture_mode="independent",
+        )(outputs, batch, model=model)
+        total_density = FourierStabilityLoss(
+            **common,
+            mixture_mode="total_density",
+        )(outputs, batch, model=model)
+        charge = FourierStabilityLoss(
+            **common,
+            mixture_mode="charge",
+            charges=(1.0, -1.0),
+        )(outputs, batch, model=model)
+        full_matrix = FourierStabilityLoss(
+            **common,
+            mixture_mode="full_matrix",
+        )(outputs, batch, model=model)
+        full_matrix.backward()
+
+        self.assertEqual(independent.item(), 0.0)
+        self.assertEqual(total_density.item(), 0.0)
+        self.assertEqual(charge.item(), 0.0)
+        self.assertGreater(full_matrix.item(), 1.0e-3)
+        self.assertTrue(torch.all(torch.isfinite(model.matrix.grad)))
+        self.assertNotEqual(torch.count_nonzero(model.matrix.grad).item(), 0)
+
+    def test_full_matrix_perturbations_preserve_every_particle_number(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], 0.5 * batch["rho"]),
+            dim=-1,
+        )
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            mixture_mode="full_matrix",
+        )
+
+        term(model(batch), batch, model=model)
+
+        reference = batch["rho"].sum(dim=-2)
+        perturbed = model.last_rho.sum(dim=-2)
+        self.assertTrue(
+            torch.allclose(
+                perturbed,
+                reference[:, None, :].expand_as(perturbed),
+                atol=1.0e-12,
+                rtol=0.0,
+            )
+        )
+
     def test_coupled_modes_preserve_every_component_particle_number(self):
         batch = self._batch()
         batch["rho"] = torch.cat((batch["rho"], 0.5 * batch["rho"]), dim=-1)
@@ -441,6 +505,45 @@ class TestFourierStabilityLoss(unittest.TestCase):
         value.backward()
 
         self.assertAlmostEqual(value.item(), 5.0, places=3)
+        self.assertTrue(torch.all(torch.isfinite(readout.mlp[-1].weight.grad)))
+
+    def test_full_matrix_integrates_with_grid_model(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat(
+            (batch["rho"], 0.5 * batch["rho"]),
+            dim=-1,
+        )
+        readout = LDAReadout(
+            mean_density=1.0,
+            n_types=2,
+            hidden_sizes=(),
+        ).to(dtype=torch.float64)
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(
+                torch.tensor([[-4.0, -4.0, 0.0]], dtype=torch.float64)
+            )
+            readout.mlp[-1].bias.zero_()
+        model = GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=[readout],
+            grid_spacing=1.0,
+            compute_c1=False,
+            free_energy_mode="beta",
+        ).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            relative_amplitude=0.01,
+            mixture_mode="full_matrix",
+        )
+
+        value = term(model(batch, compute_c1=False), batch, model=model)
+        value.backward()
+
+        # The linear per-particle LDA gives F_exc=-4*(rho_1+rho_2)^2.
+        # At densities (0.5,0.25), the ideal-metric Hessian eigenvalues are
+        # (1,-5), so the mean squared stability hinge is 25/2.
+        self.assertAlmostEqual(value.item(), 12.5, places=3)
         self.assertTrue(torch.all(torch.isfinite(readout.mlp[-1].weight.grad)))
 
     def test_absent_component_is_excluded_from_average(self):
@@ -652,6 +755,18 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 mixture_mode="total_density",
                 charges=(1.0,),
             )
+        with self.assertRaisesRegex(ValueError, "require charge"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="full_matrix",
+                charges=(1.0,),
+            )
+        with self.assertRaisesRegex(ValueError, "perturbations_per_forward"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                mixture_mode="full_matrix",
+                perturbations_per_forward=0,
+            )
         with self.assertRaisesRegex(ValueError, "one value per density type"):
             term = FourierStabilityLoss(
                 modes=((1, 0, 0),),
@@ -815,6 +930,208 @@ class TestFourierResponseLoss(unittest.TestCase):
         expected = torch.tensor((2.5, -0.5), dtype=torch.float64)
         self.assertTrue(
             torch.allclose(curvature[0, 0], expected.expand(2, -1))
+        )
+
+    def test_shared_response_returns_full_inverse_response_matrix(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+        response = FourierResponse(relative_amplitude=2.0**-10)
+
+        matrix, active = response.matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        expected = torch.tensor(
+            [[1.0, 1.5], [1.5, 1.0]],
+            dtype=torch.float64,
+        )
+        self.assertEqual(matrix.shape, (1, 1, 2, 2, 2))
+        self.assertTrue(torch.all(active).item())
+        self.assertTrue(
+            torch.allclose(
+                matrix[0, 0],
+                expected.expand(2, -1, -1),
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_full_matrix_recovers_three_component_hessian(self):
+        batch = self._batch(n_modes=1)
+        densities = torch.tensor((0.5, 0.25, 0.75), dtype=torch.float64)
+        batch["rho"] = densities.expand(1, 8, -1).clone()
+        excess = torch.tensor(
+            (
+                (0.2, 0.3, -0.1),
+                (0.3, -0.4, 0.5),
+                (-0.1, 0.5, 0.7),
+            ),
+            dtype=torch.float64,
+        )
+        model = _CoupledQuadraticExcessModel(excess)
+
+        matrix, active = FourierResponse(
+            relative_amplitude=2.0**-10,
+        ).matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        root_density = torch.sqrt(densities)
+        expected = torch.eye(3, dtype=torch.float64) + (
+            root_density[:, None] * excess * root_density[None, :]
+        )
+        self.assertTrue(torch.all(active).item())
+        self.assertTrue(
+            torch.allclose(
+                matrix[0, 0],
+                expected.expand(2, -1, -1),
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_projected_response_is_a_matrix_rayleigh_quotient(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        densities = torch.tensor((0.5, 0.25), dtype=torch.float64)
+        batch["rho"] = densities.expand(1, 8, -1).clone()
+        model = _CoupledQuadraticExcessModel([[0.2, 0.3], [0.3, -0.4]])
+        response = FourierResponse(relative_amplitude=2.0**-10)
+        weights = torch.tensor(((1.0, -0.7),), dtype=torch.float64)
+
+        curvature, valid = response(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            directions=weights,
+            outputs=model(batch),
+        )
+        matrix, active = response.matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        direction = torch.sqrt(densities) * weights[0]
+        rayleigh = torch.einsum(
+            "i,...ij,j->...",
+            direction,
+            matrix,
+            direction,
+        ) / torch.dot(direction, direction)
+        self.assertTrue(torch.all(valid).item())
+        self.assertTrue(torch.all(active).item())
+        self.assertTrue(
+            torch.allclose(
+                curvature[..., 0],
+                rayleigh,
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_full_matrix_ideal_metric_handles_unequal_nonuniform_densities(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        profile = torch.linspace(0.2, 0.8, 8, dtype=torch.float64)
+        batch["rho"] = torch.stack(
+            (profile, 0.7 * torch.flip(profile, dims=(0,))),
+            dim=-1,
+        )[None]
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        response = FourierResponse(relative_amplitude=2.0**-10)
+
+        matrix, active = response.matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        expected = torch.eye(2, dtype=torch.float64).expand(2, -1, -1)
+        self.assertTrue(torch.all(active).item())
+        self.assertTrue(
+            torch.allclose(
+                matrix[0, 0],
+                expected,
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_full_matrix_excludes_absent_components(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        batch["rho"][..., 1].zero_()
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+
+        matrix, active = FourierResponse(
+            relative_amplitude=2.0**-10,
+        ).matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        self.assertTrue(torch.all(active[..., 0]).item())
+        self.assertFalse(torch.any(active[..., 1]).item())
+        self.assertTrue(torch.all(matrix[..., 1, :] == 0.0).item())
+        self.assertTrue(torch.all(matrix[..., :, 1] == 0.0).item())
+        self.assertTrue(
+            torch.allclose(
+                matrix[..., 0, 0],
+                torch.ones_like(matrix[..., 0, 0]),
+                atol=2.0e-6,
+                rtol=0.0,
+            )
+        )
+
+    def test_full_matrix_nyquist_excludes_only_the_aliased_phase(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        batch["fourier_modes"] = torch.tensor([[[4, 0, 0]]])
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+
+        matrix, active = FourierResponse(
+            relative_amplitude=2.0**-10,
+        ).matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        self.assertTrue(torch.all(active[:, :, 0]).item())
+        self.assertFalse(torch.any(active[:, :, 1]).item())
+        self.assertTrue(torch.all(matrix[:, :, 1] == 0.0).item())
+
+    def test_full_matrix_chunking_matches_single_forward(self):
+        batch = self._batch(n_types=2, n_modes=1)
+        model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
+
+        unchunked = FourierResponse(relative_amplitude=2.0**-10).matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+        chunked = FourierResponse(
+            relative_amplitude=2.0**-10,
+            perturbations_per_forward=2,
+        ).matrix(
+            model=model,
+            batch=batch,
+            modes=batch["fourier_modes"],
+            outputs=model(batch),
+        )
+
+        self.assertTrue(torch.equal(unchunked[1], chunked[1]))
+        self.assertTrue(
+            torch.allclose(unchunked[0], chunked[0], atol=1.0e-12, rtol=0.0)
         )
 
     def test_perturbations_can_be_evaluated_in_small_forward_chunks(self):

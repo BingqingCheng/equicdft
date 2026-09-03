@@ -42,13 +42,19 @@ class FourierStabilityLoss(nn.Module):
 
     ``rho * delta^2(beta*F) / (DeltaV * sum(delta_rho**2)) = 1 / S(k)``.
 
-    For mixtures, ``mixture_mode`` selects the component-space direction.
+    For mixtures, ``mixture_mode`` selects the component-space treatment.
     ``"independent"`` averages independently perturbed physical components,
     ``"total_density"`` perturbs every component in phase, and ``"charge"``
     weights the component perturbations by explicit charges. The latter two
     modes probe coupled directions of the component-space Hessian. For a
     symmetric binary mixture with equal component densities and charges
     ``(+1, -1)``, they are the number-number and charge-charge directions.
+    ``"full_matrix"`` reconstructs the complete physical-component Hessian
+    in the ideal-gas metric and penalizes every eigenvalue below the requested
+    minimum. For homogeneous fields this is the inverse OZ response matrix.
+    For inhomogeneous fields it does not include coupling between phases or
+    different wavevectors. Matrix polarization also makes very small finite-
+    difference amplitudes susceptible to floating-point cancellation.
 
     Parameters
     ----------
@@ -79,13 +85,16 @@ class FourierStabilityLoss(nn.Module):
     name
         Unique name used by :class:`equicdft.loss.Loss`.
     mixture_mode
-        Component-space perturbation. It must be ``"independent"``,
-        ``"total_density"``, or ``"charge"``. The default preserves the
-        original independent-component behavior.
+        Component-space treatment. It must be ``"independent"``,
+        ``"total_density"``, ``"charge"``, or ``"full_matrix"``. The default
+        preserves the original independent-component behavior.
     charges
         Explicit finite charge weight for every density component. Required
         only by ``mixture_mode="charge"``. A common scale is immaterial because
         the weights are normalized by their largest absolute value.
+    perturbations_per_forward
+        Optional maximum number of perturbed fields evaluated together. This
+        can limit memory use for the quadratic number of full-matrix probes.
     """
 
     requires_model = True
@@ -102,6 +111,7 @@ class FourierStabilityLoss(nn.Module):
         mixture_mode: str = "independent",
         charges: Optional[Sequence[float]] = None,
         wavevector_range: Optional[Sequence[float]] = None,
+        perturbations_per_forward: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -161,10 +171,15 @@ class FourierStabilityLoss(nn.Module):
             )
         training_only = boolean(training_only, "training_only")
         mixture_mode = nonempty_string(mixture_mode, "mixture_mode")
-        if mixture_mode not in ("independent", "total_density", "charge"):
+        if mixture_mode not in (
+            "independent",
+            "total_density",
+            "charge",
+            "full_matrix",
+        ):
             raise ValueError(
-                "mixture_mode must be 'independent', 'total_density', or "
-                "'charge'"
+                "mixture_mode must be 'independent', 'total_density', "
+                "'charge', or 'full_matrix'"
             )
         if mixture_mode == "charge":
             if charges is None:
@@ -192,7 +207,10 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("relative_amplitude must lie in (0, 1)")
 
         self.relative_amplitude = relative_amplitude
-        self.response = FourierResponse(relative_amplitude=relative_amplitude)
+        self.response = FourierResponse(
+            relative_amplitude=relative_amplitude,
+            perturbations_per_forward=perturbations_per_forward,
+        )
         self.random_modes_per_field = random_modes_per_field
         self.wavevector_range = selected_wavevector_range
         self.training_only = training_only
@@ -242,6 +260,15 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("beta_F_exc must contain one value per field")
 
         modes = self._select_modes(batch, rho)
+        if self.mixture_mode == "full_matrix":
+            matrix, active = self.response.matrix(
+                model=model,
+                batch=batch,
+                modes=modes,
+                outputs=outputs,
+            )
+            return self._matrix_loss(matrix, active)
+
         mixture_weights = self._mixture_weights(rho.shape[-1], rho)
         normalized_curvature, valid = self.response(
             model=model,
@@ -256,6 +283,37 @@ class FourierStabilityLoss(nn.Module):
             self.minimum_curvature - normalized_curvature
         ).square()
         return self.weight * torch.sum(hinge * valid.to(hinge)) / valid.sum()
+
+    def _matrix_loss(
+        self,
+        matrix: torch.Tensor,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the mean spectral hinge over active component submatrices."""
+
+        n_types = matrix.shape[-1]
+        if matrix.shape[-2:] != (n_types, n_types):
+            raise ValueError("curvature matrix must be square")
+        if active.shape != matrix.shape[:-1]:
+            raise ValueError("active mask must match the matrix components")
+
+        penalties = []
+        for value, selected in zip(
+            matrix.reshape(-1, n_types, n_types),
+            active.reshape(-1, n_types),
+        ):
+            if torch.any(selected).item():
+                value = value[selected][:, selected]
+                value = 0.5 * (value + value.transpose(-1, -2))
+                eigenvalues = torch.linalg.eigvalsh(value)
+                penalties.append(
+                    torch.relu(
+                        self.minimum_curvature - eigenvalues
+                    ).square()
+                )
+        if not penalties:
+            raise ValueError("batch contains no valid full-matrix direction")
+        return self.weight * torch.cat(penalties).mean()
 
     def _mixture_weights(
         self,
@@ -276,6 +334,8 @@ class FourierStabilityLoss(nn.Module):
                 device=reference.device,
                 dtype=reference.dtype,
             )
+        if self.mixture_mode == "full_matrix":
+            raise RuntimeError("full_matrix does not use mixture weights")
         if self.charges.shape != (n_types,):
             raise ValueError("charges must contain one value per density type")
         charges = self.charges.to(reference)

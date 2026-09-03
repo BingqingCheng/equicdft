@@ -248,6 +248,23 @@ The result has shape `[field, mode, phase, direction]`. This evaluator is the
 shared numerical core used by both stability regularization and supervised
 response fitting.
 
+For multicomponent stability, the same evaluator can reconstruct the complete
+physical-component curvature matrix:
+
+```python
+curvature_matrix, active_components = response.matrix(
+    model,
+    batch,
+    modes=integer_modes,
+)
+```
+
+The matrix has shape `[field, mode, phase, type, type]`. It is normalized in
+the ideal-gas metric, so the ideal contribution is the identity. For a
+homogeneous mixture it is the dimensionless inverse OZ matrix
+`I-sqrt(R)c(k)sqrt(R)`. Around an inhomogeneous field it is a projected
+component Hessian; it is not the complete position-dependent OZ operator.
+
 ## Fourier-stability loss
 
 `FourierStabilityLoss` applies a squared hinge when projected curvature falls
@@ -266,6 +283,21 @@ stability = FourierStabilityLoss(
 )
 ```
 
+The complete multicomponent stability test is selected explicitly with:
+
+```python
+matrix_stability = FourierStabilityLoss(
+    random_modes_per_field=1,
+    wavevector_range=(k_min, k_max),
+    relative_amplitude=0.05,
+    minimum_curvature=0.0,
+    mixture_mode="full_matrix",
+    perturbations_per_forward=4,
+    weight=1.0,
+    training_only=True,
+)
+```
+
 Explicit `modes=((nx,ny,nz),...)` and random sampling are mutually exclusive.
 Random candidates lie in the physical isotropic Nyquist sphere. The optional
 inclusive `wavevector_range=(k_min,k_max)` is expressed in reciprocal units
@@ -277,10 +309,31 @@ Mixture directions are:
 - `"independent"`: perturb and average individual physical components;
 - `"total_density"`: perturb all components in phase;
 - `"charge"`: perturb with explicit charge weights.
+- `"full_matrix"`: reconstruct the ideal-metric physical-component Hessian
+  and penalize every eigenvalue below `minimum_curvature`.
 
 For an equal-density symmetric binary mixture, `(1,1)` and `(1,-1)` are the
 number and charge directions. That special interpretation must not be assumed
-for a general mixture.
+for a general mixture. Positive curvature along selected directions does not
+guarantee that the coupled matrix is positive definite, so `"full_matrix"` is
+the recommended general mixture stability check. Existing modes remain useful
+as cheaper targeted regularizers.
+
+The matrix is a finite-difference estimate with truncation error of order
+`relative_amplitude**2`. Taking an extremely small amplitude can instead
+amplify energy roundoff, especially in float32, and the off-diagonal
+polarization adds another subtraction. Check amplitude convergence for the
+actual model and grid; a smaller amplitude is not automatically more accurate.
+For inhomogeneous fields this check covers the physical-component subspace of
+each selected cosine or sine perturbation, but not cosine-sine or inter-mode
+Hessian blocks.
+
+For `n` components the exact matrix reconstruction uses `n(n+1)/2` component
+directions. Cosine and sine phases and symmetric positive/negative differences
+therefore require `2n(n+1)` perturbed fields per selected wavevector. Use
+`perturbations_per_forward` to limit peak memory. The loss gives every active
+eigenvalue equal weight, matching the existing equal weighting of valid scalar
+directions.
 
 Stability loss prevents selected negative curvatures; it does not determine
 the correct positive response and is not direct structure-factor training.
