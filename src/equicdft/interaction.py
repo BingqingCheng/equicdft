@@ -8,8 +8,11 @@ from torch import nn
 from ._argument_checks import boolean, positive_integer
 from ._grid import gather_neighbors
 from ._nn import build_mlp
-from ._radial import _RadialTransform
-from .features import prepare_radial_centers, prepare_radial_exponents
+from ._radial import (
+    _RadialTransform,
+    prepare_radial_centers,
+    prepare_radial_exponents,
+)
 
 
 class BChiMessage(nn.Module):

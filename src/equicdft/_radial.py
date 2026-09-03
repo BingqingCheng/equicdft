@@ -1,12 +1,94 @@
 """Radial functions and conditioning for Cartesian grid features."""
 
 import math
-from typing import Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
+
+
+DEFAULT_RADIAL_EXPONENTS = (0.125,)
+
+
+def prepare_radial_exponents(
+    radial_basis: str,
+    radial_exponents: Optional[Union[Sequence[float], torch.Tensor]],
+    trainable: bool,
+) -> torch.Tensor:
+    """Validate and return the initial radial damping exponents."""
+
+    if radial_basis == "none":
+        if radial_exponents is not None:
+            raise ValueError(
+                "radial_exponents are unavailable when radial_basis='none'"
+            )
+        if trainable:
+            raise ValueError(
+                "trainable_radial_exponents requires radial_basis='gaussian'"
+            )
+        return torch.zeros(1, dtype=torch.get_default_dtype())
+
+    if radial_exponents is None:
+        radial_exponents = DEFAULT_RADIAL_EXPONENTS
+    if isinstance(radial_exponents, bool):
+        raise TypeError("radial_exponents must be a one-dimensional sequence")
+
+    exponents = torch.as_tensor(
+        radial_exponents,
+        dtype=torch.get_default_dtype(),
+    ).detach().clone()
+    if exponents.ndim != 1:
+        raise ValueError("radial_exponents must be one-dimensional")
+    if exponents.numel() == 0:
+        raise ValueError("radial_exponents must not be empty")
+    if not torch.all(torch.isfinite(exponents)).item():
+        raise ValueError("radial_exponents must be finite")
+    if not torch.all(exponents >= 0.0).item():
+        raise ValueError("radial_exponents must be nonnegative")
+    if trainable and not torch.all(exponents > 0.0).item():
+        raise ValueError("trainable_radial_exponents must be positive")
+    return exponents
+
+
+def prepare_radial_centers(
+    radial_basis: str,
+    radial_centers: Optional[Union[Sequence[float], torch.Tensor]],
+    n_radial_channels: int,
+) -> torch.Tensor:
+    """Validate and return Gaussian centers ``u`` in grid units."""
+
+    if radial_basis == "none":
+        if radial_centers is not None:
+            raise ValueError(
+                "radial_centers are unavailable when radial_basis='none'"
+            )
+        return torch.zeros(1, dtype=torch.get_default_dtype())
+
+    if radial_centers is None:
+        return torch.zeros(
+            n_radial_channels,
+            dtype=torch.get_default_dtype(),
+        )
+    if isinstance(radial_centers, bool):
+        raise TypeError("radial_centers must be a one-dimensional sequence")
+
+    centers = torch.as_tensor(
+        radial_centers,
+        dtype=torch.get_default_dtype(),
+    ).detach().clone()
+    if centers.ndim != 1:
+        raise ValueError("radial_centers must be one-dimensional")
+    if centers.numel() != n_radial_channels:
+        raise ValueError(
+            "radial_centers length must match radial_exponents length"
+        )
+    if not torch.all(torch.isfinite(centers)).item():
+        raise ValueError("radial_centers must be finite")
+    if not torch.all(centers >= 0.0).item():
+        raise ValueError("radial_centers must be nonnegative")
+    return centers
 
 
 def gaussian_radial_values(
@@ -31,6 +113,24 @@ def gaussian_radial_values(
         torch.sum(radial_values, dim=0, keepdim=True),
         min=torch.finfo(radial_values.dtype).tiny,
     )
+
+
+def _cartesian_stencil_basis(
+    squared_distances: torch.Tensor,
+    monomial_values: torch.Tensor,
+    radial_exponents: torch.Tensor,
+    radial_centers: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return normalized radial-Cartesian values with shape ``[J, N, K]``."""
+
+    radial_values = gaussian_radial_values(
+        squared_distances,
+        radial_exponents,
+        radial_centers,
+        neighbor_mask,
+    )
+    return radial_values[:, :, None] * monomial_values[:, None, :]
 
 
 def bessel_radial_values(
@@ -161,6 +261,33 @@ def whiten_radial_cartesian_basis(
         result[:, :, component_mask] = conditioned
     result = result / math.sqrt(float(n_active))
     return result, torch.stack(eigenvalue_blocks)
+
+
+def _conditioned_bessel_stencil_basis(
+    squared_distances: torch.Tensor,
+    monomial_values: torch.Tensor,
+    powers: torch.Tensor,
+    cutoff_grid: int,
+    neighbor_mask: torch.Tensor,
+    n_radial_functions: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return conditioned Bessel values and their discrete Gram spectra."""
+
+    radial_values = bessel_radial_values(
+        squared_distances,
+        n_radial_functions,
+        cutoff_grid,
+        neighbor_mask,
+    )
+    support = neighbor_mask & (
+        squared_distances < float(cutoff_grid) ** 2
+    )
+    return whiten_radial_cartesian_basis(
+        radial_values,
+        monomial_values,
+        powers,
+        support,
+    )
 
 
 class _RadialTransform(nn.Module):
