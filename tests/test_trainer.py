@@ -218,8 +218,8 @@ class TestTrainer(unittest.TestCase):
         )
         self.assertIn("total", history[0]["train_losses"])
         self.assertIn("mae", history[0]["valid_metrics"]["target"])
-        self.assertEqual(trainer.metrics[0].logs["train"]["prediction"], [])
-        self.assertEqual(trainer.metrics[0].logs["valid"]["prediction"], [])
+        self.assertEqual(trainer.metrics[0].logs["train"]["count"], 0)
+        self.assertEqual(trainer.metrics[0].logs["valid"]["count"], 0)
 
     def test_model_dependent_loss_runs_through_trainer(self):
         model = _QuadraticDictionaryFunctional()

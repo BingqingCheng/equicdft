@@ -95,12 +95,13 @@ def compute_metric(
 
 
 class Metrics(nn.Module):
-    """Record predictions and targets and report dataset-level metrics.
+    """Stream predictions and targets into dataset-level metrics.
 
     Call :meth:`update_metrics` for every batch, then
-    :meth:`retrieve_metrics` once at the end of an epoch. Metrics are evaluated
-    after concatenating all batches, so RMSE and R2 are true dataset-level
-    values rather than averages of per-batch values.
+    :meth:`retrieve_metrics` once at the end of an epoch. Fixed-size
+    sufficient statistics are accumulated in float64, so RMSE and R2 are true
+    dataset-level values rather than averages of per-batch values without
+    retaining complete fields.
 
     Parameters
     ----------
@@ -177,7 +178,7 @@ class Metrics(nn.Module):
 
         subset_names = unique_strings(subsets, "subsets")
         self.logs = {
-            subset: {"prediction": [], "target": []}
+            subset: self._empty_statistics()
             for subset in subset_names
         }
 
@@ -200,12 +201,24 @@ class Metrics(nn.Module):
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
     ) -> None:
-        """Append one detached CPU batch to a subset's metric log."""
+        """Accumulate one detached batch into a subset's statistics."""
 
         self._require_subset(subset)
-        prediction, target = self._collect_tensors(outputs, batch)
-        self.logs[subset]["prediction"].append(prediction)
-        self.logs[subset]["target"].append(target)
+        prediction, target = self._select_tensors(outputs, batch)
+        batch_statistics = self._batch_statistics(prediction, target)
+        trailing_shape = self.logs[subset]["trailing_shape"]
+        if (
+            trailing_shape is not None
+            and trailing_shape != batch_statistics["trailing_shape"]
+        ):
+            raise ValueError(
+                "recorded prediction batches must have matching trailing "
+                "shapes"
+            )
+        self.logs[subset] = self._merge_statistics(
+            self.logs[subset],
+            batch_statistics,
+        )
 
     def retrieve_metrics(
         self,
@@ -216,15 +229,14 @@ class Metrics(nn.Module):
 
         clear = boolean(clear, "clear")
         self._require_subset(subset)
-        if not self.logs[subset]["prediction"]:
+        if self.logs[subset]["count"] == 0:
             raise ValueError("no metric data recorded for subset '{}'".format(subset))
 
-        prediction = torch.cat(self.logs[subset]["prediction"], dim=0)
-        target = torch.cat(self.logs[subset]["target"], dim=0)
-        values = {
-            metric: compute_metric(metric, target, prediction)
-            for metric in self.metric_keys
+        statistics = {
+            key: value.cpu() if torch.is_tensor(value) else value
+            for key, value in self.logs[subset].items()
         }
+        values = self._metrics_from_statistics(statistics)
         if clear:
             self.clear_metrics(subset)
         return values
@@ -233,8 +245,7 @@ class Metrics(nn.Module):
         """Discard all batches recorded for one subset."""
 
         self._require_subset(subset)
-        self.logs[subset]["prediction"] = []
-        self.logs[subset]["target"] = []
+        self.logs[subset] = self._empty_statistics()
 
     def _collect_tensors(
         self,
@@ -243,6 +254,19 @@ class Metrics(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Select, validate, detach, and move one tensor pair to CPU."""
 
+        prediction, target = self._select_tensors(outputs, batch)
+        return (
+            prediction.detach().to(device="cpu").clone(),
+            target.detach().to(device="cpu").clone(),
+        )
+
+    def _select_tensors(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select and validate one prediction-target tensor pair."""
+
         if self.prediction_key not in outputs:
             raise KeyError(
                 "model outputs are missing prediction '{}'".format(
@@ -250,6 +274,8 @@ class Metrics(nn.Module):
                 )
             )
         prediction = outputs[self.prediction_key]
+        if not prediction.is_floating_point():
+            raise TypeError("prediction must be a real floating-point tensor")
         target = resolve_target(
             prediction=prediction,
             prediction_key=self.prediction_key,
@@ -257,6 +283,11 @@ class Metrics(nn.Module):
             outputs=outputs,
             batch=batch,
         )
+        for label, value in (("prediction", prediction), ("target", target)):
+            if not value.is_floating_point() or value.is_complex():
+                raise TypeError(
+                    "{} must be a real floating-point tensor".format(label)
+                )
 
         if self.selection_mask_key is not None:
             if self.selection_mask_key in outputs:
@@ -285,10 +316,191 @@ class Metrics(nn.Module):
         if prediction.ndim == 0:
             prediction = prediction.unsqueeze(0)
             target = target.unsqueeze(0)
-        return (
-            prediction.detach().to(device="cpu").clone(),
-            target.detach().to(device="cpu").clone(),
+        return prediction, target
+
+    def _empty_statistics(self) -> Dict[str, object]:
+        """Return an empty fixed-size streaming accumulator."""
+
+        return {
+            "count": 0,
+            "result_dtype": None,
+            "trailing_shape": None,
+            "absolute_error_sum": None,
+            "squared_error_sum": None,
+            "target_mean": None,
+            "target_m2": None,
+            "prediction_mean": None,
+            "prediction_m2": None,
+            "target_prediction_covariance": None,
+        }
+
+    def _batch_statistics(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Dict[str, object]:
+        """Reduce one batch to float64 error and centered-moment statistics."""
+
+        result_dtype = torch.promote_types(prediction.dtype, target.dtype)
+        prediction = prediction.detach()
+        target = target.detach()
+        error = prediction - target
+        count = target.numel()
+
+        needs_absolute_error = "mae" in self.metric_keys
+        needs_squared_error = any(
+            key in self.metric_keys
+            for key in ("mse", "rmse", "rmse_percent", "r2")
         )
+        needs_target_moments = any(
+            key in self.metric_keys
+            for key in ("rmse_percent", "pearson_r", "r2")
+        )
+        needs_prediction_moments = "pearson_r" in self.metric_keys
+
+        target_mean = None
+        target_m2 = None
+        if needs_target_moments:
+            target_mean = torch.mean(target)
+            target_m2 = torch.sum((target - target_mean).square())
+
+        prediction_mean = None
+        prediction_m2 = None
+        covariance = None
+        if needs_prediction_moments:
+            prediction_mean = torch.mean(prediction)
+            prediction_centered = prediction - prediction_mean
+            prediction_m2 = torch.sum(prediction_centered.square())
+            covariance = torch.sum(
+                (target - target_mean) * prediction_centered
+            )
+
+        return {
+            "count": count,
+            "result_dtype": result_dtype,
+            "trailing_shape": tuple(prediction.shape[1:]),
+            "absolute_error_sum": self._float64(
+                torch.sum(torch.abs(error)) if needs_absolute_error else None
+            ),
+            "squared_error_sum": self._float64(
+                torch.sum(error.square()) if needs_squared_error else None
+            ),
+            "target_mean": self._float64(target_mean),
+            "target_m2": self._float64(target_m2),
+            "prediction_mean": self._float64(prediction_mean),
+            "prediction_m2": self._float64(prediction_m2),
+            "target_prediction_covariance": self._float64(covariance),
+        }
+
+    @staticmethod
+    def _float64(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Cast one reduced scalar to the accumulator dtype."""
+
+        return None if value is None else value.to(dtype=torch.float64)
+
+    @staticmethod
+    def _merge_statistics(
+        accumulated: Dict[str, object],
+        batch: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Merge two centered-moment accumulators with Chan's formulas."""
+
+        if accumulated["count"] == 0:
+            return batch
+
+        device = next(
+            value.device for value in batch.values() if torch.is_tensor(value)
+        )
+        accumulated = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in accumulated.items()
+        }
+        old_count = accumulated["count"]
+        batch_count = batch["count"]
+        count = old_count + batch_count
+        result = {
+            "count": count,
+            "result_dtype": torch.promote_types(
+                accumulated["result_dtype"],
+                batch["result_dtype"],
+            ),
+            "trailing_shape": accumulated["trailing_shape"],
+        }
+
+        for key in ("absolute_error_sum", "squared_error_sum"):
+            old_value = accumulated[key]
+            batch_value = batch[key]
+            result[key] = (
+                None
+                if old_value is None
+                else old_value + batch_value
+            )
+
+        merge_factor = old_count * batch_count / count
+        target_mean = accumulated["target_mean"]
+        if target_mean is None:
+            result["target_mean"] = None
+            result["target_m2"] = None
+        else:
+            target_delta = batch["target_mean"] - target_mean
+            result["target_mean"] = (
+                target_mean + target_delta * batch_count / count
+            )
+            result["target_m2"] = (
+                accumulated["target_m2"]
+                + batch["target_m2"]
+                + target_delta.square() * merge_factor
+            )
+
+        prediction_mean = accumulated["prediction_mean"]
+        if prediction_mean is None:
+            result["prediction_mean"] = None
+            result["prediction_m2"] = None
+            result["target_prediction_covariance"] = None
+        else:
+            prediction_delta = batch["prediction_mean"] - prediction_mean
+            result["prediction_mean"] = (
+                prediction_mean + prediction_delta * batch_count / count
+            )
+            result["prediction_m2"] = (
+                accumulated["prediction_m2"]
+                + batch["prediction_m2"]
+                + prediction_delta.square() * merge_factor
+            )
+            result["target_prediction_covariance"] = (
+                accumulated["target_prediction_covariance"]
+                + batch["target_prediction_covariance"]
+                + target_delta * prediction_delta * merge_factor
+            )
+        return result
+
+    def _metrics_from_statistics(
+        self,
+        statistics: Dict[str, object],
+    ) -> Dict[str, torch.Tensor]:
+        """Evaluate configured metrics from one complete accumulator."""
+
+        count = statistics["count"]
+        squared_error_sum = statistics["squared_error_sum"]
+        target_m2 = statistics["target_m2"]
+        values = {}
+        for metric in self.metric_keys:
+            if metric == "mae":
+                value = statistics["absolute_error_sum"] / count
+            elif metric == "mse":
+                value = squared_error_sum / count
+            elif metric == "rmse":
+                value = torch.sqrt(squared_error_sum / count)
+            elif metric == "rmse_percent":
+                value = 100.0 * torch.sqrt(squared_error_sum / target_m2)
+            elif metric == "pearson_r":
+                value = statistics["target_prediction_covariance"] / torch.sqrt(
+                    target_m2 * statistics["prediction_m2"]
+                )
+            elif metric == "r2":
+                value = 1.0 - squared_error_sum / target_m2
+            values[metric] = value.to(dtype=statistics["result_dtype"])
+        return values
 
     def _require_subset(self, subset: str) -> None:
         if subset not in self.logs:

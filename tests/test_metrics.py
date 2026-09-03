@@ -113,11 +113,127 @@ class TestMetrics(unittest.TestCase):
 
         self.assertAlmostEqual(values["mae"].item(), 1.0)
         self.assertAlmostEqual(values["rmse"].item(), math.sqrt(3.0))
-        self.assertEqual(len(metrics.logs["train"]["prediction"]), 2)
+        self.assertEqual(values["rmse"].dtype, torch.float32)
+        self.assertEqual(metrics.logs["train"]["count"], 3)
 
         metrics.clear_metrics("train")
         with self.assertRaisesRegex(ValueError, "no metric data"):
             metrics.retrieve_metrics("train")
+
+    def test_streaming_matches_concatenated_metrics(self):
+        metric_keys = (
+            "mae",
+            "rmse",
+            "rmse_percent",
+            "mse",
+            "pearson_r",
+            "r2",
+        )
+        metrics = Metrics("c1", metric_keys=metric_keys)
+        targets = (
+            torch.tensor([1.0e8 + 1.0, 1.0e8 + 2.0], dtype=torch.float64),
+            torch.tensor(
+                [1.0e8 - 3.0, 1.0e8 + 5.0, 1.0e8 + 7.0],
+                dtype=torch.float64,
+            ),
+        )
+        predictions = (
+            targets[0] + torch.tensor([0.5, -1.5], dtype=torch.float64),
+            targets[1] + torch.tensor([2.0, -0.5, 1.0], dtype=torch.float64),
+        )
+        for target, prediction in zip(targets, predictions):
+            metrics.update_metrics(
+                "valid",
+                {"c1": prediction},
+                {"c1": target},
+            )
+
+        values = metrics.retrieve_metrics("valid", clear=False)
+        target = torch.cat(targets)
+        prediction = torch.cat(predictions)
+
+        self.assertEqual(tuple(values), metric_keys)
+        for key in metric_keys:
+            torch.testing.assert_close(
+                values[key],
+                compute_metric(key, target, prediction),
+            )
+
+    def test_streaming_storage_is_fixed_size(self):
+        metrics = Metrics("c1")
+        for offset in range(20):
+            metrics.update_metrics(
+                "train",
+                {"c1": torch.arange(5.0) + offset},
+                {"c1": torch.arange(5.0)},
+            )
+
+        log = metrics.logs["train"]
+        self.assertEqual(log["count"], 100)
+        self.assertEqual(len(log), 10)
+        self.assertTrue(
+            all(
+                value is None
+                or torch.is_tensor(value)
+                or isinstance(value, torch.dtype)
+                for key, value in log.items()
+                if key not in ("count", "trailing_shape")
+            )
+        )
+        self.assertEqual(log["trailing_shape"], ())
+        self.assertLessEqual(
+            sum(value.numel() for value in log.values() if torch.is_tensor(value)),
+            7,
+        )
+
+    def test_each_metric_streams_across_multiple_batches(self):
+        target_batches = (
+            torch.tensor([1.0, -2.0], dtype=torch.float32),
+            torch.tensor([4.0], dtype=torch.float32),
+        )
+        prediction_batches = (
+            torch.tensor([2.0, -1.5], dtype=torch.float32),
+            torch.tensor([3.0], dtype=torch.float32),
+        )
+        target = torch.cat(target_batches)
+        prediction = torch.cat(prediction_batches)
+
+        for key in (
+            "mae",
+            "mse",
+            "rmse",
+            "rmse_percent",
+            "pearson_r",
+            "r2",
+        ):
+            with self.subTest(metric=key):
+                metrics = Metrics("c1", metric_keys=(key,))
+                for target_batch, prediction_batch in zip(
+                    target_batches,
+                    prediction_batches,
+                ):
+                    metrics.update_metrics(
+                        "train",
+                        {"c1": prediction_batch},
+                        {"c1": target_batch},
+                    )
+                value = metrics.retrieve_metrics("train")[key]
+                torch.testing.assert_close(
+                    value,
+                    compute_metric(key, target, prediction),
+                )
+
+    def test_streaming_statistics_are_not_serialized(self):
+        metrics = Metrics("c1")
+        self.assertEqual(metrics.state_dict(), {})
+
+        metrics.update_metrics(
+            "train",
+            {"c1": torch.tensor([2.0])},
+            {"c1": torch.tensor([1.0])},
+        )
+
+        self.assertEqual(metrics.state_dict(), {})
 
     def test_retrieval_clears_by_default(self):
         metrics = Metrics("c1")
@@ -129,8 +245,37 @@ class TestMetrics(unittest.TestCase):
 
         metrics.retrieve_metrics("valid")
 
-        self.assertEqual(metrics.logs["valid"]["prediction"], [])
-        self.assertEqual(metrics.logs["valid"]["target"], [])
+        self.assertEqual(metrics.logs["valid"]["count"], 0)
+        self.assertTrue(
+            all(
+                value is None
+                for key, value in metrics.logs["valid"].items()
+                if key not in ("count", "result_dtype", "trailing_shape")
+            )
+        )
+        self.assertIsNone(metrics.logs["valid"]["trailing_shape"])
+
+    def test_streaming_rejects_nonfloating_and_incompatible_batches(self):
+        metrics = Metrics("c1")
+        with self.assertRaisesRegex(TypeError, "floating-point"):
+            metrics.update_metrics(
+                "train",
+                {"c1": torch.ones(2, dtype=torch.int64)},
+                {"c1": torch.ones(2, dtype=torch.int64)},
+            )
+
+        metrics.update_metrics(
+            "train",
+            {"c1": torch.ones(2, 3)},
+            {"c1": torch.ones(2, 3)},
+        )
+        with self.assertRaisesRegex(ValueError, "trailing shapes"):
+            metrics.update_metrics(
+                "train",
+                {"c1": torch.ones(2, 4)},
+                {"c1": torch.ones(2, 4)},
+            )
+        self.assertIsNone(metrics.logs["valid"]["result_dtype"])
 
     def test_output_target_is_expanded_and_selection_masked(self):
         metrics = Metrics(
@@ -159,6 +304,11 @@ class TestMetrics(unittest.TestCase):
 
         self.assertAlmostEqual(values["mae"].item(), 1.2)
         self.assertAlmostEqual(values["rmse"].item(), math.sqrt(2.0))
+
+        metrics.update_metrics("test", outputs, {})
+        streamed = metrics.retrieve_metrics("test")
+        self.assertAlmostEqual(streamed["mae"].item(), 1.2)
+        self.assertAlmostEqual(streamed["rmse"].item(), math.sqrt(2.0))
 
     def test_ordered_targets_mix_known_and_inferred_values(self):
         metrics = Metrics(
@@ -212,9 +362,15 @@ class TestMetrics(unittest.TestCase):
             {"c1": torch.tensor([0.0])},
         )
 
-        recorded = metrics.logs["test"]["prediction"][0]
-        self.assertFalse(recorded.requires_grad)
-        self.assertEqual(recorded.device.type, "cpu")
+        recorded = metrics.logs["test"]
+        self.assertTrue(
+            all(
+                not value.requires_grad
+                for value in recorded.values()
+                if torch.is_tensor(value)
+            )
+        )
+        self.assertEqual(recorded["count"], 1)
 
     def test_missing_keys_shape_and_subset_are_reported(self):
         metrics = Metrics("target_c1", prediction_key="predicted_c1")
@@ -233,6 +389,20 @@ class TestMetrics(unittest.TestCase):
                 "unknown",
                 {"predicted_c1": torch.ones(1)},
                 {"target_c1": torch.ones(1)},
+            )
+
+    def test_non_real_or_non_floating_tensors_are_rejected(self):
+        metrics = Metrics("c1")
+        with self.assertRaisesRegex(TypeError, "real floating-point"):
+            metrics(
+                {"c1": torch.tensor([1])},
+                {"c1": torch.tensor([1])},
+            )
+        with self.assertRaisesRegex(TypeError, "real floating-point"):
+            metrics.update_metrics(
+                "train",
+                {"c1": torch.tensor([1.0 + 1.0j])},
+                {"c1": torch.tensor([1.0 + 0.0j])},
             )
 
     def test_configuration_is_validated(self):
