@@ -493,6 +493,89 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("K_density_rmse", response_metrics)
         self.assertIn("S_density_relative_rmse_positive_percent", response_metrics)
 
+    def test_evaluate_streams_uses_the_requested_subset_loader(self):
+        trainer = self._make_trainer()
+        stream = TrainingStream(
+            "field",
+            DataLoader(_dataset([1]), batch_size=1),
+            DataLoader(_dataset([3]), batch_size=1),
+            trainer.loss,
+        )
+
+        train = trainer.evaluate_streams((stream,), subset="train")
+        valid = trainer.evaluate_streams((stream,), subset="valid")
+
+        self.assertEqual(train["field"][0]["total"], 4.0)
+        self.assertEqual(valid["field"][0]["total"], 36.0)
+        self.assertFalse(trainer.model.training)
+        self.assertFalse(stream.loss.training)
+
+    def test_evaluate_streams_is_pure_and_allows_cycling_streams(self):
+        trainer = self._make_trainer()
+        loader = DataLoader(_dataset([2]), batch_size=1)
+        stream = TrainingStream(
+            "response",
+            loader,
+            loader,
+            trainer.loss,
+            cycle=True,
+        )
+
+        evaluated = trainer.evaluate_streams((stream,))
+
+        self.assertEqual(evaluated["response"][0]["total"], 16.0)
+        self.assertEqual(trainer._streams, ())
+        self.assertEqual(len(trainer.stream_losses), 0)
+        self.assertEqual(len(trainer.stream_metrics), 0)
+
+    def test_registered_stream_is_never_silently_replaced(self):
+        trainer = self._make_trainer()
+        trainer.optimizer_args = {"lr": 0.0}
+        original_loader = DataLoader(_dataset([1]), batch_size=1)
+        original = TrainingStream(
+            "field",
+            original_loader,
+            original_loader,
+            trainer.loss,
+        )
+        trainer.fit_streams((original,), epochs=1, verbose=False)
+        replacement_loader = DataLoader(_dataset([4]), batch_size=1)
+        replacement = TrainingStream(
+            "field",
+            replacement_loader,
+            replacement_loader,
+            trainer.loss,
+        )
+
+        evaluated = trainer.evaluate_streams((replacement,))
+
+        self.assertEqual(evaluated["field"][0]["total"], 64.0)
+        self.assertIs(trainer._streams[0], original)
+        with self.assertRaisesRegex(ValueError, "registered"):
+            trainer.fit_streams((replacement,), epochs=1, verbose=False)
+
+    def test_stream_fit_cannot_start_after_ordinary_optimization(self):
+        trainer = self._make_trainer()
+        loader = DataLoader(_dataset([1]), batch_size=1)
+        trainer.fit(loader, loader, epochs=1, verbose=False)
+        stream = TrainingStream("field", loader, loader, trainer.loss)
+
+        with self.assertRaisesRegex(ValueError, "after optimization"):
+            trainer.fit_streams((stream,), epochs=1, verbose=False)
+
+    def test_stream_fit_honors_exhausted_early_stopping_before_updates(self):
+        trainer = self._make_trainer(early_stopping_patience=1)
+        trainer.optimizer_args = {"lr": 0.0}
+        loader = DataLoader(_dataset([1]), batch_size=1)
+        stream = TrainingStream("field", loader, loader, trainer.loss)
+
+        trainer.fit_streams((stream,), epochs=5, verbose=False)
+        completed_epochs = len(trainer.history)
+        trainer.fit_streams((stream,), epochs=2, verbose=False)
+
+        self.assertEqual(completed_epochs, 2)
+        self.assertEqual(len(trainer.history), completed_epochs)
+
     def test_optional_scheduler_steps_each_epoch(self):
         trainer = self._make_trainer(scheduler=True)
 

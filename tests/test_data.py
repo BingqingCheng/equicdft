@@ -848,7 +848,7 @@ class TestFourierResponseData(unittest.TestCase):
         data = FourierResponseData(
             template=self._template(),
             density=[[0.1, 0.2], [0.3, 0.4]],
-            modes=[[1, 0, 0], [1, 1, 0]],
+            modes=[[1, 0, 0], [1, 0, 0]],
             curvature=[[2.0, 3.0], [4.0, 5.0]],
             scale=[[1.0, 2.0], [2.0, 4.0]],
             weight=[[1.0, 1.0], [0.5, 2.0]],
@@ -900,6 +900,57 @@ class TestFourierResponseData(unittest.TestCase):
                 [[1.0]],
                 indices=[1],
             )
+
+    def test_modes_are_validated_before_integer_conversion(self):
+        template = self._template()
+        for modes, error in (
+            ([[1.5, 0.0, 0.0]], ValueError),
+            ([[float("nan"), 0.0, 0.0]], ValueError),
+            ([[float("inf"), 0.0, 0.0]], ValueError),
+            ([[True, False, False]], TypeError),
+            ([[1.0 + 0.0j, 0.0j, 0.0j]], TypeError),
+        ):
+            with self.subTest(modes=modes):
+                with self.assertRaisesRegex(error, "modes"):
+                    FourierResponseData(
+                        template,
+                        [[0.2, 0.2]],
+                        modes,
+                        [[1.0]],
+                    )
+
+        data = FourierResponseData(
+            template,
+            [[0.2, 0.2]],
+            [[-1.0, 0.0, 0.0]],
+            [[1.0]],
+        )
+        self.assertEqual(data.modes.dtype, torch.long)
+        self.assertTrue(
+            torch.equal(data.modes, torch.tensor([[[1, 0, 0]]]))
+        )
+
+    def test_modes_are_physically_validated_against_the_template(self):
+        template = self._template()
+        cases = (
+            ([[0, 0, 0]], [[1.0]], "zero mode"),
+            (
+                [[[1, 0, 0], [-1, 0, 0]]],
+                [[[1.0], [1.0]]],
+                "equivalent",
+            ),
+            (torch.empty((1, 0, 3)), torch.empty((1, 0, 1)), "shape"),
+            ([[0, 1, 0]], [[1.0]], "Nyquist"),
+        )
+        for modes, curvature, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    FourierResponseData(
+                        template,
+                        [[0.2, 0.2]],
+                        modes,
+                        curvature,
+                    )
 
 
 if __name__ == "__main__":

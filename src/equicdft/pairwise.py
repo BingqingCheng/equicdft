@@ -6,6 +6,7 @@ from typing import Dict, Sequence
 import torch
 
 from ._argument_checks import boolean, positive_integer
+from ._component_pairs import symmetric_component_pairs
 from ._grid import common_grid_size
 from ._nn import build_mlp
 from .energy import EnergyReadout
@@ -83,11 +84,7 @@ class PairwiseReadout(EnergyReadout):
         if self.cutoff_grid < 2:
             raise ValueError("cutoff_grid must be at least two")
         self.n_types = positive_integer(n_types, "n_types")
-        self.type_pairs = tuple(
-            (first, second)
-            for first in range(self.n_types)
-            for second in range(first, self.n_types)
-        )
+        self.type_pairs = symmetric_component_pairs(self.n_types)
         self.n_type_pairs = len(self.type_pairs)
         zero_init = boolean(zero_init, "zero_init")
 

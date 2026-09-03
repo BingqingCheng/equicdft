@@ -9,6 +9,7 @@ from ._argument_checks import (
     optional_positive_integer,
     positive_integer,
 )
+from ._component_pairs import symmetric_component_pairs
 from ._nn import build_mlp
 from .energy import EnergyReadout, density_weighted_integral
 from .reciprocal import ReciprocalFeatures
@@ -217,7 +218,8 @@ class LongRangeReadout(EnergyReadout):
 
         self.n_kernels = positive_integer(n_kernels, "n_kernels")
         self.n_types = positive_integer(n_types, "n_types")
-        self.n_type_pairs = self.n_types * (self.n_types + 1) // 2
+        type_pairs = symmetric_component_pairs(self.n_types)
+        self.n_type_pairs = len(type_pairs)
         self.n_state_features = 1 + self.n_types
 
         if charges is None:
@@ -241,8 +243,7 @@ class LongRangeReadout(EnergyReadout):
             pair_charge_products = torch.tensor(
                 [
                     charge_tensor[first] * charge_tensor[second]
-                    for first in range(self.n_types)
-                    for second in range(first, self.n_types)
+                    for first, second in type_pairs
                 ],
                 dtype=charge_tensor.dtype,
             )

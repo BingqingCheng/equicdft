@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
+from ._component_pairs import symmetric_component_pairs
 from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
 
 
@@ -103,7 +104,7 @@ class ReciprocalFeatures(nn.Module):
         self.kernel = kernel
         self.n_types = n_types
         self.n_kernels = int(exponents.numel())
-        self.n_type_pairs = n_types * (n_types + 1) // 2
+        self.n_type_pairs = len(symmetric_component_pairs(n_types))
         self.register_buffer("radial_exponents", exponents)
         self.register_buffer("screening", screening_values)
 
@@ -159,21 +160,20 @@ class ReciprocalFeatures(nn.Module):
         )
 
         pair_features = []
-        for first in range(self.n_types):
-            for second in range(first, self.n_types):
-                cross_power = torch.real(
-                    torch.conj(fourier_density[..., first])
-                    * fourier_density[..., second]
-                )
-                multiplicity = 1.0 if first == second else 2.0
-                contracted = torch.einsum(
-                    "nk,...k->...n",
-                    kernels,
-                    cross_power,
-                )
-                pair_features.append(
-                    multiplicity * contracted / (2.0 * volume)
-                )
+        for first, second in symmetric_component_pairs(self.n_types):
+            cross_power = torch.real(
+                torch.conj(fourier_density[..., first])
+                * fourier_density[..., second]
+            )
+            multiplicity = 1.0 if first == second else 2.0
+            contracted = torch.einsum(
+                "nk,...k->...n",
+                kernels,
+                cross_power,
+            )
+            pair_features.append(
+                multiplicity * contracted / (2.0 * volume)
+            )
         return torch.stack(pair_features, dim=-1)
 
     def _kernel_values(

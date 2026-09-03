@@ -222,27 +222,25 @@ class Trainer(nn.Module):
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization(train_loader)
         start_epoch = self._next_epoch()
+        stream = TrainingStream(
+            "default",
+            train_loader,
+            valid_loader,
+            self.loss,
+            metrics=tuple(self.metrics),
+        )
 
-        if self._early_stopping_reached():
-            self.log_message(
-                "Early stopping already reached after {} epochs without "
-                "validation-loss improvement.".format(
-                    self.epochs_without_improvement
-                ),
-                display=verbose,
-            )
+        if self._stop_before_training(verbose):
             return self.history
 
         for epoch in range(start_epoch, start_epoch + epochs):
-            train_losses, train_metrics = self._run_loader(
-                train_loader,
-                subset="train",
-                training=True,
-            )
-            valid_losses, valid_metrics = self._run_loader(
-                valid_loader,
+            train_losses, train_metrics = self._run_training_streams(
+                (stream,),
+                {stream.name: 1.0},
+            )[stream.name]
+            valid_losses, valid_metrics = self._evaluate_stream(
+                stream,
                 subset="valid",
-                training=False,
             )
 
             learning_rate = self.optimizer.param_groups[0]["lr"]
@@ -254,22 +252,7 @@ class Trainer(nn.Module):
                 "train_metrics": train_metrics,
                 "valid_metrics": valid_metrics,
             }
-            self.history.append(record)
-
-            self._step_scheduler(valid_losses["total"])
-            self._write_epoch_checkpoints(record)
-            self._write_history_csv()
-            if verbose and epoch % print_interval == 0:
-                self.log_message(format_record(record))
-            if self._early_stopping_reached():
-                self.log_message(
-                    "Early stopping at epoch {} after {} epochs without "
-                    "validation-loss improvement.".format(
-                        epoch,
-                        self.epochs_without_improvement,
-                    ),
-                    display=verbose,
-                )
+            if self._finish_epoch(record, verbose, print_interval):
                 break
 
         return self.history
@@ -333,6 +316,9 @@ class Trainer(nn.Module):
                 verbose,
             )
         start_epoch = self._next_epoch()
+        if self._stop_before_training(verbose):
+            return self.history
+
         for epoch in range(start_epoch, start_epoch + epochs):
             weights = self._resolve_stream_weights(
                 streams,
@@ -341,10 +327,9 @@ class Trainer(nn.Module):
             )
             train_by_stream = self._run_training_streams(streams, weights)
             valid_by_stream = {
-                stream.name: self._run_stream_loader(
+                stream.name: self._evaluate_stream(
                     stream,
                     subset="valid",
-                    training=False,
                 )
                 for stream in streams
             }
@@ -365,21 +350,7 @@ class Trainer(nn.Module):
                 "train_metrics": train_metrics,
                 "valid_metrics": valid_metrics,
             }
-            self.history.append(record)
-            self._step_scheduler(valid_losses["total"])
-            self._write_epoch_checkpoints(record)
-            self._write_history_csv()
-            if verbose and epoch % print_interval == 0:
-                self.log_message(format_record(record))
-            if self._early_stopping_reached():
-                self.log_message(
-                    "Early stopping at epoch {} after {} epochs without "
-                    "validation-loss improvement.".format(
-                        epoch,
-                        self.epochs_without_improvement,
-                    ),
-                    display=verbose,
-                )
+            if self._finish_epoch(record, verbose, print_interval):
                 break
         return self.history
 
@@ -390,14 +361,13 @@ class Trainer(nn.Module):
     ) -> Dict[str, Tuple[Dict[str, float], Dict[str, Dict[str, float]]]]:
         """Evaluate named streams independently without optimizer updates."""
 
-        streams = self._configure_streams(streams)
         if subset not in ("train", "valid"):
             raise ValueError("subset must be 'train' or 'valid'")
+        streams = self._validate_streams(streams)
         return {
-            stream.name: self._run_stream_loader(
+            stream.name: self._evaluate_stream(
                 stream,
                 subset=subset,
-                training=False,
             )
             for stream in streams
         }
@@ -411,10 +381,9 @@ class Trainer(nn.Module):
         """Append validation-only epoch 0 before the first optimizer update."""
 
         evaluated = {
-            stream.name: self._run_stream_loader(
+            stream.name: self._evaluate_stream(
                 stream,
                 subset="valid",
-                training=False,
             )
             for stream in streams
         }
@@ -702,69 +671,26 @@ class Trainer(nn.Module):
                 **self.scheduler_args,
             )
 
-    def _run_loader(
-        self,
-        loader: Iterable[Dict[str, torch.Tensor]],
-        subset: str,
-        training: bool,
-    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-        """Run one loader and return field-averaged losses and metrics."""
+    @staticmethod
+    def _validate_streams(
+        streams: Sequence[TrainingStream],
+        require_epoch_driver: bool = False,
+    ) -> Tuple[TrainingStream, ...]:
+        """Return a validated stream tuple without changing trainer state."""
 
-        self.model.train(training)
-        self.loss.train(training)
-        loss_sums = {}
-        n_fields = 0
-
-        gradient_context = torch.enable_grad() if training else torch.no_grad()
-        with gradient_context:
-            for batch in loader:
-                batch = self._move_batch(batch)
-                if training:
-                    self.optimizer.zero_grad(set_to_none=True)
-
-                outputs = self.model(batch)
-                loss_values, loss_details = self.loss.evaluate(
-                    outputs,
-                    batch,
-                    model=self.model,
-                )
-                for metric in self.metrics:
-                    if getattr(metric, "requires_loss_details", False):
-                        metric.update_metrics(
-                            subset,
-                            loss_details[metric.name],
-                        )
-                    else:
-                        metric.update_metrics(subset, outputs, batch)
-
-                if training:
-                    loss_values["total"].backward()
-                    self.optimizer.step()
-
-                n_batch_fields = int(batch["rho"].shape[0])
-                for name, value in loss_values.items():
-                    loss_sums[name] = loss_sums.get(name, 0.0) + (
-                        value.detach().item() * n_batch_fields
-                    )
-                n_fields += n_batch_fields
-
-        if n_fields == 0:
+        streams = tuple(streams)
+        if not streams:
+            raise ValueError("streams must contain at least one stream")
+        if any(not isinstance(stream, TrainingStream) for stream in streams):
+            raise TypeError("streams must contain only TrainingStream objects")
+        names = [stream.name for stream in streams]
+        if len(set(names)) != len(names):
+            raise ValueError("stream names must be unique")
+        if require_epoch_driver and all(stream.cycle for stream in streams):
             raise ValueError(
-                "{}_loader must contain at least one batch".format(subset)
+                "at least one training stream must have cycle=False"
             )
-
-        losses = {
-            name: value / n_fields
-            for name, value in loss_sums.items()
-        }
-        metric_values = {
-            metric.name: {
-                name: value.item()
-                for name, value in metric.retrieve_metrics(subset).items()
-            }
-            for metric in self.metrics
-        }
-        return losses, metric_values
+        return streams
 
     def _configure_streams(
         self,
@@ -772,22 +698,22 @@ class Trainer(nn.Module):
     ) -> Tuple[TrainingStream, ...]:
         """Validate and register a stable set of training streams."""
 
-        streams = tuple(streams)
-        if not streams:
-            raise ValueError("fit_streams requires at least one stream")
-        if any(not isinstance(stream, TrainingStream) for stream in streams):
-            raise TypeError("streams must contain only TrainingStream objects")
-        names = [stream.name for stream in streams]
-        if len(set(names)) != len(names):
-            raise ValueError("stream names must be unique")
-        if all(stream.cycle for stream in streams):
+        streams = self._validate_streams(
+            streams,
+            require_epoch_driver=True,
+        )
+        if not self._streams and self.optimizer is not None:
             raise ValueError(
-                "at least one training stream must have cycle=False"
+                "cannot configure streams after optimization has started"
             )
-        if self.optimizer is not None and tuple(names) != tuple(
-            stream.name for stream in self._streams
+        if self._streams and (
+            len(streams) != len(self._streams)
+            or any(
+                supplied is not configured
+                for supplied, configured in zip(streams, self._streams)
+            )
         ):
-            raise ValueError("configured streams cannot change after optimization")
+            raise ValueError("configured streams cannot change once registered")
         if not self._streams:
             self.stream_losses = nn.ModuleDict(
                 {stream.name: stream.loss for stream in streams}
@@ -896,15 +822,13 @@ class Trainer(nn.Module):
             for stream in streams:
                 batches = groups.get(stream.name, ())
                 for batch in batches:
-                    batch = self._move_batch(batch)
-                    outputs = self.model(batch, **stream.model_kwargs)
-                    losses, details = stream.loss.evaluate(
-                        outputs,
+                    batch, outputs, losses, details = self._forward_loss(
                         batch,
-                        model=self.model,
+                        stream.loss,
+                        stream.model_kwargs,
                     )
-                    self._update_stream_metrics(
-                        stream,
+                    self._update_metrics(
+                        stream.metrics,
                         "train",
                         outputs,
                         batch,
@@ -929,41 +853,45 @@ class Trainer(nn.Module):
             n_fields = field_counts[stream.name]
             if n_fields == 0:
                 raise ValueError(
-                    "train loader for stream '{}' is empty".format(stream.name)
+                    "train_loader for stream '{}' is empty".format(stream.name)
                 )
             losses = {
                 name: value / n_fields
                 for name, value in loss_sums[stream.name].items()
             }
-            metrics = self._retrieve_stream_metrics(stream, "train")
+            metrics = self._retrieve_metrics(stream.metrics, "train")
             results[stream.name] = (losses, metrics)
         return results
 
-    def _run_stream_loader(
+    def _evaluate_stream(
         self,
         stream: TrainingStream,
         subset: str,
-        training: bool,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
         """Evaluate one named stream without combining its statistics."""
 
-        self.model.train(training)
-        stream.loss.train(training)
+        if subset == "train":
+            loader = stream.train_loader
+        elif subset == "valid":
+            loader = stream.valid_loader
+        else:
+            raise ValueError("subset must be 'train' or 'valid'")
+
+        self.model.eval()
+        stream.loss.to(self.device).eval()
+        for metric in stream.metrics:
+            metric.to(self.device)
         loss_sums = {}
         n_fields = 0
-        gradient_context = torch.enable_grad() if training else torch.no_grad()
-        loader = stream.train_loader if training else stream.valid_loader
-        with gradient_context:
+        with torch.no_grad():
             for batch in loader:
-                batch = self._move_batch(batch)
-                outputs = self.model(batch, **stream.model_kwargs)
-                losses, details = stream.loss.evaluate(
-                    outputs,
+                batch, outputs, losses, details = self._forward_loss(
                     batch,
-                    model=self.model,
+                    stream.loss,
+                    stream.model_kwargs,
                 )
-                self._update_stream_metrics(
-                    stream,
+                self._update_metrics(
+                    stream.metrics,
                     subset,
                     outputs,
                     batch,
@@ -980,17 +908,17 @@ class Trainer(nn.Module):
                 "{} loader for stream '{}' is empty".format(subset, stream.name)
             )
         losses = {name: value / n_fields for name, value in loss_sums.items()}
-        return losses, self._retrieve_stream_metrics(stream, subset)
+        return losses, self._retrieve_metrics(stream.metrics, subset)
 
-    def _update_stream_metrics(
-        self,
-        stream: TrainingStream,
+    @staticmethod
+    def _update_metrics(
+        metrics: Sequence[nn.Module],
         subset: str,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
         details: Dict[str, Dict[str, torch.Tensor]],
     ) -> None:
-        for metric in self.stream_metrics[stream.name]:
+        for metric in metrics:
             if getattr(metric, "requires_loss_details", False):
                 if metric.name not in details:
                     raise KeyError(
@@ -1002,9 +930,9 @@ class Trainer(nn.Module):
             else:
                 metric.update_metrics(subset, outputs, batch)
 
-    def _retrieve_stream_metrics(
-        self,
-        stream: TrainingStream,
+    @staticmethod
+    def _retrieve_metrics(
+        metrics: Sequence[nn.Module],
         subset: str,
     ) -> Dict[str, Dict[str, float]]:
         return {
@@ -1012,8 +940,26 @@ class Trainer(nn.Module):
                 name: value.item()
                 for name, value in metric.retrieve_metrics(subset).items()
             }
-            for metric in self.stream_metrics[stream.name]
+            for metric in metrics
         }
+
+    def _forward_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        loss: Loss,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, Dict[str, torch.Tensor]],
+    ]:
+        """Move one batch, run the model, and evaluate one loss module."""
+
+        batch = self._move_batch(batch)
+        outputs = self.model(batch, **(model_kwargs or {}))
+        losses, details = loss.evaluate(outputs, batch, model=self.model)
+        return batch, outputs, losses, details
 
     @staticmethod
     def _flatten_stream_results(
@@ -1047,6 +993,46 @@ class Trainer(nn.Module):
             self.scheduler.step(valid_loss)
         else:
             self.scheduler.step()
+
+    def _finish_epoch(
+        self,
+        record: Dict[str, Any],
+        verbose: bool,
+        print_interval: int,
+    ) -> bool:
+        """Record one epoch and return whether early stopping was reached."""
+
+        self.history.append(record)
+        self._step_scheduler(record["valid_losses"]["total"])
+        self._write_epoch_checkpoints(record)
+        self._write_history_csv()
+        if verbose and record["epoch"] % print_interval == 0:
+            self.log_message(format_record(record))
+        if not self._early_stopping_reached():
+            return False
+        self.log_message(
+            "Early stopping at epoch {} after {} epochs without "
+            "validation-loss improvement.".format(
+                record["epoch"],
+                self.epochs_without_improvement,
+            ),
+            display=verbose,
+        )
+        return True
+
+    def _stop_before_training(self, verbose: bool) -> bool:
+        """Report an already exhausted patience counter before another fit."""
+
+        if not self._early_stopping_reached():
+            return False
+        self.log_message(
+            "Early stopping already reached after {} epochs without "
+            "validation-loss improvement.".format(
+                self.epochs_without_improvement
+            ),
+            display=verbose,
+        )
+        return True
 
     def _write_epoch_checkpoints(self, record: Dict[str, Any]) -> None:
         """Write configured periodic, best, and last checkpoints."""

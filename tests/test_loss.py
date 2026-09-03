@@ -635,6 +635,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             )
             batch = self._batch()
             term._select_modes(batch, batch["rho"])
+
         with self.assertRaisesRegex(ValueError, "mixture_mode"):
             FourierStabilityLoss(
                 modes=((1, 0, 0),),
@@ -670,6 +671,40 @@ class TestFourierStabilityLoss(unittest.TestCase):
                 model=model,
             )
 
+    def test_explicit_modes_share_canonical_grid_validation(self):
+        batch = self._batch()
+        term = FourierStabilityLoss(modes=((-1, 0, 0),))
+
+        selected = term._select_modes(batch, batch["rho"])
+
+        self.assertTrue(
+            torch.equal(selected, torch.tensor([[[1, 0, 0]]]))
+        )
+        duplicate = FourierStabilityLoss(
+            modes=((1, 0, 0), (-1, 0, 0))
+        )
+        with self.assertRaisesRegex(ValueError, "equivalent"):
+            duplicate._select_modes(batch, batch["rho"])
+
+    def test_mode_selection_validates_complete_grid_geometry(self):
+        term = FourierStabilityLoss(modes=((1, 0, 0),))
+        cases = (
+            ("grid_size", [[0, 1, 1]], "positive integers"),
+            ("grid_size", [[4, 1, 1]], "number of grid points"),
+            ("grid_spacing", [[0.0, 1.0, 1.0]], "finite positive"),
+            (
+                "grid_spacing",
+                [[float("nan"), 1.0, 1.0]],
+                "finite positive",
+            ),
+        )
+        for key, value, message in cases:
+            batch = self._batch()
+            batch[key] = torch.tensor(value, dtype=batch[key].dtype)
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    term._select_modes(batch, batch["rho"])
+
 
 class TestFourierResponseLoss(unittest.TestCase):
     @staticmethod
@@ -696,6 +731,30 @@ class TestFourierResponseLoss(unittest.TestCase):
             value.item(),
             10.0 * torch.finfo(torch.float64).eps,
         )
+
+    def test_response_validates_grid_geometry_before_mode_evaluation(self):
+        term = FourierResponseLoss(
+            directions=((1.0,),),
+            relative_amplitude=1.0e-4,
+        )
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        for key, value, message in (
+            ("grid_size", [[4, 1, 1]], "number of grid points"),
+            (
+                "grid_spacing",
+                [[1.0, float("inf"), 1.0]],
+                "finite.*positive",
+            ),
+        ):
+            batch = self._batch(n_modes=1)
+            batch["fourier_curvature"] = torch.ones(
+                (1, 1, 1),
+                dtype=torch.float64,
+            )
+            batch[key] = torch.tensor(value, dtype=batch[key].dtype)
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, message):
+                    term(model(batch), batch, model=model)
 
     def test_response_mismatch_is_penalized_and_differentiable(self):
         batch = self._batch(n_modes=1)
@@ -918,6 +977,20 @@ class TestFourierResponseLoss(unittest.TestCase):
         zero_mode["fourier_modes"].zero_()
         with self.assertRaisesRegex(ValueError, "zero mode"):
             term(model(zero_mode), zero_mode, model=model)
+
+        for value, message in (
+            (1.5, "integers"),
+            (float("nan"), "finite"),
+        ):
+            invalid_mode = {
+                key: value.clone() for key, value in batch.items()
+            }
+            invalid_mode["fourier_modes"] = torch.tensor(
+                [[[value, 0.0, 0.0]]], dtype=torch.float64
+            )
+            with self.subTest(mode=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    term(model(invalid_mode), invalid_mode, model=model)
 
         wrong_target = {key: value.clone() for key, value in batch.items()}
         wrong_target["fourier_curvature"] = torch.ones((1, 1))

@@ -123,66 +123,6 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
-### Optional conditioned radial basis
-
-`CartesianAFeatures` can use fixed spherical-Bessel-like primitives followed
-by an optional learned transform before the invariant products are formed:
-
-```python
-a_features = CartesianAFeatures(
-    mean_density=loaders["mean_density"],
-    cutoff_grid=6,
-    max_power=3,
-    radial_basis="bessel",
-    n_radial_functions=6,  # primitive functions N
-    n_radial_channels=4,   # learned output channels M <= N
-    separate_center=True,
-    n_types=n_types,
-)
-```
-
-For integer-grid radius $r$ and cutoff $R_c$ equal to `cutoff_grid`, primitive
-$n$ is $\sqrt{2/R_c}\sin(n\pi r/R_c)/r$ for $r<R_c$, using its finite
-analytic limit at $r=0$ and exact zero at and beyond the cutoff. Its physical
-radial wave number is $n\pi/(R_c\Delta)$ for grid spacing $\Delta$. The
-primitive radial-Cartesian products are whitened on the exact discrete stencil
-separately for every total Cartesian degree. Numerically rank-deficient
-choices are rejected.
-
-Because whitening is performed separately at each total Cartesian degree,
-the uniform per-degree scale introduced by `coordinate_scaling="cutoff"`
-cancels for this Bessel construction up to roundoff. The option remains
-meaningful for unconditioned radial bases.
-
-Explicitly supplying `n_radial_channels=M` for a Gaussian or Bessel basis
-enables a bias-free learned map from $N$ primitive functions to $M\leq N$
-channels. One matrix is used per total Cartesian degree and shared across all
-density channels and all monomials of that degree. It is initialized as a
-rectangular identity. Omitting `n_radial_channels` retains all primitives
-without a transform; the established `radial_basis="none"` configuration
-continues to accept only its compatibility value `n_radial_channels=1`.
-
-A message-passing layer without its own radial parameters shares this
-transformed basis. A layer with explicit `radial_exponents` continues to use
-an independent Gaussian basis and bypasses the initial transform. A message
-can instead own a conditioned Bessel basis and an independent transform:
-
-```python
-message = BChiMessage(
-    n_invariant_features=b_features.n_features,
-    n_radial_channels=4,       # transformed channels M
-    n_channels=a_features.n_output_channels,
-    radial_basis="bessel",
-    n_radial_functions=6,      # fixed primitives N >= M
-)
-```
-
-The message uses the cutoff, center mask, Cartesian monomials, and stencil
-geometry of `a_features`. Its fixed primitive basis is conditioned once when
-`GridCACEModel` is constructed. Its own degree-dependent `N -> M` transform
-is then applied on every forward pass before the message convolution and the
-next invariant products. Bessel frequencies remain fixed.
-
 ## Data format
 
 `GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
@@ -261,72 +201,6 @@ every coarse block is either entirely accessible or entirely excluded;
 partially accessible coarse voxels require an explicit accessible-volume
 representation and are rejected.
 
-## Homogeneous Fourier-response training
-
-`FourierResponseLoss` supervises the projected curvature of the total
-intrinsic dimensionless free energy at homogeneous periodic states. It uses
-the same symmetric, fixed-particle-number finite difference as
-`FourierStabilityLoss`, but compares the result with response targets instead
-of applying a positivity hinge. For a one-component fluid its target is
-$1/S(k)$.
-
-The file-format-specific conversion from a measured structure-factor matrix
-to projected inverse-response targets belongs in the application workflow.
-EquiCDFT consumes only explicit tensors. One response state can be constructed
-without a response-specific dataset class:
-
-```python
-import torch
-from equicdft import FourierResponseLoss, GridData, Loss
-
-state = GridData.from_dict(
-    {
-        "grid_size": (32, 32, 32),
-        "grid_spacing": 0.25,
-        "temperature": 1.0,
-        "n_types": 2,
-    },
-    cutoff_grid=3,
-    boltzmann_constant=1.0,
-)
-state["rho"] = torch.tensor([0.2, 0.2]).expand(32**3, -1).clone()
-state["fourier_modes"] = torch.tensor([[1, 0, 0], [1, 1, 0]])
-state["fourier_curvature"] = torch.tensor(
-    [
-        [1.0 / S_NN_100, 1.0 / S_ZZ_100],
-        [1.0 / S_NN_110, 1.0 / S_ZZ_110],
-    ]
-)
-state["fourier_curvature_scale"] = torch.tensor(
-    [[sigma_NN_100, sigma_ZZ_100], [sigma_NN_110, sigma_ZZ_110]]
-)
-
-loss = Loss(
-    [
-        FourierResponseLoss(
-            directions=((1.0, 1.0), (1.0, -1.0)),
-            scale_key="fourier_curvature_scale",
-            relative_amplitude=0.01,
-        )
-    ]
-)
-```
-
-Here the simple reciprocals are valid because number and charge are symmetry
-eigenchannels and the supplied $S_{NN}$ and $S_{ZZ}$ convention has ideal-gas
-limit one. A general mixture must first construct and invert its full response
-matrix, then project it using the same direction and normalization convention
-as the loss. Targets have per-item shape `[n_modes, n_directions]`; PyTorch's
-default collation adds the leading field dimension. Optional positive scales
-and nonnegative element weights have the same shape.
-
-Response states must be spatially uniform, periodic, and unmasked. Mode
-triplets are integer reciprocal-grid indices and must lie inside the physical
-isotropic Nyquist sphere. The loss averages the valid cosine and sine estimates
-for each mode. It does not shell-average, interpolate, extrapolate, regularize,
-or invert structure factors; those scientifically consequential operations
-must be recorded when the target tensors are prepared.
-
 ## Inference and equilibrium solution
 
 A saved full model can be loaded without reconstructing the architecture:
@@ -370,13 +244,11 @@ reciprocal kernels with nonperiodic boundary conditions.
 ## Package map
 
 - `data.py`, `stencil.py`: complete fields and periodic neighborhoods
-- `_radial.py`, `features.py`, `symmetrize.py`: radial bases and conditioning,
-  Cartesian moments, and cubic invariants
+- `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
 - `readout.py`, `semilocal.py`: local and state-dependent contributions
 - `pairwise.py`: finite-range distance-dependent pair contribution
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
-- `loss.py`, `stability.py`: composable response and stability objectives
-- `_fourier.py`: shared Fourier modes, projections, and curvature evaluation
+- `loss.py`: composable training objectives
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support

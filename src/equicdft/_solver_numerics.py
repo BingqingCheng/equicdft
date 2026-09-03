@@ -4,18 +4,10 @@ from typing import Dict, Optional, Sequence, Union
 
 import torch
 
-from .energy import density_weighted_integral
-
-
-def _log_dimensionless_density(
-    rho: torch.Tensor,
-    thermal_wavelength: torch.Tensor,
-) -> torch.Tensor:
-    tiny = torch.finfo(rho.dtype).tiny
-    return torch.log(
-        torch.clamp(rho, min=tiny)
-        * thermal_wavelength[..., None, :] ** 3
-    )
+from .energy import (
+    density_weighted_integral,
+    log_dimensionless_density,
+)
 
 
 def _component_tensor(
@@ -48,7 +40,7 @@ def _thermodynamic_objective(
     accumulation_dtype = _accumulation_dtype(rho.dtype)
     rho = rho.to(accumulation_dtype)
     wavelength = thermal_wavelength.to(accumulation_dtype)
-    log_density = _log_dimensionless_density(rho, wavelength)
+    log_density = log_dimensionless_density(rho, wavelength)
     beta = evaluation["beta"].to(accumulation_dtype)
     per_particle = (
         log_density - 1.0
@@ -91,28 +83,21 @@ def _mirror_descent_trial(
         max=max_log_density_change,
     )
     trial_log_rho = log_rho + log_change
-    accessible = _accessible_density_mask(rho, accessible_mask)
     if particle_numbers is None:
         trial_rho = torch.exp(trial_log_rho)
-        if maximum_density is not None:
-            trial_rho = torch.minimum(
-                trial_rho,
-                maximum_density[None, :],
-            )
-        return torch.where(accessible, trial_rho, torch.zeros_like(trial_rho))
-
-    accumulation_dtype = _accumulation_dtype(rho.dtype)
-    trial_rho = (
-        particle_numbers.to(accumulation_dtype)[None, :]
-        * torch.softmax(trial_log_rho.to(accumulation_dtype), dim=0)
-        / voxel_volume.to(accumulation_dtype)
-    )
-    return _normalize_particle_numbers(
-        trial_rho.to(rho.dtype),
+    else:
+        accumulation_dtype = _accumulation_dtype(rho.dtype)
+        trial_rho = (
+            particle_numbers.to(accumulation_dtype)[None, :]
+            * torch.softmax(trial_log_rho.to(accumulation_dtype), dim=0)
+            / voxel_volume.to(accumulation_dtype)
+        ).to(rho.dtype)
+    return _project_density_constraints(
+        trial_rho,
         particle_numbers,
         voxel_volume,
-        maximum_density=maximum_density,
-        accessible_mask=accessible_mask,
+        maximum_density,
+        accessible_mask,
     )
 
 
@@ -225,6 +210,92 @@ def _normalize_particle_numbers(
     return torch.where(accessible, normalized, torch.zeros_like(normalized))
 
 
+def _project_density_constraints(
+    rho: torch.Tensor,
+    particle_numbers: Optional[torch.Tensor],
+    voxel_volume: torch.Tensor,
+    maximum_density: Optional[torch.Tensor] = None,
+    accessible_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply the solver's mask, particle-number, and upper-bound constraints."""
+
+    accessible = _accessible_density_mask(rho, accessible_mask)
+    projected = torch.where(accessible, rho, torch.zeros_like(rho))
+    if particle_numbers is not None:
+        return _normalize_particle_numbers(
+            projected,
+            particle_numbers,
+            voxel_volume,
+            maximum_density=maximum_density,
+            accessible_mask=accessible_mask,
+        )
+    if maximum_density is not None:
+        projected = torch.minimum(projected, maximum_density[None, :])
+    return projected
+
+
+def _anderson_log_density_candidate(
+    log_density_history: Sequence[torch.Tensor],
+    residual_history: Sequence[torch.Tensor],
+    weights: torch.Tensor,
+    regularization: float,
+    damping: float,
+) -> torch.Tensor:
+    """Return a density-weighted constrained Anderson log-density trial."""
+
+    history_size = len(log_density_history)
+    if history_size != len(residual_history):
+        raise ValueError("Anderson density and residual history differ")
+    if history_size < 2:
+        raise ValueError("Anderson acceleration requires two history entries")
+
+    accumulation_dtype = torch.float64
+    residual_matrix = torch.stack(
+        residual_history,
+        dim=-1,
+    ).reshape(-1, history_size).to(accumulation_dtype)
+    flattened_weights = weights.reshape(-1).to(accumulation_dtype)
+    gram = residual_matrix.mT @ (
+        flattened_weights[:, None] * residual_matrix
+    )
+    scale = torch.clamp(
+        torch.trace(gram) / history_size,
+        min=torch.finfo(accumulation_dtype).eps,
+    )
+    system = gram + regularization * scale * torch.eye(
+        history_size,
+        dtype=accumulation_dtype,
+        device=gram.device,
+    )
+    ones = torch.ones(
+        history_size,
+        dtype=accumulation_dtype,
+        device=gram.device,
+    )
+    coefficients = torch.linalg.solve(system, ones)
+    denominator = torch.sum(coefficients)
+    if (
+        not torch.all(torch.isfinite(coefficients)).item()
+        or not torch.isfinite(denominator).item()
+        or torch.abs(denominator).item()
+        <= torch.finfo(accumulation_dtype).eps
+    ):
+        raise RuntimeError("Anderson coefficient solve is singular")
+    coefficients = coefficients / denominator
+
+    candidates = (
+        torch.stack(log_density_history)
+        + damping * torch.stack(residual_history)
+    ).to(accumulation_dtype)
+    coefficient_shape = (history_size,) + (1,) * (
+        candidates.ndim - 1
+    )
+    return torch.sum(
+        coefficients.reshape(coefficient_shape) * candidates,
+        dim=0,
+    ).to(log_density_history[-1].dtype)
+
+
 def _euler_residual(
     rho: torch.Tensor,
     c1: torch.Tensor,
@@ -245,7 +316,7 @@ def _euler_residual(
 
     accessible = _accessible_density_mask(rho, accessible_mask)
     local_chemical_potential = (
-        _log_dimensionless_density(rho, thermal_wavelength)
+        log_dimensionless_density(rho, thermal_wavelength)
         + beta * V_ext
         - c1
     )

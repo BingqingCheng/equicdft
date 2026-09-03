@@ -14,16 +14,20 @@ from ._argument_checks import (
 )
 from ._grid import voxel_volume
 from ._solver_numerics import (
+    _anderson_log_density_candidate,
     _component_tensor,
     _euler_residual,
-    _log_dimensionless_density,
     _maximum_relative_change,
     _mirror_descent_trial,
-    _normalize_particle_numbers,
+    _project_density_constraints,
     _residuals_converged,
     _thermodynamic_objective,
 )
-from .energy import density_weighted_integral
+from .energy import (
+    density_weighted_integral,
+    ideal_free_energy,
+    log_dimensionless_density,
+)
 
 
 class GridSolver:
@@ -96,18 +100,9 @@ class GridSolver:
                 device=rho.device,
             ),
         )
-        log_density = _log_dimensionless_density(
+        result["beta_F_id"] = ideal_free_energy(
             rho,
             thermal_wavelength,
-        )
-        ideal_per_particle = torch.where(
-            rho > 0.0,
-            log_density - 1.0,
-            torch.zeros_like(rho),
-        )
-        result["beta_F_id"] = density_weighted_integral(
-            rho,
-            ideal_per_particle,
             volume_element,
         )
         result["beta_F"] = result["beta_F_id"] + result["beta_F_exc"]
@@ -438,16 +433,13 @@ class GridSolver:
                 torch.zeros_like(boltzmann_weights),
             )
 
-        if fixed_N is not None:
-            rho = _normalize_particle_numbers(
-                rho,
-                fixed_N,
-                volume_element,
-                maximum_density=density_cap,
-                accessible_mask=accessible_mask,
-            )
-        elif density_cap is not None:
-            rho = torch.minimum(rho, density_cap[None, :])
+        rho = _project_density_constraints(
+            rho,
+            fixed_N,
+            volume_element,
+            density_cap,
+            accessible_mask,
+        )
 
         was_training = self.model.training
         self.model.eval()
@@ -621,7 +613,7 @@ class GridSolver:
             # update and convergence test use the projected KKT residual
             # when an upper density bound is active.
             line_search_gradient = (
-                _log_dimensionless_density(rho, thermal_wavelength)
+                log_dimensionless_density(rho, thermal_wavelength)
                 + data["beta"] * V_ext
                 - evaluation["c1"].detach()
             )
@@ -868,19 +860,13 @@ class GridSolver:
                     (1.0 - trial_mixing) * rho
                     + trial_mixing * target_rho
                 )
-                if fixed_N is not None:
-                    next_rho = _normalize_particle_numbers(
-                        next_rho,
-                        fixed_N,
-                        voxel_volume,
-                        maximum_density=maximum_density,
-                        accessible_mask=accessible_mask,
-                    )
-                elif maximum_density is not None:
-                    next_rho = torch.minimum(
-                        next_rho,
-                        maximum_density[None, :],
-                    )
+                next_rho = _project_density_constraints(
+                    next_rho,
+                    fixed_N,
+                    voxel_volume,
+                    maximum_density,
+                    accessible_mask,
+                )
 
                 (
                     trial_evaluation,
@@ -929,19 +915,13 @@ class GridSolver:
                     candidate_rho = torch.exp(
                         current_log_density + log_change
                     ).masked_fill(~accessible_mask[:, None], 0.0)
-                    if fixed_N is not None:
-                        candidate_rho = _normalize_particle_numbers(
-                            candidate_rho,
-                            fixed_N,
-                            voxel_volume,
-                            maximum_density=maximum_density,
-                            accessible_mask=accessible_mask,
-                        )
-                    elif maximum_density is not None:
-                        candidate_rho = torch.minimum(
-                            candidate_rho,
-                            maximum_density[None, :],
-                        )
+                    candidate_rho = _project_density_constraints(
+                        candidate_rho,
+                        fixed_N,
+                        voxel_volume,
+                        maximum_density,
+                        accessible_mask,
+                    )
 
                     (
                         candidate_evaluation,
@@ -1019,68 +999,6 @@ class GridSolver:
             key: value.to(self.device) if torch.is_tensor(value) else value
             for key, value in data.items()
         }
-
-
-def _anderson_log_density_candidate(
-    log_density_history: Sequence[torch.Tensor],
-    residual_history: Sequence[torch.Tensor],
-    weights: torch.Tensor,
-    regularization: float,
-    damping: float,
-) -> torch.Tensor:
-    """Return a density-weighted constrained Anderson log-density trial."""
-
-    history_size = len(log_density_history)
-    if history_size != len(residual_history):
-        raise ValueError("Anderson density and residual history differ")
-    if history_size < 2:
-        raise ValueError("Anderson acceleration requires two history entries")
-
-    accumulation_dtype = torch.float64
-    residual_matrix = torch.stack(
-        residual_history,
-        dim=-1,
-    ).reshape(-1, history_size).to(accumulation_dtype)
-    flattened_weights = weights.reshape(-1).to(accumulation_dtype)
-    gram = residual_matrix.mT @ (
-        flattened_weights[:, None] * residual_matrix
-    )
-    scale = torch.clamp(
-        torch.trace(gram) / history_size,
-        min=torch.finfo(accumulation_dtype).eps,
-    )
-    system = gram + regularization * scale * torch.eye(
-        history_size,
-        dtype=accumulation_dtype,
-        device=gram.device,
-    )
-    ones = torch.ones(
-        history_size,
-        dtype=accumulation_dtype,
-        device=gram.device,
-    )
-    coefficients = torch.linalg.solve(system, ones)
-    denominator = torch.sum(coefficients)
-    if (
-        not torch.all(torch.isfinite(coefficients)).item()
-        or not torch.isfinite(denominator).item()
-        or torch.abs(denominator).item()
-        <= torch.finfo(accumulation_dtype).eps
-    ):
-        raise RuntimeError("Anderson coefficient solve is singular")
-    coefficients = coefficients / denominator
-
-    candidates = (
-        torch.stack(log_density_history)
-        + damping * torch.stack(residual_history)
-    ).to(accumulation_dtype)
-    coefficient_shape = (history_size,) + (1,) * (
-        candidates.ndim - 1
-    )
-    return torch.sum(
-        coefficients.reshape(coefficient_shape) * candidates,
-        dim=0,
-    ).to(log_density_history[-1].dtype)
 
 
 def _module_device(module: nn.Module) -> torch.device:

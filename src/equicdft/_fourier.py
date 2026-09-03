@@ -7,7 +7,40 @@ import torch
 from torch import nn
 
 from ._grid import voxel_volume
-from .energy import density_weighted_integral
+from .energy import fixed_number_ideal_free_energy as _ideal_free_energy
+
+
+def integer_mode_tensor(
+    supplied_modes: object,
+    name: str = "modes",
+) -> torch.Tensor:
+    """Return exact integer reciprocal modes without rounding or truncation."""
+
+    modes = torch.as_tensor(supplied_modes)
+    if modes.dtype == torch.bool or torch.is_complex(modes):
+        raise TypeError("{} must contain real integer values".format(name))
+    if not torch.all(torch.isfinite(modes)).item():
+        raise ValueError("{} must be finite".format(name))
+    integer_modes = modes.to(torch.long)
+    if not torch.equal(modes, integer_modes.to(modes.dtype)):
+        raise ValueError("{} must contain integers".format(name))
+    return integer_modes
+
+
+def mode_triplets(
+    supplied_modes: object,
+    name: str = "modes",
+) -> torch.Tensor:
+    """Return a nonempty collection of distinct, nonzero integer triplets."""
+
+    modes = integer_mode_tensor(supplied_modes, name)
+    if modes.ndim != 2 or modes.shape[0] == 0 or modes.shape[1] != 3:
+        raise ValueError("{} must have shape [n_modes, 3]".format(name))
+    if torch.any(torch.all(modes == 0, dim=-1)).item():
+        raise ValueError("{} must not contain the zero mode".format(name))
+    if torch.unique(modes, dim=0).shape[0] != modes.shape[0]:
+        raise ValueError("{} must not contain duplicates".format(name))
+    return modes
 
 
 def projected_fourier_curvature(
@@ -284,28 +317,23 @@ def validate_explicit_modes(
         raise ValueError(
             "response modes must have shape [n_fields, n_modes, 3]"
         )
-    integer_modes = modes.to(torch.long)
-    if not torch.equal(modes, integer_modes.to(modes.dtype)):
-        raise ValueError("response modes must contain integers")
-    if torch.any(torch.all(integer_modes == 0, dim=-1)).item():
-        raise ValueError("response modes must not contain the zero mode")
-
-    grid_size, grid_spacing = _validated_grid(batch, n_fields)
+    grid_size, grid_spacing = _validated_grid(
+        batch,
+        n_fields,
+        n_grid=rho.shape[1],
+    )
     canonical_by_field = []
     for field in range(n_fields):
         size = tuple(grid_size[field].tolist())
         spacing = tuple(grid_spacing[field].tolist())
-        selected = [
-            canonical_grid_mode(mode, size)
-            for mode in integer_modes[field].detach().cpu().tolist()
-        ]
-        if len(set(selected)) != len(selected):
-            raise ValueError("response modes contain equivalent directions")
-        if any(not _mode_is_feasible(mode, size, spacing) for mode in selected):
-            raise ValueError(
-                "a response mode lies outside the isotropic Nyquist sphere"
+        canonical_by_field.append(
+            canonical_mode_triplets(
+                modes[field],
+                size,
+                spacing,
+                name="response modes",
             )
-        canonical_by_field.append(torch.tensor(selected, dtype=torch.long))
+        )
     return torch.stack(canonical_by_field).to(device=rho.device)
 
 
@@ -315,14 +343,12 @@ def feasible_modes(
 ) -> Sequence[Tuple[int, int, int]]:
     """Return unique modes inside the physical isotropic Nyquist sphere."""
 
-    if len(grid_size) != 3 or any(size <= 0 for size in grid_size):
-        raise ValueError("grid_size must contain three positive integers")
-    if (
-        len(grid_spacing) != 3
-        or any(not math.isfinite(spacing) for spacing in grid_spacing)
-        or any(spacing <= 0.0 for spacing in grid_spacing)
-    ):
-        raise ValueError("grid_spacing must contain three positive values")
+    size_tensor, spacing_tensor = _validated_grid_geometry(
+        grid_size,
+        grid_spacing,
+    )
+    grid_size = tuple(size_tensor.tolist())
+    grid_spacing = tuple(spacing_tensor.tolist())
 
     half_sizes = [size // 2 for size in grid_size]
     feasible = set()
@@ -373,6 +399,7 @@ def canonical_grid_mode(
 def _validated_grid(
     batch: Dict[str, torch.Tensor],
     n_fields: int,
+    n_grid: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return validated CPU grid sizes and spacings."""
 
@@ -382,10 +409,49 @@ def _validated_grid(
         raise ValueError("grid_size must have shape [n_fields, 3]")
     if grid_spacing.shape != (n_fields, 3):
         raise ValueError("grid_spacing must have shape [n_fields, 3]")
-    integer_grid_size = grid_size.to(torch.long)
-    if not torch.equal(grid_size, integer_grid_size.to(grid_size.dtype)):
-        raise ValueError("grid_size must contain integers")
+    geometries = [
+        _validated_grid_geometry(grid_size[field], grid_spacing[field])
+        for field in range(n_fields)
+    ]
+    integer_grid_size = torch.stack([item[0] for item in geometries])
+    grid_spacing = torch.stack([item[1] for item in geometries])
+    if n_grid is not None and torch.any(
+        torch.prod(integer_grid_size, dim=-1) != n_grid
+    ).item():
+        raise ValueError("grid_size product must match the number of grid points")
     return integer_grid_size, grid_spacing
+
+
+def _validated_grid_geometry(
+    grid_size: object,
+    grid_spacing: object,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return one positive integer grid size and finite positive spacing."""
+
+    size = torch.as_tensor(grid_size)
+    spacing = torch.as_tensor(grid_spacing)
+    if size.dtype == torch.bool or torch.is_complex(size):
+        raise TypeError("grid_size must contain real integer values")
+    if size.shape != (3,):
+        raise ValueError("grid_size must contain three positive integers")
+    if not torch.all(torch.isfinite(size)).item():
+        raise ValueError("grid_size must be finite")
+    integer_size = size.to(torch.long)
+    if not torch.equal(size, integer_size.to(size.dtype)):
+        raise ValueError("grid_size must contain integers")
+    if torch.any(integer_size <= 0).item():
+        raise ValueError("grid_size must contain three positive integers")
+
+    if spacing.dtype == torch.bool or torch.is_complex(spacing):
+        raise TypeError("grid_spacing must contain real values")
+    if spacing.shape != (3,):
+        raise ValueError("grid_spacing must contain three positive values")
+    if (
+        not torch.all(torch.isfinite(spacing)).item()
+        or torch.any(spacing <= 0.0).item()
+    ):
+        raise ValueError("grid_spacing must contain three finite positive values")
+    return integer_size, spacing
 
 
 def _mode_is_feasible(
@@ -408,6 +474,34 @@ def _mode_is_feasible(
         wavevector_magnitude(mode, box_lengths) ** 2
         <= isotropic_nyquist**2 * (1.0 + 1.0e-12)
     )
+
+
+def canonical_mode_triplets(
+    supplied_modes: object,
+    grid_size: Sequence[int],
+    grid_spacing: Sequence[float],
+    name: str = "modes",
+) -> torch.Tensor:
+    """Validate and canonicalize explicit modes for one periodic grid."""
+
+    modes = mode_triplets(supplied_modes, name)
+    size, spacing = _validated_grid_geometry(grid_size, grid_spacing)
+    grid_size = tuple(size.tolist())
+    grid_spacing = tuple(spacing.tolist())
+    selected = [
+        canonical_grid_mode(mode, grid_size)
+        for mode in modes.detach().cpu().tolist()
+    ]
+    if len(set(selected)) != len(selected):
+        raise ValueError("{} contain equivalent Fourier directions".format(name))
+    if any(
+        not _mode_is_feasible(mode, grid_size, grid_spacing)
+        for mode in selected
+    ):
+        raise ValueError(
+            "a requested mode lies outside the isotropic Nyquist sphere"
+        )
+    return torch.tensor(selected, dtype=torch.long, device=modes.device)
 
 
 def _expand_batch(
@@ -434,19 +528,3 @@ def _expand_batch(
         else:
             expanded[key] = value
     return expanded
-
-
-def _ideal_free_energy(
-    rho: torch.Tensor,
-    volume_element: torch.Tensor,
-) -> torch.Tensor:
-    """Return discrete ``beta*F_id``; omitted linear terms cancel."""
-
-    positive = rho > 0.0
-    safe_density = torch.where(positive, rho, torch.ones_like(rho))
-    per_particle = torch.where(
-        positive,
-        torch.log(safe_density) - 1.0,
-        torch.zeros_like(rho),
-    )
-    return density_weighted_integral(rho, per_particle, volume_element)

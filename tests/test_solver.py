@@ -4,7 +4,15 @@ import torch
 from torch import nn
 
 from equicdft import GridCACEModel, GridData, GridSolver, LocalReadout
-from equicdft.solver import _euler_residual, _residuals_converged
+from equicdft._solver_numerics import (
+    _anderson_log_density_candidate as numerical_anderson_candidate,
+    _project_density_constraints,
+)
+from equicdft.solver import (
+    _anderson_log_density_candidate as solver_anderson_candidate,
+    _euler_residual,
+    _residuals_converged,
+)
 
 
 class _DensityFeatures(nn.Module):
@@ -85,6 +93,49 @@ class TestGridSolver(unittest.TestCase):
         if include_mu:
             data["mu"] = mu
         return data
+
+    def test_constraint_projection_is_shared_by_solver_updates(self):
+        rho = torch.tensor(
+            [[4.0, 1.0], [9.0, 9.0], [1.0, 4.0]],
+            dtype=torch.float64,
+        )
+        accessible = torch.tensor([True, False, True])
+        particle_numbers = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        maximum_density = torch.tensor([1.5, 3.0], dtype=torch.float64)
+
+        canonical = _project_density_constraints(
+            rho,
+            particle_numbers,
+            torch.tensor(0.5, dtype=torch.float64),
+            maximum_density,
+            accessible,
+        )
+        grand_canonical = _project_density_constraints(
+            rho,
+            None,
+            torch.tensor(0.5, dtype=torch.float64),
+            maximum_density,
+            accessible,
+        )
+
+        self.assertTrue(torch.equal(canonical[1], torch.zeros(2)))
+        self.assertTrue(torch.equal(grand_canonical[1], torch.zeros(2)))
+        self.assertTrue(
+            torch.allclose(0.5 * canonical.sum(dim=0), particle_numbers)
+        )
+        self.assertTrue(torch.all(canonical <= maximum_density[None, :]))
+        self.assertTrue(
+            torch.equal(
+                grand_canonical,
+                torch.tensor(
+                    [[1.5, 1.0], [0.0, 0.0], [1.0, 3.0]],
+                    dtype=torch.float64,
+                ),
+            )
+        )
+
+    def test_solver_preserves_anderson_private_import(self):
+        self.assertIs(solver_anderson_candidate, numerical_anderson_candidate)
 
     def test_evaluate_collects_functional_and_thermodynamics(self):
         rho = torch.tensor(

@@ -19,7 +19,7 @@ from ._grid import (
     voxel_volume as compute_voxel_volume,
 )
 from .derivatives import compute_grid_derivative
-from .energy import EnergyReadout
+from .energy import EnergyReadout, log_dimensionless_density
 from .features import CartesianAFeatures
 from .interaction import BChiMessage
 from .symmetrize import CartesianBFeatures
@@ -306,9 +306,8 @@ class GridCACEModel(nn.Module):
         beta = data["beta"].detach().to(rho)
         wavelength = self.thermal_wavelength.to(rho)
         positive_density = rho > 0.0
-        safe_rho = torch.where(positive_density, rho, torch.ones_like(rho))
         local_chemical_potential = (
-            torch.log(safe_rho * wavelength.pow(3))
+            log_dimensionless_density(rho, wavelength)
             + beta[..., None, None] * data["V_ext"].detach()
             - c1
         )

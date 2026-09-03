@@ -2,7 +2,12 @@ import unittest
 
 import torch
 
-from equicdft.energy import density_weighted_integral
+from equicdft.energy import (
+    density_weighted_integral,
+    fixed_number_ideal_free_energy,
+    ideal_free_energy,
+    log_dimensionless_density,
+)
 
 
 class TestDensityWeightedIntegral(unittest.TestCase):
@@ -101,6 +106,49 @@ class TestDensityWeightedIntegral(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             density_weighted_integral(rho, torch.ones_like(rho), 0.0)
+
+
+class TestIdealGasThermodynamics(unittest.TestCase):
+    def test_log_density_and_vacuum_convention(self):
+        rho = torch.tensor([[0.0, 0.5], [2.0, 1.0]], dtype=torch.float64)
+        wavelength = torch.tensor([2.0, 3.0], dtype=torch.float64)
+
+        value = log_dimensionless_density(rho, wavelength)
+
+        self.assertTrue(torch.all(torch.isfinite(value)))
+        self.assertEqual(value[1, 0], rho.new_tensor(16.0).log())
+        self.assertEqual(value[1, 1], rho.new_tensor(27.0).log())
+
+    def test_positive_subnormal_density_is_floored(self):
+        tiny = torch.finfo(torch.float64).tiny
+        rho = torch.tensor([[0.5 * tiny]], dtype=torch.float64)
+        wavelength = torch.ones(1, dtype=torch.float64)
+
+        self.assertEqual(
+            log_dimensionless_density(rho, wavelength).item(),
+            rho.new_tensor(tiny).log().item(),
+        )
+
+    def test_fixed_number_form_omits_only_the_wavelength_term(self):
+        rho = torch.tensor([[0.5, 1.0], [1.5, 2.0]], dtype=torch.float64)
+        wavelength = torch.tensor([2.0, 3.0], dtype=torch.float64)
+        volume = torch.tensor(0.25, dtype=torch.float64)
+
+        full = ideal_free_energy(rho, wavelength, volume)
+        fixed_number = fixed_number_ideal_free_energy(rho, volume)
+        expected_offset = volume * torch.sum(
+            rho * (3.0 * torch.log(wavelength))[None, :]
+        )
+
+        self.assertTrue(torch.allclose(full - fixed_number, expected_offset))
+
+    def test_vacuum_has_exactly_zero_ideal_free_energy(self):
+        rho = torch.zeros((2, 3, 2), dtype=torch.float64)
+        wavelength = torch.tensor([2.0, 3.0], dtype=torch.float64)
+
+        value = ideal_free_energy(rho, wavelength, 0.125)
+
+        self.assertTrue(torch.equal(value, torch.zeros(2, dtype=rho.dtype)))
 
 
 if __name__ == "__main__":

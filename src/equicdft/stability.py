@@ -13,8 +13,10 @@ from ._argument_checks import (
     nonnegative_scalar,
 )
 from ._fourier import (
-    canonical_grid_mode as _canonical_grid_mode,
+    _validated_grid,
+    canonical_mode_triplets,
     feasible_modes as _feasible_modes,
+    mode_triplets,
     wavevector_magnitude as _wavevector_magnitude,
 )
 from .response import FourierResponse
@@ -107,25 +109,7 @@ class FourierStabilityLoss(nn.Module):
         if modes is None:
             integer_modes = torch.empty((0, 3), dtype=torch.long)
         else:
-            modes_tensor = torch.as_tensor(modes)
-            if (
-                modes_tensor.ndim != 2
-                or modes_tensor.shape[0] == 0
-                or modes_tensor.shape[1] != 3
-            ):
-                raise ValueError("modes must have shape [n_modes, 3]")
-            integer_modes = modes_tensor.to(torch.long)
-            if not torch.equal(
-                modes_tensor,
-                integer_modes.to(modes_tensor.dtype),
-            ):
-                raise ValueError("modes must contain integers")
-            if torch.any(torch.all(integer_modes == 0, dim=-1)).item():
-                raise ValueError("modes must not contain the zero mode")
-            if torch.unique(integer_modes, dim=0).shape[0] != len(
-                integer_modes
-            ):
-                raise ValueError("modes must not contain duplicates")
+            integer_modes = mode_triplets(modes)
 
         random_modes_per_field = nonnegative_integer(
             random_modes_per_field,
@@ -305,36 +289,24 @@ class FourierStabilityLoss(nn.Module):
         """Return fixed or randomly sampled physical modes for every field."""
 
         n_fields = rho.shape[0]
-        grid_size = batch["grid_size"].detach().cpu()
-        grid_spacing = batch["grid_spacing"].detach().cpu()
-        if grid_size.shape != (n_fields, 3):
-            raise ValueError("grid_size must have shape [n_fields, 3]")
-        if grid_spacing.shape != (n_fields, 3):
-            raise ValueError("grid_spacing must have shape [n_fields, 3]")
-        integer_grid_size = grid_size.to(torch.long)
-        if not torch.equal(grid_size, integer_grid_size.to(grid_size.dtype)):
-            raise ValueError("grid_size must contain integers")
+        grid_size, grid_spacing = _validated_grid(
+            batch,
+            n_fields,
+            n_grid=rho.shape[1],
+        )
 
         selected_by_field = []
         for field in range(n_fields):
-            size = tuple(integer_grid_size[field].tolist())
+            size = tuple(grid_size[field].tolist())
             spacing = tuple(grid_spacing[field].tolist())
-            candidates = _feasible_modes(size, spacing)
             if self.modes.shape[0] > 0:
-                candidate_set = set(candidates)
-                selected = [
-                    _canonical_grid_mode(mode, size)
-                    for mode in self.modes.detach().cpu().tolist()
-                ]
-                if len(set(selected)) != len(selected):
-                    raise ValueError(
-                        "modes contain equivalent Fourier directions"
-                    )
-                if any(mode not in candidate_set for mode in selected):
-                    raise ValueError(
-                        "a requested mode lies outside the isotropic Nyquist sphere"
-                    )
+                selected = canonical_mode_triplets(
+                    self.modes,
+                    size,
+                    spacing,
+                ).detach().cpu().tolist()
             else:
+                candidates = _feasible_modes(size, spacing)
                 if self.wavevector_range is not None:
                     box_lengths = tuple(
                         axis_size * axis_spacing

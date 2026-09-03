@@ -25,6 +25,7 @@ from ._data_helpers import (
     process_atoms,
     validate_frame_grid_info,
 )
+from ._fourier import canonical_mode_triplets, integer_mode_tensor
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -318,8 +319,19 @@ class FourierResponseData(Dataset):
         if not isinstance(template, Mapping):
             raise TypeError("template must be a mapping")
         self.template = dict(template)
-        if "index" not in self.template or "n_types" not in self.template:
-            raise ValueError("template must contain index and n_types")
+        required_template_keys = {
+            "index",
+            "n_types",
+            "grid_size",
+            "grid_spacing",
+        }
+        missing_template_keys = required_template_keys - set(self.template)
+        if missing_template_keys:
+            raise ValueError(
+                "template is missing keys: {}".format(
+                    sorted(missing_template_keys)
+                )
+            )
         self.modes_key = nonempty_string(modes_key, "modes_key")
         self.target_key = nonempty_string(target_key, "target_key")
         self.scale_key = nonempty_string(scale_key, "scale_key")
@@ -330,7 +342,7 @@ class FourierResponseData(Dataset):
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError("dtype must be a floating-point torch dtype")
         self.density = torch.as_tensor(density, dtype=dtype)
-        self.modes = torch.as_tensor(modes, dtype=torch.long)
+        self.modes = integer_mode_tensor(modes)
         self.curvature = torch.as_tensor(curvature, dtype=dtype)
         if self.modes.ndim == 2:
             self.modes = self.modes.unsqueeze(1)
@@ -346,6 +358,16 @@ class FourierResponseData(Dataset):
             raise ValueError("modes must have shape [n_items, n_modes, 3]")
         if self.modes.shape[-1] != 3:
             raise ValueError("modes must contain three integer components")
+        self.modes = torch.stack(
+            [
+                canonical_mode_triplets(
+                    item_modes,
+                    self.template["grid_size"],
+                    self.template["grid_spacing"],
+                )
+                for item_modes in self.modes
+            ]
+        )
         expected = (n_items, self.modes.shape[1])
         if self.curvature.ndim != 3 or self.curvature.shape[:2] != expected:
             raise ValueError(
