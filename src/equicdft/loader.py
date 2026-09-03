@@ -1,11 +1,23 @@
 """Split complete density fields and construct PyTorch data loaders."""
 
-from typing import Dict, Iterator, Optional, Sequence, Tuple, Union
+import weakref
+
+from typing import (
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, default_collate
 
 from ._argument_checks import (
+    boolean,
     finite_scalar,
     nonnegative_integer,
     positive_integer,
@@ -13,6 +25,18 @@ from ._argument_checks import (
 
 
 LoaderResult = Dict[str, Union[DataLoader, float, None]]
+
+
+class _GridGeometryBatch(dict):
+    """Batched fields with identity-proven reusable geometry tensors."""
+
+    def __init__(
+        self,
+        values: Mapping[str, torch.Tensor],
+        shared_geometry: Mapping[str, torch.Tensor],
+    ) -> None:
+        super().__init__(values)
+        self._shared_geometry = dict(shared_geometry)
 
 
 def make_dataloaders(
@@ -25,6 +49,7 @@ def make_dataloaders(
     compute_mean_density: bool = False,
     compute_mean_temperature: bool = False,
     num_workers: int = 0,
+    reuse_grid_geometry: bool = False,
 ) -> LoaderResult:
     """Build train, validation, and optional test loaders.
 
@@ -58,6 +83,10 @@ def make_dataloaders(
         frames to the returned loaders. Test frames are always excluded.
     num_workers
         Number of worker processes used by each data loader.
+    reuse_grid_geometry
+        If true, reuse an identity-shared ``local_density_index`` tensor
+        across batches instead of copying it for every field. This opt-in
+        path currently requires ``num_workers=0``.
 
     Returns
     -------
@@ -69,8 +98,11 @@ def make_dataloaders(
 
     Notes
     -----
-    PyTorch's default collation is used. Fields within each dataset must
-    therefore have matching tensor shapes and dictionary keys.
+    PyTorch's default collation is used unless ``reuse_grid_geometry=True``.
+    The optimized collator changes only an identity-shared
+    ``local_density_index``; all other values retain default collation.
+    Fields within each dataset must therefore have matching tensor shapes and
+    dictionary keys.
     """
 
     if (valid_dataset is None) == (valid_fraction is None):
@@ -79,6 +111,14 @@ def make_dataloaders(
         )
     batch_size = positive_integer(batch_size, "batch_size")
     num_workers = nonnegative_integer(num_workers, "num_workers")
+    reuse_grid_geometry = boolean(
+        reuse_grid_geometry,
+        "reuse_grid_geometry",
+    )
+    if reuse_grid_geometry and num_workers != 0:
+        raise ValueError(
+            "reuse_grid_geometry currently requires num_workers=0"
+        )
     _require_nonempty(train_dataset, "train_dataset")
 
     statistics_datasets = [train_dataset]
@@ -100,6 +140,8 @@ def make_dataloaders(
     # Keep splitting and epoch shuffling reproducible but independent: drawing
     # a split must not advance the training sampler's random-number stream.
     shuffle_generator = torch.Generator().manual_seed(int(seed))
+    train_collate = _grid_collator(train_data) if reuse_grid_geometry else None
+    valid_collate = _grid_collator(valid_data) if reuse_grid_geometry else None
     train_loader = DataLoader(
         train_data,
         batch_size=batch_size,
@@ -107,6 +149,7 @@ def make_dataloaders(
         drop_last=False,
         num_workers=num_workers,
         generator=shuffle_generator,
+        collate_fn=train_collate,
     )
     valid_loader = DataLoader(
         valid_data,
@@ -114,15 +157,20 @@ def make_dataloaders(
         shuffle=False,
         drop_last=False,
         num_workers=num_workers,
+        collate_fn=valid_collate,
     )
     test_loader = None
     if test_dataset is not None:
+        test_collate = (
+            _grid_collator(test_dataset) if reuse_grid_geometry else None
+        )
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=num_workers,
+            collate_fn=test_collate,
         )
 
     result: LoaderResult = {
@@ -135,6 +183,92 @@ def make_dataloaders(
     if compute_mean_temperature:
         result["mean_temperature"] = _mean_temperature(statistics_datasets)
     return result
+
+
+def _grid_collator(
+    dataset: Dataset,
+) -> Callable[[Sequence[Mapping[str, torch.Tensor]]], dict]:
+    """Return a collator that reuses repeated neighborhood-table objects."""
+
+    shared_indices = _repeated_tensor_objects(
+        dataset,
+        "local_density_index",
+    )
+
+    def collate(frames: Sequence[Mapping[str, torch.Tensor]]) -> dict:
+        source = _common_shared_tensor(
+            frames,
+            "local_density_index",
+            shared_indices,
+        )
+        if source is None:
+            return default_collate(frames)
+
+        values = default_collate(
+            [
+                {
+                    key: value
+                    for key, value in frame.items()
+                    if key != "local_density_index"
+                }
+                for frame in frames
+            ]
+        )
+        values["local_density_index"] = source.unsqueeze(0).expand(
+            len(frames),
+            -1,
+            -1,
+        )
+        return _GridGeometryBatch(
+            values,
+            {"local_density_index": source},
+        )
+
+    return collate
+
+
+def _repeated_tensor_objects(
+    dataset: Dataset,
+    key: str,
+) -> Dict[int, torch.Tensor]:
+    """Return tensor objects used by more than one frame under ``key``."""
+
+    tensors = weakref.WeakValueDictionary()
+    counts: Dict[int, int] = {}
+    for frame_index in range(len(dataset)):
+        value = dataset[frame_index].get(key)
+        if not torch.is_tensor(value):
+            continue
+        identity = id(value)
+        known = tensors.get(identity)
+        if known is not None and known is not value:
+            raise RuntimeError("tensor object identity changed during scan")
+        tensors[identity] = value
+        counts[identity] = counts.get(identity, 0) + 1 if known is value else 1
+    return {
+        identity: tensor
+        for identity in counts
+        if counts[identity] > 1
+        and (tensor := tensors.get(identity)) is not None
+    }
+
+
+def _common_shared_tensor(
+    frames: Sequence[Mapping[str, torch.Tensor]],
+    key: str,
+    shared_tensors: Mapping[int, torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return one repeated tensor object shared by all selected frames."""
+
+    if not frames or key not in frames[0]:
+        return None
+    source = frames[0][key]
+    known = shared_tensors.get(id(source))
+    if known is not source:
+        return None
+    if any(frame.get(key) is not source for frame in frames[1:]):
+        return None
+    return source
 
 
 def _random_split(

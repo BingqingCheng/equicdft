@@ -1,5 +1,6 @@
 """Training orchestration for grid density-functional models."""
 
+from collections import OrderedDict
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,9 @@ from ._trainer_io import (
     write_history_csv,
 )
 from .loss import Loss
+
+
+_MAX_CACHED_GRID_GEOMETRIES = 2
 
 
 @dataclass
@@ -203,6 +207,7 @@ class Trainer(nn.Module):
         self.stream_metrics = nn.ModuleDict()
         self._streams = ()
         self._stream_loader_generators = {}
+        self._grid_geometry_device_cache = OrderedDict()
         self.to(self.device)
 
     def fit(
@@ -1088,12 +1093,35 @@ class Trainer(nn.Module):
         self,
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Move every tensor value in a grid-data dictionary to the device."""
+        """Move batch tensors while reusing identity-shared grid geometry."""
 
-        return {
-            key: value.to(self.device) if torch.is_tensor(value) else value
-            for key, value in batch.items()
-        }
+        shared_geometry = getattr(batch, "_shared_geometry", {})
+        moved = {}
+        for key, value in batch.items():
+            source = shared_geometry.get(key)
+            if source is None:
+                moved[key] = (
+                    value.to(self.device) if torch.is_tensor(value) else value
+                )
+                continue
+
+            identity = id(source)
+            cached = self._grid_geometry_device_cache.pop(identity, None)
+            if (
+                cached is None
+                or cached[0] is not source
+                or cached[1] != source._version
+            ):
+                cached = None
+                while (
+                    len(self._grid_geometry_device_cache)
+                    >= _MAX_CACHED_GRID_GEOMETRIES
+                ):
+                    self._grid_geometry_device_cache.popitem(last=False)
+                cached = (source, source._version, source.to(self.device))
+            self._grid_geometry_device_cache[identity] = cached
+            moved[key] = cached[2].unsqueeze(0).expand(value.shape)
+        return moved
 
     def _has_uninitialized_parameters(self) -> bool:
         """Return whether model or loss contains lazy parameters."""

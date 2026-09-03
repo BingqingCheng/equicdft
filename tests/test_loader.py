@@ -22,6 +22,66 @@ def _dataset(values, n_grid=4, temperatures=None):
 
 
 class TestMakeDataloaders(unittest.TestCase):
+    def test_opt_in_reuses_identity_shared_neighborhood_table(self):
+        geometry = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        train_dataset = _dataset([1.0, 2.0], n_grid=2)
+        valid_dataset = _dataset([3.0, 4.0], n_grid=2)
+        for frame in train_dataset + valid_dataset:
+            frame["local_density_index"] = geometry
+
+        loaders = make_dataloaders(
+            train_dataset,
+            valid_dataset=valid_dataset,
+            batch_size=2,
+            reuse_grid_geometry=True,
+        )
+        batch = next(iter(loaders["valid"]))
+
+        self.assertEqual(batch["rho"].shape, (2, 2, 1))
+        self.assertEqual(batch["local_density_index"].shape, (2, 2, 2))
+        self.assertEqual(batch["local_density_index"].stride(0), 0)
+        self.assertEqual(
+            batch["local_density_index"].data_ptr(),
+            geometry.data_ptr(),
+        )
+        self.assertIs(batch._shared_geometry["local_density_index"], geometry)
+
+    def test_opt_in_falls_back_for_nonshared_neighborhood_tables(self):
+        dataset = _dataset([1.0, 2.0], n_grid=2)
+        for frame in dataset:
+            frame["local_density_index"] = torch.tensor(
+                [[0, 1], [1, 0]],
+                dtype=torch.long,
+            )
+
+        loaders = make_dataloaders(
+            dataset,
+            valid_dataset=dataset,
+            batch_size=2,
+            reuse_grid_geometry=True,
+        )
+        batch = next(iter(loaders["valid"]))
+
+        self.assertEqual(batch["local_density_index"].shape, (2, 2, 2))
+        self.assertFalse(hasattr(batch, "_shared_geometry"))
+
+    def test_grid_geometry_reuse_requires_single_process_loading(self):
+        dataset = _dataset([1.0, 2.0])
+
+        with self.assertRaisesRegex(ValueError, "num_workers=0"):
+            make_dataloaders(
+                dataset,
+                valid_fraction=0.5,
+                num_workers=1,
+                reuse_grid_geometry=True,
+            )
+        with self.assertRaisesRegex(TypeError, "reuse_grid_geometry"):
+            make_dataloaders(
+                dataset,
+                valid_fraction=0.5,
+                reuse_grid_geometry=1,
+            )
+
     def test_fractional_split_is_deterministic_disjoint_and_complete(self):
         dataset = _dataset(range(10))
         loaders_a = make_dataloaders(

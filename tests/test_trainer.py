@@ -18,6 +18,7 @@ from equicdft import (
     TensorLoss,
     Trainer,
     TrainingStream,
+    make_dataloaders,
 )
 from equicdft._grid import voxel_volume
 
@@ -90,6 +91,66 @@ def _functional_dataset(n_fields=2):
 
 
 class TestTrainer(unittest.TestCase):
+    def test_shared_grid_geometry_device_copy_is_cached_but_not_serialized(self):
+        geometry = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        dataset = _dataset([1, 2])
+        for frame in dataset:
+            frame["local_density_index"] = geometry
+        loader = make_dataloaders(
+            dataset,
+            valid_dataset=dataset,
+            batch_size=1,
+            reuse_grid_geometry=True,
+        )["valid"]
+        trainer = self._make_trainer()
+
+        batches = list(loader)
+        first = trainer._move_batch(batches[0])
+        second = trainer._move_batch(batches[1])
+
+        self.assertEqual(len(trainer._grid_geometry_device_cache), 1)
+        self.assertEqual(
+            first["local_density_index"].data_ptr(),
+            second["local_density_index"].data_ptr(),
+        )
+        self.assertFalse(
+            any("geometry" in key for key in trainer.state_dict())
+        )
+
+        cached_version = next(
+            iter(trainer._grid_geometry_device_cache.values())
+        )[1]
+        geometry.add_(1)
+        trainer._move_batch(batches[0])
+        refreshed_version = next(
+            iter(trainer._grid_geometry_device_cache.values())
+        )[1]
+        self.assertEqual(refreshed_version, cached_version + 1)
+
+    def test_shared_grid_geometry_device_cache_is_bounded(self):
+        trainer = self._make_trainer()
+        for offset in range(3):
+            geometry = torch.tensor(
+                [[0, 1], [1, 0]],
+                dtype=torch.long,
+            ) + offset
+            dataset = _dataset([1, 2])
+            for frame in dataset:
+                frame["local_density_index"] = geometry
+            batch = next(
+                iter(
+                    make_dataloaders(
+                        dataset,
+                        valid_dataset=dataset,
+                        batch_size=2,
+                        reuse_grid_geometry=True,
+                    )["valid"]
+                )
+            )
+            trainer._move_batch(batch)
+
+        self.assertEqual(len(trainer._grid_geometry_device_cache), 2)
+
     def _make_trainer(
         self,
         checkpoint_dir=None,

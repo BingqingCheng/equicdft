@@ -114,6 +114,35 @@ class TestCartesianAFeatures(unittest.TestCase):
             )
         )
 
+    def test_batched_expanded_neighborhood_table_preserves_gradients(self):
+        module = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=0,
+            max_power=0,
+        )
+        shared = torch.zeros((1, 1, 1), dtype=torch.long).expand(2, -1, -1)
+        repeated = shared.clone()
+        rho_shared = torch.tensor([[[0.5]], [[1.5]]], requires_grad=True)
+        rho_repeated = rho_shared.detach().clone().requires_grad_(True)
+
+        shared_features = module(
+            {"rho": rho_shared, "local_density_index": shared}
+        )
+        repeated_features = module(
+            {"rho": rho_repeated, "local_density_index": repeated}
+        )
+        shared_gradient = torch.autograd.grad(
+            shared_features.square().sum(),
+            rho_shared,
+        )[0]
+        repeated_gradient = torch.autograd.grad(
+            repeated_features.square().sum(),
+            rho_repeated,
+        )[0]
+
+        self.assertTrue(torch.equal(shared_features, repeated_features))
+        self.assertTrue(torch.equal(shared_gradient, repeated_gradient))
+
     def test_damping_and_raw_integer_monomials(self):
         module = CartesianAFeatures(
             mean_density=2.0,
