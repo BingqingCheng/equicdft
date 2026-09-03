@@ -1,8 +1,4 @@
-"""Cartesian moment features for density fields on fixed integer grids.
-
-The angular basis uses integer stencil coordinates. Optional Gaussian factors
-damp distant stencil points and provide one feature channel per exponent.
-"""
+"""Cartesian moment features for density fields on fixed integer grids."""
 
 from typing import Mapping, Optional, Sequence, Union
 
@@ -16,6 +12,12 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._grid import gather_neighbors
+from ._radial import (
+    _RadialTransform,
+    bessel_radial_values,
+    gaussian_radial_values,
+    whiten_radial_cartesian_basis,
+)
 from .stencil import make_stencil
 
 
@@ -31,19 +33,11 @@ def _cartesian_stencil_basis(
 ) -> torch.Tensor:
     """Return normalized radial-Cartesian values with shape ``[J, N, K]``."""
 
-    distances = torch.sqrt(squared_distances)
-    centered_squared_distances = (
-        squared_distances[:, None]
-        - 2.0 * distances[:, None] * radial_centers[None, :]
-        + radial_centers[None, :].square()
-    ).clamp_min(0.0)
-    radial_values = torch.exp(
-        -centered_squared_distances * radial_exponents[None, :]
-    )
-    radial_values = radial_values * neighbor_mask[:, None]
-    radial_values = radial_values / torch.clamp(
-        torch.sum(radial_values, dim=0, keepdim=True),
-        min=torch.finfo(radial_values.dtype).tiny,
+    radial_values = gaussian_radial_values(
+        squared_distances,
+        radial_exponents,
+        radial_centers,
+        neighbor_mask,
     )
     return radial_values[:, :, None] * monomial_values[:, None, :]
 
@@ -163,9 +157,17 @@ class CartesianAFeatures(nn.Module):
 
     With ``radial_basis="none"``, the module uses the same expression with one
     fixed exponent ``alpha[0]=0``, exactly recovering the uniform normalized
-    polynomial moment. When ``separate_center=True``, the central point is
-    excluded from every normalized channel and supplied directly to the local
-    readout by the model.
+    polynomial moment. With ``radial_basis="bessel"``, primitive ``n`` is
+
+    ``sqrt(2/R_c) * sin(n*pi*r/R_c) / r``, ``n=1,...,N``,
+
+    inside the cutoff, with its finite limit at ``r=0`` and exact zero at the
+    boundary. The primitive radial-Cartesian products are discretely whitened
+    separately for each total Cartesian degree on the actual integer stencil.
+    An explicitly requested radial transform then mixes primitive channels
+    before invariant products are formed. When ``separate_center=True``, the
+    central point is excluded from every neighbor channel and supplied
+    directly to the local readout by the model.
     Grid-volume quadrature is deliberately left to the free-energy readout
     rather than included in these local descriptors.
 
@@ -178,17 +180,24 @@ class CartesianAFeatures(nn.Module):
         Maximum total Cartesian power ``a + b + c``.
     radial_basis
         ``"none"`` selects uniform normalized weights. ``"gaussian"``
-        selects normalized exponential damping channels.
+        selects normalized exponential damping channels. ``"bessel"``
+        selects fixed spherical-Bessel-like functions conditioned on the
+        exact discrete Cartesian stencil.
     radial_exponents
         Optional nonempty sequence of nonnegative damping coefficients
         ``alpha_n`` in inverse squared grid units. Its length determines the
         number of channels. For ``radial_basis="gaussian"``, ``None`` uses
         one channel with ``alpha=0.125``. It is unavailable for
-        ``radial_basis="none"``, which always uses one fixed zero exponent.
+        ``radial_basis="none"``, which always uses one fixed zero exponent,
+        and for ``radial_basis="bessel"``.
     n_radial_channels
-        Compatibility argument for the retained example script. Only ``1``
-        with ``radial_basis="none"`` is accepted; Gaussian channel count is
-        determined by ``radial_exponents``.
+        Optional number of channels after a learned bias-free radial
+        transform. For Gaussian and Bessel bases, explicitly supplying this
+        argument enables one transform matrix per total Cartesian degree;
+        omitting it retains all primitive functions without a transform. The
+        output count cannot exceed the primitive count. With
+        ``radial_basis="none"``, only the retained value ``1`` is accepted
+        and no transform is applied.
     trainable_radial_exponents
         If ``True``, optimize positive ``radial_exponents`` in logarithmic
         form. Zero exponents are allowed only when the list is fixed.
@@ -196,9 +205,10 @@ class CartesianAFeatures(nn.Module):
         Optional Gaussian centers ``u_n`` in grid units. Its length must
         match ``radial_exponents``. ``None`` uses zero for every channel,
         exactly retaining the original zero-centered Gaussian basis. It is
-        unavailable for ``radial_basis="none"``. A center ``u`` corresponds
-        to physical radius ``u * grid_spacing``; ``coordinate_scaling`` does
-        not alter this radial convention.
+        unavailable for ``radial_basis="none"`` and
+        ``radial_basis="bessel"``. A center ``u`` corresponds to physical
+        radius ``u * grid_spacing``; ``coordinate_scaling`` does not alter
+        this radial convention.
     trainable_radial_centers
         If ``True``, optimize the Gaussian centers directly. The default is
         ``False``. Initial centers must be nonnegative, but their optimized
@@ -208,7 +218,9 @@ class CartesianAFeatures(nn.Module):
         uses the raw integer stencil offsets. ``"cutoff"`` divides each
         coordinate by ``cutoff_grid``, keeping polynomial moments similarly
         scaled when comparing different cutoffs. The damping distance remains
-        in raw squared grid units.
+        in raw squared grid units. For the Bessel basis, degreewise whitening
+        cancels this uniform scale factor up to numerical roundoff; the option
+        is retained there only for a common Cartesian-feature interface.
     separate_center
         If ``True``, remove the zero offset from all neighbor moments. The
         model then concatenates the normalized central density to the
@@ -234,6 +246,10 @@ class CartesianAFeatures(nn.Module):
         ``True``, retaining the existing learned ``n_channels`` behavior.
         Set it to ``False`` with explicit ``density_transform`` weights for a
         fixed physical basis such as number and charge densities.
+    n_radial_functions
+        Number of primitive Bessel functions. This is required with
+        ``radial_basis="bessel"`` and unavailable for other radial bases.
+        Frequencies are the fixed integer sequence ``n*pi/cutoff_grid``.
     mean_density
         Positive scalar used for scale-only density normalization. For fitting,
         set this to the precomputed mean density of the training split. It is
@@ -270,24 +286,43 @@ class CartesianAFeatures(nn.Module):
             Union[Sequence[Sequence[float]], torch.Tensor]
         ] = None,
         trainable_density_transform: bool = True,
+        n_radial_functions: Optional[int] = None,
     ) -> None:
         super().__init__()
 
         if not isinstance(radial_basis, str):
-            raise TypeError("radial_basis must be 'gaussian' or 'none'")
+            raise TypeError(
+                "radial_basis must be 'bessel', 'gaussian', or 'none'"
+            )
         radial_basis = radial_basis.lower()
-        if radial_basis not in ("gaussian", "none"):
-            raise ValueError("radial_basis must be 'gaussian' or 'none'")
+        if radial_basis not in ("bessel", "gaussian", "none"):
+            raise ValueError(
+                "radial_basis must be 'bessel', 'gaussian', or 'none'"
+            )
         if n_radial_channels is not None:
             n_radial_channels = positive_integer(
                 n_radial_channels,
                 "n_radial_channels",
             )
-            if radial_basis != "none" or n_radial_channels != 1:
+            if radial_basis == "none" and n_radial_channels != 1:
                 raise ValueError(
-                    "n_radial_channels is retained only as 1 with "
+                    "n_radial_channels must be 1 with "
                     "radial_basis='none'"
                 )
+        n_radial_functions = optional_positive_integer(
+            n_radial_functions,
+            "n_radial_functions",
+        )
+        if radial_basis == "bessel":
+            if n_radial_functions is None:
+                raise ValueError(
+                    "n_radial_functions is required with "
+                    "radial_basis='bessel'"
+                )
+        elif n_radial_functions is not None:
+            raise ValueError(
+                "n_radial_functions requires radial_basis='bessel'"
+            )
         trainable_radial_exponents = boolean(
             trainable_radial_exponents,
             "trainable_radial_exponents",
@@ -296,10 +331,26 @@ class CartesianAFeatures(nn.Module):
             trainable_radial_centers,
             "trainable_radial_centers",
         )
-        if radial_basis == "none" and trainable_radial_centers:
+        if radial_basis != "gaussian" and trainable_radial_centers:
             raise ValueError(
                 "trainable_radial_centers requires radial_basis='gaussian'"
             )
+        if radial_basis == "bessel":
+            if radial_exponents is not None:
+                raise ValueError(
+                    "radial_exponents are unavailable with "
+                    "radial_basis='bessel'"
+                )
+            if trainable_radial_exponents:
+                raise ValueError(
+                    "trainable_radial_exponents requires "
+                    "radial_basis='gaussian'"
+                )
+            if radial_centers is not None:
+                raise ValueError(
+                    "radial_centers are unavailable with "
+                    "radial_basis='bessel'"
+                )
         if not isinstance(coordinate_scaling, str):
             raise TypeError("coordinate_scaling must be 'none' or 'cutoff'")
         coordinate_scaling = coordinate_scaling.lower()
@@ -383,44 +434,83 @@ class CartesianAFeatures(nn.Module):
                 :, axis, None
             ].pow(powers[None, :, axis])
 
-        # Each factor exp(-alpha_n * (|q| - u_n)**2) changes only the relative
-        # emphasis of stencil points. Unit-sum normalization keeps every scalar
-        # moment on the same scale as the undamped neighborhood average.
-        # Trainable positive exponents are stored logarithmically; centers are
-        # fixed architecture parameters.
         center_mask = squared_distances == 0
         neighbor_mask = ~center_mask if separate_center else torch.ones_like(
             center_mask
         )
-        initial_radial_exponents = prepare_radial_exponents(
-            radial_basis,
-            radial_exponents,
-            trainable_radial_exponents,
-        )
-        initial_radial_centers = prepare_radial_centers(
-            radial_basis,
-            radial_centers,
-            int(initial_radial_exponents.numel()),
-        )
 
-        if radial_basis == "gaussian" and trainable_radial_exponents:
-            self.log_radial_exponents = nn.Parameter(
-                torch.log(initial_radial_exponents)
+        if radial_basis == "bessel":
+            radial_function_count = int(n_radial_functions)
+            bessel_values = bessel_radial_values(
+                squared_distances,
+                radial_function_count,
+                int(cutoff_grid),
+                neighbor_mask,
+            )
+            bessel_support = neighbor_mask & (
+                squared_distances < float(cutoff_grid) ** 2
+            )
+            bessel_basis, bessel_gram_eigenvalues = (
+                whiten_radial_cartesian_basis(
+                    bessel_values,
+                    monomial_values,
+                    powers,
+                    bessel_support,
+                )
             )
         else:
-            self.register_buffer(
-                "fixed_radial_exponents",
-                initial_radial_exponents,
+            # Preserve the established unit-sum Gaussian/none construction.
+            initial_radial_exponents = prepare_radial_exponents(
+                radial_basis,
+                radial_exponents,
+                trainable_radial_exponents,
             )
-        if radial_basis == "gaussian" and trainable_radial_centers:
-            self.learned_radial_centers = nn.Parameter(
-                initial_radial_centers
+            initial_radial_centers = prepare_radial_centers(
+                radial_basis,
+                radial_centers,
+                int(initial_radial_exponents.numel()),
             )
-        elif radial_basis == "gaussian":
+
+            if radial_basis == "gaussian" and trainable_radial_exponents:
+                self.log_radial_exponents = nn.Parameter(
+                    torch.log(initial_radial_exponents)
+                )
+            else:
+                self.register_buffer(
+                    "fixed_radial_exponents",
+                    initial_radial_exponents,
+                )
+            if radial_basis == "gaussian" and trainable_radial_centers:
+                self.learned_radial_centers = nn.Parameter(
+                    initial_radial_centers
+                )
+            elif radial_basis == "gaussian":
+                self.register_buffer(
+                    "fixed_radial_centers",
+                    initial_radial_centers,
+                    persistent=False,
+                )
+            radial_function_count = int(initial_radial_exponents.numel())
+
+        if radial_basis == "none" or n_radial_channels is None:
+            radial_channel_count = radial_function_count
+            radial_transform = None
+        else:
+            radial_transform = _RadialTransform(
+                max_power=int(max_power),
+                n_radial_functions=radial_function_count,
+                n_radial_channels=n_radial_channels,
+            )
+            radial_channel_count = n_radial_channels
+
+        if radial_basis == "bessel":
             self.register_buffer(
-                "fixed_radial_centers",
-                initial_radial_centers,
-                persistent=False,
+                "fixed_bessel_stencil_basis",
+                bessel_basis,
+            )
+            self.register_buffer(
+                "bessel_gram_eigenvalues",
+                bessel_gram_eigenvalues,
             )
         self.cutoff_grid = int(cutoff_grid)
         self.max_power = int(max_power)
@@ -432,8 +522,10 @@ class CartesianAFeatures(nn.Module):
         self.n_types = n_types
         self.n_channels = n_channels
         self.trainable_density_transform = trainable_density_transform
-        self.n_radial_channels = int(initial_radial_exponents.numel())
+        self.n_radial_functions = radial_function_count
+        self.n_radial_channels = radial_channel_count
         self.n_output_channels = n_types if n_channels is None else n_channels
+        self.radial_transform = radial_transform
         self.density_transform = (
             None
             if n_channels is None
@@ -455,12 +547,16 @@ class CartesianAFeatures(nn.Module):
 
     @property
     def radial_exponents(self) -> torch.Tensor:
-        """Damping coefficients for all radial channels.
+        """Gaussian damping coefficients for all primitive channels.
 
         The zero fallback keeps the retained undamped regression example
         loadable; its checkpoint predates explicit radial-basis attributes.
         """
 
+        if getattr(self, "radial_basis", "none") == "bessel":
+            raise RuntimeError(
+                "radial_exponents are unavailable for the Bessel basis"
+            )
         if getattr(self, "trainable_radial_exponents", False):
             return torch.exp(self.log_radial_exponents)
         stored = self._buffers.get("fixed_radial_exponents")
@@ -474,6 +570,10 @@ class CartesianAFeatures(nn.Module):
     def radial_centers(self) -> torch.Tensor:
         """Gaussian centers, with a zero fallback for older checkpoints."""
 
+        if getattr(self, "radial_basis", "none") == "bessel":
+            raise RuntimeError(
+                "radial_centers are unavailable for the Bessel basis"
+            )
         if getattr(self, "trainable_radial_centers", False):
             return self.learned_radial_centers
         stored = self._buffers.get("fixed_radial_centers")
@@ -488,27 +588,58 @@ class CartesianAFeatures(nn.Module):
     ) -> torch.Tensor:
         """Return a radial-Cartesian basis with shape ``[J, N, K]``.
 
-        ``J`` is the number of stencil points, ``N`` the number of radial
-        channels, and ``K`` the number of Cartesian monomials. By default the
-        module's own exponents are used. Message layers may supply independent
-        exponents while reusing this fixed stencil geometry.
+        ``J`` is the number of stencil points, ``N`` the number of output
+        radial channels, and ``K`` the number of Cartesian monomials. With no
+        arguments, this returns the configured basis including any learned
+        pre-invariant radial transform. Message layers may supply independent
+        Gaussian exponents while reusing the fixed stencil geometry; such an
+        explicit override bypasses the initial basis and transform.
         """
 
-        if radial_exponents is None:
+        if radial_centers is not None and radial_exponents is None:
+            if getattr(self, "radial_basis", "none") == "bessel":
+                raise ValueError(
+                    "radial_centers require explicit Gaussian "
+                    "radial_exponents"
+                )
             radial_exponents = self.radial_exponents
-        if radial_centers is None:
-            radial_centers = self.radial_centers
-        if radial_centers.shape != radial_exponents.shape:
-            raise ValueError(
-                "radial_centers shape must match radial_exponents shape"
+        independent_gaussian = radial_exponents is not None
+        if independent_gaussian:
+            if radial_centers is None:
+                if getattr(self, "radial_basis", "none") == "bessel":
+                    radial_centers = torch.zeros_like(radial_exponents)
+                else:
+                    radial_centers = self.radial_centers
+            if radial_centers.shape != radial_exponents.shape:
+                raise ValueError(
+                    "radial_centers shape must match radial_exponents shape"
+                )
+            return _cartesian_stencil_basis(
+                self.squared_distances,
+                self.monomial_values,
+                radial_exponents,
+                radial_centers,
+                self.stencil_neighbor_mask(),
             )
-        return _cartesian_stencil_basis(
-            self.squared_distances,
-            self.monomial_values,
-            radial_exponents,
-            radial_centers,
-            self.stencil_neighbor_mask(),
-        )
+
+        if getattr(self, "radial_basis", "none") == "bessel":
+            basis = self.fixed_bessel_stencil_basis
+        else:
+            basis = _cartesian_stencil_basis(
+                self.squared_distances,
+                self.monomial_values,
+                self.radial_exponents,
+                self.radial_centers,
+                self.stencil_neighbor_mask(),
+            )
+
+        # Older whole-model objects have no radial_transform entry. The
+        # established Gaussian/none basis therefore remains directly loadable
+        # without a model migration or external fallback loader.
+        radial_transform = self._modules.get("radial_transform")
+        if radial_transform is not None:
+            basis = radial_transform(basis, self.powers)
+        return basis
 
     def stencil_neighbor_mask(self) -> torch.Tensor:
         """Return the center-inclusion mask, including legacy fallback."""

@@ -123,6 +123,49 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
+### Optional conditioned radial basis
+
+`CartesianAFeatures` can use fixed spherical-Bessel-like primitives followed
+by an optional learned transform before the invariant products are formed:
+
+```python
+a_features = CartesianAFeatures(
+    mean_density=loaders["mean_density"],
+    cutoff_grid=6,
+    max_power=3,
+    radial_basis="bessel",
+    n_radial_functions=6,  # primitive functions N
+    n_radial_channels=4,   # learned output channels M <= N
+    separate_center=True,
+    n_types=n_types,
+)
+```
+
+For integer-grid radius $r$ and cutoff $R_c$ equal to `cutoff_grid`, primitive
+$n$ is $\sqrt{2/R_c}\sin(n\pi r/R_c)/r$ for $r<R_c$, using its finite
+analytic limit at $r=0$ and exact zero at and beyond the cutoff. Its physical
+radial wave number is $n\pi/(R_c\Delta)$ for grid spacing $\Delta$. The
+primitive radial-Cartesian products are whitened on the exact discrete stencil
+separately for every total Cartesian degree. Numerically rank-deficient
+choices are rejected.
+
+Because whitening is performed separately at each total Cartesian degree,
+the uniform per-degree scale introduced by `coordinate_scaling="cutoff"`
+cancels for this Bessel construction up to roundoff. The option remains
+meaningful for unconditioned radial bases.
+
+Explicitly supplying `n_radial_channels=M` for a Gaussian or Bessel basis
+enables a bias-free learned map from $N$ primitive functions to $M\leq N$
+channels. One matrix is used per total Cartesian degree and shared across all
+density channels and all monomials of that degree. It is initialized as a
+rectangular identity. Omitting `n_radial_channels` retains all primitives
+without a transform; the established `radial_basis="none"` configuration
+continues to accept only its compatibility value `n_radial_channels=1`.
+
+A message-passing layer without its own radial parameters shares this
+transformed basis. A layer with explicit `radial_exponents` continues to use
+an independent Gaussian basis and bypasses the initial transform.
+
 ## Data format
 
 `GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
@@ -310,7 +353,8 @@ reciprocal kernels with nonperiodic boundary conditions.
 ## Package map
 
 - `data.py`, `stencil.py`: complete fields and periodic neighborhoods
-- `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
+- `_radial.py`, `features.py`, `symmetrize.py`: radial bases and conditioning,
+  Cartesian moments, and cubic invariants
 - `readout.py`, `semilocal.py`: local and state-dependent contributions
 - `pairwise.py`: finite-range distance-dependent pair contribution
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives

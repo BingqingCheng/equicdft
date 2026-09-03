@@ -436,6 +436,25 @@ class TestCartesianAFeatures(unittest.TestCase):
         )
         self.assertFalse(module.radial_centers.requires_grad)
 
+    def test_explicit_exponents_reuse_configured_centers(self):
+        module = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.5, 1.0),
+            radial_centers=(0.25, 1.25),
+        )
+        override = torch.tensor((0.2, 0.8))
+
+        implicit_centers = module.stencil_basis(override)
+        explicit_centers = module.stencil_basis(
+            override,
+            module.radial_centers,
+        )
+
+        self.assertTrue(torch.equal(implicit_centers, explicit_centers))
+
     def test_radial_center_options_are_validated(self):
         common = dict(
             max_power=0,
@@ -730,6 +749,215 @@ class TestCartesianAFeatures(unittest.TestCase):
                 radial_basis="gaussian",
                 radial_exponents=(float("nan"),),
             )
+
+
+class TestCartesianAFeatureBesselBasis(unittest.TestCase):
+    def test_new_options_do_not_change_legacy_state_keys(self):
+        expected = {
+            "fixed_radial_exponents",
+            "local_density_positions",
+            "squared_distances",
+            "powers",
+            "monomial_values",
+            "mean_density",
+        }
+        undamped = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            radial_basis="none",
+            n_radial_channels=1,
+        )
+        gaussian = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+        )
+
+        self.assertEqual(set(undamped.state_dict()), expected)
+        self.assertEqual(set(gaussian.state_dict()), expected)
+
+    def test_bessel_transform_shapes_and_identity_initialization(self):
+        untransformed = CartesianAFeatures(
+            max_power=3,
+            mean_density=0.2,
+            cutoff_grid=6,
+            radial_basis="bessel",
+            n_radial_functions=6,
+            n_types=2,
+        )
+        transformed = CartesianAFeatures(
+            max_power=3,
+            mean_density=0.2,
+            cutoff_grid=6,
+            radial_basis="bessel",
+            n_radial_functions=6,
+            n_radial_channels=4,
+            n_types=2,
+        )
+
+        self.assertEqual(untransformed.n_radial_functions, 6)
+        self.assertEqual(untransformed.n_radial_channels, 6)
+        self.assertEqual(transformed.n_radial_functions, 6)
+        self.assertEqual(transformed.n_radial_channels, 4)
+        self.assertEqual(transformed.stencil_basis().shape, (925, 4, 20))
+        self.assertTrue(
+            torch.equal(
+                transformed.stencil_basis(),
+                untransformed.stencil_basis()[:, :4],
+            )
+        )
+        self.assertEqual(
+            transformed.radial_transform.weight.numel(),
+            96,
+        )
+
+    def test_folded_transform_matches_explicit_A_transform(self):
+        module = CartesianAFeatures(
+            max_power=2,
+            mean_density=0.7,
+            cutoff_grid=3,
+            radial_basis="bessel",
+            n_radial_functions=3,
+            n_radial_channels=2,
+            separate_center=True,
+        )
+        with torch.no_grad():
+            module.radial_transform.weight.add_(
+                0.1 * torch.randn_like(module.radial_transform.weight)
+            )
+        n_grid = module.local_density_positions.shape[0]
+        local_density = torch.randn(n_grid, n_grid, 1)
+        primitive_A = torch.einsum(
+            "gjt,jnk->gnkt",
+            local_density / module.mean_density,
+            module.fixed_bessel_stencil_basis,
+        )
+        weights = module.radial_transform.weight.index_select(
+            0,
+            module.powers.sum(dim=-1),
+        )
+        explicit = torch.einsum("gnkt,knm->gmkt", primitive_A, weights)
+        folded = torch.einsum(
+            "gjt,jmk->gmkt",
+            local_density / module.mean_density,
+            module.stencil_basis(),
+        )
+
+        self.assertTrue(torch.allclose(folded, explicit, atol=1.0e-6))
+
+    def test_gaussian_can_use_the_same_pre_invariant_transform(self):
+        untransformed = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+        )
+        transformed = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5),
+            n_radial_channels=1,
+        )
+
+        self.assertEqual(transformed.n_radial_functions, 2)
+        self.assertEqual(transformed.n_radial_channels, 1)
+        self.assertTrue(
+            torch.equal(
+                transformed.stencil_basis(),
+                untransformed.stencil_basis()[:, :1],
+            )
+        )
+
+    def test_new_bessel_state_loads_strictly(self):
+        source = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=3,
+            radial_basis="bessel",
+            n_radial_functions=3,
+            n_radial_channels=2,
+        )
+        with torch.no_grad():
+            source.radial_transform.weight.add_(0.2)
+        restored = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=3,
+            radial_basis="bessel",
+            n_radial_functions=3,
+            n_radial_channels=2,
+        )
+
+        restored.load_state_dict(source.state_dict(), strict=True)
+
+        self.assertTrue(
+            torch.equal(restored.stencil_basis(), source.stencil_basis())
+        )
+        self.assertIn("fixed_bessel_stencil_basis", source.state_dict())
+        self.assertIn("bessel_gram_eigenvalues", source.state_dict())
+
+    def test_old_full_model_feature_object_needs_no_migration(self):
+        module = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.125,),
+        )
+        expected = module.stencil_basis()
+
+        del module.n_radial_functions
+        del module.radial_transform
+
+        self.assertTrue(torch.equal(module.stencil_basis(), expected))
+
+    def test_bessel_arguments_are_validated(self):
+        common = dict(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=3,
+            radial_basis="bessel",
+        )
+        with self.assertRaisesRegex(ValueError, "required"):
+            CartesianAFeatures(**common)
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                **common,
+                n_radial_functions=2,
+                radial_exponents=(0.1,),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                **common,
+                n_radial_functions=2,
+                radial_centers=(0.0, 1.0),
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                **common,
+                n_radial_functions=2,
+                trainable_radial_exponents=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            CartesianAFeatures(
+                **common,
+                n_radial_functions=2,
+                n_radial_channels=3,
+            )
+        with self.assertRaises(ValueError):
+            CartesianAFeatures(
+                max_power=0,
+                mean_density=1.0,
+                cutoff_grid=0,
+                radial_basis="bessel",
+                n_radial_functions=1,
+            )
+
+
 class TestCartesianAFeatureDensityTransform(unittest.TestCase):
     @staticmethod
     def _single_grid_data(rho):

@@ -76,6 +76,22 @@ class TestCartesianBFeatures(unittest.TestCase):
         with self.assertRaises(ValueError):
             CartesianBFeatures(max_power=2, max_product_order=4)
 
+    def test_pre_invariant_radial_mixing_creates_cross_terms(self):
+        module = CartesianBFeatures(max_power=0, max_product_order=2)
+        primitive_A = torch.tensor([[[[2.0]], [[3.0]]]])
+        mixed_A = primitive_A.sum(dim=-3, keepdim=True)
+
+        primitive_B = module(primitive_A)
+        mixed_B = module(mixed_A)
+
+        self.assertTrue(
+            torch.equal(primitive_B.flatten(), torch.tensor([2.0, 4.0, 3.0, 9.0]))
+        )
+        self.assertTrue(
+            torch.equal(mixed_B.flatten(), torch.tensor([5.0, 25.0]))
+        )
+        self.assertEqual(mixed_B.flatten()[1].item(), 4.0 + 12.0 + 9.0)
+
 
 if __name__ == "__main__":
     unittest.main()
