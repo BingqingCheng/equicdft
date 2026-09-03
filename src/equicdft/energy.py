@@ -81,29 +81,6 @@ def ideal_free_energy(
     return density_weighted_integral(rho, per_particle, voxel_volume)
 
 
-def fixed_number_ideal_free_energy(
-    rho: torch.Tensor,
-    voxel_volume: Union[float, torch.Tensor],
-) -> torch.Tensor:
-    r"""Return ideal free energy with the fixed-``N`` wavelength term omitted.
-
-    The omitted ``3 N log(Lambda)`` term cancels from fixed-particle-number
-    finite differences, including the projected Fourier response.
-    """
-
-    wavelength = torch.ones(
-        rho.shape[-1],
-        dtype=rho.dtype,
-        device=rho.device,
-    )
-    per_particle = torch.where(
-        rho > 0.0,
-        log_dimensionless_density(rho, wavelength) - 1.0,
-        torch.zeros_like(rho),
-    )
-    return density_weighted_integral(rho, per_particle, voxel_volume)
-
-
 class EnergyReadout(nn.Module):
     """Neural readout that supplies one scalar functional contribution."""
 

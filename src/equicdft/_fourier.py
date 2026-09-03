@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from ._grid import voxel_volume
-from .energy import fixed_number_ideal_free_energy as _ideal_free_energy
+from .energy import ideal_free_energy
 
 
 def integer_mode_tensor(
@@ -67,8 +67,12 @@ def projected_fourier_curvature(
     n_directions = directions.shape[1]
     perturbed_rho = torch.stack((rho_plus, rho_minus), dim=2).flatten(1, 2)
     volume_element = voxel_volume(batch["grid_spacing"].to(rho))
+    # These modes conserve each component's particle number, so the
+    # thermal-wavelength term is linear and has zero projected curvature.
+    thermal_wavelength = rho.new_ones(rho.shape[-1])
     reference_energy = (
-        _ideal_free_energy(rho, volume_element) + outputs["beta_F_exc"]
+        ideal_free_energy(rho, thermal_wavelength, volume_element)
+        + outputs["beta_F_exc"]
     )
     chunk_size = perturbations_per_forward or perturbed_rho.shape[1]
     energy_chunks = []
@@ -81,8 +85,9 @@ def projected_fourier_curvature(
         if "beta_F_exc" not in perturbed_outputs:
             raise KeyError("model outputs are missing 'beta_F_exc'")
         energy_chunks.append(
-            _ideal_free_energy(
+            ideal_free_energy(
                 chunk,
+                thermal_wavelength,
                 volume_element[:, None].expand(-1, chunk.shape[1]),
             )
             + perturbed_outputs["beta_F_exc"]

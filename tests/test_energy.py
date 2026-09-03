@@ -4,7 +4,6 @@ import torch
 
 from equicdft.energy import (
     density_weighted_integral,
-    fixed_number_ideal_free_energy,
     ideal_free_energy,
     log_dimensionless_density,
 )
@@ -129,18 +128,24 @@ class TestIdealGasThermodynamics(unittest.TestCase):
             rho.new_tensor(tiny).log().item(),
         )
 
-    def test_fixed_number_form_omits_only_the_wavelength_term(self):
+    def test_thermal_wavelength_contributes_expected_linear_term(self):
         rho = torch.tensor([[0.5, 1.0], [1.5, 2.0]], dtype=torch.float64)
         wavelength = torch.tensor([2.0, 3.0], dtype=torch.float64)
         volume = torch.tensor(0.25, dtype=torch.float64)
 
         full = ideal_free_energy(rho, wavelength, volume)
-        fixed_number = fixed_number_ideal_free_energy(rho, volume)
+        unit_wavelength = ideal_free_energy(
+            rho,
+            torch.ones_like(wavelength),
+            volume,
+        )
         expected_offset = volume * torch.sum(
             rho * (3.0 * torch.log(wavelength))[None, :]
         )
 
-        self.assertTrue(torch.allclose(full - fixed_number, expected_offset))
+        self.assertTrue(
+            torch.allclose(full - unit_wavelength, expected_offset)
+        )
 
     def test_vacuum_has_exactly_zero_ideal_free_energy(self):
         rho = torch.zeros((2, 3, 2), dtype=torch.float64)
