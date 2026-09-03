@@ -782,7 +782,9 @@ class TestFourierResponseLoss(unittest.TestCase):
         model = _CoupledQuadraticExcessModel([[0.0, 3.0], [3.0, 0.0]])
         term = FourierResponseLoss(
             directions=((1.0, 1.0), (1.0, -1.0)),
-            relative_amplitude=1.0e-4,
+            # A power-of-two amplitude avoids decimal-representation noise
+            # in this strict float64 roundoff test.
+            relative_amplitude=2.0**-13,
         )
 
         value = term(model(batch), batch, model=model)

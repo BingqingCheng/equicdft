@@ -634,7 +634,7 @@ class TestCartesianAFeatures(unittest.TestCase):
             trainable_radial_exponents=True,
             coordinate_scaling="none",
             separate_center=True,
-        )
+        ).to(dtype=torch.float64)
         n_neighbors = module.local_density_positions.shape[0]
         rho = torch.linspace(
             0.1,
