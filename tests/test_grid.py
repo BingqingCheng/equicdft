@@ -6,6 +6,7 @@ import torch
 from equicdft._grid import (
     gather_neighbors,
     grid_spacing_tensor,
+    periodic_density_convolution,
     periodic_stencil_convolution,
     require_matching_grid_spacing,
     voxel_volume,
@@ -149,6 +150,53 @@ class TestGridGeometry(unittest.TestCase):
                 torch.tensor(shape),
                 offsets,
                 backend="fft",
+            )
+
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                apply_fft,
+                (values, basis),
+                fast_mode=True,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradgradcheck(
+                apply_fft,
+                (values, basis),
+                fast_mode=True,
+            )
+        )
+
+    def test_density_fft_has_first_and_second_derivatives(self):
+        torch.manual_seed(29)
+        shape = (3, 4, 5)
+        positions = torch.tensor(
+            np.indices(shape, dtype=int).reshape(3, -1).T
+        )
+        offsets = torch.tensor(
+            [[0, 0, 0], [1, -1, 0], [-2, 1, 1], [1, -1, 0]]
+        )
+        values = torch.randn(
+            np.prod(shape),
+            2,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        basis = torch.randn(
+            len(offsets),
+            2,
+            2,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+
+        def apply_fft(current_values, current_basis):
+            return periodic_density_convolution(
+                current_values,
+                current_basis,
+                positions,
+                torch.tensor(shape),
+                offsets,
             )
 
         self.assertTrue(

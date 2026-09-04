@@ -127,6 +127,28 @@ radial terms.
 Omitting `n_radial_channels` retains all primitive functions without a
 transform. The `"none"` basis accepts only its compatibility width of one.
 
+### FFT Cartesian A construction
+
+The initial Cartesian density moments normally gather every local
+neighborhood explicitly. Complete regular periodic grids can instead apply
+the same stencil as a circular FFT cross-correlation:
+
+```python
+a_features = CartesianAFeatures(
+    mean_density=mean_density,
+    cutoff_grid=6,
+    max_power=3,
+    convolution_backend="fft",
+    # radial and density-transform arguments omitted here
+)
+```
+
+The pointwise density transform, when configured, is applied before this
+contraction. Its transformed density channels are Fourier transformed once
+and shared across all radial and Cartesian stencil channels. `"gather"`
+remains the default and legacy behavior. Selecting FFT adds no parameters or
+`state_dict` keys, but requires complete `grid_positions` and `grid_size`.
+
 ## Equivariant message passing
 
 `BChiMessage` converts invariant `B` features into a new equivariant `A`

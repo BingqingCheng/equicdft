@@ -411,8 +411,7 @@ class BChiMessage(nn.Module):
 
         ``B`` must have shape ``[..., G, N, Q, C]`` and ``stencil_basis`` must
         have shape ``[J, N, K]``. The periodic neighbor table has shape
-        ``[..., G, J]``. The ``"conv3d"`` backend additionally requires the
-        The ``"conv3d"`` and ``"fft"`` backends additionally require the
+        ``[..., G, J]``. The ``"conv3d"`` and ``"fft"`` backends require the
         complete grid coordinates, grid size, and matching stencil offsets.
         """
 

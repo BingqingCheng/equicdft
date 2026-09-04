@@ -230,6 +230,156 @@ def _periodic_extend_grid(
     return values
 
 
+def _periodic_stencil_fft(
+    grid_values: torch.Tensor,
+    stencil_basis: torch.Tensor,
+    offsets: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    *,
+    shared_values: bool,
+) -> torch.Tensor:
+    """Return a periodic stencil cross-correlation on canonical grids.
+
+    ``grid_values`` is ``[F, N, C, X, Y, Z]`` for radial-channel-paired
+    message inputs. With ``shared_values=True`` it is instead
+    ``[F, C, X, Y, Z]`` and the same density spectrum is shared by every
+    radial channel. Both paths return ``[F, N, C, K, X, Y, Z]``.
+    """
+
+    n_neighbors, n_radial, n_monomials = stencil_basis.shape
+    n_grid = math.prod(grid_shape)
+    periodic_offsets = offsets.remainder(offsets.new_tensor(grid_shape))
+    kernel_flat = _ravel_grid_indices(periodic_offsets, grid_shape)
+    periodic_basis = stencil_basis.new_zeros(
+        n_radial,
+        n_monomials,
+        n_grid,
+    ).scatter_add(
+        2,
+        kernel_flat.reshape(1, 1, n_neighbors).expand(
+            n_radial,
+            n_monomials,
+            -1,
+        ),
+        stencil_basis.permute(1, 2, 0),
+    ).reshape(n_radial, n_monomials, *grid_shape)
+    value_spectrum = torch.fft.rfftn(
+        grid_values,
+        dim=(-3, -2, -1),
+    )
+    basis_spectrum = torch.fft.rfftn(
+        periodic_basis,
+        dim=(-3, -2, -1),
+    )
+    if shared_values:
+        product = (
+            value_spectrum[:, None, :, None]
+            * basis_spectrum[None, :, None].conj()
+        )
+    else:
+        product = (
+            value_spectrum[:, :, :, None]
+            * basis_spectrum[:, None].conj()
+        )
+    return torch.fft.irfftn(
+        product,
+        s=grid_shape,
+        dim=(-3, -2, -1),
+    )
+
+
+def periodic_density_convolution(
+    values: torch.Tensor,
+    stencil_basis: torch.Tensor,
+    grid_positions: torch.Tensor,
+    grid_size: torch.Tensor,
+    stencil_positions: torch.Tensor,
+) -> torch.Tensor:
+    r"""Contract one density spectrum with every periodic stencil channel.
+
+    ``values`` has shape ``[..., G, C]`` and ``stencil_basis`` has shape
+    ``[J, N, K]``. The returned circular cross-correlation
+
+    ``output[i,n,k,c] = sum_j basis[j,n,k] values[i+s_j,c]``
+
+    has shape ``[..., G, N, K, C]``. Each input-channel Fourier transform is
+    computed once and shared over all radial channels and monomials.
+    """
+
+    if values.ndim < 2:
+        raise ValueError("values must have shape [..., G, C]")
+    if stencil_basis.ndim != 3:
+        raise ValueError("stencil_basis must have shape [J, N, K]")
+    leading_shape = values.shape[:-2]
+    n_grid, n_channels = values.shape[-2:]
+    n_neighbors, n_radial, n_monomials = stencil_basis.shape
+    offsets = _integer_tensor(
+        stencil_positions,
+        "stencil_positions",
+        values.device,
+    )
+    if offsets.ndim != 2 or offsets.shape[-1] != 3:
+        raise ValueError("stencil_positions must have shape [J, 3]")
+    if offsets.shape[0] != n_neighbors:
+        raise ValueError(
+            "stencil_positions and stencil_basis counts must match"
+        )
+    grid_shape = common_grid_size(grid_size, leading_shape)
+    if math.prod(grid_shape) != n_grid:
+        raise ValueError("grid_size product must match the values grid axis")
+
+    flat_positions, rows_are_canonical = _flat_grid_positions(
+        grid_positions,
+        grid_shape,
+        leading_shape,
+        values.device,
+    )
+    n_fields = math.prod(leading_shape) if leading_shape else 1
+    values_flat = values.reshape(n_fields, n_grid, n_channels)
+    if rows_are_canonical:
+        canonical_values = values_flat
+    else:
+        scatter_index = flat_positions[..., None].expand_as(values_flat)
+        canonical_values = torch.zeros_like(values_flat).scatter(
+            1,
+            scatter_index,
+            values_flat,
+        )
+    grid_values = canonical_values.reshape(
+        n_fields,
+        *grid_shape,
+        n_channels,
+    ).permute(0, 4, 1, 2, 3)
+    convolved = _periodic_stencil_fft(
+        grid_values,
+        stencil_basis,
+        offsets,
+        grid_shape,
+        shared_values=True,
+    )
+    canonical_output = convolved.permute(0, 4, 5, 6, 1, 3, 2).reshape(
+        n_fields,
+        n_grid,
+        n_radial,
+        n_monomials,
+        n_channels,
+    )
+    if rows_are_canonical:
+        output = canonical_output
+    else:
+        gather_index = flat_positions[..., None, None, None].expand_as(
+            canonical_output
+        )
+        output = torch.gather(canonical_output, 1, gather_index)
+    return output.reshape(
+        *leading_shape,
+        n_grid,
+        n_radial,
+        n_monomials,
+        n_channels,
+    )
+
+
 def periodic_stencil_convolution(
     values: torch.Tensor,
     stencil_basis: torch.Tensor,
@@ -343,34 +493,12 @@ def periodic_stencil_convolution(
         # row at its periodic positive offset therefore requires the complex
         # conjugate of its Fourier transform. scatter_add also preserves exact
         # duplicate offsets and aliases on grids smaller than the stencil.
-        periodic_offsets = offsets.remainder(offsets.new_tensor(grid_shape))
-        kernel_flat = _ravel_grid_indices(periodic_offsets, grid_shape)
-        periodic_basis = stencil_basis.new_zeros(
-            n_radial,
-            n_monomials,
-            n_grid,
-        ).scatter_add(
-            2,
-            kernel_flat.reshape(1, 1, n_neighbors).expand(
-                n_radial,
-                n_monomials,
-                -1,
-            ),
-            stencil_basis.permute(1, 2, 0),
-        ).reshape(n_radial, n_monomials, *grid_shape)
-        value_spectrum = torch.fft.rfftn(
+        convolved = _periodic_stencil_fft(
             grid_values,
-            dim=(-3, -2, -1),
-        )
-        basis_spectrum = torch.fft.rfftn(
-            periodic_basis,
-            dim=(-3, -2, -1),
-        )
-        convolved = torch.fft.irfftn(
-            value_spectrum[:, :, :, None]
-            * basis_spectrum[:, None].conj(),
-            s=grid_shape,
-            dim=(-3, -2, -1),
+            stencil_basis,
+            offsets,
+            grid_shape,
+            shared_values=False,
         )
 
     canonical_output = convolved.permute(0, 4, 5, 6, 1, 3, 2).reshape(

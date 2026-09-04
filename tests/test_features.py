@@ -1,13 +1,209 @@
+import io
 import math
 import unittest
+from unittest import mock
 
+import numpy as np
 import torch
 from torch import nn
 
-from equicdft import CartesianAFeatures, CartesianBFeatures
+from equicdft import (
+    BChiMessage,
+    CartesianAFeatures,
+    CartesianBFeatures,
+    GridCACEModel,
+    LocalReadout,
+)
+from equicdft.stencil import get_neighbor_indices
+
+
+def _load_whole_model(serialized):
+    """Load a test model across pre- and post-weights-only PyTorch APIs."""
+
+    try:
+        return torch.load(serialized, weights_only=False)
+    except TypeError:
+        return torch.load(serialized)
+
+
+def _periodic_data(shape, cutoff_grid, n_types=1):
+    positions = np.indices(shape, dtype=int).reshape(3, -1).T
+    neighbor_index, stencil_positions = get_neighbor_indices(
+        positions,
+        cutoff_grid=cutoff_grid,
+    )
+    return {
+        "rho": torch.rand(int(np.prod(shape)), n_types) + 0.1,
+        "grid_positions": torch.tensor(positions, dtype=torch.long),
+        "grid_size": torch.tensor(shape, dtype=torch.long),
+        "local_density_index": torch.tensor(
+            neighbor_index,
+            dtype=torch.long,
+        ),
+        "stencil_positions": torch.tensor(
+            stencil_positions,
+            dtype=torch.long,
+        ),
+        "grid_spacing": torch.ones(3),
+        "temperature": torch.tensor(1.5),
+        "beta": torch.tensor(1.0 / 1.5),
+    }
 
 
 class TestCartesianAFeatures(unittest.TestCase):
+    def test_convolution_backend_preserves_defaults_and_state_keys(self):
+        common = dict(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=1,
+            separate_center=False,
+        )
+        gather = CartesianAFeatures(**common)
+        fft = CartesianAFeatures(**common, convolution_backend="fft")
+
+        self.assertEqual(gather.convolution_backend, "gather")
+        self.assertEqual(fft.convolution_backend, "fft")
+        self.assertEqual(set(gather.state_dict()), set(fft.state_dict()))
+        fft.load_state_dict(gather.state_dict(), strict=True)
+        with self.assertRaisesRegex(ValueError, "gather.*fft"):
+            CartesianAFeatures(**common, convolution_backend="invalid")
+
+        rho = torch.arange(1.0, 8.0).reshape(7, 1)
+        data = {
+            "rho": rho,
+            "local_density_index": torch.arange(7).repeat(7, 1),
+        }
+        expected = gather(data)
+        del gather.convolution_backend
+        self.assertTrue(torch.equal(gather(data), expected))
+
+    def test_fft_matches_gather_after_trainable_density_transform(self):
+        torch.manual_seed(31)
+        shape = (3, 4, 5)
+        canonical_positions = np.indices(shape, dtype=int).reshape(3, -1).T
+        generator = np.random.default_rng(31)
+        positions = []
+        neighbor_indices = []
+        for _ in range(2):
+            field_positions = canonical_positions[
+                generator.permutation(len(canonical_positions))
+            ]
+            neighbor_index, stencil_positions = get_neighbor_indices(
+                field_positions,
+                cutoff_grid=2,
+            )
+            positions.append(field_positions)
+            neighbor_indices.append(neighbor_index)
+        common = dict(
+            mean_density=0.7,
+            cutoff_grid=2,
+            max_power=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 0.75),
+            trainable_radial_exponents=True,
+            radial_centers=(0.1, 0.8),
+            trainable_radial_centers=True,
+            separate_center=False,
+            n_types=2,
+            density_transform=((0.5, 0.5), (-0.5, 0.5), (1.0, 0.0)),
+            trainable_density_transform=True,
+        )
+        gather = CartesianAFeatures(**common).double()
+        fft = CartesianAFeatures(
+            **common,
+            convolution_backend="fft",
+        ).double()
+        fft.load_state_dict(gather.state_dict(), strict=True)
+        source_rho = torch.randn(
+            2,
+            np.prod(shape),
+            2,
+            dtype=torch.float64,
+        )
+        gather_rho = source_rho.clone().requires_grad_(True)
+        fft_rho = source_rho.clone().requires_grad_(True)
+        expected = gather(
+            {
+                "rho": gather_rho,
+                "local_density_index": torch.tensor(
+                    np.stack(neighbor_indices)
+                ),
+            }
+        )
+        rfftn = torch.fft.rfftn
+        with mock.patch(
+            "equicdft._grid.torch.fft.rfftn",
+            wraps=rfftn,
+        ) as transform:
+            actual = fft(
+                {
+                    "rho": fft_rho,
+                    "grid_positions": torch.tensor(np.stack(positions)),
+                    "grid_size": torch.tensor(shape).expand(2, -1),
+                }
+            )
+
+        density_transforms = [
+            call
+            for call in transform.call_args_list
+            if tuple(call.args[0].shape) == (2, 3, *shape)
+        ]
+        self.assertEqual(
+            len(density_transforms),
+            1,
+            "the transformed density must be Fourier transformed only once",
+        )
+        self.assertTrue(
+            torch.allclose(actual, expected, rtol=2.0e-12, atol=2.0e-12)
+        )
+        expected.square().mean().backward()
+        actual.square().mean().backward()
+        self.assertTrue(
+            torch.allclose(
+                fft_rho.grad,
+                gather_rho.grad,
+                rtol=2.0e-11,
+                atol=2.0e-12,
+            )
+        )
+        for (expected_name, expected_parameter), (
+            actual_name,
+            actual_parameter,
+        ) in zip(gather.named_parameters(), fft.named_parameters()):
+            self.assertEqual(actual_name, expected_name)
+            self.assertTrue(
+                torch.allclose(
+                    actual_parameter.grad,
+                    expected_parameter.grad,
+                    rtol=2.0e-11,
+                    atol=2.0e-12,
+                ),
+                expected_name,
+            )
+
+    def test_fft_requires_complete_grid_geometry(self):
+        module = CartesianAFeatures(
+            max_power=0,
+            mean_density=1.0,
+            cutoff_grid=0,
+            convolution_backend="fft",
+        )
+        complete = {
+            "rho": torch.ones(1, 1),
+            "grid_positions": torch.zeros(1, 3, dtype=torch.long),
+            "grid_size": torch.ones(3, dtype=torch.long),
+        }
+
+        for missing in ("grid_positions", "grid_size"):
+            with self.subTest(missing=missing):
+                data = complete.copy()
+                data.pop(missing)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "grid_positions and grid_size",
+                ):
+                    module(data)
+
     def test_fixed_monomials_and_density_contraction(self):
         module = CartesianAFeatures(
             mean_density=2.0,
@@ -840,6 +1036,233 @@ class TestCartesianAFeatureBesselBasis(unittest.TestCase):
             transformed.radial_transform.weight.numel(),
             96,
         )
+
+    def test_fft_model_matches_gather_functional_derivatives(self):
+        def make_model(backend):
+            a_features = CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=2,
+                max_power=2,
+                radial_basis="bessel",
+                n_radial_functions=2,
+                n_radial_channels=2,
+                separate_center=True,
+                convolution_backend=backend,
+            )
+            return GridCACEModel(
+                a_features=a_features,
+                b_features=CartesianBFeatures(2, 2),
+                readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+                grid_spacing=1.0,
+                compute_c1=True,
+                compute_c2=True,
+            ).double()
+
+        torch.manual_seed(37)
+        source_data = _periodic_data((3, 4, 5), cutoff_grid=2)
+
+        def copy_data(include_neighbors=True):
+            copied = {key: value.clone() for key, value in source_data.items()}
+            if not include_neighbors:
+                copied.pop("local_density_index")
+            for key in ("rho", "grid_spacing", "temperature", "beta"):
+                copied[key] = copied[key].double()
+            return copied
+
+        gather = make_model("gather")
+        fft = make_model("fft")
+        gather(copy_data(), compute_c1=False, compute_c2=False)
+        fft(copy_data(False), compute_c1=False, compute_c2=False)
+        fft.load_state_dict(gather.state_dict(), strict=True)
+        gather.zero_grad(set_to_none=True)
+        fft.zero_grad(set_to_none=True)
+        gather_data = copy_data()
+        fft_data = copy_data(False)
+        expected = gather(gather_data, c2_reference=(1, 0))
+        actual = fft(fft_data, c2_reference=(1, 0))
+
+        for key in ("beta_F_exc", "c1", "c2"):
+            self.assertTrue(
+                torch.allclose(
+                    actual[key],
+                    expected[key],
+                    rtol=2.0e-9,
+                    atol=2.0e-10,
+                ),
+                key,
+            )
+        serialized = io.BytesIO()
+        torch.save(fft, serialized)
+        serialized.seek(0)
+        restored = _load_whole_model(serialized)
+        restored_output = restored(
+            copy_data(False),
+            c2_reference=(1, 0),
+        )
+        self.assertEqual(restored.a_features.convolution_backend, "fft")
+        for key in ("beta_F_exc", "c1", "c2"):
+            self.assertTrue(torch.equal(restored_output[key], actual[key]))
+
+        expected["c1"].square().mean().backward()
+        actual["c1"].square().mean().backward()
+        self.assertTrue(
+            torch.allclose(
+                fft_data["rho"].grad,
+                gather_data["rho"].grad,
+                rtol=2.0e-8,
+                atol=2.0e-9,
+            )
+        )
+        for (expected_name, expected_parameter), (
+            actual_name,
+            actual_parameter,
+        ) in zip(gather.named_parameters(), fft.named_parameters()):
+            self.assertEqual(actual_name, expected_name)
+            if expected_parameter.grad is None:
+                self.assertIsNone(actual_parameter.grad)
+            else:
+                self.assertTrue(
+                    torch.allclose(
+                        actual_parameter.grad,
+                        expected_parameter.grad,
+                        rtol=2.0e-8,
+                        atol=2.0e-9,
+                    ),
+                    expected_name,
+                )
+        radial_gradient = fft.a_features.radial_transform.weight.grad
+        self.assertIsNotNone(radial_gradient)
+        self.assertTrue(torch.all(torch.isfinite(radial_gradient)))
+        self.assertGreater(radial_gradient.abs().sum(), 0.0)
+
+    def test_fft_A_matches_gather_in_transformed_gaussian_MP_model(self):
+        density_transform = (
+            (0.5, 0.5),
+            (-0.5, 0.5),
+            (1.0, 0.0),
+            (0.0, 1.0),
+        )
+
+        def make_model(backend):
+            a_features = CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=2,
+                max_power=3,
+                radial_basis="gaussian",
+                radial_exponents=(0.1, 0.3, 0.8, 1.6),
+                n_radial_channels=4,
+                trainable_radial_exponents=True,
+                radial_centers=(0.0, 0.4, 0.8, 1.2),
+                trainable_radial_centers=True,
+                separate_center=True,
+                n_types=2,
+                density_transform=density_transform,
+                trainable_density_transform=True,
+                convolution_backend=backend,
+            )
+            b_features = CartesianBFeatures(3, 2)
+            message = BChiMessage(
+                n_invariant_features=b_features.n_features,
+                n_radial_channels=4,
+                n_channels=4,
+                hidden_sizes=(8,),
+                radial_basis="gaussian",
+                radial_exponents=(0.15, 0.4, 0.9, 1.8),
+                trainable_radial_exponents=True,
+                radial_centers=(0.1, 0.5, 0.9, 1.3),
+                trainable_radial_centers=True,
+                convolution_backend="fft",
+            )
+            return GridCACEModel(
+                a_features=a_features,
+                b_features=b_features,
+                message_layers=[message],
+                readout=[LocalReadout(n_types=2, hidden_sizes=(8,))],
+                grid_spacing=1.0,
+                compute_c1=True,
+            ).double()
+
+        torch.manual_seed(41)
+        source_data = _periodic_data((3, 4, 5), cutoff_grid=2, n_types=2)
+
+        def copy_data():
+            copied = {key: value.clone() for key, value in source_data.items()}
+            for key in ("rho", "grid_spacing", "temperature", "beta"):
+                copied[key] = copied[key].double()
+            return copied
+
+        gather = make_model("gather")
+        fft = make_model("fft")
+        gather(copy_data(), compute_c1=False)
+        fft(copy_data(), compute_c1=False)
+        fft.load_state_dict(gather.state_dict(), strict=True)
+
+        gather.zero_grad(set_to_none=True)
+        fft.zero_grad(set_to_none=True)
+        gather_data = copy_data()
+        fft_data = copy_data()
+        expected = gather(gather_data)
+        actual = fft(fft_data)
+
+        for key in ("beta_F_exc", "c1"):
+            self.assertTrue(
+                torch.allclose(
+                    actual[key],
+                    expected[key],
+                    rtol=2.0e-9,
+                    atol=2.0e-10,
+                ),
+                key,
+            )
+
+        expected["c1"].square().mean().backward()
+        actual["c1"].square().mean().backward()
+        self.assertTrue(
+            torch.allclose(
+                fft_data["rho"].grad,
+                gather_data["rho"].grad,
+                rtol=2.0e-8,
+                atol=2.0e-9,
+            )
+        )
+        for (expected_name, expected_parameter), (
+            actual_name,
+            actual_parameter,
+        ) in zip(gather.named_parameters(), fft.named_parameters()):
+            self.assertEqual(actual_name, expected_name)
+            self.assertEqual(
+                actual_parameter.grad is None,
+                expected_parameter.grad is None,
+                actual_name,
+            )
+            if actual_parameter.grad is None:
+                continue
+            self.assertTrue(
+                torch.all(torch.isfinite(actual_parameter.grad)),
+                actual_name,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    actual_parameter.grad,
+                    expected_parameter.grad,
+                    rtol=2.0e-8,
+                    atol=2.0e-9,
+                ),
+                actual_name,
+            )
+
+        for name in (
+            "a_features.density_transform.weight",
+            "a_features.log_radial_exponents",
+            "a_features.learned_radial_centers",
+            "a_features.radial_transform.weight",
+            "message_layers.0.log_radial_exponents",
+            "message_layers.0.learned_radial_centers",
+        ):
+            gradient = dict(fft.named_parameters())[name].grad
+            self.assertIsNotNone(gradient, name)
+            self.assertTrue(torch.all(torch.isfinite(gradient)), name)
+            self.assertGreater(gradient.abs().sum(), 0.0, name)
 
     def test_folded_transform_matches_explicit_A_transform(self):
         module = CartesianAFeatures(

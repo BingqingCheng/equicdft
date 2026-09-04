@@ -11,7 +11,7 @@ from ._argument_checks import (
     optional_positive_integer,
     positive_integer,
 )
-from ._grid import gather_neighbors
+from ._grid import gather_neighbors, periodic_density_convolution
 # These imports also retain the historical package-internal access points in
 # this module while their implementations live with the radial helpers.
 from ._radial import (
@@ -160,6 +160,10 @@ class CartesianAFeatures(nn.Module):
         set this to the precomputed mean density of the training split. It is
         stored as a fixed buffer; no mean is subtracted, so zero density
         remains zero.
+    convolution_backend
+        ``"gather"`` retains explicit periodic neighborhoods. ``"fft"``
+        evaluates the same circular stencil contraction in reciprocal space
+        without materializing ``[..., G, J, C]``.
 
     Notes
     -----
@@ -167,6 +171,10 @@ class CartesianAFeatures(nn.Module):
     once using the same canonical ordering as ``GridData`` and registered as
     buffers, so they follow the module across devices without being optimized.
     """
+
+    # Older whole-model objects have no execution-backend attribute. A class
+    # default preserves their original explicit-neighborhood behavior.
+    convolution_backend: str = "gather"
 
     def __init__(
         self,
@@ -192,6 +200,7 @@ class CartesianAFeatures(nn.Module):
         ] = None,
         trainable_density_transform: bool = True,
         n_radial_functions: Optional[int] = None,
+        convolution_backend: str = "gather",
     ) -> None:
         super().__init__()
 
@@ -261,6 +270,11 @@ class CartesianAFeatures(nn.Module):
         coordinate_scaling = coordinate_scaling.lower()
         if coordinate_scaling not in ("none", "cutoff"):
             raise ValueError("coordinate_scaling must be 'none' or 'cutoff'")
+        if not isinstance(convolution_backend, str):
+            raise TypeError("convolution_backend must be 'gather' or 'fft'")
+        convolution_backend = convolution_backend.lower()
+        if convolution_backend not in ("gather", "fft"):
+            raise ValueError("convolution_backend must be 'gather' or 'fft'")
         separate_center = boolean(separate_center, "separate_center")
         n_types = positive_integer(n_types, "n_types")
         trainable_density_transform = boolean(
@@ -416,6 +430,7 @@ class CartesianAFeatures(nn.Module):
         self.trainable_radial_exponents = trainable_radial_exponents
         self.trainable_radial_centers = trainable_radial_centers
         self.coordinate_scaling = coordinate_scaling
+        self.convolution_backend = convolution_backend
         self.separate_center = separate_center
         self.n_types = n_types
         self.n_channels = n_channels
@@ -592,9 +607,11 @@ class CartesianAFeatures(nn.Module):
                 Live density tensor with shape ``[..., n_grid, n_types]``.
             ``local_density_index``
                 Periodic neighbor rows with shape
-                ``[..., n_grid, n_neighbors]``. Local environments are
-                gathered from ``rho`` inside this forward pass so that
-                automatic differentiation includes overlapping neighbors.
+                ``[..., n_grid, n_neighbors]``, required by the default
+                ``"gather"`` backend.
+            ``grid_positions``, ``grid_size``
+                Complete regular-grid geometry required by the ``"fft"``
+                backend.
         Returns
         -------
         torch.Tensor
@@ -605,6 +622,23 @@ class CartesianAFeatures(nn.Module):
         """
 
         descriptor_density = self.transform_density(data["rho"])
+        stencil_basis = self.stencil_basis()
+        if self.convolution_backend == "fft":
+            if "grid_positions" not in data or "grid_size" not in data:
+                raise ValueError(
+                    "fft features require grid_positions and grid_size"
+                )
+            return periodic_density_convolution(
+                descriptor_density / self.mean_density,
+                stencil_basis,
+                data["grid_positions"],
+                data["grid_size"],
+                self.local_density_positions,
+            )
+        if self.convolution_backend != "gather":
+            raise RuntimeError(
+                "convolution_backend must be 'gather' or 'fft'"
+            )
         local_density = gather_neighbors(
             descriptor_density,
             data["local_density_index"],
@@ -622,7 +656,7 @@ class CartesianAFeatures(nn.Module):
         features = torch.einsum(
             "...gjt,jnk->...gnkt",
             local_density / self.mean_density,
-            self.stencil_basis(),
+            stencil_basis,
         )
         return features
 
