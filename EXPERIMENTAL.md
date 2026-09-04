@@ -258,6 +258,72 @@ neighbor tensor. These backends require a complete regular periodic grid.
 The FFT path is intended for real float32 or float64 fields; mixed-precision
 FFT support is device- and grid-size-dependent and is not assumed here.
 
+### Enabling FFT throughout a model
+
+Select FFT independently for the initial Cartesian features and for every
+message layer. For example, a one-message model uses:
+
+```python
+a_features = CartesianAFeatures(
+    mean_density=mean_density,
+    cutoff_grid=6,
+    max_power=3,
+    convolution_backend="fft",
+    # radial and density-transform arguments omitted here
+)
+
+message = BChiMessage(
+    n_invariant_features=b_features.n_features,
+    n_radial_channels=a_features.n_radial_channels,
+    n_channels=a_features.n_output_channels,
+    hidden_sizes=(32, 16),
+    convolution_backend="fft",
+    # optional independent radial-basis arguments omitted here
+)
+
+model = GridCACEModel(
+    a_features=a_features,
+    b_features=b_features,
+    message_layers=[message],
+    readout=readouts,
+    # remaining thermodynamic arguments omitted here
+)
+```
+
+If all local contractions use FFT, the large gather table may also be omitted:
+
+```python
+assert not model.requires_local_density_index
+frames = GridData.from_xyz(
+    paths,
+    grid_info=model.grid_info,
+    include_local_density_index=False,
+)
+```
+
+For a trusted whole-object model that was saved with the legacy gather
+backend, the execution method can be changed without modifying its learned
+state:
+
+```python
+model.a_features.convolution_backend = "fft"
+for message in getattr(model, "message_layers", ()):
+    message.convolution_backend = "fft"
+```
+
+Do this only when inputs provide a complete regular periodic grid. A model
+reconstructed from a `state_dict` should instead set the backend explicitly in
+the constructors, because `convolution_backend` is deliberately not a learned
+or serialized state tensor.
+
+Gather and FFT evaluate the same periodic cross-correlation. Their outputs are
+mathematically equivalent, but need not be bitwise identical because the FFT
+changes floating-point summation order. Validate energies, functional
+derivatives, parameter gradients, and application-level tolerances before
+adopting FFT for a new dtype, device, grid, or model family. Performance also
+depends on grid size and runtime: benchmark the complete workload rather than
+assuming the large-grid speedup transfers to a small model.
+
 ## Charge-factorized reciprocal readouts
 
 `LongRangeReadout` can constrain pair coefficients to a known charge-product
