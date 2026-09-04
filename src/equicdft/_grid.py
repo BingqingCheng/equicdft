@@ -236,6 +236,8 @@ def periodic_stencil_convolution(
     grid_positions: torch.Tensor,
     grid_size: torch.Tensor,
     stencil_positions: torch.Tensor,
+    *,
+    backend: str = "conv3d",
 ) -> torch.Tensor:
     r"""Contract a periodic stencil without materializing neighborhoods.
 
@@ -245,12 +247,18 @@ def periodic_stencil_convolution(
 
     ``output[i,n,k,c] = sum_j basis[j,n,k] values[i+s_j,n,c]``
 
-    with shape ``[..., G, N, K, C]``. A grouped three-dimensional
-    cross-correlation evaluates the same sum while avoiding the much larger
-    explicit ``[..., G, J, N, C]`` neighbor tensor. Arbitrary complete input
-    row order is preserved through ``grid_positions``.
+    with shape ``[..., G, N, K, C]``. ``backend="conv3d"`` uses a grouped
+    three-dimensional cross-correlation, while ``backend="fft"`` evaluates
+    the same circular cross-correlation in reciprocal space. Both avoid the
+    much larger explicit ``[..., G, J, N, C]`` neighbor tensor. Arbitrary
+    complete input row order is preserved through ``grid_positions``.
     """
 
+    if not isinstance(backend, str):
+        raise TypeError("backend must be 'conv3d' or 'fft'")
+    backend = backend.lower()
+    if backend not in ("conv3d", "fft"):
+        raise ValueError("backend must be 'conv3d' or 'fft'")
     if values.ndim < 3:
         raise ValueError("values must have shape [..., G, N, C]")
     if stencil_basis.ndim != 3:
@@ -295,44 +303,77 @@ def periodic_stencil_convolution(
             values_flat,
         )
 
-    # Each (radial, channel) pair is an independent convolution group. The K
-    # Cartesian components are its outputs. conv3d is cross-correlation, so
-    # stencil offsets are scattered without reversal.
-    weight, minimum_offsets, maximum_offsets = _dense_stencil_weight(
-        stencil_basis,
-        offsets,
-        n_channels,
-    )
-
     grid_values = canonical_values.reshape(
         n_fields,
         *grid_shape,
         n_radial,
         n_channels,
-    ).permute(0, 4, 5, 1, 2, 3).reshape(
-        n_fields,
-        n_radial * n_channels,
-        *grid_shape,
-    )
-    grid_values = _periodic_extend_grid(
-        grid_values,
-        grid_shape,
-        minimum_offsets,
-        maximum_offsets,
-    )
+    ).permute(0, 4, 5, 1, 2, 3)
+    if backend == "conv3d":
+        # Each (radial, channel) pair is an independent convolution group.
+        # conv3d is cross-correlation, so offsets are not reversed.
+        weight, minimum_offsets, maximum_offsets = _dense_stencil_weight(
+            stencil_basis,
+            offsets,
+            n_channels,
+        )
+        extended_values = _periodic_extend_grid(
+            grid_values.reshape(
+                n_fields,
+                n_radial * n_channels,
+                *grid_shape,
+            ),
+            grid_shape,
+            minimum_offsets,
+            maximum_offsets,
+        )
+        convolved = F.conv3d(
+            extended_values,
+            weight,
+            groups=n_radial * n_channels,
+        ).reshape(
+            n_fields,
+            n_radial,
+            n_channels,
+            n_monomials,
+            *grid_shape,
+        )
+    else:
+        # y[i] = sum_j basis[j] * values[i + offset[j]]. Placing each basis
+        # row at its periodic positive offset therefore requires the complex
+        # conjugate of its Fourier transform. scatter_add also preserves exact
+        # duplicate offsets and aliases on grids smaller than the stencil.
+        periodic_offsets = offsets.remainder(offsets.new_tensor(grid_shape))
+        kernel_flat = _ravel_grid_indices(periodic_offsets, grid_shape)
+        periodic_basis = stencil_basis.new_zeros(
+            n_radial,
+            n_monomials,
+            n_grid,
+        ).scatter_add(
+            2,
+            kernel_flat.reshape(1, 1, n_neighbors).expand(
+                n_radial,
+                n_monomials,
+                -1,
+            ),
+            stencil_basis.permute(1, 2, 0),
+        ).reshape(n_radial, n_monomials, *grid_shape)
+        value_spectrum = torch.fft.rfftn(
+            grid_values,
+            dim=(-3, -2, -1),
+        )
+        basis_spectrum = torch.fft.rfftn(
+            periodic_basis,
+            dim=(-3, -2, -1),
+        )
+        convolved = torch.fft.irfftn(
+            value_spectrum[:, :, :, None]
+            * basis_spectrum[:, None].conj(),
+            s=grid_shape,
+            dim=(-3, -2, -1),
+        )
 
-    convolved = F.conv3d(
-        grid_values,
-        weight,
-        groups=n_radial * n_channels,
-    )
-    canonical_output = convolved.reshape(
-        n_fields,
-        n_radial,
-        n_channels,
-        n_monomials,
-        *grid_shape,
-    ).permute(0, 4, 5, 6, 1, 3, 2).reshape(
+    canonical_output = convolved.permute(0, 4, 5, 6, 1, 3, 2).reshape(
         n_fields,
         n_grid,
         n_radial,

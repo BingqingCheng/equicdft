@@ -64,12 +64,21 @@ class TestBChiMessage(unittest.TestCase):
             hidden_sizes=(),
             convolution_backend="conv3d",
         )
+        fft = BChiMessage(
+            1,
+            1,
+            1,
+            hidden_sizes=(),
+            convolution_backend="fft",
+        )
 
         self.assertEqual(gather.convolution_backend, "gather")
         self.assertEqual(convolution.convolution_backend, "conv3d")
+        self.assertEqual(fft.convolution_backend, "fft")
         self.assertEqual(set(gather.state_dict()), set(convolution.state_dict()))
-        with self.assertRaisesRegex(ValueError, "gather.*conv3d"):
-            BChiMessage(1, 1, 1, convolution_backend="fft")
+        self.assertEqual(set(gather.state_dict()), set(fft.state_dict()))
+        with self.assertRaisesRegex(ValueError, "gather.*conv3d.*fft"):
+            BChiMessage(1, 1, 1, convolution_backend="invalid")
 
     def test_convolution_matches_gather_without_neighbor_materialization(self):
         torch.manual_seed(31)
@@ -84,14 +93,6 @@ class TestBChiMessage(unittest.TestCase):
             separate_center=False,
         ).double()
         gather = BChiMessage(3, 2, 2, hidden_sizes=(5,)).double()
-        convolution = BChiMessage(
-            3,
-            2,
-            2,
-            hidden_sizes=(5,),
-            convolution_backend="conv3d",
-        ).double()
-        convolution.load_state_dict(gather.state_dict(), strict=True)
         B = torch.randn(
             np.prod(shape),
             2,
@@ -106,31 +107,38 @@ class TestBChiMessage(unittest.TestCase):
             data["local_density_index"],
             basis,
         )
-        with mock.patch(
-            "equicdft.interaction.gather_neighbors",
-            side_effect=AssertionError("gather backend was reached"),
-        ):
-            actual = convolution(
-                B,
-                data["local_density_index"],
-                basis,
-                grid_positions=data["grid_positions"],
-                grid_size=data["grid_size"],
-                stencil_positions=a_features.local_density_positions,
-            )
-
-        self.assertTrue(
-            torch.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
-        )
+        for backend in ("conv3d", "fft"):
+            with self.subTest(backend=backend):
+                convolution = BChiMessage(
+                    3,
+                    2,
+                    2,
+                    hidden_sizes=(5,),
+                    convolution_backend=backend,
+                ).double()
+                convolution.load_state_dict(gather.state_dict(), strict=True)
+                with mock.patch(
+                    "equicdft.interaction.gather_neighbors",
+                    side_effect=AssertionError("gather backend was reached"),
+                ):
+                    actual = convolution(
+                        B,
+                        data["local_density_index"],
+                        basis,
+                        grid_positions=data["grid_positions"],
+                        grid_size=data["grid_size"],
+                        stencil_positions=a_features.local_density_positions,
+                    )
+                self.assertTrue(
+                    torch.allclose(
+                        actual,
+                        expected,
+                        rtol=1.0e-12,
+                        atol=1.0e-12,
+                    )
+                )
 
     def test_convolution_requires_geometry_arguments(self):
-        message = BChiMessage(
-            1,
-            1,
-            1,
-            hidden_sizes=(),
-            convolution_backend="conv3d",
-        )
         B = torch.zeros(8, 1, 1, 1)
         indices = torch.zeros(8, 1, dtype=torch.long)
         basis = torch.ones(1, 1, 1)
@@ -142,15 +150,23 @@ class TestBChiMessage(unittest.TestCase):
             "stencil_positions": torch.zeros(1, 3, dtype=torch.long),
         }
 
-        for missing in geometry:
-            with self.subTest(missing=missing):
-                incomplete = geometry.copy()
-                incomplete[missing] = None
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "grid_positions, grid_size, and stencil_positions",
-                ):
-                    message(B, indices, basis, **incomplete)
+        for backend in ("conv3d", "fft"):
+            message = BChiMessage(
+                1,
+                1,
+                1,
+                hidden_sizes=(),
+                convolution_backend=backend,
+            )
+            for missing in geometry:
+                with self.subTest(backend=backend, missing=missing):
+                    incomplete = geometry.copy()
+                    incomplete[missing] = None
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "grid_positions, grid_size, and stencil_positions",
+                    ):
+                        message(B, indices, basis, **incomplete)
 
     def test_zero_invariant_field_gives_numerically_zero_message(self):
         data = _grid_data(shape=(3, 3, 3))
@@ -952,9 +968,6 @@ class TestMessagePassingModel(unittest.TestCase):
                 ],
             ).double()
 
-        torch.manual_seed(37)
-        gather = make_model("gather")
-        convolution = make_model("conv3d")
         source_data = _grid_data(shape=(3, 4, 5), cutoff_grid=1)
 
         def copy_data():
@@ -963,71 +976,124 @@ class TestMessagePassingModel(unittest.TestCase):
                 copied[key] = copied[key].double()
             return copied
 
-        gather(copy_data(), compute_c1=False, compute_c2=False)
-        convolution(copy_data(), compute_c1=False, compute_c2=False)
-        convolution.load_state_dict(gather.state_dict(), strict=True)
-        gather.zero_grad(set_to_none=True)
-        convolution.zero_grad(set_to_none=True)
-        gather_data = copy_data()
-        convolution_data = copy_data()
-        expected = gather(gather_data, c2_reference=(1, 0))
-        actual = convolution(convolution_data, c2_reference=(1, 0))
+        for backend in ("conv3d", "fft"):
+            with self.subTest(backend=backend):
+                torch.manual_seed(37)
+                gather = make_model("gather")
+                convolution = make_model(backend)
+                gather(copy_data(), compute_c1=False, compute_c2=False)
+                convolution(copy_data(), compute_c1=False, compute_c2=False)
+                convolution.load_state_dict(gather.state_dict(), strict=True)
+                gather.zero_grad(set_to_none=True)
+                convolution.zero_grad(set_to_none=True)
+                gather_data = copy_data()
+                convolution_data = copy_data()
+                expected = gather(gather_data, c2_reference=(1, 0))
+                actual = convolution(
+                    convolution_data,
+                    c2_reference=(1, 0),
+                )
 
-        for key in ("beta_F_exc", "c1", "c2"):
-            self.assertTrue(
-                torch.allclose(
-                    actual[key],
-                    expected[key],
-                    rtol=2.0e-9,
-                    atol=2.0e-10,
-                ),
-                key,
-            )
-        serialized = io.BytesIO()
-        torch.save(convolution, serialized)
-        serialized.seek(0)
-        restored = _load_whole_model(serialized)
-        self.assertEqual(
-            restored.message_layers[0].convolution_backend,
-            "conv3d",
-        )
-        with mock.patch(
-            "equicdft.interaction.gather_neighbors",
-            side_effect=AssertionError("gather backend was reached"),
-        ):
-            restored_output = restored(
-                copy_data(),
-                c2_reference=(1, 0),
-            )
-        for key in ("beta_F_exc", "c1", "c2"):
-            self.assertTrue(torch.equal(restored_output[key], actual[key]))
-        expected["c1"].square().mean().backward()
-        actual["c1"].square().mean().backward()
-        self.assertTrue(
-            torch.allclose(
-                convolution_data["rho"].grad,
-                gather_data["rho"].grad,
-                rtol=2.0e-8,
-                atol=2.0e-9,
-            )
-        )
-        for (expected_name, expected_parameter), (
-            actual_name,
-            actual_parameter,
-        ) in zip(gather.named_parameters(), convolution.named_parameters()):
-            self.assertEqual(actual_name, expected_name)
-            if expected_parameter.grad is None:
-                self.assertIsNone(actual_parameter.grad)
-            else:
+                for key in ("beta_F_exc", "c1", "c2"):
+                    self.assertTrue(
+                        torch.allclose(
+                            actual[key],
+                            expected[key],
+                            rtol=2.0e-9,
+                            atol=2.0e-10,
+                        ),
+                        key,
+                    )
+                serialized = io.BytesIO()
+                torch.save(convolution, serialized)
+                serialized.seek(0)
+                restored = _load_whole_model(serialized)
+                self.assertEqual(
+                    restored.message_layers[0].convolution_backend,
+                    backend,
+                )
+                with mock.patch(
+                    "equicdft.interaction.gather_neighbors",
+                    side_effect=AssertionError("gather backend was reached"),
+                ):
+                    restored_output = restored(
+                        copy_data(),
+                        c2_reference=(1, 0),
+                    )
+                for key in ("beta_F_exc", "c1", "c2"):
+                    self.assertTrue(
+                        torch.equal(restored_output[key], actual[key])
+                    )
+                expected["c1"].square().mean().backward()
+                actual["c1"].square().mean().backward()
                 self.assertTrue(
                     torch.allclose(
-                        actual_parameter.grad,
-                        expected_parameter.grad,
+                        convolution_data["rho"].grad,
+                        gather_data["rho"].grad,
                         rtol=2.0e-8,
                         atol=2.0e-9,
-                    ),
-                    expected_name,
+                    )
                 )
+                for (expected_name, expected_parameter), (
+                    actual_name,
+                    actual_parameter,
+                ) in zip(
+                    gather.named_parameters(),
+                    convolution.named_parameters(),
+                ):
+                    self.assertEqual(actual_name, expected_name)
+                    if expected_parameter.grad is None:
+                        self.assertIsNone(actual_parameter.grad)
+                    else:
+                        self.assertTrue(
+                            torch.allclose(
+                                actual_parameter.grad,
+                                expected_parameter.grad,
+                                rtol=2.0e-8,
+                                atol=2.0e-9,
+                            ),
+                            expected_name,
+                        )
+
+    def test_independent_bessel_fft_has_finite_functional_derivatives(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=2,
+            max_power=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 1.0),
+        )
+        b_features = CartesianBFeatures(2, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            2,
+            1,
+            hidden_sizes=(6,),
+            radial_basis="bessel",
+            n_radial_functions=3,
+            convolution_backend="fft",
+        )
+        model = GridCACEModel(
+            a_features=a_features,
+            b_features=b_features,
+            readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+            grid_spacing=1.0,
+            compute_c1=True,
+            compute_c2=True,
+            message_layers=[message],
+        )
+        data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
+
+        outputs = model(data, c2_reference=(0, 0))
+
+        for key in ("beta_F_exc", "c1", "c2"):
+            self.assertTrue(torch.all(torch.isfinite(outputs[key])), key)
+        outputs["c1"].square().mean().backward()
+
+        gradient = message.radial_transform.weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertGreater(gradient.abs().sum(), 0.0)
 
     def test_bessel_model_has_finite_functional_derivatives(self):
         a_features = CartesianAFeatures(

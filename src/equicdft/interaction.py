@@ -77,7 +77,9 @@ class BChiMessage(nn.Module):
     convolution_backend
         ``"gather"`` retains the established explicit-neighborhood
         contraction. ``"conv3d"`` evaluates the same periodic stencil as a
-        grouped dense convolution without materializing ``[G, J, N, C]``.
+        grouped dense convolution, and ``"fft"`` evaluates it as a circular
+        Fourier cross-correlation. Neither alternative materializes
+        ``[G, J, N, C]``.
     """
 
     # A class default keeps whole-object models saved before this execution
@@ -231,10 +233,14 @@ class BChiMessage(nn.Module):
             )
         self.radial_basis = resolved_radial_basis
         if not isinstance(convolution_backend, str):
-            raise TypeError("convolution_backend must be 'gather' or 'conv3d'")
+            raise TypeError(
+                "convolution_backend must be 'gather', 'conv3d', or 'fft'"
+            )
         convolution_backend = convolution_backend.lower()
-        if convolution_backend not in ("gather", "conv3d"):
-            raise ValueError("convolution_backend must be 'gather' or 'conv3d'")
+        if convolution_backend not in ("gather", "conv3d", "fft"):
+            raise ValueError(
+                "convolution_backend must be 'gather', 'conv3d', or 'fft'"
+            )
         self.convolution_backend = convolution_backend
         self.trainable_radial_exponents = trainable_radial_exponents
         self.trainable_radial_centers = trainable_radial_centers
@@ -357,15 +363,15 @@ class BChiMessage(nn.Module):
     ) -> torch.Tensor:
         """Apply the configured periodic stencil contraction."""
 
-        if self.convolution_backend == "conv3d":
+        if self.convolution_backend in ("conv3d", "fft"):
             if (
                 grid_positions is None
                 or grid_size is None
                 or stencil_positions is None
             ):
                 raise ValueError(
-                    "conv3d messages require grid_positions, grid_size, "
-                    "and stencil_positions"
+                    f"{self.convolution_backend} messages require "
+                    "grid_positions, grid_size, and stencil_positions"
                 )
             return periodic_stencil_convolution(
                 gates,
@@ -373,10 +379,11 @@ class BChiMessage(nn.Module):
                 grid_positions,
                 grid_size,
                 stencil_positions,
+                backend=self.convolution_backend,
             )
         if self.convolution_backend != "gather":
             raise RuntimeError(
-                "convolution_backend must be 'gather' or 'conv3d'"
+                "convolution_backend must be 'gather', 'conv3d', or 'fft'"
             )
         if stencil_basis.shape[0] != local_density_index.shape[-1]:
             raise ValueError(
@@ -405,6 +412,7 @@ class BChiMessage(nn.Module):
         ``B`` must have shape ``[..., G, N, Q, C]`` and ``stencil_basis`` must
         have shape ``[J, N, K]``. The periodic neighbor table has shape
         ``[..., G, J]``. The ``"conv3d"`` backend additionally requires the
+        The ``"conv3d"`` and ``"fft"`` backends additionally require the
         complete grid coordinates, grid size, and matching stencil offsets.
         """
 

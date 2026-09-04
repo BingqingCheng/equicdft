@@ -190,9 +190,9 @@ radial-transform parameters.
 ### Low-memory periodic convolution
 
 The established message contraction explicitly gathers a tensor with shape
-`[..., G, J, N, C]`. Large grids and stencils can instead select a
-mathematically equivalent grouped three-dimensional convolution (up to
-floating-point operation order):
+`[..., G, J, N, C]`. Large regular grids and stencils can instead select a
+mathematically equivalent periodic convolution (up to floating-point
+operation order):
 
 ```python
 message = BChiMessage(
@@ -200,17 +200,20 @@ message = BChiMessage(
     n_radial_channels=4,
     n_channels=a_features.n_output_channels,
     hidden_sizes=(32, 16),
-    convolution_backend="conv3d",
+    convolution_backend="fft",  # or "conv3d"
 )
 ```
 
 This execution option changes neither learned parameters nor `state_dict`
 keys. A reconstructed model must select it explicitly; whole-object saves
-retain it, while legacy whole objects use the class default `"gather"`. It
-scatters the spherical stencil into its enclosing dense Cartesian kernel and
-uses periodic cross-correlation, avoiding the explicit neighbor tensor. The
-convolution backend is intended for complete regular periodic grids and may
-trade additional arithmetic on zero kernel entries for lower peak memory.
+retain it, while legacy whole objects use the class default `"gather"`.
+`"conv3d"` scatters the spherical stencil into its enclosing dense Cartesian
+kernel and applies grouped cross-correlation. `"fft"` scatters onto the
+periodic grid and applies the same cross-correlation in reciprocal space;
+duplicate or periodically aliased offsets are summed. Both avoid the explicit
+neighbor tensor. These backends require a complete regular periodic grid.
+The FFT path is intended for real float32 or float64 fields; mixed-precision
+FFT support is device- and grid-size-dependent and is not assumed here.
 
 ## Charge-factorized reciprocal readouts
 
