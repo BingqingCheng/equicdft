@@ -317,6 +317,8 @@ class TestTrainer(unittest.TestCase):
         scheduler=False,
         log_dir=None,
         early_stopping_patience=None,
+        ema_decay=None,
+        ema_start_step=0,
     ):
         loss = Loss(
             [
@@ -348,6 +350,8 @@ class TestTrainer(unittest.TestCase):
             save_best=True,
             early_stopping_patience=early_stopping_patience,
             log_dir=log_dir,
+            ema_decay=ema_decay,
+            ema_start_step=ema_start_step,
         )
 
     def test_fit_updates_model_and_returns_history(self):
@@ -380,6 +384,148 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("mae", history[0]["valid_metrics"]["target"])
         self.assertEqual(trainer.metrics[0].logs["train"]["count"], 0)
         self.assertEqual(trainer.metrics[0].logs["valid"]["count"], 0)
+
+    def test_ema_arguments_are_strict_and_opt_in(self):
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        for value in (True, "0.9"):
+            with self.subTest(decay=value), self.assertRaises(TypeError):
+                Trainer(_LinearDictionaryModel(), loss, ema_decay=value)
+        for value in (0.0, 1.0, 2.0, float("nan")):
+            with self.subTest(decay=value), self.assertRaises(ValueError):
+                Trainer(_LinearDictionaryModel(), loss, ema_decay=value)
+        for value in (True, 1.5):
+            with self.subTest(start=value), self.assertRaises(TypeError):
+                Trainer(_LinearDictionaryModel(), loss, ema_start_step=value)
+        with self.assertRaises(ValueError):
+            Trainer(_LinearDictionaryModel(), loss, ema_start_step=-1)
+        with self.assertRaisesRegex(ValueError, "requires ema_decay"):
+            Trainer(_LinearDictionaryModel(), loss, ema_start_step=1)
+
+        trainer = Trainer(_LinearDictionaryModel(), loss)
+        self.assertIsNone(trainer._ema)
+
+    def test_ema_drives_validation_and_checkpoint_model_state(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trainer = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                ema_decay=0.5,
+            )
+            loader = DataLoader(_dataset([1]), batch_size=1)
+            trainer.fit(loader, loader, epochs=2, verbose=False)
+            raw_weight = trainer.model.weight.detach().clone()
+            checkpoint = torch.load(
+                Path(temporary_directory) / "last.pt",
+                weights_only=False,
+            )
+
+        self.assertAlmostEqual(raw_weight.item(), 0.72, places=6)
+        self.assertAlmostEqual(
+            checkpoint["model_state_dict"]["weight"].item(),
+            0.56,
+            places=6,
+        )
+        self.assertTrue(
+            torch.equal(
+                checkpoint["raw_model_state_dict"]["weight"],
+                raw_weight,
+            )
+        )
+        self.assertAlmostEqual(
+            trainer.history[-1]["valid_losses"]["total"],
+            (0.56 - 2.0) ** 2,
+            places=6,
+        )
+        self.assertEqual(trainer.history[-1]["optimizer_steps"], 2)
+        self.assertEqual(trainer.history[-1]["ema_updates"], 2)
+        self.assertEqual(
+            trainer.history[-1]["validation_parameter_source"],
+            "ema",
+        )
+        self.assertTrue(torch.equal(trainer.model.weight, raw_weight))
+
+    def test_ema_start_step_is_number_of_warmup_updates(self):
+        trainer = self._make_trainer(ema_decay=0.5, ema_start_step=2)
+        loader = DataLoader(_dataset([1]), batch_size=1)
+
+        trainer.fit(loader, loader, epochs=3, verbose=False)
+
+        self.assertEqual(trainer.history[0]["ema_updates"], 0)
+        self.assertEqual(
+            trainer.history[0]["validation_parameter_source"],
+            "raw",
+        )
+        self.assertEqual(trainer.history[1]["ema_updates"], 0)
+        self.assertEqual(
+            trainer.history[1]["validation_parameter_source"],
+            "raw",
+        )
+        self.assertEqual(trainer.history[2]["ema_updates"], 1)
+        self.assertEqual(
+            trainer.history[2]["validation_parameter_source"],
+            "ema",
+        )
+
+    def test_ema_and_optimizer_state_resume_exactly(self):
+        train_values = [1, 2, 3, 4]
+        valid_loader = DataLoader(_dataset([5, 6]), batch_size=2)
+        continuous = self._make_trainer(
+            scheduler=True,
+            ema_decay=0.8,
+            ema_start_step=2,
+        )
+        continuous_loader = DataLoader(
+            _dataset(train_values),
+            batch_size=2,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(17),
+        )
+        continuous.fit(continuous_loader, valid_loader, epochs=4, verbose=False)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            partial = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                scheduler=True,
+                ema_decay=0.8,
+                ema_start_step=2,
+            )
+            partial_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(17),
+            )
+            partial.fit(partial_loader, valid_loader, epochs=2, verbose=False)
+
+            resumed = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                scheduler=True,
+                ema_decay=0.8,
+                ema_start_step=2,
+            )
+            resumed_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(17),
+            )
+            resumed.load_checkpoint(
+                Path(temporary_directory) / "last.pt",
+                train_loader=resumed_loader,
+            )
+            resumed.fit(resumed_loader, valid_loader, epochs=2, verbose=False)
+
+        self.assertTrue(
+            torch.equal(resumed.model.weight, continuous.model.weight)
+        )
+        self.assertEqual(resumed.optimizer_steps, continuous.optimizer_steps)
+        self.assertEqual(resumed._ema.num_updates, continuous._ema.num_updates)
+        self.assertTrue(
+            torch.equal(
+                resumed._ema.shadow_parameters["weight"],
+                continuous._ema.shadow_parameters["weight"],
+            )
+        )
+        self.assertEqual(resumed.history, continuous.history)
 
     def test_model_dependent_loss_runs_through_trainer(self):
         model = _QuadraticDictionaryFunctional()
@@ -844,6 +990,8 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("epochs_without_improvement", checkpoint)
         self.assertIn("torch_rng_state", checkpoint)
         self.assertIn("train_loader_generator_state", checkpoint)
+        self.assertNotIn("ema_state_dict", checkpoint)
+        self.assertNotIn("raw_model_state_dict", checkpoint)
         self.assertEqual(len(checkpoint["history"]), 2)
 
     def test_checkpoint_resume_restores_complete_training_state(self):

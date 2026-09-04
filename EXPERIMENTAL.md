@@ -560,6 +560,53 @@ This option changes optimization only. It adds no model parameters or
 `state_dict` keys and does not make a feature parameter intrinsically “fast”;
 the multiplier remains an explicit training choice.
 
+## Exponential moving average during training
+
+`Trainer` can optionally use an exponential moving average (EMA) of the
+trainable model parameters for validation, scheduling, early stopping, and
+best-checkpoint selection:
+
+```python
+trainer = Trainer(
+    model=model,
+    loss=loss,
+    optimizer_cls=torch.optim.Adam,
+    optimizer_args={"lr": 1.0e-3},
+    feature_learning_rate_multiplier=10.0,
+    ema_decay=0.999,
+    ema_start_step=1000,
+)
+```
+
+`ema_decay=None`, the default, exactly preserves raw-parameter training and
+validation. `ema_start_step` is the number of optimizer updates completed
+before averaging begins; the first included update is copied exactly rather
+than mixed with the model initialization. This makes the EMA unbiased by an
+arbitrary initial shadow state.
+
+Only trainable model parameters are averaged. Model buffers, loss parameters,
+optimizer state, and scheduler state are not averaged. Training metrics are
+therefore raw-parameter diagnostics, whereas validation metrics and validation
+loss use EMA parameters after averaging begins. The latter drives the
+scheduler, early stopping, and checkpoint selection.
+
+In an EMA checkpoint, `model_state_dict` contains the evaluated EMA model so
+that the established best-model export pattern reproduces the selected
+validation result. `raw_model_state_dict`, `ema_state_dict`,
+`optimizer_steps`, and `ema_start_step` retain the complete continuation
+state. EMA shadows are reconstructed from `model_state_dict` rather than
+stored a second time. Loading a training checkpoint requires the same EMA
+configuration; loading `model_state_dict` directly remains the model-only
+evaluation path.
+Epoch history records the optimizer-update count, EMA-update count, and
+whether validation used `raw` or `ema` parameters.
+
+EMA is an exploratory optimization choice for EquiCDFT, not an established LJ
+workflow default and not a change to the functional form. Decay and start step
+must be reported with fitted-model provenance. A controlled comparison should
+hold the initialization, data, batches, learning-rate schedule, stopping
+budget, and model architecture fixed.
+
 ## Joint field and response training
 
 `TrainingStream` keeps different datasets, losses, metrics, and model-forward

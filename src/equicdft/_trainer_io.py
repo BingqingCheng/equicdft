@@ -76,6 +76,13 @@ def _flatten_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     }
     if "feature_learning_rate" in record:
         row["feature_learning_rate"] = record["feature_learning_rate"]
+    for name in (
+        "optimizer_steps",
+        "ema_updates",
+        "validation_parameter_source",
+    ):
+        if name in record:
+            row[name] = record[name]
     loss_names = _ordered_union(
         record["train_losses"],
         record["valid_losses"],
@@ -154,6 +161,11 @@ def format_record(record: Dict[str, Any]) -> str:
     if "feature_learning_rate" in record:
         lines[0] += " | feature learning rate {:.3e}".format(
             record["feature_learning_rate"]
+        )
+    if "ema_updates" in record:
+        lines[0] += " | EMA updates {} | validation {}".format(
+            record["ema_updates"],
+            record["validation_parameter_source"],
         )
 
     available_losses = _ordered_union(
