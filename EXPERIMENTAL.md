@@ -560,6 +560,27 @@ This option changes optimization only. It adds no model parameters or
 `state_dict` keys and does not make a feature parameter intrinsically “fast”;
 the multiplier remains an explicit training choice.
 
+## Learning-rate warmup
+
+`Trainer` can linearly warm every optimizer learning-rate group over a fixed
+number of optimizer updates:
+
+```python
+trainer = Trainer(
+    ...,
+    optimizer_args={"lr": 5.0e-3},
+    learning_rate_warmup_steps=10_000,
+)
+```
+
+The configured optimizer rates are the target rates. Update `s` of `W` uses
+the fraction `s / W`, so update 1 uses `1 / W` of each target and update `W`
+uses the full target. All groups are scaled proportionally, preserving any
+feature learning-rate multiplier. An epoch scheduler is held until warmup is
+complete and then proceeds normally. Warmup progress is restored exactly from
+training checkpoints. The default `learning_rate_warmup_steps=0` preserves
+the established behavior.
+
 ## Exponential moving average during training
 
 `Trainer` can optionally use an exponential moving average (EMA) of the

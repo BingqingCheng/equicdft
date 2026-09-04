@@ -317,6 +317,7 @@ class TestTrainer(unittest.TestCase):
         scheduler=False,
         log_dir=None,
         early_stopping_patience=None,
+        learning_rate_warmup_steps=0,
         ema_decay=None,
         ema_start_step=0,
     ):
@@ -350,6 +351,7 @@ class TestTrainer(unittest.TestCase):
             save_best=True,
             early_stopping_patience=early_stopping_patience,
             log_dir=log_dir,
+            learning_rate_warmup_steps=learning_rate_warmup_steps,
             ema_decay=ema_decay,
             ema_start_step=ema_start_step,
         )
@@ -384,6 +386,108 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("mae", history[0]["valid_metrics"]["target"])
         self.assertEqual(trainer.metrics[0].logs["train"]["count"], 0)
         self.assertEqual(trainer.metrics[0].logs["valid"]["count"], 0)
+
+    def test_learning_rate_warmup_is_linear_and_defers_scheduler(self):
+        trainer = self._make_trainer(
+            scheduler=True,
+            learning_rate_warmup_steps=3,
+        )
+        loader = DataLoader(_dataset([1]), batch_size=1)
+
+        trainer.fit(loader, loader, epochs=4, verbose=False)
+
+        self.assertEqual(
+            [record["optimizer_steps"] for record in trainer.history],
+            [1, 2, 3, 4],
+        )
+        for actual, expected in zip(
+            [record["learning_rate"] for record in trainer.history],
+            [0.1 / 3.0, 0.2 / 3.0, 0.1, 0.05],
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(trainer.optimizer.param_groups[0]["lr"], 0.025)
+
+    def test_learning_rate_warmup_scales_all_parameter_groups(self):
+        trainer = Trainer(
+            _FeatureGroupedLinearDictionaryModel(),
+            Loss([TensorLoss("target", "prediction", "target")]),
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 1.0e-3},
+            feature_learning_rate_multiplier=10.0,
+            learning_rate_warmup_steps=4,
+        )
+        loader = DataLoader(_dataset([1]), batch_size=1)
+        trainer._initialize_optimization(loader)
+
+        trainer._apply_learning_rate_warmup()
+
+        self.assertEqual(
+            [group["lr"] for group in trainer.optimizer.param_groups],
+            [2.5e-4, 2.5e-3],
+        )
+
+    def test_learning_rate_warmup_steps_is_nonnegative_integer(self):
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        for value in (True, 1.5, "10"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                Trainer(
+                    _LinearDictionaryModel(),
+                    loss,
+                    learning_rate_warmup_steps=value,
+                )
+        with self.assertRaises(ValueError):
+            Trainer(
+                _LinearDictionaryModel(),
+                loss,
+                learning_rate_warmup_steps=-1,
+            )
+
+    def test_learning_rate_warmup_resumes_exactly(self):
+        train_values = [1, 2, 3, 4]
+        valid_loader = DataLoader(_dataset([5, 6]), batch_size=2)
+        continuous = self._make_trainer(learning_rate_warmup_steps=5)
+        continuous_loader = DataLoader(
+            _dataset(train_values),
+            batch_size=2,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(23),
+        )
+        continuous.fit(continuous_loader, valid_loader, epochs=3, verbose=False)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            partial = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                learning_rate_warmup_steps=5,
+            )
+            partial_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(23),
+            )
+            partial.fit(partial_loader, valid_loader, epochs=1, verbose=False)
+
+            resumed = self._make_trainer(
+                checkpoint_dir=temporary_directory,
+                learning_rate_warmup_steps=5,
+            )
+            resumed_loader = DataLoader(
+                _dataset(train_values),
+                batch_size=2,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(23),
+            )
+            resumed.load_checkpoint(
+                Path(temporary_directory) / "last.pt",
+                train_loader=resumed_loader,
+            )
+            resumed.fit(resumed_loader, valid_loader, epochs=2, verbose=False)
+
+        self.assertTrue(
+            torch.equal(resumed.model.weight, continuous.model.weight)
+        )
+        self.assertEqual(resumed.optimizer_steps, continuous.optimizer_steps)
+        self.assertEqual(resumed.history, continuous.history)
 
     def test_ema_arguments_are_strict_and_opt_in(self):
         loss = Loss([TensorLoss("target", "prediction", "target")])

@@ -138,6 +138,10 @@ class Trainer(nn.Module):
         ``model.feature_parameters``.  The default ``1.0`` retains the
         established single optimizer group.  The model, not the trainer,
         defines which parameters belong to the feature representation.
+    learning_rate_warmup_steps
+        Number of optimizer updates over which every learning-rate group is
+        ramped linearly from ``1 / learning_rate_warmup_steps`` of its target
+        value to the target value. ``0`` disables warmup.
     ema_decay
         Optional exponential-moving-average decay for trainable model
         parameters. ``None`` preserves the established raw-parameter
@@ -164,6 +168,7 @@ class Trainer(nn.Module):
         early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
         feature_learning_rate_multiplier: float = 1.0,
+        learning_rate_warmup_steps: int = 0,
         ema_decay: Optional[float] = None,
         ema_start_step: int = 0,
     ) -> None:
@@ -185,6 +190,10 @@ class Trainer(nn.Module):
         feature_learning_rate_multiplier = positive_scalar(
             feature_learning_rate_multiplier,
             "feature_learning_rate_multiplier",
+        )
+        learning_rate_warmup_steps = nonnegative_integer(
+            learning_rate_warmup_steps,
+            "learning_rate_warmup_steps",
         )
         ema_start_step = nonnegative_integer(ema_start_step, "ema_start_step")
         if ema_decay is not None:
@@ -222,6 +231,8 @@ class Trainer(nn.Module):
             feature_learning_rate_multiplier
         )
         self.feature_parameter_names = ()
+        self.learning_rate_warmup_steps = learning_rate_warmup_steps
+        self._warmup_target_learning_rates = ()
         self.ema_decay = ema_decay
         self.ema_start_step = ema_start_step
         self.optimizer_steps = 0
@@ -508,9 +519,14 @@ class Trainer(nn.Module):
                     "raw_model_state_dict": self.model.state_dict(),
                     "ema_state_dict": self._ema.state_dict(),
                     "ema_start_step": self.ema_start_step,
-                    "optimizer_steps": self.optimizer_steps,
                 }
             )
+        if self.learning_rate_warmup_steps:
+            checkpoint["learning_rate_warmup_steps"] = (
+                self.learning_rate_warmup_steps
+            )
+        if self._ema is not None or self.learning_rate_warmup_steps:
+            checkpoint["optimizer_steps"] = self.optimizer_steps
         atomic_torch_save(checkpoint, Path(path).expanduser())
 
     def load_checkpoint(
@@ -577,6 +593,15 @@ class Trainer(nn.Module):
                 "checkpoint feature parameter names do not match the model"
             )
 
+        checkpoint_warmup_steps = checkpoint.get(
+            "learning_rate_warmup_steps",
+            0,
+        )
+        if checkpoint_warmup_steps != self.learning_rate_warmup_steps:
+            raise ValueError(
+                "checkpoint learning_rate_warmup_steps does not match trainer"
+            )
+
         checkpoint_ema = checkpoint.get("ema_state_dict")
         if (checkpoint_ema is None) != (self._ema is None):
             raise ValueError("checkpoint EMA configuration does not match trainer")
@@ -585,7 +610,8 @@ class Trainer(nn.Module):
                 raise ValueError(
                     "checkpoint ema_start_step does not match the trainer"
                 )
-            optimizer_steps = checkpoint.get("optimizer_steps")
+        optimizer_steps = checkpoint.get("optimizer_steps")
+        if self._ema is not None or self.learning_rate_warmup_steps:
             if (
                 isinstance(optimizer_steps, bool)
                 or not isinstance(optimizer_steps, int)
@@ -609,6 +635,7 @@ class Trainer(nn.Module):
                 checkpoint["model_state_dict"],
                 self.model,
             )
+        if self._ema is not None or self.learning_rate_warmup_steps:
             self.optimizer_steps = optimizer_steps
         self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
@@ -795,6 +822,10 @@ class Trainer(nn.Module):
                     self.feature_learning_rate_multiplier,
                 ),
             )
+        if self.learning_rate_warmup_steps:
+            self._warmup_target_learning_rates = tuple(
+                float(group["lr"]) for group in self.optimizer.param_groups
+            )
 
     @staticmethod
     def _validate_streams(
@@ -971,6 +1002,7 @@ class Trainer(nn.Module):
                             + value.detach().item() * n_fields
                         )
                     field_counts[stream.name] += n_fields
+            self._apply_learning_rate_warmup()
             self.optimizer.step()
             self._after_optimizer_step()
 
@@ -1112,6 +1144,8 @@ class Trainer(nn.Module):
 
         if self.scheduler is None:
             return
+        if self.optimizer_steps < self.learning_rate_warmup_steps:
+            return
         if isinstance(
             self.scheduler,
             torch.optim.lr_scheduler.ReduceLROnPlateau,
@@ -1119,6 +1153,18 @@ class Trainer(nn.Module):
             self.scheduler.step(valid_loss)
         else:
             self.scheduler.step()
+
+    def _apply_learning_rate_warmup(self) -> None:
+        """Set the learning rate for the next optimizer update."""
+
+        if self.optimizer_steps >= self.learning_rate_warmup_steps:
+            return
+        factor = (self.optimizer_steps + 1) / self.learning_rate_warmup_steps
+        for group, target in zip(
+            self.optimizer.param_groups,
+            self._warmup_target_learning_rates,
+        ):
+            group["lr"] = factor * target
 
     def _evaluation_parameters(self):
         """Return a context using EMA parameters when they are available."""
@@ -1151,10 +1197,11 @@ class Trainer(nn.Module):
             self.optimizer,
             self.feature_learning_rate_multiplier,
         )
+        if self._ema is not None or self.learning_rate_warmup_steps:
+            record["optimizer_steps"] = self.optimizer_steps
         if self._ema is not None:
             record.update(
                 {
-                    "optimizer_steps": self.optimizer_steps,
                     "ema_updates": self._ema.num_updates,
                     "validation_parameter_source": (
                         "ema" if self._ema.initialized else "raw"
