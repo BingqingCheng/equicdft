@@ -149,6 +149,27 @@ and shared across all radial and Cartesian stencil channels. `"gather"`
 remains the default and legacy behavior. Selecting FFT adds no parameters or
 `state_dict` keys, but requires complete `grid_positions` and `grid_size`.
 
+### Omitting explicit neighborhood indices
+
+When the initial Cartesian features and every message layer use FFT or
+`conv3d`, their input records do not need the explicit
+`[n_grid, n_neighbors]` gather table. It may be omitted at construction:
+
+```python
+frames = GridData.from_xyz(
+    paths,
+    grid_info=model.grid_info,
+    include_local_density_index=False,
+)
+assert not model.requires_local_density_index
+```
+
+The default remains `True`. Gather-based features or messages report
+`requires_local_density_index=True` and raise a clear error if the table is
+missing. Stencil offsets remain in each record; only the large explicit
+per-grid-point index table is skipped. This option changes neither model
+parameters nor serialized model state.
+
 ## Equivariant message passing
 
 `BChiMessage` converts invariant `B` features into a new equivariant `A`

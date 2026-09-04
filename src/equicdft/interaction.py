@@ -354,7 +354,7 @@ class BChiMessage(nn.Module):
     def _apply_stencil(
         self,
         gates: torch.Tensor,
-        local_density_index: torch.Tensor,
+        local_density_index: Optional[torch.Tensor],
         stencil_basis: torch.Tensor,
         *,
         grid_positions: Optional[torch.Tensor],
@@ -385,6 +385,12 @@ class BChiMessage(nn.Module):
             raise RuntimeError(
                 "convolution_backend must be 'gather', 'conv3d', or 'fft'"
             )
+        if local_density_index is None:
+            raise ValueError(
+                "gather messages require local_density_index; reload the "
+                "data with include_local_density_index=True or use a "
+                "conv3d/fft message backend"
+            )
         if stencil_basis.shape[0] != local_density_index.shape[-1]:
             raise ValueError(
                 "stencil_basis neighbor count does not match "
@@ -400,7 +406,7 @@ class BChiMessage(nn.Module):
     def forward(
         self,
         B: torch.Tensor,
-        local_density_index: torch.Tensor,
+        local_density_index: Optional[torch.Tensor],
         stencil_basis: torch.Tensor,
         *,
         grid_positions: Optional[torch.Tensor] = None,
@@ -412,7 +418,8 @@ class BChiMessage(nn.Module):
         ``B`` must have shape ``[..., G, N, Q, C]`` and ``stencil_basis`` must
         have shape ``[J, N, K]``. The periodic neighbor table has shape
         ``[..., G, J]``. The ``"conv3d"`` and ``"fft"`` backends require the
-        complete grid coordinates, grid size, and matching stencil offsets.
+        complete grid coordinates, grid size, and matching stencil offsets;
+        for those backends ``local_density_index`` may be ``None``.
         """
 
         if B.ndim < 4:

@@ -127,6 +127,23 @@ class TestTrainer(unittest.TestCase):
         )[1]
         self.assertEqual(refreshed_version, cached_version + 1)
 
+    def test_geometry_reuse_allows_batches_without_neighborhood_index(self):
+        dataset = _dataset([1, 2])
+        loader = make_dataloaders(
+            dataset,
+            valid_dataset=dataset,
+            batch_size=2,
+            reuse_grid_geometry=True,
+        )["valid"]
+        trainer = self._make_trainer()
+
+        batch = next(iter(loader))
+        moved = trainer._move_batch(batch)
+
+        self.assertNotIn("local_density_index", moved)
+        self.assertEqual(moved["rho"].device, trainer.device)
+        self.assertEqual(len(trainer._grid_geometry_device_cache), 0)
+
     def test_shared_grid_geometry_device_cache_is_bounded(self):
         trainer = self._make_trainer()
         for offset in range(3):

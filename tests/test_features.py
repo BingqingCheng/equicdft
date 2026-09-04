@@ -77,6 +77,18 @@ class TestCartesianAFeatures(unittest.TestCase):
         del gather.convolution_backend
         self.assertTrue(torch.equal(gather(data), expected))
 
+    def test_gather_backend_requires_explicit_neighborhood_index(self):
+        features = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=1,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "gather features require local_density_index",
+        ):
+            features({"rho": torch.ones(8, 1)})
+
     def test_fft_matches_gather_after_trainable_density_transform(self):
         torch.manual_seed(31)
         shape = (3, 4, 5)

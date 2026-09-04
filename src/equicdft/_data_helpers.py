@@ -7,11 +7,12 @@ import torch
 from ase import Atoms
 
 from ._argument_checks import (
+    boolean as _strict_boolean,
     nonnegative_integer as _strict_nonnegative_integer,
     positive_integer as _strict_positive_integer,
     positive_scalar as _strict_positive_scalar,
 )
-from .stencil import coarsen_grid, get_neighbor_indices
+from .stencil import coarsen_grid, get_neighbor_indices, make_stencil
 
 
 GRID_INFO_KEYS = {
@@ -92,6 +93,7 @@ def process_atoms(
     boltzmann_constant: float,
     thermal_wavelength: Any,
     geometry_cache: Optional[Dict[Any, Any]],
+    include_local_density_index: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Extract and canonicalize one EXTXYZ frame, then build its tensors."""
 
@@ -228,6 +230,7 @@ def process_atoms(
         excluded_mask=excluded_mask,
         geometry_cache=geometry_cache,
         include_thermal_wavelength=V_ext is not None,
+        include_local_density_index=include_local_density_index,
     )
 
 
@@ -246,6 +249,7 @@ def build_grid_data(
     excluded_mask: Optional[Any] = None,
     geometry_cache: Optional[Dict[Any, Any]] = None,
     include_thermal_wavelength: bool = True,
+    include_local_density_index: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -257,6 +261,10 @@ def build_grid_data(
     boltzmann_value = _metadata_positive_scalar(
         boltzmann_constant,
         "boltzmann_constant",
+    )
+    include_local_density_index = _strict_boolean(
+        include_local_density_index,
+        "include_local_density_index",
     )
 
     positions = np.asarray(grid_positions, dtype=np.int64)
@@ -300,6 +308,7 @@ def build_grid_data(
         grid_size=grid_size_values,
         cutoff_grid=cutoff_value,
         geometry_cache=geometry_cache,
+        include_local_density_index=include_local_density_index,
     )
     beta = 1.0 / (boltzmann_value * temperature_value)
     dtype = torch.get_default_dtype()
@@ -315,9 +324,10 @@ def build_grid_data(
             excluded_mask_values,
             dtype=torch.bool,
         ),
-        "local_density_index": local_density_index,
         "local_density_positions": local_density_positions,
     }
+    if local_density_index is not None:
+        data["local_density_index"] = local_density_index
     if rho_values is not None:
         data["rho"] = torch.tensor(rho_values, dtype=dtype)
     if V_ext_values is not None:
@@ -607,19 +617,28 @@ def _geometry_tensors(
     grid_size: np.ndarray,
     cutoff_grid: int,
     geometry_cache: Optional[Dict[Any, Any]],
+    include_local_density_index: bool,
 ) -> Any:
-    geometry_key = (cutoff_grid,) + tuple(int(value) for value in grid_size)
+    geometry_key = (
+        include_local_density_index,
+        cutoff_grid,
+    ) + tuple(int(value) for value in grid_size)
     cached = (
         None if geometry_cache is None else geometry_cache.get(geometry_key)
     )
     if cached is not None:
         return cached
-    local_density_index, local_density_positions = get_neighbor_indices(
-        grid_positions=grid_positions,
-        cutoff_grid=cutoff_grid,
-    )
+    if include_local_density_index:
+        local_density_index, local_density_positions = get_neighbor_indices(
+            grid_positions=grid_positions,
+            cutoff_grid=cutoff_grid,
+        )
+        index_tensor = torch.tensor(local_density_index, dtype=torch.long)
+    else:
+        local_density_positions = make_stencil(cutoff_grid)
+        index_tensor = None
     geometry = (
-        torch.tensor(local_density_index, dtype=torch.long),
+        index_tensor,
         torch.tensor(local_density_positions, dtype=torch.long),
     )
     if geometry_cache is not None:

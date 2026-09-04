@@ -262,6 +262,22 @@ class GridCACEModel(nn.Module):
         return getattr(self, "a_features", None) is not None
 
     @property
+    def requires_local_density_index(self) -> bool:
+        """Whether any configured local operator uses explicit gathering."""
+
+        if not self.has_local_features:
+            return False
+        if (
+            getattr(self.a_features, "convolution_backend", "gather")
+            == "gather"
+        ):
+            return True
+        return any(
+            getattr(message, "convolution_backend", "gather") == "gather"
+            for message in getattr(self, "message_layers", ())
+        )
+
+    @property
     def voxel_volume(self) -> torch.Tensor:
         """Quadrature volume represented by one grid point."""
 
@@ -391,7 +407,7 @@ class GridCACEModel(nn.Module):
                 )
                 A = message(
                     B,
-                    data["local_density_index"],
+                    data.get("local_density_index"),
                     stencil_basis,
                     grid_positions=data.get("grid_positions"),
                     grid_size=data.get("grid_size"),

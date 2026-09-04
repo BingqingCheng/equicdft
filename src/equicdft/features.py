@@ -639,6 +639,12 @@ class CartesianAFeatures(nn.Module):
             raise RuntimeError(
                 "convolution_backend must be 'gather' or 'fft'"
             )
+        if "local_density_index" not in data:
+            raise ValueError(
+                "gather features require local_density_index; reload the "
+                "data with include_local_density_index=True or use the fft "
+                "feature backend"
+            )
         local_density = gather_neighbors(
             descriptor_density,
             data["local_density_index"],

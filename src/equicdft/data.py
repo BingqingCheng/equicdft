@@ -10,6 +10,7 @@ from ase.io import read
 from torch.utils.data import Dataset
 
 from ._argument_checks import (
+    boolean,
     nonempty_string,
     nonnegative_integer,
     positive_scalar,
@@ -72,9 +73,9 @@ def _normalize_xyz_paths(
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
-    Every object contains the grid geometry, temperature, beta, and
-    neighborhood fields. Density, external-potential, chemical-potential, and
-    reference fields are included only when their source quantities are
+    Every object contains the grid geometry, temperature, beta, and stencil
+    offsets. Density, external-potential, chemical-potential, reference, and
+    explicit-neighborhood fields are included only when requested and
     available::
 
         temperature                 scalar
@@ -91,13 +92,15 @@ class GridData(dict):
         excluded_mask               [n_grid] bool; true grid points are excluded
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
-        local_density_index         [n_grid, n_neighbors]
+        local_density_index         [n_grid, n_neighbors] (optional)
         local_density_positions     [n_neighbors, 3]
 
     EXTXYZ records require at least one of ``rho`` and ``V_ext``. A grid built
     directly with :meth:`from_dict` may initially contain neither. Model
-    forwards gather from the live ``rho`` tensor through
-    ``local_density_index``, preserving the functional-derivative graph.
+    gather backends use ``local_density_index`` to read from the live ``rho``
+    tensor, preserving the functional-derivative graph. FFT/conv3d local
+    operators do not use this potentially large table, so callers may omit it
+    explicitly with ``include_local_density_index=False``.
     """
 
     @classmethod
@@ -115,6 +118,7 @@ class GridData(dict):
             float, Sequence[float], np.ndarray
         ] = 1.0,
         grid_info: Optional[Mapping[str, Any]] = None,
+        include_local_density_index: bool = True,
     ) -> List["GridData"]:
         """Read selected EXTXYZ frames into complete periodic grid records.
 
@@ -123,7 +127,8 @@ class GridData(dict):
         ``target_grid_spacing`` is supplied, available fields are block-
         averaged before neighborhoods are constructed. ``grid_info`` may be
         supplied from a trained model to configure and validate its grid and
-        unit metadata.
+        unit metadata. Set ``include_local_density_index=False`` only when the
+        consuming model reports ``requires_local_density_index=False``.
         """
 
         resolved_grid_info = None
@@ -136,6 +141,10 @@ class GridData(dict):
         boltzmann_constant = positive_scalar(
             boltzmann_constant,
             "boltzmann_constant",
+        )
+        include_local_density_index = boolean(
+            include_local_density_index,
+            "include_local_density_index",
         )
 
         keys = default_data_key.copy()
@@ -169,6 +178,7 @@ class GridData(dict):
                     boltzmann_constant=boltzmann_constant,
                     thermal_wavelength=thermal_wavelength,
                     geometry_cache=geometry_cache,
+                    include_local_density_index=include_local_density_index,
                 )
             )
             for atoms in configurations
@@ -189,13 +199,16 @@ class GridData(dict):
             float, Sequence[float], np.ndarray
         ] = 1.0,
         grid_info: Optional[Mapping[str, Any]] = None,
+        include_local_density_index: bool = True,
     ) -> "GridData":
         """Build one empty regular periodic grid from explicit metadata.
 
         ``values`` requires ``grid_size``, ``grid_spacing``, ``n_types``, and
         either ``temperature`` or ``T``. Matching model metadata may instead
         be supplied through ``grid_info``. Density and external-potential
-        fields can be assigned to the returned dictionary afterward.
+        fields can be assigned to the returned dictionary afterward. Set
+        ``include_local_density_index=False`` only for models whose local
+        operators all use non-gather backends.
         """
 
         if not isinstance(values, dict):
@@ -233,6 +246,10 @@ class GridData(dict):
         boltzmann_constant = positive_scalar(
             boltzmann_constant,
             "boltzmann_constant",
+        )
+        include_local_density_index = boolean(
+            include_local_density_index,
+            "include_local_density_index",
         )
 
         allowed_keys = {
@@ -280,6 +297,7 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
+                include_local_density_index=include_local_density_index,
             )
         )
 

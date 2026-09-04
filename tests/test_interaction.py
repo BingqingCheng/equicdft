@@ -80,6 +80,44 @@ class TestBChiMessage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gather.*conv3d.*fft"):
             BChiMessage(1, 1, 1, convolution_backend="invalid")
 
+    def test_only_gather_backend_requires_neighborhood_index(self):
+        data = _grid_data(shape=(3, 4, 5), cutoff_grid=1)
+        positions = data["grid_positions"].numpy()
+        _, stencil_positions = get_neighbor_indices(positions, cutoff_grid=1)
+        stencil_positions = torch.tensor(stencil_positions, dtype=torch.long)
+        stencil_basis = torch.randn(stencil_positions.shape[0], 1, 4)
+        B = torch.randn(60, 1, 1, 1)
+
+        gather = BChiMessage(1, 1, 1, hidden_sizes=())
+        with self.assertRaisesRegex(
+            ValueError,
+            "gather messages require local_density_index",
+        ):
+            gather(B, None, stencil_basis)
+
+        for backend in ("conv3d", "fft"):
+            with self.subTest(backend=backend):
+                message = BChiMessage(
+                    1,
+                    1,
+                    1,
+                    hidden_sizes=(),
+                    convolution_backend=backend,
+                )
+                arguments = {
+                    "grid_positions": data["grid_positions"],
+                    "grid_size": data["grid_size"],
+                    "stencil_positions": stencil_positions,
+                }
+                expected = message(
+                    B,
+                    data["local_density_index"],
+                    stencil_basis,
+                    **arguments,
+                )
+                actual = message(B, None, stencil_basis, **arguments)
+                self.assertTrue(torch.equal(actual, expected))
+
     def test_convolution_matches_gather_without_neighbor_materialization(self):
         torch.manual_seed(31)
         shape = (4, 5, 6)
@@ -932,6 +970,141 @@ class TestMessagePassingModel(unittest.TestCase):
 
         self.assertEqual(outputs["c2"].shape, data["rho"].shape)
         self.assertTrue(torch.all(torch.isfinite(outputs["c2"])))
+
+    def test_non_gather_model_exactly_ignores_neighborhood_index(self):
+        def make_model(message_backend):
+            a_features = CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=1,
+                max_power=2,
+                radial_basis="gaussian",
+                radial_exponents=(0.25, 1.0),
+                n_radial_channels=2,
+                trainable_radial_exponents=True,
+                separate_center=True,
+                convolution_backend="fft",
+            )
+            b_features = CartesianBFeatures(2, 2)
+            return GridCACEModel(
+                a_features=a_features,
+                b_features=b_features,
+                readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+                grid_spacing=1.0,
+                compute_c1=True,
+                compute_c2=True,
+                message_layers=[
+                    BChiMessage(
+                        b_features.n_features,
+                        2,
+                        1,
+                        hidden_sizes=(6,),
+                        radial_exponents=(0.5, 1.5),
+                        trainable_radial_exponents=True,
+                        convolution_backend=message_backend,
+                    )
+                ],
+            ).double()
+
+        source_data = _grid_data(shape=(3, 4, 5), cutoff_grid=1)
+
+        def copy_data(include_neighbors):
+            copied = {
+                key: value.clone() for key, value in source_data.items()
+            }
+            if not include_neighbors:
+                copied.pop("local_density_index")
+            for key in ("rho", "grid_spacing", "temperature", "beta"):
+                copied[key] = copied[key].double()
+            return copied
+
+        for backend in ("conv3d", "fft"):
+            with self.subTest(backend=backend):
+                torch.manual_seed(43)
+                model = make_model(backend)
+                self.assertFalse(model.requires_local_density_index)
+                included_data = copy_data(True)
+                omitted_data = copy_data(False)
+                included = model(included_data, c2_reference=(1, 0))
+                omitted = model(omitted_data, c2_reference=(1, 0))
+
+                for key in ("beta_F_exc", "c1", "c2"):
+                    self.assertTrue(
+                        torch.equal(included[key], omitted[key]),
+                        key,
+                    )
+
+                included["c1"].square().mean().backward()
+                included_rho_gradient = included_data["rho"].grad.clone()
+                included_parameter_gradients = {
+                    name: parameter.grad.clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.grad is not None
+                }
+                model.zero_grad(set_to_none=True)
+                omitted["c1"].square().mean().backward()
+
+                self.assertTrue(
+                    torch.equal(omitted_data["rho"].grad, included_rho_gradient)
+                )
+                self.assertEqual(
+                    set(included_parameter_gradients),
+                    {
+                        name
+                        for name, parameter in model.named_parameters()
+                        if parameter.grad is not None
+                    },
+                )
+                for name, parameter in model.named_parameters():
+                    if name in included_parameter_gradients:
+                        self.assertTrue(
+                            torch.equal(
+                                parameter.grad,
+                                included_parameter_gradients[name],
+                            ),
+                            name,
+                        )
+
+    def test_model_reports_when_neighborhood_index_is_required(self):
+        gather_model = self._make_model(lambda a_features, b_features: [])
+        self.assertTrue(gather_model.requires_local_density_index)
+
+        def make_fft_model(with_message):
+            a_features = CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=1,
+                max_power=2,
+                radial_basis="gaussian",
+                radial_exponents=(0.25,),
+                convolution_backend="fft",
+            )
+            b_features = CartesianBFeatures(2, 2)
+            messages = []
+            if with_message:
+                messages.append(
+                    BChiMessage(
+                        b_features.n_features,
+                        1,
+                        1,
+                        convolution_backend="fft",
+                    )
+                )
+            return GridCACEModel(
+                a_features=a_features,
+                b_features=b_features,
+                readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
+                grid_spacing=1.0,
+                message_layers=messages,
+            )
+
+        legacy_features = make_fft_model(with_message=False)
+        self.assertFalse(legacy_features.requires_local_density_index)
+        del legacy_features.a_features.convolution_backend
+        self.assertTrue(legacy_features.requires_local_density_index)
+
+        legacy_message = make_fft_model(with_message=True)
+        self.assertFalse(legacy_message.requires_local_density_index)
+        del legacy_message.message_layers[0].convolution_backend
+        self.assertTrue(legacy_message.requires_local_density_index)
 
     def test_convolution_matches_gather_energy_c1_c2_and_gradients(self):
         def make_model(backend):

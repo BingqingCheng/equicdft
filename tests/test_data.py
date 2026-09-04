@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -166,6 +167,53 @@ class TestGridData(unittest.TestCase):
         }
         with self.assertRaisesRegex(TypeError, "cutoff_grid"):
             GridData.from_dict(values, cutoff_grid=np.asarray([1]))
+        with self.assertRaisesRegex(TypeError, "include_local_density_index"):
+            GridData.from_xyz(
+                self.path,
+                include_local_density_index=1,
+            )
+        with self.assertRaisesRegex(TypeError, "include_local_density_index"):
+            GridData.from_dict(
+                values,
+                include_local_density_index=0,
+            )
+
+    def test_explicitly_omits_unused_neighborhood_index(self):
+        default_xyz = GridData.from_xyz(self.path, cutoff_grid=1)[0]
+        values = {
+            "grid_size": [4, 4, 4],
+            "grid_spacing": 0.5,
+            "temperature": 1.5,
+            "n_types": 1,
+        }
+        default_dict = GridData.from_dict(values, cutoff_grid=1)
+
+        with mock.patch(
+            "equicdft._data_helpers.get_neighbor_indices",
+            side_effect=AssertionError("neighbor table was constructed"),
+        ):
+            omitted_xyz = GridData.from_xyz(
+                self.path,
+                cutoff_grid=1,
+                include_local_density_index=False,
+            )[0]
+            omitted_dict = GridData.from_dict(
+                values,
+                cutoff_grid=1,
+                include_local_density_index=False,
+            )
+
+        for default, omitted in (
+            (default_xyz, omitted_xyz),
+            (default_dict, omitted_dict),
+        ):
+            self.assertNotIn("local_density_index", omitted)
+            self.assertEqual(
+                set(default),
+                set(omitted) | {"local_density_index"},
+            )
+            for key, value in omitted.items():
+                self.assertTrue(torch.equal(value, default[key]), key)
 
     def test_from_xyz_accepts_ordered_path_sequence(self):
         second_path = Path(self.temporary_directory.name) / "grid-second.extxyz"

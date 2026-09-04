@@ -121,6 +121,7 @@ class TestGridLDABranch(unittest.TestCase):
         self.assertTrue(torch.allclose(outputs["c1"], -2.0 * data["rho"]))
         self.assertEqual(model.cutoff_grid, 0)
         self.assertIsInstance(model.readout[0], LDAReadout)
+        self.assertFalse(model.requires_local_density_index)
         self.assertNotIn("local_density_index", data)
 
     def test_lda_c2_has_expected_local_hessian(self):
