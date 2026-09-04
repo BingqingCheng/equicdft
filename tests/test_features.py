@@ -51,6 +51,45 @@ def _periodic_data(shape, cutoff_grid, n_types=1):
 
 
 class TestCartesianAFeatures(unittest.TestCase):
+    def test_feature_parameters_are_declared_by_their_owner(self):
+        module = CartesianAFeatures(
+            max_power=2,
+            mean_density=1.0,
+            cutoff_grid=2,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 0.5),
+            trainable_radial_exponents=True,
+            radial_centers=(0.0, 1.0),
+            trainable_radial_centers=True,
+            n_radial_channels=2,
+            n_types=2,
+            density_transform=((1.0, 0.0), (0.0, 1.0)),
+            trainable_density_transform=True,
+        )
+
+        self.assertEqual(
+            set(module.feature_parameters),
+            {
+                "log_radial_exponents",
+                "learned_radial_centers",
+                "radial_transform.weight",
+                "density_transform.weight",
+            },
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in module.feature_parameters.values()
+            )
+        )
+
+        retained = CartesianAFeatures(
+            max_power=1,
+            mean_density=1.0,
+            cutoff_grid=1,
+        )
+        self.assertEqual(retained.feature_parameters, {})
+
     def test_convolution_backend_preserves_defaults_and_state_keys(self):
         common = dict(
             max_power=1,

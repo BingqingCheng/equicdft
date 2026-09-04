@@ -278,6 +278,25 @@ class GridCACEModel(nn.Module):
         )
 
     @property
+    def feature_parameters(self) -> Dict[str, nn.Parameter]:
+        """Return named trainable representation parameters declared by owners."""
+
+        parameters = {}
+        if self.has_local_features:
+            for name, parameter in self.a_features.feature_parameters.items():
+                parameters["a_features.{}".format(name)] = parameter
+        for index, message in enumerate(getattr(self, "message_layers", ())):
+            for name, parameter in message.feature_parameters.items():
+                parameters[
+                    "message_layers.{}.{}".format(index, name)
+                ] = parameter
+        if len({id(parameter) for parameter in parameters.values()}) != len(
+            parameters
+        ):
+            raise RuntimeError("feature parameter declarations contain aliases")
+        return parameters
+
+    @property
     def voxel_volume(self) -> torch.Tensor:
         """Quadrature volume represented by one grid point."""
 

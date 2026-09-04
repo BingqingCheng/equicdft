@@ -43,6 +43,21 @@ class _RecordingLinearDictionaryModel(_LinearDictionaryModel):
         return super().forward(batch)
 
 
+class _FeatureGroupedLinearDictionaryModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_weight = nn.Parameter(torch.tensor(0.0))
+        self.feature_weight = nn.Parameter(torch.tensor(0.0))
+
+    @property
+    def feature_parameters(self):
+        return {"feature_weight": self.feature_weight}
+
+    def forward(self, batch):
+        prediction = (self.base_weight + self.feature_weight) * batch["x"]
+        return {"prediction": prediction}
+
+
 class _QuadraticDictionaryFunctional(nn.Module):
     """Small functional for exercising model-dependent trainer losses."""
 
@@ -91,6 +106,134 @@ def _functional_dataset(n_fields=2):
 
 
 class TestTrainer(unittest.TestCase):
+    def test_feature_learning_rate_multiplier_builds_declared_groups(self):
+        model = _FeatureGroupedLinearDictionaryModel()
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        trainer = Trainer(
+            model,
+            loss,
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 1.0e-3},
+            scheduler_cls=torch.optim.lr_scheduler.ReduceLROnPlateau,
+            scheduler_args={"min_lr": 1.0e-5},
+            feature_learning_rate_multiplier=10.0,
+        )
+        loader = DataLoader(_dataset([1, 2]), batch_size=2)
+
+        trainer._initialize_optimization(loader)
+
+        groups = trainer.optimizer.param_groups
+        self.assertEqual([group["group_name"] for group in groups], ["base", "feature"])
+        self.assertEqual([group["lr"] for group in groups], [1.0e-3, 1.0e-2])
+        self.assertIs(groups[0]["params"][0], model.base_weight)
+        self.assertIs(groups[1]["params"][0], model.feature_weight)
+        self.assertEqual(trainer.feature_parameter_names, ("feature_weight",))
+        self.assertEqual(trainer.scheduler.min_lrs, [1.0e-5, 1.0e-4])
+
+    def test_feature_learning_rate_multiplier_is_positive(self):
+        loss = Loss([TensorLoss("target", "prediction", "target")])
+        for value in (True, "10"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                Trainer(
+                    _FeatureGroupedLinearDictionaryModel(),
+                    loss,
+                    feature_learning_rate_multiplier=value,
+                )
+        for value in (0.0, -1.0, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Trainer(
+                    _FeatureGroupedLinearDictionaryModel(),
+                    loss,
+                    feature_learning_rate_multiplier=value,
+                )
+
+    def test_default_feature_multiplier_preserves_one_optimizer_group(self):
+        model = _FeatureGroupedLinearDictionaryModel()
+        trainer = Trainer(
+            model,
+            Loss([TensorLoss("target", "prediction", "target")]),
+            optimizer_cls=torch.optim.SGD,
+            optimizer_args={"lr": 1.0e-3},
+        )
+
+        trainer._initialize_optimization(
+            DataLoader(_dataset([1, 2]), batch_size=2)
+        )
+
+        self.assertEqual(len(trainer.optimizer.param_groups), 1)
+        self.assertNotIn("group_name", trainer.optimizer.param_groups[0])
+        self.assertEqual(trainer.feature_parameter_names, ())
+
+    def test_feature_multiplier_requires_model_declaration(self):
+        trainer = Trainer(
+            _LinearDictionaryModel(),
+            Loss([TensorLoss("target", "prediction", "target")]),
+            feature_learning_rate_multiplier=10.0,
+        )
+        with self.assertRaisesRegex(ValueError, "feature_parameters"):
+            trainer.fit(
+                DataLoader(_dataset([1]), batch_size=1),
+                DataLoader(_dataset([1]), batch_size=1),
+                epochs=1,
+                verbose=False,
+            )
+
+    def test_feature_learning_rates_are_logged_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            loader = DataLoader(_dataset([1, 2]), batch_size=2)
+            trainer = Trainer(
+                _FeatureGroupedLinearDictionaryModel(),
+                Loss([TensorLoss("target", "prediction", "target")]),
+                optimizer_cls=torch.optim.SGD,
+                optimizer_args={"lr": 1.0e-3},
+                feature_learning_rate_multiplier=10.0,
+                checkpoint_dir=directory / "checkpoints",
+                log_dir=directory / "logs",
+            )
+            trainer.fit(loader, loader, epochs=1, verbose=False)
+            self.assertEqual(trainer.history[0]["learning_rate"], 1.0e-3)
+            self.assertEqual(
+                trainer.history[0]["feature_learning_rate"],
+                1.0e-2,
+            )
+            with (directory / "logs" / "history.csv").open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(float(row["feature_learning_rate"]), 1.0e-2)
+
+            resumed = Trainer(
+                _FeatureGroupedLinearDictionaryModel(),
+                Loss([TensorLoss("target", "prediction", "target")]),
+                optimizer_cls=torch.optim.SGD,
+                optimizer_args={"lr": 1.0e-3},
+                feature_learning_rate_multiplier=10.0,
+                checkpoint_dir=directory / "checkpoints",
+            )
+            resumed.load_checkpoint(
+                directory / "checkpoints" / "last.pt",
+                train_loader=loader,
+            )
+            self.assertEqual(
+                [group["lr"] for group in resumed.optimizer.param_groups],
+                [1.0e-3, 1.0e-2],
+            )
+
+            mismatched = Trainer(
+                _FeatureGroupedLinearDictionaryModel(),
+                Loss([TensorLoss("target", "prediction", "target")]),
+                optimizer_cls=torch.optim.SGD,
+                optimizer_args={"lr": 1.0e-3},
+                checkpoint_dir=directory / "checkpoints",
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "feature_learning_rate_multiplier",
+            ):
+                mismatched.load_checkpoint(
+                    directory / "checkpoints" / "last.pt",
+                    train_loader=loader,
+                )
+
     def test_shared_grid_geometry_device_copy_is_cached_but_not_serialized(self):
         geometry = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         dataset = _dataset([1, 2])

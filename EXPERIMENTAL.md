@@ -525,6 +525,41 @@ reports curvature RMSE, scaled curvature RMSE, nonpositive counts, and
 diagonal `S=1/K` diagnostics. The latter are not a substitute for inverting a
 coupled response matrix.
 
+## Feature-specific learning rate
+
+Feature-owning modules publish their trainable representation parameters to
+`GridCACEModel`. `Trainer` can apply one learning-rate multiplier to that
+declared group without parameter-name logic in a scientific training script:
+
+```python
+trainer = Trainer(
+    model=model,
+    loss=loss,
+    optimizer_cls=torch.optim.Adam,
+    optimizer_args={"lr": 1.0e-4},
+    feature_learning_rate_multiplier=10.0,
+    scheduler_cls=torch.optim.lr_scheduler.ReduceLROnPlateau,
+    scheduler_args={"min_lr": 1.0e-6},
+)
+```
+
+`CartesianAFeatures` declares any trainable Gaussian exponents and centers,
+pre-invariant radial transform, and density transform. `BChiMessage` declares
+only the radial parameters or radial transform that the message layer owns;
+a shared initial basis therefore creates no duplicate group entries. Readout
+and message-network parameters retain the base learning rate.
+
+The default multiplier is `1.0` and preserves the established single optimizer
+group. With a non-unit multiplier, epoch records retain `learning_rate` for the
+base group and add `feature_learning_rate`. A scalar `min_lr` supplied to
+`ReduceLROnPlateau` is scaled for the feature group, preserving the requested
+ratio at the scheduler floor. Resuming a grouped checkpoint requires the same
+multiplier and feature declarations.
+
+This option changes optimization only. It adds no model parameters or
+`state_dict` keys and does not make a feature parameter intrinsically “fast”;
+the multiplier remains an explicit training choice.
+
 ## Joint field and response training
 
 `TrainingStream` keeps different datasets, losses, metrics, and model-forward

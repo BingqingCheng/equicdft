@@ -1,6 +1,6 @@
 """Cartesian moment features for density fields on fixed integer grids."""
 
-from typing import Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -12,6 +12,7 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._grid import gather_neighbors, periodic_density_convolution
+from ._parameter_groups import trainable_parameter_mapping
 # These imports also retain the historical package-internal access points in
 # this module while their implementations live with the radial helpers.
 from ._radial import (
@@ -478,6 +479,34 @@ class CartesianAFeatures(nn.Module):
         if getattr(self, "radial_basis", "none") == "none":
             return self.squared_distances.new_zeros(1)
         raise RuntimeError("this Gaussian radial checkpoint is incompatible")
+
+    @property
+    def feature_parameters(self) -> Dict[str, nn.Parameter]:
+        """Return trainable parameters owned by the feature representation.
+
+        The mapping is an optimizer hint rather than fitted state.  Returning
+        it dynamically keeps optional Gaussian, radial-transform, and density-
+        transform parameters accurate without registering duplicate aliases.
+        """
+
+        radial_transform = getattr(self, "radial_transform", None)
+        density_transform = getattr(self, "density_transform", None)
+        return trainable_parameter_mapping(
+            {
+                "log_radial_exponents": getattr(
+                    self, "log_radial_exponents", None
+                ),
+                "learned_radial_centers": getattr(
+                    self, "learned_radial_centers", None
+                ),
+                "radial_transform.weight": getattr(
+                    radial_transform, "weight", None
+                ),
+                "density_transform.weight": getattr(
+                    density_transform, "weight", None
+                ),
+            }
+        )
 
     @property
     def radial_centers(self) -> torch.Tensor:

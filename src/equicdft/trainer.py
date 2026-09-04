@@ -1,8 +1,8 @@
 """Training orchestration for grid density-functional models."""
 
 from collections import OrderedDict
-import math
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import (
     Any,
@@ -28,6 +28,12 @@ from ._argument_checks import (
     nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
+    positive_scalar,
+)
+from ._parameter_groups import (
+    build_optimizer_parameters,
+    learning_rate_record,
+    scheduler_arguments_for_groups,
 )
 from ._trainer_io import (
     append_log_message,
@@ -124,6 +130,11 @@ class Trainer(nn.Module):
         Optional directory for ``history.csv`` and ``training.log``.
         ``history.csv`` is atomically reconstructed from the complete trainer
         history after every epoch and after loading a checkpoint.
+    feature_learning_rate_multiplier
+        Positive multiplier applied to parameters explicitly published by
+        ``model.feature_parameters``.  The default ``1.0`` retains the
+        established single optimizer group.  The model, not the trainer,
+        defines which parameters belong to the feature representation.
     """
 
     def __init__(
@@ -141,6 +152,7 @@ class Trainer(nn.Module):
         save_best: bool = True,
         early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
+        feature_learning_rate_multiplier: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -156,6 +168,10 @@ class Trainer(nn.Module):
         early_stopping_patience = optional_positive_integer(
             early_stopping_patience,
             "early_stopping_patience",
+        )
+        feature_learning_rate_multiplier = positive_scalar(
+            feature_learning_rate_multiplier,
+            "feature_learning_rate_multiplier",
         )
 
         metrics = list(metrics)
@@ -182,6 +198,10 @@ class Trainer(nn.Module):
         self.checkpoint_interval = checkpoint_interval
         self.save_best = save_best
         self.early_stopping_patience = early_stopping_patience
+        self.feature_learning_rate_multiplier = (
+            feature_learning_rate_multiplier
+        )
+        self.feature_parameter_names = ()
 
         self.checkpoint_dir = None
         if checkpoint_dir is not None:
@@ -248,10 +268,12 @@ class Trainer(nn.Module):
                 subset="valid",
             )
 
-            learning_rate = self.optimizer.param_groups[0]["lr"]
             record = {
                 "epoch": epoch,
-                "learning_rate": learning_rate,
+                **learning_rate_record(
+                    self.optimizer,
+                    self.feature_learning_rate_multiplier,
+                ),
                 "train_losses": train_losses,
                 "valid_losses": valid_losses,
                 "train_metrics": train_metrics,
@@ -348,7 +370,10 @@ class Trainer(nn.Module):
             )
             record = {
                 "epoch": epoch,
-                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                **learning_rate_record(
+                    self.optimizer,
+                    self.feature_learning_rate_multiplier,
+                ),
                 "stream_weights": weights,
                 "train_losses": train_losses,
                 "valid_losses": valid_losses,
@@ -398,7 +423,10 @@ class Trainer(nn.Module):
         )
         record = {
             "epoch": 0,
-            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            **learning_rate_record(
+                self.optimizer,
+                self.feature_learning_rate_multiplier,
+            ),
             "stream_weights": weights,
             "train_losses": {},
             "valid_losses": valid_losses,
@@ -429,6 +457,10 @@ class Trainer(nn.Module):
             ),
             "stream_names": [stream.name for stream in self._streams],
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "feature_learning_rate_multiplier": (
+                self.feature_learning_rate_multiplier
+            ),
+            "feature_parameter_names": self.feature_parameter_names,
             "scheduler_state_dict": (
                 None if self.scheduler is None else self.scheduler.state_dict()
             ),
@@ -500,6 +532,24 @@ class Trainer(nn.Module):
                 "checkpoint is missing keys: {}".format(
                     sorted(missing_keys)
                 )
+            )
+
+        checkpoint_multiplier = checkpoint.get(
+            "feature_learning_rate_multiplier",
+            1.0,
+        )
+        if checkpoint_multiplier != self.feature_learning_rate_multiplier:
+            raise ValueError(
+                "checkpoint feature_learning_rate_multiplier does not "
+                "match the configured trainer"
+            )
+        checkpoint_feature_names = checkpoint.get("feature_parameter_names")
+        if (
+            checkpoint_feature_names is not None
+            and tuple(checkpoint_feature_names) != self.feature_parameter_names
+        ):
+            raise ValueError(
+                "checkpoint feature parameter names do not match the model"
             )
 
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -666,14 +716,27 @@ class Trainer(nn.Module):
             if id(parameter) not in seen:
                 unique_parameters.append(parameter)
                 seen.add(id(parameter))
+        optimizer_parameters, self.feature_parameter_names = (
+            build_optimizer_parameters(
+                self.model,
+                unique_parameters,
+                self.optimizer_args,
+                self.feature_learning_rate_multiplier,
+            )
+        )
         self.optimizer = self.optimizer_cls(
-            unique_parameters,
+            optimizer_parameters,
             **self.optimizer_args,
         )
         if self.scheduler_cls is not None:
             self.scheduler = self.scheduler_cls(
                 self.optimizer,
-                **self.scheduler_args,
+                **scheduler_arguments_for_groups(
+                    self.scheduler_cls,
+                    self.scheduler_args,
+                    self.optimizer,
+                    self.feature_learning_rate_multiplier,
+                ),
             )
 
     @staticmethod

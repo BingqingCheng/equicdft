@@ -1,6 +1,6 @@
 """Finite-range message passing between invariant grid environments."""
 
-from typing import Optional, Sequence, Union
+from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -8,6 +8,7 @@ from torch import nn
 from ._argument_checks import boolean, positive_integer
 from ._grid import gather_neighbors, periodic_stencil_convolution
 from ._nn import build_mlp
+from ._parameter_groups import trainable_parameter_mapping
 from ._radial import (
     _RadialTransform,
     prepare_radial_centers,
@@ -265,6 +266,25 @@ class BChiMessage(nn.Module):
         if getattr(self, "trainable_radial_exponents", False):
             return torch.exp(self.log_radial_exponents)
         return self.fixed_radial_exponents
+
+    @property
+    def feature_parameters(self) -> Dict[str, nn.Parameter]:
+        """Return trainable radial-representation parameters owned here."""
+
+        radial_transform = getattr(self, "radial_transform", None)
+        return trainable_parameter_mapping(
+            {
+                "log_radial_exponents": getattr(
+                    self, "log_radial_exponents", None
+                ),
+                "learned_radial_centers": getattr(
+                    self, "learned_radial_centers", None
+                ),
+                "radial_transform.weight": getattr(
+                    radial_transform, "weight", None
+                ),
+            }
+        )
 
     @property
     def radial_centers(self) -> Optional[torch.Tensor]:

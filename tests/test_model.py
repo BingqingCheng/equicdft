@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    BChiMessage,
     BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
@@ -372,6 +373,51 @@ class TestGridLDAGGABranch(unittest.TestCase):
 
 
 class TestGridCACEModel(unittest.TestCase):
+    def test_feature_parameters_are_aggregated_from_owning_modules(self):
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 0.5),
+            trainable_radial_exponents=True,
+            radial_centers=(0.0, 1.0),
+            trainable_radial_centers=True,
+            n_radial_channels=2,
+            n_types=2,
+            density_transform=((1.0, 0.0), (0.0, 1.0)),
+        )
+        b_features = CartesianBFeatures(1, 2)
+        message = BChiMessage(
+            b_features.n_features,
+            2,
+            2,
+            hidden_sizes=(),
+            radial_exponents=(0.25, 0.5),
+            trainable_radial_exponents=True,
+            radial_centers=(0.0, 1.0),
+            trainable_radial_centers=True,
+        )
+        model = GridCACEModel(
+            a_features,
+            b_features,
+            [LocalReadout(n_types=2, hidden_sizes=(4,))],
+            grid_spacing=1.0,
+            message_layers=[message],
+        )
+
+        self.assertEqual(
+            set(model.feature_parameters),
+            {
+                "a_features.log_radial_exponents",
+                "a_features.learned_radial_centers",
+                "a_features.radial_transform.weight",
+                "a_features.density_transform.weight",
+                "message_layers.0.log_radial_exponents",
+                "message_layers.0.learned_radial_centers",
+            },
+        )
+
     def _make_data(self):
         shape = (3, 3, 3)
         grid_positions = np.indices(shape, dtype=int).reshape(3, -1).T

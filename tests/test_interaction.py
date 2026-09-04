@@ -55,6 +55,53 @@ def _load_whole_model(serialized):
 
 
 class TestBChiMessage(unittest.TestCase):
+    def test_feature_parameters_include_only_owned_radial_state(self):
+        independent = BChiMessage(
+            1,
+            2,
+            1,
+            hidden_sizes=(),
+            radial_exponents=(0.25, 0.5),
+            trainable_radial_exponents=True,
+            radial_centers=(0.0, 1.0),
+            trainable_radial_centers=True,
+        )
+        shared = BChiMessage(1, 2, 1, hidden_sizes=())
+
+        self.assertEqual(
+            set(independent.feature_parameters),
+            {"log_radial_exponents", "learned_radial_centers"},
+        )
+        self.assertEqual(shared.feature_parameters, {})
+
+        a_features = CartesianAFeatures(
+            mean_density=1.0,
+            cutoff_grid=2,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.25, 0.5),
+        )
+        b_features = CartesianBFeatures(1, 2)
+        bessel = BChiMessage(
+            b_features.n_features,
+            2,
+            1,
+            hidden_sizes=(),
+            radial_basis="bessel",
+            n_radial_functions=3,
+        )
+        GridCACEModel(
+            a_features,
+            b_features,
+            [LocalReadout(n_types=1, hidden_sizes=(4,))],
+            grid_spacing=1.0,
+            message_layers=[bessel],
+        )
+        self.assertEqual(
+            set(bessel.feature_parameters),
+            {"radial_transform.weight"},
+        )
+
     def test_convolution_backend_is_validated_without_state_keys(self):
         gather = BChiMessage(1, 1, 1, hidden_sizes=())
         convolution = BChiMessage(
