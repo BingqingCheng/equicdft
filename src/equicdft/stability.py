@@ -63,9 +63,14 @@ class FourierStabilityLoss(nn.Module):
         ``random_modes_per_field`` triplets are sampled independently for every
         field and batch.
     random_modes_per_field
-        Number of distinct reciprocal triplets sampled per field. Feasible
-        modes lie inside the physically isotropic Nyquist sphere. It must be
-        zero when explicit ``modes`` are supplied.
+        Number of distinct reciprocal triplets sampled per field from
+        ``mode_domain``. It must be zero when explicit ``modes`` are supplied.
+    mode_domain
+        ``"sphere"`` keeps the physical isotropic Nyquist sphere (default).
+        ``"cube"`` includes every grid-representable mode, bounded separately
+        by each axis's Nyquist limit. This includes high-wavevector corners
+        omitted by the sphere. Both domains remove the zero mode, global-sign
+        duplicates, and equivalent signs of even-grid Nyquist components.
     wavevector_range
         Optional inclusive ``(minimum, maximum)`` magnitude used to restrict
         random mode sampling. Values use the reciprocal units implied by
@@ -112,6 +117,7 @@ class FourierStabilityLoss(nn.Module):
         charges: Optional[Sequence[float]] = None,
         wavevector_range: Optional[Sequence[float]] = None,
         perturbations_per_forward: Optional[int] = None,
+        mode_domain: str = "sphere",
     ) -> None:
         super().__init__()
 
@@ -210,7 +216,9 @@ class FourierStabilityLoss(nn.Module):
         self.response = FourierResponse(
             relative_amplitude=relative_amplitude,
             perturbations_per_forward=perturbations_per_forward,
+            mode_domain=mode_domain,
         )
+        self.mode_domain = self.response.mode_domain
         self.random_modes_per_field = random_modes_per_field
         self.wavevector_range = selected_wavevector_range
         self.training_only = training_only
@@ -364,9 +372,12 @@ class FourierStabilityLoss(nn.Module):
                     self.modes,
                     size,
                     spacing,
+                    mode_domain=self.mode_domain,
                 ).detach().cpu().tolist()
             else:
-                candidates = _feasible_modes(size, spacing)
+                candidates = _feasible_modes(
+                    size, spacing, mode_domain=self.mode_domain,
+                )
                 if self.wavevector_range is not None:
                     box_lengths = tuple(
                         axis_size * axis_spacing

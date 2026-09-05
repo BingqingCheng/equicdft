@@ -321,7 +321,15 @@ def component_fourier_directions(
         / grid_size[:, None, None, :],
         dim=-1,
     )
-    waves = torch.stack((torch.cos(phase), torch.sin(phase)), dim=2)
+    # A self-conjugate grid mode has an identically zero sine phase. Enforce
+    # this algebraically: float32 sin(m*pi) roundoff at Nyquist corners can
+    # otherwise be normalized into a spurious finite perturbation.
+    self_conjugate = torch.all(
+        torch.remainder(2 * modes, batch["grid_size"].to(modes)[:, None, :]) == 0,
+        dim=-1,
+    )
+    sine = torch.sin(phase).masked_fill(self_conjugate[:, :, None], 0.0)
+    waves = torch.stack((torch.cos(phase), sine), dim=2)
     waves = waves.flatten(start_dim=1, end_dim=2)
 
     total_density = torch.sum(rho, dim=-2)
@@ -441,6 +449,7 @@ def validate_explicit_modes(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     supplied_modes: torch.Tensor,
+    mode_domain: str = "sphere",
 ) -> torch.Tensor:
     """Validate and canonicalize per-field integer response modes."""
 
@@ -470,6 +479,7 @@ def validate_explicit_modes(
                 size,
                 spacing,
                 name="response modes",
+                mode_domain=mode_domain,
             )
         )
     return torch.stack(canonical_by_field).to(device=rho.device)
@@ -478,9 +488,11 @@ def validate_explicit_modes(
 def feasible_modes(
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
+    mode_domain: str = "sphere",
 ) -> Sequence[Tuple[int, int, int]]:
-    """Return unique modes inside the physical isotropic Nyquist sphere."""
+    """Return unique real modes in the selected grid-representable domain."""
 
+    mode_domain = validated_mode_domain(mode_domain)
     size_tensor, spacing_tensor = _validated_grid_geometry(
         grid_size,
         grid_spacing,
@@ -498,6 +510,7 @@ def feasible_modes(
                     mode,
                     grid_size,
                     grid_spacing,
+                    mode_domain,
                 ):
                     feasible.add(canonical_grid_mode(mode, grid_size))
     return sorted(feasible)
@@ -528,10 +541,24 @@ def canonical_grid_mode(
         if size % 2 == 0 and abs(component) == size // 2:
             component = abs(component)
         canonical.append(component)
-    first_nonzero = next(component for component in canonical if component != 0)
-    if first_nonzero < 0:
-        canonical = [-component for component in canonical]
-    return tuple(canonical)
+    # Nyquist components are their own negatives on an even grid. Select
+    # the sign with a positive first non-Nyquist component; the two signs
+    # coincide when every nonzero component is Nyquist.
+    opposite = [
+        component
+        if size % 2 == 0 and component == size // 2
+        else -component
+        for component, size in zip(canonical, grid_size)
+    ]
+    return max(tuple(canonical), tuple(opposite))
+
+
+def validated_mode_domain(mode_domain: str) -> str:
+    """Return the requested Nyquist-domain convention."""
+
+    if mode_domain not in ("sphere", "cube"):
+        raise ValueError("mode_domain must be 'sphere' or 'cube'")
+    return mode_domain
 
 
 def _validated_grid(
@@ -596,14 +623,17 @@ def _mode_is_feasible(
     mode: Sequence[int],
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
+    mode_domain: str = "sphere",
 ) -> bool:
-    """Return whether a mode lies on-grid and inside the isotropic sphere."""
+    """Return whether a mode is on-grid and inside the requested domain."""
 
     if any(
         abs(component) > size // 2
         for component, size in zip(mode, grid_size)
     ):
         return False
+    if mode_domain == "cube":
+        return True
     box_lengths = tuple(
         size * spacing for size, spacing in zip(grid_size, grid_spacing)
     )
@@ -619,9 +649,11 @@ def canonical_mode_triplets(
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
     name: str = "modes",
+    mode_domain: str = "sphere",
 ) -> torch.Tensor:
     """Validate and canonicalize explicit modes for one periodic grid."""
 
+    mode_domain = validated_mode_domain(mode_domain)
     modes = mode_triplets(supplied_modes, name)
     size, spacing = _validated_grid_geometry(grid_size, grid_spacing)
     grid_size = tuple(size.tolist())
@@ -633,12 +665,15 @@ def canonical_mode_triplets(
     if len(set(selected)) != len(selected):
         raise ValueError("{} contain equivalent Fourier directions".format(name))
     if any(
-        not _mode_is_feasible(mode, grid_size, grid_spacing)
+        not _mode_is_feasible(mode, grid_size, grid_spacing, mode_domain)
         for mode in selected
     ):
-        raise ValueError(
-            "a requested mode lies outside the isotropic Nyquist sphere"
+        domain_name = (
+            "isotropic Nyquist sphere"
+            if mode_domain == "sphere"
+            else "componentwise Nyquist cube"
         )
+        raise ValueError("a requested mode lies outside the " + domain_name)
     return torch.tensor(selected, dtype=torch.long, device=modes.device)
 
 

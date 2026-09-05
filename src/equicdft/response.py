@@ -12,6 +12,7 @@ from ._fourier import (
     projected_fourier_curvature,
     validate_explicit_modes,
     validate_response,
+    validated_mode_domain,
 )
 
 
@@ -21,6 +22,9 @@ class FourierResponse(nn.Module):
     Integer reciprocal-grid modes and component-space directions are supplied
     at evaluation time. ``require_uniform`` distinguishes bulk-response
     fitting from stability tests around general inhomogeneous fields.
+    ``mode_domain="sphere"`` retains the physical isotropic Nyquist sphere;
+    ``"cube"`` admits all componentwise grid-representable wavevectors,
+    including the high-wavevector corners outside that sphere.
     """
 
     def __init__(
@@ -28,6 +32,7 @@ class FourierResponse(nn.Module):
         relative_amplitude: float = 0.01,
         perturbations_per_forward: Optional[int] = None,
         require_uniform: bool = False,
+        mode_domain: str = "sphere",
     ) -> None:
         super().__init__()
 
@@ -43,6 +48,7 @@ class FourierResponse(nn.Module):
             "perturbations_per_forward",
         )
         self.require_uniform = boolean(require_uniform, "require_uniform")
+        self.mode_domain = validated_mode_domain(mode_domain)
 
     def forward(
         self,
@@ -63,7 +69,9 @@ class FourierResponse(nn.Module):
             n_types=directions.shape[-1],
             require_uniform=self.require_uniform,
         )
-        modes = validate_explicit_modes(batch, rho, modes)
+        modes = validate_explicit_modes(
+            batch, rho, modes, mode_domain=self.mode_domain,
+        )
         perturbations, valid, mean_densities = fourier_directions(
             batch,
             rho,
@@ -117,7 +125,9 @@ class FourierResponse(nn.Module):
             n_types=supplied_rho.shape[-1],
             require_uniform=self.require_uniform,
         )
-        modes = validate_explicit_modes(batch, rho, modes)
+        modes = validate_explicit_modes(
+            batch, rho, modes, mode_domain=self.mode_domain,
+        )
         return fourier_curvature_matrix(
             model=model,
             outputs=outputs,
