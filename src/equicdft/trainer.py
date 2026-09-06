@@ -1,7 +1,6 @@
 """Training orchestration for grid density-functional models."""
 
 from collections import OrderedDict
-from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -25,14 +24,12 @@ from torch.nn.parameter import UninitializedParameter
 
 from ._argument_checks import (
     boolean,
-    nonnegative_integer,
     nonempty_string,
     nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
     positive_scalar,
 )
-from ._ema import _ParameterEMA
 from ._parameter_groups import (
     build_optimizer_parameters,
     learning_rate_record,
@@ -138,14 +135,6 @@ class Trainer(nn.Module):
         ``model.feature_parameters``.  The default ``1.0`` retains the
         established single optimizer group.  The model, not the trainer,
         defines which parameters belong to the feature representation.
-    ema_decay
-        Optional exponential-moving-average decay for trainable model
-        parameters. ``None`` preserves the established raw-parameter
-        validation and checkpoint behavior.
-    ema_start_step
-        Number of optimizer updates to complete before EMA tracking begins.
-        The first EMA update copies the current model exactly, avoiding
-        initialization bias.
     """
 
     def __init__(
@@ -164,8 +153,6 @@ class Trainer(nn.Module):
         early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
         feature_learning_rate_multiplier: float = 1.0,
-        ema_decay: Optional[float] = None,
-        ema_start_step: int = 0,
     ) -> None:
         super().__init__()
 
@@ -186,13 +173,6 @@ class Trainer(nn.Module):
             feature_learning_rate_multiplier,
             "feature_learning_rate_multiplier",
         )
-        ema_start_step = nonnegative_integer(ema_start_step, "ema_start_step")
-        if ema_decay is not None:
-            ema_decay = positive_scalar(ema_decay, "ema_decay")
-            if ema_decay >= 1.0:
-                raise ValueError("ema_decay must be smaller than one")
-        elif ema_start_step != 0:
-            raise ValueError("ema_start_step requires ema_decay")
 
         metrics = list(metrics)
         if any(not isinstance(metric, nn.Module) for metric in metrics):
@@ -222,10 +202,6 @@ class Trainer(nn.Module):
             feature_learning_rate_multiplier
         )
         self.feature_parameter_names = ()
-        self.ema_decay = ema_decay
-        self.ema_start_step = ema_start_step
-        self.optimizer_steps = 0
-        self._ema = None if ema_decay is None else _ParameterEMA(ema_decay)
 
         self.checkpoint_dir = None
         if checkpoint_dir is not None:
@@ -294,7 +270,10 @@ class Trainer(nn.Module):
 
             record = {
                 "epoch": epoch,
-                **self._optimization_record(),
+                **learning_rate_record(
+                    self.optimizer,
+                    self.feature_learning_rate_multiplier,
+                ),
                 "train_losses": train_losses,
                 "valid_losses": valid_losses,
                 "train_metrics": train_metrics,
@@ -391,7 +370,10 @@ class Trainer(nn.Module):
             )
             record = {
                 "epoch": epoch,
-                **self._optimization_record(),
+                **learning_rate_record(
+                    self.optimizer,
+                    self.feature_learning_rate_multiplier,
+                ),
                 "stream_weights": weights,
                 "train_losses": train_losses,
                 "valid_losses": valid_losses,
@@ -441,7 +423,10 @@ class Trainer(nn.Module):
         )
         record = {
             "epoch": 0,
-            **self._optimization_record(),
+            **learning_rate_record(
+                self.optimizer,
+                self.feature_learning_rate_multiplier,
+            ),
             "stream_weights": weights,
             "train_losses": {},
             "valid_losses": valid_losses,
@@ -462,11 +447,10 @@ class Trainer(nn.Module):
     ) -> None:
         """Write model, optimization, scheduler, and history state."""
 
-        evaluation_model_state = self.evaluation_model_state_dict()
         checkpoint = {
             "checkpoint_version": 1,
             "epoch": record["epoch"],
-            "model_state_dict": evaluation_model_state,
+            "model_state_dict": self.model.state_dict(),
             "loss_state_dict": self.loss.state_dict(),
             "stream_loss_state_dict": (
                 self.stream_losses.state_dict() if self._streams else None
@@ -502,15 +486,6 @@ class Trainer(nn.Module):
                 for name, generator in self._stream_loader_generators.items()
             },
         }
-        if self._ema is not None:
-            checkpoint.update(
-                {
-                    "raw_model_state_dict": self.model.state_dict(),
-                    "ema_state_dict": self._ema.state_dict(),
-                    "ema_start_step": self.ema_start_step,
-                    "optimizer_steps": self.optimizer_steps,
-                }
-            )
         atomic_torch_save(checkpoint, Path(path).expanduser())
 
     def load_checkpoint(
@@ -577,39 +552,7 @@ class Trainer(nn.Module):
                 "checkpoint feature parameter names do not match the model"
             )
 
-        checkpoint_ema = checkpoint.get("ema_state_dict")
-        if (checkpoint_ema is None) != (self._ema is None):
-            raise ValueError("checkpoint EMA configuration does not match trainer")
-        if self._ema is not None:
-            if checkpoint.get("ema_start_step") != self.ema_start_step:
-                raise ValueError(
-                    "checkpoint ema_start_step does not match the trainer"
-                )
-            optimizer_steps = checkpoint.get("optimizer_steps")
-            if (
-                isinstance(optimizer_steps, bool)
-                or not isinstance(optimizer_steps, int)
-                or optimizer_steps < 0
-            ):
-                raise ValueError(
-                    "checkpoint optimizer step count must be nonnegative"
-                )
-
-        model_state = checkpoint["model_state_dict"]
-        if self._ema is not None:
-            model_state = checkpoint.get("raw_model_state_dict")
-            if model_state is None:
-                raise ValueError(
-                    "EMA checkpoint has no raw model state for restart"
-                )
-        self.model.load_state_dict(model_state, strict=True)
-        if self._ema is not None:
-            self._ema.load_state_dict(
-                checkpoint_ema,
-                checkpoint["model_state_dict"],
-                self.model,
-            )
-            self.optimizer_steps = optimizer_steps
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:
@@ -972,7 +915,6 @@ class Trainer(nn.Module):
                         )
                     field_counts[stream.name] += n_fields
             self.optimizer.step()
-            self._after_optimizer_step()
 
         results = {}
         for stream in streams:
@@ -1009,7 +951,7 @@ class Trainer(nn.Module):
             metric.to(self.device)
         loss_sums = {}
         n_fields = 0
-        with self._evaluation_parameters(), torch.no_grad():
+        with torch.no_grad():
             for batch in loader:
                 batch, outputs, losses, details = self._forward_loss(
                     batch,
@@ -1119,49 +1061,6 @@ class Trainer(nn.Module):
             self.scheduler.step(valid_loss)
         else:
             self.scheduler.step()
-
-    def _evaluation_parameters(self):
-        """Return a context using EMA parameters when they are available."""
-
-        if self._ema is None:
-            return nullcontext()
-        return self._ema.average_parameters(self.model)
-
-    def _after_optimizer_step(self) -> None:
-        """Advance optimizer-step bookkeeping and an optional model EMA."""
-
-        self.optimizer_steps += 1
-        if self._ema is not None and self.optimizer_steps > self.ema_start_step:
-            self._ema.update(self.model)
-
-    def evaluation_model_state_dict(self):
-        """Return the model state used for validation and model selection."""
-
-        if self._ema is None:
-            return OrderedDict(
-                (name, value.detach().clone())
-                for name, value in self.model.state_dict().items()
-            )
-        return self._ema.evaluation_state_dict(self.model)
-
-    def _optimization_record(self) -> Dict[str, Any]:
-        """Return learning-rate and optional EMA progress metadata."""
-
-        record = learning_rate_record(
-            self.optimizer,
-            self.feature_learning_rate_multiplier,
-        )
-        if self._ema is not None:
-            record.update(
-                {
-                    "optimizer_steps": self.optimizer_steps,
-                    "ema_updates": self._ema.num_updates,
-                    "validation_parameter_source": (
-                        "ema" if self._ema.initialized else "raw"
-                    ),
-                }
-            )
-        return record
 
     def _finish_epoch(
         self,
