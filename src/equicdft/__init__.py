@@ -7,6 +7,7 @@ from .interaction import BChiMessage
 from .loader import make_dataloaders
 from .loss import FourierResponseLoss, Loss, TensorLoss
 from .metrics import FourierResponseMetrics, Metrics
+from .metalwall import MetalWall, MetalElectrodeReadout
 from .model import GridCACEModel
 from .pairwise import PairwiseReadout
 from .readout import BulkReadout, LocalReadout, LongRangeReadout
@@ -41,6 +42,8 @@ __all__ = [
     "LongRangeReadout",
     "Loss",
     "Metrics",
+    "MetalWall",
+    "MetalElectrodeReadout",
     "PairwiseReadout",
     "ReciprocalFeatures",
     "TensorLoss",

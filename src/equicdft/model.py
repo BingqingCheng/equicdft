@@ -43,7 +43,9 @@ class GridCACEModel(nn.Module):
     ``average_chemical_potential`` represent ``beta * mu_local`` and
     ``beta * mu_average``; despite their established key names, they are not
     energy-valued chemical potentials. Constructor response flags provide
-    defaults that individual forward calls may override.
+    defaults that individual forward calls may override. Readouts may also
+    return named observables through ``energy_and_outputs``; these are passed
+    through unchanged and are not additional energy contributions.
     """
 
     def __init__(
@@ -516,6 +518,11 @@ class GridCACEModel(nn.Module):
                 "normalized_temperature": normalized_temperature,
                 "voxel_volume": volume_element,
                 "grid_spacing": self.grid_spacing.to(rho),
+                # Physical analytical readouts use the model's unit contract,
+                # not a possibly stale beta field supplied by a caller.
+                "beta": 1.0 / (self.boltzmann_constant.to(rho) * temperature),
+                "reference_energy": self.reference_energy.to(rho),
+                "free_energy_mode": getattr(self, "free_energy_mode", "beta"),
             }
             if local_features is not None:
                 context["local_features"] = local_features
@@ -523,15 +530,36 @@ class GridCACEModel(nn.Module):
                 context["state_features"] = state_features
             if "grid_size" in data:
                 context["grid_size"] = data["grid_size"]
+            for key in (
+                "grid_positions", "metal_mask", "metal_group_ids",
+                "metal_total_charge", "metal_charge_units",
+            ):
+                if key in data:
+                    context[key] = data[key]
 
             readout_energies = []
+            readout_outputs = {}
+            reserved_outputs = {
+                "F_exc", "beta_F_exc", "c1", "c2",
+                "local_chemical_potential", "average_chemical_potential",
+                "chemical_potential_weights",
+            }
             for item in self.readout:
-                energy = item.energy(context)
+                energy, extra_outputs = item.energy_and_outputs(context)
                 if energy.shape != rho.shape[:-2]:
                     raise ValueError(
                         "every readout must return one scalar energy per field"
                     )
                 readout_energies.append(energy)
+                conflicts = set(extra_outputs) & (
+                    reserved_outputs | set(readout_outputs)
+                )
+                if conflicts:
+                    raise ValueError(
+                        "readout output names must be unique and not reserved: "
+                        + ", ".join(sorted(conflicts))
+                    )
+                readout_outputs.update(extra_outputs)
 
             # Summing the scalar readouts before conversion and
             # differentiation makes every enabled contribution part of one
@@ -556,6 +584,7 @@ class GridCACEModel(nn.Module):
             else:
                 beta_F_exc = readout_energy
                 outputs = {"beta_F_exc": beta_F_exc}
+            outputs.update(readout_outputs)
 
             if compute_c1:
                 # beta_F_exc_derivative and c1 have the same shape as rho:

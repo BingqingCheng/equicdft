@@ -46,6 +46,10 @@ default_data_key = {
     "V_ext": "V_ext",
     "rho": "density",
     "excluded_mask": "excluded_mask",
+    "metal_mask": "metal_mask",
+    "metal_group_ids": "metal_group_ids",
+    "metal_total_charge": "metal_total_charge",
+    "metal_charge_units": "metal_charge_units",
 }
 
 
@@ -90,6 +94,10 @@ class GridData(dict):
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
         excluded_mask               [n_grid] bool; true grid points are excluded
+        metal_mask                  [n_grid] integer; negative nonmetal (optional)
+        metal_group_ids             [n_groups] unique IDs in charge order
+        metal_total_charge          [n_groups] prescribed total charge per group
+        metal_charge_units          "e" (required when metal is present)
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors] (optional)
@@ -101,6 +109,9 @@ class GridData(dict):
     tensor, preserving the functional-derivative graph. FFT/conv3d local
     operators do not use this potentially large table, so callers may omit it
     explicitly with ``include_local_density_index=False``.
+    Metal points additionally exclude fluid density without changing the
+    separately retained ``excluded_mask``. Group charge metadata is mandatory
+    when ``metal_mask`` contains any nonnegative group ID.
     """
 
     @classmethod
@@ -259,6 +270,10 @@ class GridData(dict):
             "T",
             "n_types",
             "excluded_mask",
+            "metal_mask",
+            "metal_group_ids",
+            "metal_total_charge",
+            "metal_charge_units",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -297,6 +312,10 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
+                metal_mask=values.get("metal_mask"),
+                metal_group_ids=values.get("metal_group_ids"),
+                metal_total_charge=values.get("metal_total_charge"),
+                metal_charge_units=values.get("metal_charge_units"),
                 include_local_density_index=include_local_density_index,
             )
         )

@@ -13,6 +13,7 @@ from ._argument_checks import (
     positive_scalar,
 )
 from ._grid import voxel_volume
+from ._metal_data import metal_mask_tensor
 from ._solver_numerics import (
     _anderson_log_density_candidate,
     _component_tensor,
@@ -42,7 +43,8 @@ class GridSolver:
     unbatched field; prescribed-density evaluation also supports batches.
     An optional Boolean ``excluded_mask`` has shape ``[..., n_grid]``; true
     entries are hard exclusions whose density is fixed to zero and omitted
-    from residuals.
+    from residuals. Nonnegative entries in integer ``metal_mask`` add metal
+    exclusions while the two input masks remain separately recorded.
     """
 
     def __init__(
@@ -86,6 +88,10 @@ class GridSolver:
                 "temperature",
                 "beta",
                 "excluded_mask",
+                "metal_mask",
+                "metal_group_ids",
+                "metal_total_charge",
+                "metal_charge_units",
             )
             if key in data
         }
@@ -192,6 +198,8 @@ class GridSolver:
         normalized over accessible points, and excluded residuals do not enter
         convergence. The exclusion mask does not alter the periodic
         neighborhood topology.
+        Nonnegative ``metal_mask`` entries are excluded by the same rules;
+        the metal group IDs and total charges remain separate metadata.
 
         When no density is supplied through ``initial_rho`` or ``data["rho"]``,
         the initial profile is proportional to
@@ -1034,8 +1042,15 @@ def _resolve_accessibility_masks(
                 "excluded_mask must have shape field.shape[:-1]"
             )
         excluded = excluded_mask.to(device=field.device)
+    if "metal_mask" in data:
+        metal = metal_mask_tensor(
+            data["metal_mask"], field.shape[-2], field.device,
+        )
+        if metal.shape not in ((field.shape[-2],), expected_shape):
+            raise ValueError("metal_mask must match the field grid and batch shape")
+        excluded = excluded | (metal >= 0).expand(expected_shape)
     if torch.any(torch.all(excluded, dim=-1)).item():
         raise ValueError(
-            "excluded_mask must leave at least one accessible grid point"
+            "exclusion masks must leave at least one accessible grid point"
         )
     return excluded, ~excluded

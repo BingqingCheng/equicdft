@@ -11,6 +11,36 @@ from ._component_pairs import symmetric_component_pairs
 from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
 
 
+def _squared_wavevectors(grid_size, grid_spacing, device, dtype):
+    """Full FFT-grid wave numbers, in inverse coordinate units squared."""
+
+    axes = [
+        2.0 * math.pi * torch.fft.fftfreq(
+            n, d=float(grid_spacing[axis].detach().cpu().item()),
+            device=device, dtype=dtype,
+        )
+        for axis, n in enumerate(grid_size)
+    ]
+    kx, ky, kz = torch.meshgrid(*axes, indexing="ij")
+    return kx.square() + ky.square() + kz.square()
+
+
+def _coulomb_values(squared_wavevector, exponents):
+    """4 pi exp(-alpha k²)/k²; zero mode is a declared potential gauge."""
+
+    gaussian = torch.exp(
+        -exponents[:, None, None, None] * squared_wavevector[None, ...]
+    )
+    safe = torch.where(
+        squared_wavevector > 0.0, squared_wavevector,
+        torch.ones_like(squared_wavevector),
+    )
+    values = 4.0 * math.pi * gaussian / safe[None, ...]
+    return torch.where(
+        squared_wavevector[None, ...] > 0.0, values, torch.zeros_like(values),
+    )
+
+
 class ReciprocalFeatures(nn.Module):
     r"""Contract Fourier density fluctuations against fixed radial kernels.
 
@@ -185,21 +215,12 @@ class ReciprocalFeatures(nn.Module):
     ) -> torch.Tensor:
         """Return ``[n_kernels, nx, ny, nz]`` radial kernel values."""
 
-        nx, ny, nz = grid_size
-        k_axes = [
-            2.0
-            * math.pi
-            * torch.fft.fftfreq(
-                n,
-                d=float(grid_spacing[axis].detach().cpu().item()),
-                device=device,
-                dtype=dtype,
-            )
-            for axis, n in enumerate((nx, ny, nz))
-        ]
-        kx, ky, kz = torch.meshgrid(*k_axes, indexing="ij")
-        squared_wavevector = kx.square() + ky.square() + kz.square()
+        squared_wavevector = _squared_wavevectors(
+            grid_size, grid_spacing, device, dtype,
+        )
         exponents = self.radial_exponents.to(device=device, dtype=dtype)
+        if self.kernel == "coulomb":
+            return _coulomb_values(squared_wavevector, exponents)
         gaussian = torch.exp(
             -exponents[:, None, None, None]
             * squared_wavevector[None, ...]
@@ -219,19 +240,6 @@ class ReciprocalFeatures(nn.Module):
                 torch.ones_like(denominator),
             )
             values = gaussian / safe_denominator
-        else:
-            safe_squared_wavevector = torch.where(
-                squared_wavevector > 0.0,
-                squared_wavevector,
-                torch.ones_like(squared_wavevector),
-            )
-            values = (
-                4.0
-                * math.pi
-                * gaussian
-                / safe_squared_wavevector[None, ...]
-            )
-
         # The homogeneous mode belongs to the bulk/local functional. Removing
         # it also makes the inverse-Laplacian kernel finite when kappa is zero.
         return torch.where(

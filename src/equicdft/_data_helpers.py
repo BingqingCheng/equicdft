@@ -13,6 +13,7 @@ from ._argument_checks import (
     positive_scalar as _strict_positive_scalar,
 )
 from .stencil import coarsen_grid, get_neighbor_indices, make_stencil
+from ._metal_data import normalize_metal_metadata
 
 
 GRID_INFO_KEYS = {
@@ -147,6 +148,12 @@ def process_atoms(
         data_key["excluded_mask"],
         order,
     )
+    metal_mask = _get_source_value(atoms, data_key["metal_mask"])
+    if metal_mask is not None:
+        metal_mask = np.asarray(metal_mask)
+        if metal_mask.shape != (n_grid,):
+            raise ValueError("metal_mask must have shape [n_grid]")
+        metal_mask = metal_mask[order]
     V_ext = _ordered_optional_field(
         atoms,
         data_key["V_ext"],
@@ -170,6 +177,13 @@ def process_atoms(
         )
     )
     if target_grid_spacing is not None:
+        if metal_mask is not None and not np.allclose(
+            grid_spacing, _metadata_grid_spacing(target_grid_spacing),
+        ):
+            raise ValueError(
+                "coarsening metal_mask is unsupported; supply metal data "
+                "on the target grid"
+            )
         fields_to_coarsen = [
             field for field in (rho, V_ext) if field is not None
         ]
@@ -228,6 +242,10 @@ def process_atoms(
         V_ext=V_ext,
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
+        metal_mask=metal_mask,
+        metal_group_ids=_get_source_value(atoms, data_key["metal_group_ids"]),
+        metal_total_charge=_get_source_value(atoms, data_key["metal_total_charge"]),
+        metal_charge_units=_get_source_value(atoms, data_key["metal_charge_units"]),
         geometry_cache=geometry_cache,
         include_thermal_wavelength=V_ext is not None,
         include_local_density_index=include_local_density_index,
@@ -250,6 +268,10 @@ def build_grid_data(
     geometry_cache: Optional[Dict[Any, Any]] = None,
     include_thermal_wavelength: bool = True,
     include_local_density_index: bool = True,
+    metal_mask: Optional[Any] = None,
+    metal_group_ids: Optional[Any] = None,
+    metal_total_charge: Optional[Any] = None,
+    metal_charge_units: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -288,13 +310,22 @@ def build_grid_data(
     )
     mu_values = _normalize_optional_mu(mu, n_type_values)
     excluded_mask_values = _normalize_excluded_mask(excluded_mask, n_grid)
+    metal_data = normalize_metal_metadata(
+        metal_mask, metal_group_ids, metal_total_charge, metal_charge_units,
+        n_grid=n_grid, batch_shape=(),
+    )
+    effective_exclusion = excluded_mask_values.copy()
+    if metal_data:
+        effective_exclusion |= metal_data["metal_mask"].cpu().numpy() >= 0
+    if np.all(effective_exclusion):
+        raise ValueError("masks must leave at least one accessible grid point")
     if rho_values is not None and np.any(
-        np.abs(rho_values[excluded_mask_values]) > 1.0e-12
+        np.abs(rho_values[effective_exclusion]) > 1.0e-12
     ):
         raise ValueError("rho must be zero at excluded grid points")
     if rho_values is not None:
         rho_values = rho_values.copy()
-        rho_values[excluded_mask_values] = 0.0
+        rho_values[effective_exclusion] = 0.0
     wavelength_values = None
     if include_thermal_wavelength:
         wavelength_values = _metadata_per_type_positive_values(
@@ -326,6 +357,7 @@ def build_grid_data(
         ),
         "local_density_positions": local_density_positions,
     }
+    data.update(metal_data)
     if local_density_index is not None:
         data["local_density_index"] = local_density_index
     if rho_values is not None:
@@ -344,13 +376,25 @@ def build_grid_data(
         mu=mu_values,
         beta=beta,
         thermal_wavelength=wavelength_values,
-        excluded_mask=excluded_mask_values,
+        excluded_mask=effective_exclusion,
     )
     return data
 
 
 def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
     """Make optional target keys compatible with default PyTorch collation."""
+
+    metal_keys = {
+        "metal_mask", "metal_group_ids", "metal_total_charge", "metal_charge_units",
+    }
+    if data and any(metal_keys & set(frame) for frame in data):
+        present = [metal_keys & set(frame) for frame in data]
+        if any(keys != present[0] for keys in present):
+            raise ValueError("frames must share metal metadata keys for batching")
+        counts = {frame["metal_group_ids"].numel() for frame in data
+                  if "metal_group_ids" in frame}
+        if len(counts) > 1:
+            raise ValueError("frames must have the same metal group count for batching")
 
     if any("c1_plus_beta_mu" not in frame for frame in data):
         for frame in data:

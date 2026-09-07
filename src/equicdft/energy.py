@@ -1,6 +1,6 @@
 """Common interface for additive free-energy readouts."""
 
-from typing import Dict, Union
+from typing import Dict, Tuple, Union
 
 import torch
 from torch import nn
@@ -82,7 +82,7 @@ def ideal_free_energy(
 
 
 class EnergyReadout(nn.Module):
-    """Neural readout that supplies one scalar functional contribution."""
+    """Readout supplying a scalar functional and optional observable outputs."""
 
     requires_local_features = False
     requires_state_features = False
@@ -94,3 +94,15 @@ class EnergyReadout(nn.Module):
         """Return one scalar energy per complete density field."""
 
         raise NotImplementedError
+
+    def energy_and_outputs(
+        self,
+        context: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Return energy and observables from one evaluation.
+
+        Existing scalar-only readouts need not override this method. Output
+        names must be unique across readouts and must not shadow model outputs.
+        """
+
+        return self.energy(context), {}
