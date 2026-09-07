@@ -71,6 +71,28 @@ class TestMetalData(unittest.TestCase):
         self.assertTrue(torch.all(frame["rho"][(mask >= 0) | excluded] == 0))
         self.assertTrue(torch.all(frame["c1_plus_beta_mu"][(mask >= 0) | excluded] == 0))
 
+    def test_extxyz_field_metadata_and_zero_field_batch(self):
+        atoms, mask, _ = _metal_atoms(single_group=True)
+        no_field = atoms.copy()
+        atoms.info["metal_external_field"] = np.array([0., 0., -0.2])
+        atoms.info["metal_field_origin"] = np.array([0., 0., -0.5])
+        frames = self._read([no_field, atoms])
+        batch = next(iter(DataLoader(frames, batch_size=2)))
+        torch.testing.assert_close(batch["metal_external_field"],
+                                   torch.tensor([[0., 0., 0.], [0., 0., -0.2]]))
+        torch.testing.assert_close(batch["metal_field_origin"][1], torch.tensor([0., 0., -0.5]))
+        direct = GridData.from_dict({
+            "grid_size": [4, 2, 2], "grid_spacing": 1., "temperature": 1.,
+            "n_types": 2, "metal_mask": mask, "metal_group_ids": 2,
+            "metal_total_charge": 0., "metal_charge_units": "e",
+            "metal_external_field": [0., 0., -0.2],
+        }, cutoff_grid=0)
+        torch.testing.assert_close(direct["metal_external_field"], frames[1]["metal_external_field"])
+        torch.testing.assert_close(direct["metal_field_origin"], torch.zeros(3))
+        atoms.info["metal_external_field"] = 0.2
+        with self.assertRaisesRegex(ValueError, "metal_external_field"):
+            self._read(atoms)
+
     def test_single_group_scalar_info_and_from_dict(self):
         atoms, mask, _ = _metal_atoms(single_group=True)
         frame = self._read(atoms)[0]

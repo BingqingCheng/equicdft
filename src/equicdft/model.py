@@ -533,6 +533,7 @@ class GridCACEModel(nn.Module):
             for key in (
                 "grid_positions", "metal_mask", "metal_group_ids",
                 "metal_total_charge", "metal_charge_units",
+                "metal_external_field", "metal_field_origin",
             ):
                 if key in data:
                     context[key] = data[key]

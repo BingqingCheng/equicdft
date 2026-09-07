@@ -5,6 +5,34 @@ from typing import Any, Dict, Optional, Sequence
 import torch
 
 
+def normalize_metal_field(field=None, origin=None, *, dtype=None, device=None,
+                          batch_shape=()) -> Dict[str, torch.Tensor]:
+    """Optional metal-only field and wrapping origin, shared or per frame.
+
+    Vectors are Cartesian [3], in energy/(e*length) and length respectively.
+    The origin is relative to grid index zero; it defaults to that grid point.
+    """
+    if field is None:
+        if origin is not None:
+            raise ValueError("metal_field_origin requires metal_external_field")
+        return {}
+    leading = tuple(batch_shape)
+    result = {}
+    for name, value in (("metal_external_field", field),
+                        ("metal_field_origin", (0.0, 0.0, 0.0) if origin is None else origin)):
+        raw = torch.as_tensor(value, device=device)
+        if raw.dtype == torch.bool or raw.is_complex():
+            raise ValueError(name + " must contain real finite values")
+        vector = torch.as_tensor(value, dtype=dtype or torch.get_default_dtype(),
+                                 device=device)
+        if vector.shape not in ((3,), (*leading, 3)):
+            raise ValueError(name + " must have shape [3] or [..., 3] matching the field")
+        if not torch.all(torch.isfinite(vector)).item():
+            raise ValueError(name + " must contain real finite values")
+        result[name] = vector.expand(*leading, 3)
+    return result
+
+
 def _integer_tensor(value: Any, name: str, device=None) -> torch.Tensor:
     values = torch.as_tensor(value, device=device)
     if values.dtype == torch.bool or values.is_complex():

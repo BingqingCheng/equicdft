@@ -8,7 +8,7 @@ from torch import nn
 
 from ._argument_checks import nonnegative_scalar, positive_scalar
 from ._grid import common_grid_size, grid_spacing_tensor, _flat_grid_positions
-from ._metal_data import normalize_metal_metadata
+from ._metal_data import normalize_metal_field, normalize_metal_metadata
 from .energy import EnergyReadout
 from .reciprocal import _coulomb_values, _squared_wavevectors
 
@@ -49,11 +49,20 @@ class MetalWall(nn.Module):
     metal_total_charge[..., K] and metal_charge_units="e". Unbatched geometry
     may be shared. Every present group must have an explicit total charge.
 
+    Optional ``metal_external_field[..., 3]`` is a Cartesian field in
+    energy/(e * coordinate_unit), applied to metal only. ``metal_field_origin``
+    [.., 3] is the wrapping center relative to grid index zero, in coordinate
+    units (default zero). For r = grid_index * grid_spacing, use CACE's
+    r_wrap = r - origin - L * round((r - origin)/L), componentwise. Choose
+    the branch cut away from metal sites. The liquid field belongs in V_ext.
+
     Returns a new dictionary. ``q_liquid``, ``metal_q`` and their sum ``q_mw``
     are integrated charge coefficients [.., G] in e, not fluid densities.
     ``liquid_charge_density`` is sum_i(z_i*rho_i), in e / coordinate_unit³.
     ``metal_charge`` and ``metal_potential`` follow the supplied group order.
-    Potentials are energy/e; all Coulomb outputs are physical energies.
+    Potentials include the imposed metal field and are energy/e. All Coulomb
+    outputs are physical energies and exclude the imposed field work, returned
+    separately as ``metal_external_energy`` = -sum_m q_m E dot r_wrap,m.
     Charge and equipotential residuals are absolute maxima per field.
 
     Only fixed parameters/geometry are cached. The charge solve stays in the
@@ -207,14 +216,20 @@ class MetalWall(nn.Module):
         else:
             raise ValueError("grid_spacing must be [3] or match rho batch shape")
 
+        field_data = normalize_metal_field(
+            data.get("metal_external_field"), data.get("metal_field_origin"),
+            dtype=rho.dtype, device=rho.device, batch_shape=leading,
+        )
+        external = field_data.get("metal_external_field", rho.new_zeros(*leading, 3))
+        origins = field_data.get("metal_field_origin", rho.new_zeros(*leading, 3))
         fields = zip(
             rho.reshape(n_fields, n_grid, -1), mask.reshape(n_fields, n_grid),
             ids.reshape(n_fields, n_groups), totals.reshape(n_fields, n_groups),
-            spacings,
+            spacings, external.reshape(n_fields, 3), origins.reshape(n_fields, 3),
         )
         return shape, leading, fields
 
-    def _solve_charges(self, q_liquid, phi_liquid, group_totals, index, system):
+    def _solve_charges(self, q_liquid, potential, group_totals, index, system):
         """Solve fixed electrode totals and check neutrality and KKT residuals."""
 
         roundoff = 64 * torch.finfo(q_liquid.dtype).eps
@@ -227,7 +242,7 @@ class MetalWall(nn.Module):
                 "charge neutrality; no background charge is added"
             )
         A, C, factor, pivots = system
-        rhs = torch.cat((-phi_liquid[index], group_totals))
+        rhs = torch.cat((-potential, group_totals))
         # torch 1.12 has linalg.lu_factor but not linalg.lu_solve.
         lu_solve = getattr(torch.linalg, "lu_solve", None)
         solution = (
@@ -236,17 +251,17 @@ class MetalWall(nn.Module):
             lu_solve(factor, pivots, rhs[:, None])
         ).squeeze(-1)
         q = solution[:index.numel()]
-        # A q + phi_liquid + C lambda = 0: potential = -lambda.
+        # A q + (liquid + external potential) + C lambda = 0.
         metal_potential = -solution[index.numel():]
         metal_charge = C.T @ q
         charge_residual = (metal_charge - group_totals).abs().max()
-        stationarity = A @ q + phi_liquid[index] - C @ metal_potential
+        stationarity = A @ q + potential - C @ metal_potential
         potential_residual = stationarity.abs().max()
         charge_limit = (self.tolerance + roundoff) * (
             1.0 + group_totals.abs().max()
         )
         potential_limit = (self.tolerance + roundoff) * (
-            1.0 + phi_liquid[index].abs().max() + (A @ q).abs().max()
+            1.0 + potential.abs().max() + (A @ q).abs().max()
         )
         if (
             not torch.all(torch.isfinite(solution)).item()
@@ -258,8 +273,9 @@ class MetalWall(nn.Module):
 
     def _evaluate_field(
         self, shape, density, field_mask, group_ids, group_totals, spacing,
+        external_field, field_origin,
     ):
-        """Form voxel charges, solve the electrodes, and evaluate all three energies."""
+        """Form voxel charges, solve the electrodes, and evaluate their energy."""
 
         kernels, index, system = self._geometry(
             shape, spacing, field_mask, group_ids, density,
@@ -272,11 +288,23 @@ class MetalWall(nn.Module):
         metal_charge = group_totals + zero
         metal_potential = group_totals * 0.0 + zero
         charge_residual = potential_residual = zero
+        metal_external_energy = zero
         if index.numel():
+            # Canonical C-order indices; only the field uses this wrapped
+            # coordinate branch. Coulomb positions and the cached A stay fixed.
+            coordinates = torch.stack((
+                index // (shape[1] * shape[2]),
+                (index // shape[2]) % shape[1], index % shape[2],
+            ), dim=-1).to(density) * spacing - field_origin
+            cell = spacing * spacing.new_tensor(shape)
+            wrapped = coordinates - cell * torch.round(coordinates / cell)
+            external_potential = -(wrapped * external_field).sum(-1)
+            driving_potential = phi_liquid[index] + external_potential
             q, metal_charge, metal_potential, charge_residual, potential_residual = (
-                self._solve_charges(q_liquid, phi_liquid, group_totals, index, system)
+                self._solve_charges(q_liquid, driving_potential, group_totals, index, system)
             )
             metal_q = metal_q.index_copy(0, index, q)
+            metal_external_energy = torch.sum(q * external_potential)
         liquid_energy = 0.5 * torch.sum(
             q_liquid * _potential(q_liquid, kernels[0], spacing, shape),
         )
@@ -295,6 +323,7 @@ class MetalWall(nn.Module):
             "coulomb_cross_energy": cross_energy,
             "coulomb_metal_energy": metal_energy,
             "coulomb_energy": liquid_energy + cross_energy + metal_energy,
+            "metal_external_energy": metal_external_energy,
         }
 
     def forward(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -315,8 +344,9 @@ class MetalElectrodeReadout(EnergyReadout):
     metal-metal energy to an existing complete liquid functional. ``'total'``
     includes liquid-liquid Coulomb too and requires an appropriately defined
     residual liquid functional: never append it to an existing liquid LR term.
-    Neither mode includes voltage-source work: group charges, not voltages,
-    are fixed. Charges, liquid charge density and physical Coulomb diagnostics
+    Both modes add the metal-only imposed-field energy when supplied. Neither
+    adds the liquid field (supply it in V_ext) or independent electrode-voltage
+    work. Charges, liquid charge density and physical Coulomb diagnostics
     are also returned through the model, using the same charge solve.
     """
 
@@ -340,7 +370,7 @@ class MetalElectrodeReadout(EnergyReadout):
         energy = (
             state["coulomb_energy"] if self.contribution == "total" else
             state["coulomb_cross_energy"] + state["coulomb_metal_energy"]
-        )
+        ) + state["metal_external_energy"]
         mode = context.get("free_energy_mode", "beta")
         if mode == "physical":
             scale = 1.0 / torch.as_tensor(context["reference_energy"]).to(energy)

@@ -50,6 +50,8 @@ default_data_key = {
     "metal_group_ids": "metal_group_ids",
     "metal_total_charge": "metal_total_charge",
     "metal_charge_units": "metal_charge_units",
+    "metal_external_field": "metal_external_field",
+    "metal_field_origin": "metal_field_origin",
 }
 
 
@@ -98,6 +100,8 @@ class GridData(dict):
         metal_group_ids             [n_groups] unique IDs in charge order
         metal_total_charge          [n_groups] prescribed total charge per group
         metal_charge_units          "e" (required when metal is present)
+        metal_external_field        [3], energy/(e * length), metal only (optional)
+        metal_field_origin          [3], length from grid index zero (default zero)
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors] (optional)
@@ -274,6 +278,8 @@ class GridData(dict):
             "metal_group_ids",
             "metal_total_charge",
             "metal_charge_units",
+            "metal_external_field",
+            "metal_field_origin",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -316,6 +322,8 @@ class GridData(dict):
                 metal_group_ids=values.get("metal_group_ids"),
                 metal_total_charge=values.get("metal_total_charge"),
                 metal_charge_units=values.get("metal_charge_units"),
+                metal_external_field=values.get("metal_external_field"),
+                metal_field_origin=values.get("metal_field_origin"),
                 include_local_density_index=include_local_density_index,
             )
         )

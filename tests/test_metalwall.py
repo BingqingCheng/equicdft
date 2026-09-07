@@ -111,6 +111,122 @@ def _dense_solution(data, sigma=0.35, liquid_sigma=0.12, amplitude=1.7, charges=
 
 
 class TestMetalWall(unittest.TestCase):
+    @staticmethod
+    def _biased_field():
+        data = _field(shape=(4, 2, 2), group_ids=(0, 0))
+        data["metal_group_ids"] = torch.tensor([0])
+        data["metal_total_charge"] = torch.zeros(1, dtype=DTYPE)
+        data["metal_external_field"] = torch.tensor([0.17, 0.0, 0.0], dtype=DTYPE)
+        data["metal_field_origin"] = torch.tensor([-0.4, 0.0, 0.0], dtype=DTYPE)
+        return data
+
+    def test_constant_field_matches_independent_dense_kkt_and_energy(self):
+        data = self._biased_field()
+        actual = _module()(data)
+        _, klm, kmm = _dense_kernels(data, 0.35, 0.12, 1.7)
+        selected = data["metal_mask"] >= 0
+        # Centers are +/- dx/2 across the boundary, independent of FFT code.
+        x = torch.tensor([0.4] * 4 + [-0.4] * 4, dtype=DTYPE)
+        v = -0.17 * x
+        a = kmm[selected][:, selected]
+        b = klm[selected] @ actual["q_liquid"]
+        ones = torch.ones((8, 1), dtype=DTYPE)
+        kkt = torch.cat((torch.cat((a, ones), dim=1),
+                         torch.cat((ones.T, torch.zeros((1, 1), dtype=DTYPE)), dim=1)))
+        expected = torch.linalg.solve(kkt, torch.cat((-b - v, torch.zeros(1, dtype=DTYPE))))
+        torch.testing.assert_close(actual["metal_q"][selected], expected[:8], atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(actual["metal_potential"], -expected[8:], atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(actual["metal_external_energy"], expected[:8] @ v)
+        self.assertLess(actual["metal_q"].sum().abs().item(), 1e-12)
+        self.assertLess(actual["potential_residual"].item(), 1e-12)
+
+    def test_constant_field_sign_zero_limit_and_geometry_cache(self):
+        data = self._biased_field()
+        data["rho"].zero_()
+        wall = _module()
+        positive = wall(data)
+        cache = wall._cache
+        negative = wall(dict(data, metal_external_field=-data["metal_external_field"]))
+        self.assertIs(cache, wall._cache)
+        torch.testing.assert_close(negative["metal_q"], -positive["metal_q"])
+        self.assertGreater(positive["metal_q"][:4].sum().item(), 0)
+        self.assertLess(positive["metal_q"][-4:].sum().item(), 0)
+        self.assertLess(positive["metal_external_energy"].item(), 0)
+        plain = {key: value for key, value in data.items()
+                 if key not in ("metal_external_field", "metal_field_origin")}
+        zero = wall(dict(data, metal_external_field=torch.zeros(3, dtype=DTYPE)))
+        for key, value in wall(plain).items():
+            torch.testing.assert_close(zero[key], value, atol=0, rtol=0)
+
+    def test_wrapping_origin_gauge_and_periodic_shift(self):
+        data = self._biased_field()
+        wall = _module()
+        expected = wall(data)
+        # A small common origin shift without crossing a branch cut changes
+        # the potential gauge, not the response or neutral-system energy.
+        origin = data["metal_field_origin"].clone()
+        origin[0] += 0.1
+        shifted = wall(dict(data, metal_field_origin=origin))
+        torch.testing.assert_close(shifted["metal_q"], expected["metal_q"], atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(shifted["metal_external_energy"], expected["metal_external_energy"])
+        torch.testing.assert_close(shifted["metal_potential"], expected["metal_potential"] + 0.017)
+        origin = data["metal_field_origin"] + data["grid_spacing"] * data["grid_size"]
+        periodic = wall(dict(data, metal_field_origin=origin))
+        for key in expected:
+            torch.testing.assert_close(periodic[key], expected[key], atol=1e-12, rtol=1e-12)
+
+    def test_field_energy_envelope_derivative_and_voxel_volume(self):
+        data = self._biased_field()
+        data["rho"].requires_grad_()
+        result = _module()(data)
+        energy = result["coulomb_cross_energy"] + result["coulomb_metal_energy"] + result["metal_external_energy"]
+        gradient = torch.autograd.grad(energy, data["rho"])[0]
+        _, klm, _ = _dense_kernels(data, 0.35, 0.12, 1.7)
+        # Stationarity cancels dq/drho terms only if metal field work is
+        # included. This is stronger than differentiating the same wrong energy.
+        expected = ((klm @ result["metal_q"])[:, None]
+                    * data["grid_spacing"].prod() * torch.tensor([1., -1.], dtype=DTYPE))
+        torch.testing.assert_close(gradient, expected, atol=1e-12, rtol=1e-12)
+
+    def test_field_vectors_batch_and_validation(self):
+        first = self._biased_field()
+        second = dict(first, metal_external_field=-first["metal_external_field"],
+                      metal_field_origin=first["metal_field_origin"] + 0.05)
+        batch = dict(first, rho=torch.stack([first["rho"], second["rho"]]),
+                     metal_external_field=torch.stack([first["metal_external_field"], second["metal_external_field"]]),
+                     metal_field_origin=torch.stack([first["metal_field_origin"], second["metal_field_origin"]]))
+        wall = _module()
+        outputs = wall(batch)
+        for i, field in enumerate((first, second)):
+            for key, value in wall(field).items():
+                torch.testing.assert_close(outputs[key][i], value)
+        for name in ("metal_external_field", "metal_field_origin"):
+            for value in (0.1, [1, 2], [1, 2, float("nan")], [True]*3,
+                          [1j]*3, torch.zeros((2, 3))):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        wall(dict(first, **{name: value}))
+        del first["metal_external_field"]
+        with self.assertRaisesRegex(ValueError, "requires"):
+            wall(first)
+
+    def test_constant_field_float32_and_no_metal(self):
+        data = self._biased_field()
+        expected = _module()(data)
+        single = {key: value.float() if torch.is_tensor(value) and value.is_floating_point()
+                  else value for key, value in data.items()}
+        result = _module().float()(single)
+        for key in ("metal_q", "metal_potential", "metal_external_energy"):
+            torch.testing.assert_close(result[key].double(), expected[key], atol=2e-6, rtol=2e-6)
+        for key in ("metal_mask", "metal_group_ids", "metal_total_charge", "metal_charge_units"):
+            data.pop(key)
+        # The field is metal-only, even when the input contains liquid charges.
+        data["rho"].requires_grad_()
+        result = _module()(data)
+        self.assertEqual(result["metal_external_energy"].item(), 0.)
+        gradient = torch.autograd.grad(result["metal_external_energy"], data["rho"])[0]
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+
     def test_physical_parameters_and_boundary_must_be_valid(self):
         arguments = {
             "charges": (1.0, -1.0), "sigma": 0.35, "liquid_sigma": 0.0,

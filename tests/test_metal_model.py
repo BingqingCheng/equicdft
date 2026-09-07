@@ -15,6 +15,33 @@ from equicdft import (
 
 
 class TestMetalModel(unittest.TestCase):
+    def test_field_energy_readout_modes_and_c1_envelope(self):
+        for mode in ("beta", "physical"):
+            for contribution in ("total", "correction"):
+                with self.subTest(mode=mode, contribution=contribution):
+                    model = self._model(mode=mode, contribution=contribution)
+                    data = self._data()
+                    data["metal_mask"][data["metal_mask"] >= 0] = 0
+                    data["metal_group_ids"] = torch.tensor([0])
+                    data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
+                    data["metal_external_field"] = torch.tensor([0.07, 0., 0.], dtype=torch.float64)
+                    data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
+                    result = model(data, compute_c2=True, c2_reference=(2, 0))
+                    state = model.readout[1].metalwall(data)
+                    energy = state["coulomb_cross_energy"] + state["coulomb_metal_energy"] + state["metal_external_energy"]
+                    if contribution == "total":
+                        energy = energy + state["coulomb_liquid_energy"]
+                    torch.testing.assert_close(result["beta_F_exc"], data["beta"] * energy)
+                    direction = torch.zeros_like(data["rho"])
+                    direction[2, 0], direction[4, 0] = 1., -1.
+                    step = 1e-5
+                    plus = model(dict(data, rho=data["rho"].detach() + step * direction))
+                    minus = model(dict(data, rho=data["rho"].detach() - step * direction))
+                    torch.testing.assert_close((plus["beta_F_exc"] - minus["beta_F_exc"]) / (2*step),
+                                               -model.voxel_volume * (result["c1"] * direction).sum(), atol=1e-10, rtol=1e-8)
+                    torch.testing.assert_close((plus["c1"][2, 0] - minus["c1"][2, 0]) / (2*step),
+                                               model.voxel_volume * (result["c2"] * direction).sum(), atol=1e-10, rtol=1e-8)
+
     @staticmethod
     def _wall():
         return MetalWall(
@@ -242,8 +269,10 @@ class TestMetalModel(unittest.TestCase):
                 self.assertTrue(torch.allclose(outputs[key][index], expected[key], atol=1e-12))
 
     def test_inverse_baseline_and_perturbed_start_obey_both_masks(self):
+        self._check_inverse(self._data())
+
+    def _check_inverse(self, data):
         model = self._model().eval()
-        data = self._data()
         # An insulating exclusion is distinct from either electrode group.
         data["excluded_mask"] = torch.zeros(16, dtype=torch.bool)
         data["excluded_mask"][7] = True
@@ -290,6 +319,32 @@ class TestMetalModel(unittest.TestCase):
             self.assertLess(electrode["potential_residual"].abs().max().item(), 1e-12)
             solutions.append(result["rho"])
         self.assertTrue(torch.allclose(solutions[0], solutions[1], atol=1e-9))
+
+    def test_constant_field_inverse_baseline_and_perturbed_start(self):
+        # Reuse the manufactured inverse fixture with a nonzero field;
+        # V_ext is derived independently of initialization, never from MD.
+        data = self._data()
+        data["metal_mask"][data["metal_mask"] >= 0] = 0
+        data["metal_group_ids"] = torch.tensor([0])
+        data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
+        data["metal_external_field"] = torch.tensor([0.03, 0., 0.], dtype=torch.float64)
+        data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
+        self._check_inverse(data)
+
+    def test_liquid_external_field_counted_only_by_solver(self):
+        model = self._model()
+        data = self._data()
+        data["metal_external_field"] = torch.tensor([0.03, 0., 0.], dtype=torch.float64)
+        data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
+        original = model(data)
+        x = torch.arange(4, dtype=torch.float64).repeat_interleave(4) * 0.75
+        data["V_ext"] = -0.03 * x[:, None] * torch.tensor([1., -1.], dtype=torch.float64)
+        result = GridSolver(model).evaluate(data)
+        for key in ("beta_F_exc", "metal_q", "metal_external_energy", "c1"):
+            torch.testing.assert_close(result[key], original[key])
+        expected = data["beta"] * model.voxel_volume * (data["rho"] * data["V_ext"]).sum()
+        torch.testing.assert_close(result["beta_V_ext"], expected)
+        torch.testing.assert_close(result["metal_external_field"], data["metal_external_field"])
 
 
 if __name__ == "__main__":

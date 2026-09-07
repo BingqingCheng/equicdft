@@ -92,6 +92,8 @@ class GridSolver:
                 "metal_group_ids",
                 "metal_total_charge",
                 "metal_charge_units",
+                "metal_external_field",
+                "metal_field_origin",
             )
             if key in data
         }

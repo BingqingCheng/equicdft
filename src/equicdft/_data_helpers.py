@@ -13,7 +13,7 @@ from ._argument_checks import (
     positive_scalar as _strict_positive_scalar,
 )
 from .stencil import coarsen_grid, get_neighbor_indices, make_stencil
-from ._metal_data import normalize_metal_metadata
+from ._metal_data import normalize_metal_field, normalize_metal_metadata
 
 
 GRID_INFO_KEYS = {
@@ -246,6 +246,8 @@ def process_atoms(
         metal_group_ids=_get_source_value(atoms, data_key["metal_group_ids"]),
         metal_total_charge=_get_source_value(atoms, data_key["metal_total_charge"]),
         metal_charge_units=_get_source_value(atoms, data_key["metal_charge_units"]),
+        metal_external_field=_get_source_value(atoms, data_key["metal_external_field"]),
+        metal_field_origin=_get_source_value(atoms, data_key["metal_field_origin"]),
         geometry_cache=geometry_cache,
         include_thermal_wavelength=V_ext is not None,
         include_local_density_index=include_local_density_index,
@@ -272,6 +274,8 @@ def build_grid_data(
     metal_group_ids: Optional[Any] = None,
     metal_total_charge: Optional[Any] = None,
     metal_charge_units: Optional[Any] = None,
+    metal_external_field: Optional[Any] = None,
+    metal_field_origin: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -358,6 +362,7 @@ def build_grid_data(
         "local_density_positions": local_density_positions,
     }
     data.update(metal_data)
+    data.update(normalize_metal_field(metal_external_field, metal_field_origin, dtype=dtype))
     if local_density_index is not None:
         data["local_density_index"] = local_density_index
     if rho_values is not None:
@@ -383,6 +388,11 @@ def build_grid_data(
 
 def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
     """Make optional target keys compatible with default PyTorch collation."""
+
+    if any("metal_external_field" in frame for frame in data):
+        for frame in data:
+            for key in ("metal_external_field", "metal_field_origin"):
+                frame.setdefault(key, frame["grid_spacing"].new_zeros(3))
 
     metal_keys = {
         "metal_mask", "metal_group_ids", "metal_total_charge", "metal_charge_units",

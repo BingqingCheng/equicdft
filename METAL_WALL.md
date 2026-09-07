@@ -8,7 +8,7 @@ the fluid functional.
 
 This is a general software capability, not an accepted electrolyte benchmark.
 No electrode material, geometry, charge, dielectric or Gaussian width is chosen
-implicitly. The first version does not implement fixed voltage, open/slab
+implicitly. The module does not implement independent electrode voltages, open/slab
 boundaries, fitted metal hardness, or microscopic image/correlation free energy.
 
 ## Data contract
@@ -48,6 +48,55 @@ Use fixed fluid particle numbers compatible with the electrode totals for
 inverse calculations. Ordinary fixed-chemical-potential updates do not enforce
 the extra liquid-charge condition and can fail the periodic neutrality check;
 general charge-constrained grand-canonical updates are not implemented here.
+
+### Optional constant field (CACE convention)
+
+To allow charge transfer between two metal regions while constraining their
+combined charge to zero, simply label all selected sites `metal_mask=0` and use
+`metal_group_ids=0 metal_total_charge=0 metal_charge_units="e"`. No new constraint
+mode is needed. Subsample metal sites independently of the liquid grid;
+keep the entire inaccessible region in `excluded_mask`.
+
+Optional EXTXYZ comment-line fields (illustrative values, not an RPM setup):
+
+```text
+metal_external_field="0 0 -0.1" metal_field_origin="0 0 -0.25"
+```
+
+Both vectors have three Cartesian components; programmatic batches accept
+shared `[3]` or per-field `[..., 3]` values. Missing field means zero; missing
+origin defaults to zero. An origin without a field is rejected. The loader
+fills absent fields with zero when batching biased and unbiased frames.
+
+- `metal_external_field` is **energy/(e * coordinate_unit)**, not beta-scaled
+  and not automatically V/Angstrom. In Coulomb-reduced units supply
+  `E* = e*sigma*E/E_C`; retain the actual reduced temperature.
+- `metal_field_origin` is the center of the field-coordinate wrapping interval,
+  in coordinate units **relative to grid index zero**. For canonical integer
+  grid indices `g`, spacing `dx`, and cell lengths `L`, the metal coupling uses
+  `r = g*dx - origin; r_wrap = r - L*round(r/L)` componentwise, as in CACE.
+  If physical grid centers are `(g+1/2)*dx` and the desired wrapping center is
+  the physical cell origin, supply `origin=-dx/2`. This metadata does not move
+  charge centers in the Coulomb/FFT calculation.
+- Place each active field component's branch cut away from the metal sites.
+  This is a sawtooth field-potential convention for periodic cells, not a
+  globally single-valued periodic linear potential. Moving a branch cut across
+  sites can change the voltage condition; it is not generally a gauge shift.
+
+The imposed metal potential is `v_m = -E dot r_wrap,m`. The charge RHS becomes
+`[-b-v; Q]` and `metal_potential=-lambda` includes that imposed potential.
+For electrodes near opposite ends of a `[0,Lz)` cell, this uses the top-side
+image shifted by `-Lz`. It is equivalent to shifting the bottom side by `+Lz`
+under zero combined metal charge. In the corresponding LAMMPS finite-field
+convention, `E_z=(V_bottom-V_top)/Lz`, using the full periodic length, not the gap.
+
+Supply the liquid field separately through species-dependent `V_ext`, together
+with walls/other prescribed potentials. MetalWall never applies the liquid
+field, changes `V_ext`, or stores the density-dependent induced metal potential
+in it. Both readout modes add **exactly once** the metal field energy
+`metal_external_energy = sum_m q_m v_m` alongside their selected Coulomb terms.
+This is necessary for variational density derivatives. No extra independent
+electrode-voltage work should be added for this same finite-field construction.
 
 ## Minimal use
 
@@ -175,11 +224,13 @@ The returned dictionary includes:
 | `metal_charge`, `metal_potential` | Total charge in e and potential in energy/e, in header group order. |
 | `coulomb_liquid_energy`, `coulomb_cross_energy`, `coulomb_metal_energy` | `U_ll`, `qᵀb`, `qᵀAq/2` in physical energy units. |
 | `coulomb_energy` | Sum of those three terms. |
+| `metal_external_energy` | Imposed field work `-sum_m q_m E dot r_wrap,m`, physical energy; zero if no field. Not part of `coulomb_energy`. |
 | `charge_residual`, `potential_residual` | Maximum absolute group-charge and site-equipotential errors per field. |
 
 Charge residual acceptance uses `(tolerance+64*eps)*(1+max(abs(Q)))`;
 potential residual acceptance uses `(tolerance+64*eps)` times
-`1+max(abs(b))+max(abs(Aq))`. Nonfinite or inaccurate solutions raise an error.
+`1+max(abs(b+v))+max(abs(Aq))` (`v=0` without imposed field).
+Nonfinite or inaccurate solutions raise an error.
 Singular geometry/width combinations are rejected, never repaired by hidden
 diagonal jitter. Tighten/check tolerances in the chosen physical units.
 
@@ -204,6 +255,8 @@ units. They are not extra terms to sum into `beta_F_exc`, nor is diagnostic
 `contribution="total"` instead returns `U_ll + qᵀb + qᵀAq/2`. Use it only with
 a liquid residual defined for that exact explicit liquid block; appending it
 to an already complete liquid functional double-counts electrostatics.
+With an imposed field, both expressions additionally include
+`metal_external_energy`; `coulomb_energy` retains its original Coulomb-only meaning.
 
 The core amplitude is **physical**, unlike the beta-energy amplitude of the
 existing `LongRangeReadout`. `GridCACEModel` supplies its own `beta` and energy
