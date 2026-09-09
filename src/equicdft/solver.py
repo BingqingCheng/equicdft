@@ -14,6 +14,7 @@ from ._argument_checks import (
 )
 from ._grid import voxel_volume
 from ._metal_data import metal_mask_tensor
+from ._solver_symmetry import _HomogeneousDensityProjection, _normalize_homogeneous_axes
 from ._solver_numerics import (
     _anderson_log_density_candidate,
     _component_tensor,
@@ -178,6 +179,7 @@ class GridSolver:
             Union[float, Sequence[float], torch.Tensor]
         ] = None,
         beta_multiplier: float = 0.0,
+        homogeneous_axes: Optional[Union[str, Sequence[Union[int, str]]]] = None,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic functional to obtain equilibrium.
 
@@ -232,10 +234,28 @@ class GridSolver:
         ``tolerance_rms_residual`` is supplied, its density-weighted RMS bound
         must also be satisfied. ``residual_density_threshold`` excludes
         statistically unresolved low-density voxels from both diagnostics.
+
+        ``homogeneous_axes='x'`` makes liquid density constant along x;
+        ``homogeneous_axes=['x', 'y']`` leaves only z dependence. Any distinct
+        selection of 'x', 'y', 'z' is accepted; None or an empty sequence is
+        unrestricted.
+        Names refer to grid axes, not component channels. The original
+        ``homogeneous_axes=(0, 1)`` integer form remains supported (x=0, y=1,
+        z=2); names and indices may be mixed. This opt-in constraint requires
+        a complete rectangular grid whose accessibility is invariant along
+        those axes.
+        The full model (including metal response) and energy are unchanged;
+        the gradient is averaged before each update. Standard residual and
+        convergence keys then describe the constrained problem. Additional
+        ``full_*euler_lagrange_residual`` and ``full_converged`` results report
+        unrestricted stationarity. Currently available only for minimize.
         """
 
         if method not in ("minimize", "euler"):
             raise ValueError("method must be 'minimize' or 'euler'")
+        homogeneous_axes = _normalize_homogeneous_axes(homogeneous_axes)
+        if homogeneous_axes and method != "minimize":
+            raise ValueError("homogeneous_axes is currently available only with method='minimize'")
         beta_multiplier = nonnegative_scalar(
             beta_multiplier,
             "beta_multiplier",
@@ -346,6 +366,10 @@ class GridSolver:
             data,
             V_ext,
         )
+        projection = (
+            _HomogeneousDensityProjection(data, homogeneous_axes, accessible_mask)
+            if homogeneous_axes else None
+        )
 
         n_types = V_ext.shape[-1]
         thermal_wavelength = _component_tensor(
@@ -443,6 +467,8 @@ class GridSolver:
                 torch.zeros_like(boltzmann_weights),
             )
 
+        if projection is not None:
+            rho = projection.average(rho)
         rho = _project_density_constraints(
             rho,
             fixed_N,
@@ -474,6 +500,7 @@ class GridSolver:
                     residual_density_threshold=residual_density_threshold,
                     maximum_density=density_cap,
                     accessible_mask=accessible_mask,
+                    projection=projection,
                 )
             else:
                 state = self._solve_euler(
@@ -523,6 +550,19 @@ class GridSolver:
                 accessible_mask,
             )
         )
+        if projection is not None:
+            result["full_euler_lagrange_residual"] = residual
+            result["full_max_euler_lagrange_residual"] = max_residual
+            result["full_rms_euler_lagrange_residual"] = rms_residual
+            result["full_converged"] = _residuals_converged(
+                max_residual, rms_residual, tolerance_residual, tolerance_rms_residual,
+            )
+            residual, chemical_potential, max_residual, rms_residual = _euler_residual(
+                result["rho"], projection.average(result["c1"]),
+                projection.average(V_ext), data["beta"], thermal_wavelength,
+                mu, residual_density_threshold, density_cap, accessible_mask,
+            )
+            result["solver_homogeneous_axes"] = list(homogeneous_axes)
         result["euler_lagrange_residual"] = residual
         result["equilibrium_chemical_potential"] = chemical_potential
         result["max_euler_lagrange_residual"] = max_residual
@@ -571,6 +611,7 @@ class GridSolver:
         residual_density_threshold: float,
         maximum_density: Optional[torch.Tensor],
         accessible_mask: torch.Tensor,
+        projection: Optional[_HomogeneousDensityProjection] = None,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic objective by mirror descent."""
 
@@ -580,6 +621,7 @@ class GridSolver:
         line_search_failures = 0
         final_relative_change = float("inf")
 
+        projected_V_ext = V_ext if projection is None else projection.average(V_ext)
         next_step_size = step_size
         for _ in range(max_iter):
             current_data = dict(data)
@@ -600,10 +642,13 @@ class GridSolver:
             if not objective_history:
                 objective_history.append(objective.item())
 
+            projected_c1 = evaluation["c1"].detach()
+            if projection is not None:
+                projected_c1 = projection.average(projected_c1)
             residual, _, max_residual, rms_residual = _euler_residual(
                 rho,
-                evaluation["c1"].detach(),
-                V_ext,
+                projected_c1,
+                projected_V_ext,
                 data["beta"],
                 thermal_wavelength,
                 mu,
