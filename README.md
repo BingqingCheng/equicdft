@@ -10,7 +10,7 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
-An optional [CACE-style metal-wall module](METAL_WALL.md) supports integer
+An optional [polarizable metal-wall module](METAL_WALL.md) supports integer
 electrode masks, per-electrode total charges in EXTXYZ, and differentiable
 Gaussian charge equilibration with 3D-periodic Coulomb energy. The initial
 fixed-charge capability is experimental; it does not select an electrode model

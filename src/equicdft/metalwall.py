@@ -1,4 +1,4 @@
-"""CACE-style fixed-charge metal walls on periodic density grids."""
+"""Charge-constrained Gaussian metal electrodes on periodic density grids."""
 
 import math
 from typing import Any, Dict, Sequence, Tuple
@@ -35,9 +35,8 @@ def _grid_indices(index, shape):
 class MetalWall(nn.Module):
     r"""Solve Gaussian electrode charges, then evaluate combined Coulomb energy.
 
-    This follows CACE MetalWall's liquid-potential -> cached metal matrix ->
-    charge-update pattern. Group totals replace its single neutrality
-    constraint. All physical parameters are explicit constructor inputs:
+    Compute the liquid potential, solve metal charges at fixed group totals,
+    and evaluate the energy. All physical parameters are explicit inputs:
 
     * ``charges``: fixed liquid species valencies (elementary-charge units).
     * ``sigma``: metal Gaussian standard deviation, in coordinate units (>0).
@@ -60,7 +59,7 @@ class MetalWall(nn.Module):
     Optional ``metal_external_field[..., 3]`` is a Cartesian field in
     energy/(e * coordinate_unit), applied to metal only. ``metal_field_origin``
     [.., 3] is the wrapping center relative to grid index zero, in coordinate
-    units (default zero). For r = grid_index * grid_spacing, use CACE's
+    units (default zero). For r = grid_index * grid_spacing, use
     r_wrap = r - origin - L * round((r - origin)/L), componentwise. Choose
     the branch cut away from metal sites. The liquid field belongs in V_ext.
 

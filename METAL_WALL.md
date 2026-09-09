@@ -1,10 +1,9 @@
-# CACE-style metal grids (experimental)
+# Polarizable metal grids (experimental)
 
 `MetalWall` implements fixed-total-charge electrodes on an orthorhombic,
-three-dimensionally periodic density grid. It follows CACE's small
-`forward(data)` / cached interaction-matrix / charge-update pattern, followed
-by Coulomb-energy evaluation. It does not introduce an electrode species into
-the fluid functional.
+three-dimensionally periodic density grid. It computes the liquid potential,
+solves Gaussian metal charges under group-total constraints, and evaluates the
+combined Coulomb energy. Metal charge is separate from the fluid species.
 
 This is a general software capability, not an accepted electrolyte benchmark.
 No electrode material, geometry, charge, dielectric or Gaussian width is chosen
@@ -49,7 +48,7 @@ inverse calculations. Ordinary fixed-chemical-potential updates do not enforce
 the extra liquid-charge condition and can fail the periodic neutrality check;
 general charge-constrained grand-canonical updates are not implemented here.
 
-### Optional constant field (CACE convention)
+### Optional constant field
 
 To allow charge transfer between two metal regions while constraining their
 combined charge to zero, simply label all selected sites `metal_mask=0` and use
@@ -74,7 +73,7 @@ fills absent fields with zero when batching biased and unbiased frames.
 - `metal_field_origin` is the center of the field-coordinate wrapping interval,
   in coordinate units **relative to grid index zero**. For canonical integer
   grid indices `g`, spacing `dx`, and cell lengths `L`, the metal coupling uses
-  `r = g*dx - origin; r_wrap = r - L*round(r/L)` componentwise, as in CACE.
+  `r = g*dx - origin; r_wrap = r - L*round(r/L)` componentwise.
   If physical grid centers are `(g+1/2)*dx` and the desired wrapping center is
   the physical cell origin, supply `origin=-dx/2`. This metadata does not move
   charge centers in the Coulomb/FFT calculation.
@@ -145,12 +144,9 @@ The generic `EnergyReadout.energy_and_outputs(context)` interface defaults
 to `(energy(context), {})`, preserving scalar-only readouts. Auxiliary output
 names must not duplicate another readout's keys or reserved model outputs.
 
-The module supports float32 and float64 on devices supporting the corresponding
-FFT and LU operations. The published implementation passed CPU validation and
-subsequent 968-site L40S full-model energy/derivative/charge preflight; the
-fitted-liquid EDL solves did not converge. The periodic-kernel cleanup below is
-CPU-validated; its full-model GPU memory use has not been remeasured. No new
-dependency is required.
+The module supports float32 and float64 on devices with the corresponding
+FFT and LU operations. No new dependency is required. Numerical software tests
+do not establish convergence or physical accuracy of a fitted-liquid EDL solve.
 
 ## Electrostatics and units
 
@@ -187,10 +183,9 @@ is a finite-grid spectral representation; grid and Gaussian-width convergence
 must be checked before scientific use. `liquid_sigma=0` does not make the
 finite FFT grid an exact point-particle Ewald sum.
 
-For CACE's common kernel `exp(-sigma_CACE² k²/2)`, equal basis widths
-`sigma=liquid_sigma=sigma_CACE/sqrt(2)` give the same damping exponent, after
-the separate unit/normalization conversion. Do not copy LES normalization
-constants or identify a kernel damping parameter with a basis width silently.
+Each width describes a single charge basis. Equal liquid and metal widths
+produce the combined kernel factor `exp(-sigma² k²)`; a basis standard
+deviation is not the same parameter as the width of a combined damping kernel.
 
 For metal-containing cells the combined electrode + fluid charge must be zero.
 The check allows `tolerance + 64*eps*(1+sum(abs(q_liquid))+sum(abs(Q)))` in e,
@@ -218,8 +213,8 @@ charges, solve
 Each electrode potential is the solved value `-lambda[a]`. The sites within
 an electrode are equipotential, but their charges may be nonuniform. No
 independent electrode voltage or voltage-source work is imposed in this mode.
-The word "field" in the CACE precedent denotes this scalar charge derivative;
-the vector electric field would be `-grad(phi)`.
+The driving quantity `b` is a scalar potential (energy/e), not the vector
+electric field `-grad(phi)`.
 
 The returned dictionary includes:
 
@@ -250,26 +245,6 @@ requires O((n_metal+n_groups)²) memory and cubic work. The same `Aq` supplies
 the charge-solve residual checks and metal energy `q dot Aq/2`, avoiding a
 second matrix-vector product and a full-grid metal-potential FFT per evaluation.
 This remains a dense electrode solver, not a large-electrode scalable method.
-
-### Source and cleanup status
-
-The core was published as `1e22c8835a661fb74fb2424f8ddc13e875db264b`;
-constant-field support as `fefe635503b00c48cb6a7c9e0bacb22f74ba5043` on
-`metalwall`. The 2026-09-09 periodic-kernel cleanup is general software work
-on that base. It preserves public keys, scalar/batch shapes,
-units, charge constraints, field branch, autograd and cache structure.
-Private `_solve_charges` additionally returns the reused metal energy.
-The independently developed planar solver changes are retained unchanged;
-the exploratory Fourier-Euler integration is not included.
-
-Tests compare periodic lookup with the original probes on odd/even and
-anisotropic grids, including singleton axes, sparse sites, reordered group IDs,
-float32/float64 and two widths. Full outputs, first derivatives and Hessian-vector
-products match the probe reference; independent dense Fourier/KKT tests remain.
-The cleanup-only publication tree passes 470 tests; the local worktree with
-retained, unpublished planar work passes 477. The compact LJ forward/inverse
-results remain unchanged. No scientific
-convergence claim follows from this implementation equivalence.
 
 ## Integration without double counting
 
@@ -316,12 +291,11 @@ Tests cover independent dense Fourier/KKT references, energy components,
 per-group constraints, positive fluid densities and exact masked zeros,
 autograd first/second derivatives, metadata and batching, unit conversion,
 cache invalidation/serialization and inverse recovery from baseline and
-perturbed starts. The original compact LJ checkpoint and tolerances are
+perturbed starts. Periodic matrix lookup is compared with unit-charge probes
+on odd/even and anisotropic grids, sparse sites, reordered group IDs and both
+floating-point dtypes, including first/second density derivatives. The original compact LJ checkpoint and tolerances are
 unchanged. These are software tests, not constant-charge electrode MD or
 continuum-limit image-charge validation.
 
-CACE structural precedent: `cace/modules/metalwall.py` and `metalwall_qeq.py`
-at `a0536bf1940371821d84807d9572be69b4a6b20a` in the
-[shared CACE repository](https://github.com/BingqingCheng/cace/tree/a0536bf1940371821d84807d9572be69b4a6b20a/cace/modules).
 See the [LAMMPS electrode documentation](https://docs.lammps.org/latest/fix_electrode.html)
 for the distinction between fixed total electrode charge and fixed potential.
