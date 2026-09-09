@@ -24,6 +24,14 @@ def _potential(charge, kernel, spacing, shape):
     return result.reshape_as(charge)
 
 
+def _grid_indices(index, shape):
+    """Integer coordinates of selected canonical C-order grid rows."""
+    return torch.stack((
+        index // (shape[1] * shape[2]),
+        (index // shape[2]) % shape[1], index % shape[2],
+    ), dim=-1)
+
+
 class MetalWall(nn.Module):
     r"""Solve Gaussian electrode charges, then evaluate combined Coulomb energy.
 
@@ -138,12 +146,19 @@ class MetalWall(nn.Module):
         return self._cache
 
     def _compute_S_matrix(self, index, mask, ids, kernel, spacing, shape):
-        """CACE unit-charge probes, but cache a KKT factorization, not inverse."""
+        """Sample the periodic impulse response; factor the constrained system."""
 
-        n_metal, n_groups = index.numel(), ids.numel()
-        probes = kernel.new_zeros((n_metal, math.prod(shape)))
-        probes[torch.arange(n_metal, device=index.device), index] = 1.0
-        A = _potential(probes, kernel, spacing, shape)[:, index].T
+        n_groups = ids.numel()
+        # Translation invariance gives A_ij = G[(r_i-r_j) mod grid_size].
+        # This is the same discrete convolution as full-grid unit probes,
+        # including self interaction and 1/voxel-volume normalization.
+        response = torch.fft.ifftn(kernel, dim=(-3, -2, -1)).real / spacing.prod()
+        coordinates = _grid_indices(index, shape)
+        offsets = tuple(
+            (axis[:, None] - axis[None, :]) % n
+            for axis, n in zip(coordinates.T, shape)
+        )
+        A = response[offsets]
         C = (mask[index, None] == ids[None, :]).to(A)
         matrix = torch.cat((
             torch.cat((A, C), dim=1),
@@ -254,14 +269,15 @@ class MetalWall(nn.Module):
         # A q + (liquid + external potential) + C lambda = 0.
         metal_potential = -solution[index.numel():]
         metal_charge = C.T @ q
+        self_potential = A @ q
         charge_residual = (metal_charge - group_totals).abs().max()
-        stationarity = A @ q + potential - C @ metal_potential
+        stationarity = self_potential + potential - C @ metal_potential
         potential_residual = stationarity.abs().max()
         charge_limit = (self.tolerance + roundoff) * (
             1.0 + group_totals.abs().max()
         )
         potential_limit = (self.tolerance + roundoff) * (
-            1.0 + potential.abs().max() + (A @ q).abs().max()
+            1.0 + potential.abs().max() + self_potential.abs().max()
         )
         if (
             not torch.all(torch.isfinite(solution)).item()
@@ -269,7 +285,9 @@ class MetalWall(nn.Module):
             or potential_residual.item() > potential_limit.item()
         ):
             raise RuntimeError("metal charge solve failed residual tolerances")
-        return q, metal_charge, metal_potential, charge_residual, potential_residual
+        metal_energy = 0.5 * torch.sum(q * self_potential)
+        return (q, metal_charge, metal_potential, charge_residual,
+                potential_residual, metal_energy)
 
     def _evaluate_field(
         self, shape, density, field_mask, group_ids, group_totals, spacing,
@@ -288,20 +306,18 @@ class MetalWall(nn.Module):
         metal_charge = group_totals + zero
         metal_potential = group_totals * 0.0 + zero
         charge_residual = potential_residual = zero
-        metal_external_energy = zero
+        metal_energy = metal_external_energy = zero
         if index.numel():
             # Canonical C-order indices; only the field uses this wrapped
             # coordinate branch. Coulomb positions and the cached A stay fixed.
-            coordinates = torch.stack((
-                index // (shape[1] * shape[2]),
-                (index // shape[2]) % shape[1], index % shape[2],
-            ), dim=-1).to(density) * spacing - field_origin
+            coordinates = _grid_indices(index, shape).to(density) * spacing - field_origin
             cell = spacing * spacing.new_tensor(shape)
             wrapped = coordinates - cell * torch.round(coordinates / cell)
             external_potential = -(wrapped * external_field).sum(-1)
             driving_potential = phi_liquid[index] + external_potential
-            q, metal_charge, metal_potential, charge_residual, potential_residual = (
-                self._solve_charges(q_liquid, driving_potential, group_totals, index, system)
+            (q, metal_charge, metal_potential, charge_residual,
+             potential_residual, metal_energy) = self._solve_charges(
+                q_liquid, driving_potential, group_totals, index, system,
             )
             metal_q = metal_q.index_copy(0, index, q)
             metal_external_energy = torch.sum(q * external_potential)
@@ -309,9 +325,6 @@ class MetalWall(nn.Module):
             q_liquid * _potential(q_liquid, kernels[0], spacing, shape),
         )
         cross_energy = torch.sum(metal_q * phi_liquid)
-        metal_energy = 0.5 * torch.sum(
-            metal_q * _potential(metal_q, kernels[2], spacing, shape),
-        )
         return {
             "liquid_charge_density": liquid_charge_density,
             "q_liquid": q_liquid, "metal_q": metal_q,
@@ -329,10 +342,12 @@ class MetalWall(nn.Module):
     def forward(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         shape, leading, fields = self._prepare_fields(data)
         outputs = [self._evaluate_field(shape, *field) for field in fields]
+        if not leading:
+            return outputs[0]
         return {
             key: torch.stack([field[key] for field in outputs]).reshape(
                 *leading, *outputs[0][key].shape,
-            ) if leading or outputs[0][key].ndim else outputs[0][key]
+            )
             for key in outputs[0]
         }
 

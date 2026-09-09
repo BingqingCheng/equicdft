@@ -146,9 +146,11 @@ to `(energy(context), {})`, preserving scalar-only readouts. Auxiliary output
 names must not duplicate another readout's keys or reserved model outputs.
 
 The module supports float32 and float64 on devices supporting the corresponding
-FFT and LU operations. Software validation currently covers CPU in the recorded
-environment; GPU behavior is not separately benchmarked. No new dependency is
-required.
+FFT and LU operations. The published implementation passed CPU validation and
+subsequent 968-site L40S full-model energy/derivative/charge preflight; the
+fitted-liquid EDL solves did not converge. The periodic-kernel cleanup below is
+CPU-validated; its full-model GPU memory use has not been remeasured. No new
+dependency is required.
 
 ## Electrostatics and units
 
@@ -200,8 +202,12 @@ total is fixed, not an extra dependent constraint row.
 
 ## Charge solve and outputs
 
-Construct `A` with unit-charge probes, and `C[m,a]=1` for metal site `m` in
-electrode `a`. For electrolyte potential `b` conjugate to the metal Gaussian
+Construct `G = real(ifftn(K_mm))/DeltaV` once, then sample
+`A[i,j] = G[(grid_i-grid_j) mod grid_size]`. Translation invariance makes this
+the same finite-grid matrix as the original unit-charge probes, without
+allocating one full grid per metal site. The self term is `G[0,0,0]`, unchanged.
+Set `C[m,a]=1` for metal site `m` in electrode `a`.
+For electrolyte potential `b` conjugate to the metal Gaussian
 charges, solve
 
 ```
@@ -237,10 +243,33 @@ diagonal jitter. Tighten/check tolerances in the chosen physical units.
 Cache only the latest exact geometry/operator's LU factorization. Changes in
 grid size, cell spacing, mask, group order, widths, amplitude, dtype or device
 invalidate it. Charges and right-hand sides are recomputed and remain
-differentiable. Runtime caches are not serialized. Dense probes require
-O(n_grid*n_metal) temporary storage; factorization requires O(n_metal²) memory
-and O(n_metal³) work. This first implementation targets small electrode tests,
-not large all-metal-volume grids.
+differentiable. Runtime caches are not serialized. Periodic lookup requires
+O(n_grid+n_metal²) storage, including pair-separation indices; no
+O(n_grid*n_metal) probes or batched probe FFTs remain. Dense factorization still
+requires O((n_metal+n_groups)²) memory and cubic work. The same `Aq` supplies
+the charge-solve residual checks and metal energy `q dot Aq/2`, avoiding a
+second matrix-vector product and a full-grid metal-potential FFT per evaluation.
+This remains a dense electrode solver, not a large-electrode scalable method.
+
+### Source and cleanup status
+
+The core was published as `1e22c8835a661fb74fb2424f8ddc13e875db264b`;
+constant-field support as `fefe635503b00c48cb6a7c9e0bacb22f74ba5043` on
+`metalwall`. The 2026-09-09 periodic-kernel cleanup is general software work
+on that base. It preserves public keys, scalar/batch shapes,
+units, charge constraints, field branch, autograd and cache structure.
+Private `_solve_charges` additionally returns the reused metal energy.
+The independently developed planar solver changes are retained unchanged;
+the exploratory Fourier-Euler integration is not included.
+
+Tests compare periodic lookup with the original probes on odd/even and
+anisotropic grids, including singleton axes, sparse sites, reordered group IDs,
+float32/float64 and two widths. Full outputs, first derivatives and Hessian-vector
+products match the probe reference; independent dense Fourier/KKT tests remain.
+The cleanup-only publication tree passes 470 tests; the local worktree with
+retained, unpublished planar work passes 477. The compact LJ forward/inverse
+results remain unchanged. No scientific
+convergence claim follows from this implementation equivalence.
 
 ## Integration without double counting
 
