@@ -123,7 +123,7 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
-### Fourier stability amplitudes
+### Fourier stability amplitudes and mode counts
 
 `FourierStabilityLoss(relative_amplitude=0.05, ...)` keeps the existing fixed
 5% perturbation. To sample a range instead, use a tuple or list:
@@ -157,6 +157,17 @@ The full matrix covers component couplings at a sampled mode; it does not
 certify cross-wavevector stability of an inhomogeneous field. Direct
 `FourierResponse` calls remain fixed by default; optional keyword-only
 `relative_amplitude` accepts a scalar or `[field, mode]` tensor for one call.
+
+`random_modes_per_field=(1, 3)` optionally samples an integer count uniformly
+from 1 through 3 once per training batch. Fields share that count but sample
+their wavevectors independently, without replacement. The positive integer
+upper endpoint must fit every field's feasible set after domain/range
+filtering; it is never silently clipped. An integer keeps fixed-count behavior;
+equal endpoints are identical to that integer, including RNG consumption.
+Explicit `modes` still require `random_modes_per_field=0`. The penalty remains
+an average over sampled modes, not a sum. Cost grows roughly with the count;
+this samples more separate wavevectors, not superpositions of waves. Record
+both intervals for continuation; the existing Trainer RNG restoration applies.
 
 ## Data format
 

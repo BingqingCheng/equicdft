@@ -64,7 +64,12 @@ class FourierStabilityLoss(nn.Module):
         field and batch.
     random_modes_per_field
         Number of distinct reciprocal triplets sampled per field from
-        ``mode_domain``. It must be zero when explicit ``modes`` are supplied.
+        ``mode_domain``. An integer pair ``(lower, upper)`` instead draws an
+        inclusive uniform count once per batch, with independent wavevectors
+        for each field. Both endpoints must be positive; the upper endpoint
+        must fit every field's feasible mode set. Equal endpoints preserve
+        fixed-count behavior without an extra random draw. The loss remains
+        averaged over modes. Must be zero when explicit ``modes`` are supplied.
     mode_domain
         ``"sphere"`` keeps the physical isotropic Nyquist sphere (default).
         ``"cube"`` includes every grid-representable mode, bounded separately
@@ -111,7 +116,7 @@ class FourierStabilityLoss(nn.Module):
     def __init__(
         self,
         modes: Optional[Sequence[Sequence[int]]] = None,
-        random_modes_per_field: int = 0,
+        random_modes_per_field: Union[int, Sequence[int]] = 0,
         relative_amplitude: Union[float, Sequence[float]] = 0.05,
         minimum_curvature: float = 0.0,
         weight: float = 1.0,
@@ -131,10 +136,21 @@ class FourierStabilityLoss(nn.Module):
         else:
             integer_modes = mode_triplets(modes)
 
-        random_modes_per_field = nonnegative_integer(
-            random_modes_per_field,
-            "random_modes_per_field",
-        )
+        if isinstance(random_modes_per_field, (tuple, list)):
+            if len(random_modes_per_field) != 2:
+                raise ValueError("random_modes_per_field interval must have two endpoints")
+            lower, upper = (
+                nonnegative_integer(value, "random_modes_per_field endpoint")
+                for value in random_modes_per_field
+            )
+            if not 1 <= lower <= upper:
+                raise ValueError("random_modes_per_field requires 1 <= lower <= upper")
+            random_modes_per_field = lower if lower == upper else (lower, upper)
+        else:
+            random_modes_per_field = nonnegative_integer(
+                random_modes_per_field,
+                "random_modes_per_field",
+            )
         if modes is None and random_modes_per_field == 0:
             raise ValueError(
                 "supply modes or a positive random_modes_per_field"
@@ -383,6 +399,13 @@ class FourierStabilityLoss(nn.Module):
             n_grid=rho.shape[1],
         )
 
+        count = maximum_count = self.random_modes_per_field
+        if isinstance(count, tuple):
+            lower, maximum_count = count
+            # One common count keeps the response tensor rectangular. Mode
+            # identities are still sampled independently for each field.
+            count = int(torch.randint(lower, maximum_count + 1, ()).item())
+
         selected_by_field = []
         for field in range(n_fields):
             size = tuple(grid_size[field].tolist())
@@ -413,7 +436,7 @@ class FourierStabilityLoss(nn.Module):
                         <= _wavevector_magnitude(mode, box_lengths)
                         <= maximum_wavevector
                     ]
-                if self.random_modes_per_field > len(candidates):
+                if maximum_count > len(candidates):
                     selection_scope = (
                         " in wavevector_range"
                         if self.wavevector_range is not None
@@ -423,9 +446,7 @@ class FourierStabilityLoss(nn.Module):
                         "random_modes_per_field exceeds the feasible modes"
                         + selection_scope
                     )
-                indices = torch.randperm(len(candidates))[
-                    : self.random_modes_per_field
-                ].tolist()
+                indices = torch.randperm(len(candidates))[:count].tolist()
                 selected = [candidates[index] for index in indices]
             selected_by_field.append(
                 torch.tensor(selected, dtype=torch.long)
