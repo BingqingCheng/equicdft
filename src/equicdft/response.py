@@ -1,12 +1,13 @@
 """Projected Fourier response evaluation for grid density functionals."""
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import boolean, finite_scalar, optional_positive_integer
 from ._fourier import (
+    expand_mode_amplitudes,
     fourier_curvature_matrix,
     fourier_directions,
     projected_fourier_curvature,
@@ -57,8 +58,14 @@ class FourierResponse(nn.Module):
         modes: torch.Tensor,
         directions: torch.Tensor,
         outputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return curvature and validity as ``[field, mode, phase, direction]``."""
+        """Return curvature and validity as ``[field, mode, phase, direction]``.
+
+        An optional scalar or [field, mode] amplitude overrides the fixed
+        constructor value for this call only, without mutating the module.
+        """
 
         if outputs is None:
             outputs = model(batch, compute_c1=False)
@@ -86,7 +93,10 @@ class FourierResponse(nn.Module):
             directions=perturbations,
             valid_directions=valid,
             mean_densities=mean_densities,
-            relative_amplitude=self.relative_amplitude,
+            relative_amplitude=expand_mode_amplitudes(
+                self.relative_amplitude if relative_amplitude is None else relative_amplitude,
+                rho, modes, n_directions,
+            ),
             perturbations_per_forward=self.perturbations_per_forward,
         )
         shape = (rho.shape[0], modes.shape[1], 2, n_directions)
@@ -98,6 +108,8 @@ class FourierResponse(nn.Module):
         batch: Dict[str, torch.Tensor],
         modes: torch.Tensor,
         outputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return the phase-resolved physical-component curvature matrix.
 
@@ -106,6 +118,8 @@ class FourierResponse(nn.Module):
         mask has shape ``[field, mode, phase, type]``. For homogeneous fields,
         the matrix is the dimensionless inverse OZ response
         ``I - sqrt(R) c(k) sqrt(R)``.
+        The optional scalar or [field, mode] amplitude override is shared by
+        all probes reconstructing the same matrix and does not change state.
         """
 
         if outputs is None:
@@ -134,6 +148,8 @@ class FourierResponse(nn.Module):
             batch=batch,
             rho=rho,
             modes=modes,
-            relative_amplitude=self.relative_amplitude,
+            relative_amplitude=(
+                self.relative_amplitude if relative_amplitude is None else relative_amplitude
+            ),
             perturbations_per_forward=self.perturbations_per_forward,
         )

@@ -1,6 +1,6 @@
 """Physics-based stability objectives for learned density functionals."""
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -77,7 +77,11 @@ class FourierStabilityLoss(nn.Module):
         ``grid_spacing``. It cannot be combined with explicit ``modes``.
     relative_amplitude
         Maximum pointwise fractional change of the perturbed component after
-        its fixed-number projection. It must lie strictly between zero and one.
+        its fixed-number projection. A scalar preserves fixed-amplitude
+        evaluation. A pair ``(lower, upper)`` samples uniformly per field and
+        wavevector on every call, with ``0 < lower <= upper < 1``. Each draw
+        is shared by both phases and all component/pair probes of that mode.
+        Equal endpoints behave as a scalar and consume no random draws.
     minimum_curvature
         Smallest accepted normalized curvature. Zero penalizes only locally
         unstable directions.
@@ -108,7 +112,7 @@ class FourierStabilityLoss(nn.Module):
         self,
         modes: Optional[Sequence[Sequence[int]]] = None,
         random_modes_per_field: int = 0,
-        relative_amplitude: float = 0.05,
+        relative_amplitude: Union[float, Sequence[float]] = 0.05,
         minimum_curvature: float = 0.0,
         weight: float = 1.0,
         training_only: bool = True,
@@ -205,16 +209,27 @@ class FourierStabilityLoss(nn.Module):
                 raise ValueError("charges require charge mixture_mode")
             charge_tensor = None
 
-        relative_amplitude = finite_scalar(
-            relative_amplitude,
-            "relative_amplitude",
-        )
-        if not 0.0 < relative_amplitude < 1.0:
-            raise ValueError("relative_amplitude must lie in (0, 1)")
+        if isinstance(relative_amplitude, (tuple, list)):
+            if len(relative_amplitude) != 2:
+                raise ValueError("relative_amplitude interval must have two endpoints")
+            lower, upper = (
+                finite_scalar(value, "relative_amplitude endpoint")
+                for value in relative_amplitude
+            )
+            if not 0.0 < lower <= upper < 1.0:
+                raise ValueError("relative_amplitude requires 0 < lower <= upper < 1")
+            relative_amplitude = lower if lower == upper else (lower, upper)
+        else:
+            relative_amplitude = finite_scalar(relative_amplitude, "relative_amplitude")
+            if not 0.0 < relative_amplitude < 1.0:
+                raise ValueError("relative_amplitude must lie in (0, 1)")
 
         self.relative_amplitude = relative_amplitude
         self.response = FourierResponse(
-            relative_amplitude=relative_amplitude,
+            relative_amplitude=(
+                relative_amplitude[0]
+                if isinstance(relative_amplitude, tuple) else relative_amplitude
+            ),
             perturbations_per_forward=perturbations_per_forward,
             mode_domain=mode_domain,
         )
@@ -268,12 +283,16 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("beta_F_exc must contain one value per field")
 
         modes = self._select_modes(batch, rho)
+        amplitude = None
+        if isinstance(self.relative_amplitude, tuple):
+            amplitude = rho.new_empty(modes.shape[:2]).uniform_(*self.relative_amplitude)
         if self.mixture_mode == "full_matrix":
             matrix, active = self.response.matrix(
                 model=model,
                 batch=batch,
                 modes=modes,
                 outputs=outputs,
+                relative_amplitude=amplitude,
             )
             return self._matrix_loss(matrix, active)
 
@@ -284,6 +303,7 @@ class FourierStabilityLoss(nn.Module):
             modes=modes,
             directions=mixture_weights,
             outputs=outputs,
+            relative_amplitude=amplitude,
         )
         if not torch.any(valid).item():
             raise ValueError("batch contains no valid mixture-mode direction")

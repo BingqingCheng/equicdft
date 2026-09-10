@@ -123,6 +123,41 @@ scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
 
+### Fourier stability amplitudes
+
+`FourierStabilityLoss(relative_amplitude=0.05, ...)` keeps the existing fixed
+5% perturbation. To sample a range instead, use a tuple or list:
+
+```python
+FourierStabilityLoss(
+    random_modes_per_field=1,
+    mixture_mode="full_matrix",
+    mode_domain="cube",
+    relative_amplitude=(0.02, 0.10),
+)
+```
+
+The interval must satisfy `0 < lower <= upper < 1`. Each training call draws
+uniformly per field/wavevector, reusing that amplitude for both real phases,
+both signs, and all component/pair probes of the same matrix. Amplitude means
+the maximum fractional density change after fixed-number projection. Counts
+and zero-density masks remain unchanged by the Fourier perturbations. Equal
+endpoints behave as a scalar and consume no additional random draws.
+
+Sampling uses PyTorch RNG, including the Trainer's existing checkpoint RNG
+recovery. Reconstruct the loss with the same amplitude configuration when
+resuming; record it with the other training settings. With the default
+`training_only=True`, validation remains deterministic and has zero stability
+loss. No extra energy evaluations are added compared with fixed amplitude.
+
+The interval above is illustrative, not a physical default: very small
+amplitudes can cause finite-difference cancellation, while large amplitudes
+probe nonlinear finite excursions rather than the infinitesimal Hessian.
+The full matrix covers component couplings at a sampled mode; it does not
+certify cross-wavevector stability of an inhomogeneous field. Direct
+`FourierResponse` calls remain fixed by default; optional keyword-only
+`relative_amplitude` accepts a scalar or `[field, mode]` tensor for one call.
+
 ## Data format
 
 `GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
