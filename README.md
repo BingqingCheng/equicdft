@@ -158,16 +158,33 @@ certify cross-wavevector stability of an inhomogeneous field. Direct
 `FourierResponse` calls remain fixed by default; optional keyword-only
 `relative_amplitude` accepts a scalar or `[field, mode]` tensor for one call.
 
-`random_modes_per_field=(1, 3)` optionally samples an integer count uniformly
-from 1 through 3 once per training batch. Fields share that count but sample
-their wavevectors independently, without replacement. The positive integer
-upper endpoint must fit every field's feasible set after domain/range
-filtering; it is never silently clipped. An integer keeps fixed-count behavior;
-equal endpoints are identical to that integer, including RNG consumption.
-Explicit `modes` still require `random_modes_per_field=0`. The penalty remains
-an average over sampled modes, not a sum. Cost grows roughly with the count;
-this samples more separate wavevectors, not superpositions of waves. Record
-both intervals for continuation; the existing Trainer RNG restoration applies.
+`random_modes_per_field=(1, 3)` samples an inclusive integer count once per
+training batch; `3` fixes that count. Fields sample their wavevectors independently,
+without replacement. A count of **one** retains separate cosine/sine evaluation.
+For **two or more**, independently phased equal-weight waves are **summed into
+one spatial pattern per field**, then projected to fixed component counts and
+normalized by the maximum absolute fractional change. One amplitude per field
+scales the combined perturbation, shared by every component/pair probe in
+`full_matrix`. There is no independent amplitude on each constituent wave.
+
+The positive upper endpoint must fit every field's feasible set after
+domain/range filtering; it is never silently clipped. Equal endpoints are
+identical to the corresponding integer, including RNG consumption. Explicit
+`modes` still require zero random count and retain separate-mode evaluation
+for per-wavevector diagnostics. The loss averages over fields and component
+directions, not over separately evaluated constituent modes. Summing more
+waves increases wave-construction work, not the number of energy evaluations.
+The summed curvature includes cross-wavevector contributions in heterogeneous
+fields; it is not S(k) at one k or a guarantee of complete spatial stability.
+Direct `FourierResponse` calls can supply `mode_phases` in radians [field, mode]
+to select a summed pattern with one [field, 1] amplitude and singleton mode/phase
+output axes. Omission preserves the original response API and output shapes.
+
+**Migration:** random integer counts greater than one formerly evaluated modes
+separately; they now superimpose them, as requested. Count one and explicit
+per-mode response/S(k) evaluation are unchanged. Old runs must keep their pinned
+code and must not resume under this revision silently. Record both intervals
+and the code revision on continuation; existing Trainer RNG restoration applies.
 
 ## Data format
 

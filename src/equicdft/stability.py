@@ -25,9 +25,9 @@ from .response import FourierResponse
 class FourierStabilityLoss(nn.Module):
     r"""Penalize negative fixed-particle-number Fourier curvature.
 
-    For each nonzero integer reciprocal-grid mode, cosine and sine waves are
-    constructed on the periodic grid. A fixed-number base direction is built
-    for each density component according to
+    A single mode uses separate cosine and sine waves; multiple randomly
+    sampled modes are summed with random phases into one spatial pattern.
+    A fixed-number base direction is built for each density component from
 
     ``delta_rho_a = epsilon * rho_a * (wave - <wave>_rho_a)``,
 
@@ -38,7 +38,7 @@ class FourierStabilityLoss(nn.Module):
     ``beta * (F_id + F_exc)``. External-potential and reservoir terms are
     linear in density and therefore cancel from the second difference.
 
-    For a homogeneous one-component fluid, the normalized curvature tends to
+    For a single mode in a homogeneous one-component fluid, curvature tends to
 
     ``rho * delta^2(beta*F) / (DeltaV * sum(delta_rho**2)) = 1 / S(k)``.
 
@@ -51,9 +51,10 @@ class FourierStabilityLoss(nn.Module):
     ``(+1, -1)``, they are the number-number and charge-charge directions.
     ``"full_matrix"`` reconstructs the complete physical-component Hessian
     in the ideal-gas metric and penalizes every eigenvalue below the requested
-    minimum. For homogeneous fields this is the inverse OZ response matrix.
-    For inhomogeneous fields it does not include coupling between phases or
-    different wavevectors. Matrix polarization also makes very small finite-
+    minimum. At a single mode in a homogeneous field this is the inverse OZ
+    response matrix. A summed pattern instead probes a projected Hessian with
+    cross-wavevector contributions in inhomogeneous fields, not S(k) at one k
+    or the complete spatial Hessian. Matrix polarization makes small finite-
     difference amplitudes susceptible to floating-point cancellation.
 
     Parameters
@@ -64,12 +65,17 @@ class FourierStabilityLoss(nn.Module):
         field and batch.
     random_modes_per_field
         Number of distinct reciprocal triplets sampled per field from
-        ``mode_domain``. An integer pair ``(lower, upper)`` instead draws an
-        inclusive uniform count once per batch, with independent wavevectors
-        for each field. Both endpoints must be positive; the upper endpoint
-        must fit every field's feasible mode set. Equal endpoints preserve
-        fixed-count behavior without an extra random draw. The loss remains
-        averaged over modes. Must be zero when explicit ``modes`` are supplied.
+        ``mode_domain`` and SUMMED into one pattern. An integer pair
+        ``(lower, upper)`` draws an inclusive uniform count once per batch.
+        Every field uses independent wavevectors and uniform phases
+        in [0, 2*pi). The sum is projected to fixed component counts and then
+        normalized; one amplitude per field controls the combined perturbation.
+        Both endpoints must be positive; the upper endpoint must fit every
+        field's feasible set. Equal endpoints fix the number of summed waves
+        without a count draw, identical to the corresponding integer argument.
+        A selected count of one retains the original separate cosine/sine
+        evaluation; counts of two or more use one summed spatial pattern.
+        Must be zero when explicit ``modes`` are supplied.
     mode_domain
         ``"sphere"`` keeps the physical isotropic Nyquist sphere (default).
         ``"cube"`` includes every grid-representable mode, bounded separately
@@ -84,8 +90,10 @@ class FourierStabilityLoss(nn.Module):
         Maximum pointwise fractional change of the perturbed component after
         its fixed-number projection. A scalar preserves fixed-amplitude
         evaluation. A pair ``(lower, upper)`` samples uniformly per field and
-        wavevector on every call, with ``0 < lower <= upper < 1``. Each draw
-        is shared by both phases and all component/pair probes of that mode.
+        spatial pattern on every call, with ``0 < lower <= upper < 1``. One
+        draw controls the WHOLE summed perturbation and all its component/pair
+        probes. Single-mode cosine/sine phases share one draw; explicit modes
+        use one per wavevector.
         Equal endpoints behave as a scalar and consume no random draws.
     minimum_curvature
         Smallest accepted normalized curvature. Zero penalizes only locally
@@ -299,9 +307,14 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("beta_F_exc must contain one value per field")
 
         modes = self._select_modes(batch, rho)
+        mode_phases = None
+        amplitude_shape = modes.shape[:2]
+        if self.modes.shape[0] == 0 and modes.shape[1] > 1:
+            mode_phases = rho.new_empty(modes.shape[:2]).uniform_(0.0, 2.0 * torch.pi)
+            amplitude_shape = (rho.shape[0], 1)
         amplitude = None
         if isinstance(self.relative_amplitude, tuple):
-            amplitude = rho.new_empty(modes.shape[:2]).uniform_(*self.relative_amplitude)
+            amplitude = rho.new_empty(amplitude_shape).uniform_(*self.relative_amplitude)
         if self.mixture_mode == "full_matrix":
             matrix, active = self.response.matrix(
                 model=model,
@@ -309,6 +322,7 @@ class FourierStabilityLoss(nn.Module):
                 modes=modes,
                 outputs=outputs,
                 relative_amplitude=amplitude,
+                mode_phases=mode_phases,
             )
             return self._matrix_loss(matrix, active)
 
@@ -320,6 +334,7 @@ class FourierStabilityLoss(nn.Module):
             directions=mixture_weights,
             outputs=outputs,
             relative_amplitude=amplitude,
+            mode_phases=mode_phases,
         )
         if not torch.any(valid).item():
             raise ValueError("batch contains no valid mixture-mode direction")
@@ -404,7 +419,10 @@ class FourierStabilityLoss(nn.Module):
             lower, maximum_count = count
             # One common count keeps the response tensor rectangular. Mode
             # identities are still sampled independently for each field.
-            count = int(torch.randint(lower, maximum_count + 1, ()).item())
+            count = (
+                lower if lower == maximum_count else
+                int(torch.randint(lower, maximum_count + 1, ()).item())
+            )
 
         selected_by_field = []
         for field in range(n_fields):
