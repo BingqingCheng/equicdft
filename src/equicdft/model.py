@@ -532,6 +532,7 @@ class GridCACEModel(nn.Module):
                 context["grid_size"] = data["grid_size"]
             for key in (
                 "grid_positions", "metal_mask", "metal_group_ids",
+                "metal_positions", "metal_site_groups",
                 "metal_total_charge", "metal_charge_units",
                 "metal_external_field", "metal_field_origin",
             ):

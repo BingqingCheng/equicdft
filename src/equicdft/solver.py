@@ -90,6 +90,8 @@ class GridSolver:
                 "beta",
                 "excluded_mask",
                 "metal_mask",
+                "metal_positions",
+                "metal_site_groups",
                 "metal_group_ids",
                 "metal_total_charge",
                 "metal_charge_units",

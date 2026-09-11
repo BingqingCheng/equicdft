@@ -11,7 +11,8 @@ is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
 An optional [polarizable metal-wall module](METAL_WALL.md) supports integer
-electrode masks, per-electrode total charges in EXTXYZ, and differentiable
+electrode masks or independent XYZ site coordinates, explicit group-total
+charges, and differentiable
 Gaussian charge equilibration with 3D-periodic Coulomb energy. The initial
 fixed-charge capability is experimental; it does not select an electrode model
 or replace the liquid functional's SR/LR convention.

@@ -27,6 +27,7 @@ from ._data_helpers import (
     validate_frame_grid_info,
 )
 from ._fourier import canonical_mode_triplets, integer_mode_tensor
+from ._metal_data import normalize_metal_metadata
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -47,12 +48,51 @@ default_data_key = {
     "rho": "density",
     "excluded_mask": "excluded_mask",
     "metal_mask": "metal_mask",
+    "metal_positions": "metal_positions",
+    "metal_site_groups": "metal_site_groups",
     "metal_group_ids": "metal_group_ids",
     "metal_total_charge": "metal_total_charge",
     "metal_charge_units": "metal_charge_units",
     "metal_external_field": "metal_external_field",
     "metal_field_origin": "metal_field_origin",
 }
+
+
+def read_metal_sites(
+    path: Union[str, Path], *, origin=(0.0, 0.0, 0.0), site_groups=None,
+    group_ids=None, total_charge=None, charge_units=None, index=0,
+) -> Dict[str, Any]:
+    """Read one XYZ/ASE metal geometry without inferring units or charges.
+
+    XYZ positions and ``origin`` must already use the density grid's length
+    units. The returned ``metal_positions`` are ``positions - origin``, where
+    ``origin`` is the physical position of grid index zero. No wrapping,
+    rescaling, density mask, or field origin is inferred.
+
+    Site labels come from ``site_groups`` (a scalar assigns every site to one
+    group) or the ASE array ``metal_site_groups``. Group constraints come from
+    explicit arguments or ``metal_group_ids``, ``metal_total_charge`` and
+    ``metal_charge_units`` frame metadata; all three must be declared.
+    """
+    atoms = read(str(Path(path).expanduser()), index=index)
+    if not isinstance(atoms, Atoms):
+        raise ValueError("read_metal_sites requires one selected XYZ frame")
+    offset = np.asarray(origin)
+    if (offset.shape != (3,) or not np.issubdtype(offset.dtype, np.number)
+            or np.issubdtype(offset.dtype, np.complexfloating)
+            or not np.all(np.isfinite(offset))):
+        raise ValueError("origin must contain three real finite coordinates")
+    positions = atoms.get_positions() - offset.astype(np.float64)
+    labels = atoms.arrays.get("metal_site_groups") if site_groups is None else site_groups
+    if site_groups is not None and np.ndim(site_groups) == 0:
+        labels = np.full(len(atoms), site_groups)
+    return normalize_metal_metadata(
+        None,
+        atoms.info.get("metal_group_ids") if group_ids is None else group_ids,
+        atoms.info.get("metal_total_charge") if total_charge is None else total_charge,
+        atoms.info.get("metal_charge_units") if charge_units is None else charge_units,
+        n_grid=1, batch_shape=(), metal_positions=positions, metal_site_groups=labels,
+    )
 
 
 def _normalize_xyz_paths(
@@ -97,6 +137,8 @@ class GridData(dict):
         rho                         [n_grid, n_types] (optional)
         excluded_mask               [n_grid] bool; true grid points are excluded
         metal_mask                  [n_grid] integer; negative nonmetal (optional)
+        metal_positions             [n_sites, 3], length relative to grid zero
+        metal_site_groups           [n_sites], nonnegative integer group labels
         metal_group_ids             [n_groups] unique IDs in charge order
         metal_total_charge          [n_groups] prescribed total charge per group
         metal_charge_units          "e" (required when metal is present)
@@ -116,6 +158,10 @@ class GridData(dict):
     Metal points additionally exclude fluid density without changing the
     separately retained ``excluded_mask``. Group charge metadata is mandatory
     when ``metal_mask`` contains any nonnegative group ID.
+    Alternatively, fixed explicit ``metal_positions`` and ``metal_site_groups``
+    define a charge basis independent of the density grid. They are frame
+    metadata, not per-voxel arrays, and do not imply fluid exclusion. An active
+    grid ``metal_mask`` and explicit positions cannot be combined.
     """
 
     @classmethod
@@ -275,6 +321,8 @@ class GridData(dict):
             "n_types",
             "excluded_mask",
             "metal_mask",
+            "metal_positions",
+            "metal_site_groups",
             "metal_group_ids",
             "metal_total_charge",
             "metal_charge_units",
@@ -319,6 +367,8 @@ class GridData(dict):
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
                 metal_mask=values.get("metal_mask"),
+                metal_positions=values.get("metal_positions"),
+                metal_site_groups=values.get("metal_site_groups"),
                 metal_group_ids=values.get("metal_group_ids"),
                 metal_total_charge=values.get("metal_total_charge"),
                 metal_charge_units=values.get("metal_charge_units"),

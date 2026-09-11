@@ -1,6 +1,6 @@
 """Neural density-functional models for periodic Cartesian grids."""
 
-from .data import FourierResponseData, GridData, default_data_key
+from .data import FourierResponseData, GridData, default_data_key, read_metal_sites
 from .energy import EnergyReadout
 from .features import CartesianAFeatures
 from .interaction import BChiMessage
@@ -51,6 +51,7 @@ __all__ = [
     "TrainingStream",
     "default_data_key",
     "make_dataloaders",
+    "read_metal_sites",
 ]
 
 __version__ = "0.0.1"

@@ -154,6 +154,9 @@ def process_atoms(
         if metal_mask.shape != (n_grid,):
             raise ValueError("metal_mask must have shape [n_grid]")
         metal_mask = metal_mask[order]
+    # Site geometry is per-frame metadata and must not follow voxel ordering.
+    metal_positions = _get_source_value(atoms, data_key["metal_positions"])
+    metal_site_groups = _get_source_value(atoms, data_key["metal_site_groups"])
     V_ext = _ordered_optional_field(
         atoms,
         data_key["V_ext"],
@@ -177,6 +180,13 @@ def process_atoms(
         )
     )
     if target_grid_spacing is not None:
+        if (metal_positions is not None or metal_site_groups is not None) and not np.allclose(
+            grid_spacing, _metadata_grid_spacing(target_grid_spacing),
+        ):
+            raise ValueError(
+                "coarsening explicit metal sites is unsupported; supply positions "
+                "relative to grid index zero on the target grid"
+            )
         if metal_mask is not None and not np.allclose(
             grid_spacing, _metadata_grid_spacing(target_grid_spacing),
         ):
@@ -243,6 +253,8 @@ def process_atoms(
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
         metal_mask=metal_mask,
+        metal_positions=metal_positions,
+        metal_site_groups=metal_site_groups,
         metal_group_ids=_get_source_value(atoms, data_key["metal_group_ids"]),
         metal_total_charge=_get_source_value(atoms, data_key["metal_total_charge"]),
         metal_charge_units=_get_source_value(atoms, data_key["metal_charge_units"]),
@@ -276,6 +288,8 @@ def build_grid_data(
     metal_charge_units: Optional[Any] = None,
     metal_external_field: Optional[Any] = None,
     metal_field_origin: Optional[Any] = None,
+    metal_positions: Optional[Any] = None,
+    metal_site_groups: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -317,9 +331,10 @@ def build_grid_data(
     metal_data = normalize_metal_metadata(
         metal_mask, metal_group_ids, metal_total_charge, metal_charge_units,
         n_grid=n_grid, batch_shape=(),
+        metal_positions=metal_positions, metal_site_groups=metal_site_groups,
     )
     effective_exclusion = excluded_mask_values.copy()
-    if metal_data:
+    if "metal_mask" in metal_data:
         effective_exclusion |= metal_data["metal_mask"].cpu().numpy() >= 0
     if np.all(effective_exclusion):
         raise ValueError("masks must leave at least one accessible grid point")
@@ -396,6 +411,7 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
 
     metal_keys = {
         "metal_mask", "metal_group_ids", "metal_total_charge", "metal_charge_units",
+        "metal_positions", "metal_site_groups",
     }
     if data and any(metal_keys & set(frame) for frame in data):
         present = [metal_keys & set(frame) for frame in data]
@@ -405,6 +421,10 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
                   if "metal_group_ids" in frame}
         if len(counts) > 1:
             raise ValueError("frames must have the same metal group count for batching")
+        site_counts = {frame["metal_positions"].shape[-2] for frame in data
+                       if "metal_positions" in frame}
+        if len(site_counts) > 1:
+            raise ValueError("frames must have the same metal site count for batching")
 
     if any("c1_plus_beta_mu" not in frame for frame in data):
         for frame in data:

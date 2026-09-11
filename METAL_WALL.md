@@ -1,7 +1,8 @@
-# Polarizable metal grids (experimental)
+# Polarizable metal electrodes (experimental)
 
-`MetalWall` implements fixed-total-charge electrodes on an orthorhombic,
-three-dimensionally periodic density grid. It computes the liquid potential,
+`MetalWall` implements fixed-total-charge electrodes coupled to an orthorhombic,
+three-dimensionally periodic density grid. Sites may be selected grid nodes or
+an independent list of coordinates. It computes the liquid potential,
 solves Gaussian metal charges under group-total constraints, and evaluates the
 combined Coulomb energy. Metal charge is separate from the fluid species.
 
@@ -11,6 +12,9 @@ implicitly. The module does not implement independent electrode voltages, open/s
 boundaries, fitted metal hardness, or microscopic image/correlation free energy.
 
 ## Data contract
+
+The original grid-mask interface below is unchanged. For sites independent of
+the density grid, use the [explicit-coordinate interface](#explicit-coordinates).
 
 EXTXYZ uses the existing integer grid-coordinate and density conventions. Add
 `metal_mask:I:1` to the `Properties` declaration and one integer per grid row:
@@ -48,6 +52,74 @@ inverse calculations. Ordinary fixed-chemical-potential updates do not enforce
 the extra liquid-charge condition and can fail the periodic neutrality check;
 general charge-constrained grand-canonical updates are not implemented here.
 
+### Explicit coordinates
+
+Instead of active `metal_mask` entries, supply:
+
+- `metal_positions`: `[M,3]` or `[...,M,3]`, fixed Cartesian coordinates in the
+  grid's length units, **relative to liquid grid index zero**, not grid indices.
+- `metal_site_groups`: `[M]` or `[...,M]`, nonnegative integer group labels.
+- The same `metal_group_ids`, `metal_total_charge` and `metal_charge_units="e"`
+  constraints as the grid interface. Every site group must be declared.
+
+Positions are stored in float64, independently of density precision. Values
+already rounded to float32 cannot recover precision by conversion. Shared
+geometry may be broadcast over a batch; per-frame geometry requires matching
+site counts. Empty lists, nonfinite coordinates, position tensors requiring
+gradients, duplicate/numerically coincident periodic sites and active grid-mask
+sites supplied alongside explicit sites are rejected. An all-negative legacy
+mask is harmless. Fixed geometry is cached; site-position derivatives are not
+supported in this extension.
+
+`excluded_mask` independently defines inaccessible liquid voxels. Explicit
+sites neither infer a solid volume nor snap to nearby voxels to exclude them.
+`GridData.from_dict` accepts these fields; grid EXTXYZ frames may hold the site
+arrays as frame metadata rather than per-voxel columns. Coarsening an explicit-
+site grid frame is rejected because it requires a deliberate source/grid-origin
+mapping. Load already compatible liquid data instead.
+
+For a separate XYZ/EXTXYZ geometry, use the thin reader:
+
+```python
+from equicdft import GridData, read_metal_sites
+
+# Liquid input supplies its own excluded_mask; it has no active metal_mask.
+data = GridData.from_xyz("liquid.extxyz", boltzmann_constant=1.0)[0]
+sites = read_metal_sites(
+    "metal.extxyz",
+    origin=(0.125, 0.125, 0.125),  # physical position of liquid grid index zero
+)
+data.update(sites)
+state = wall(data)
+q_sites = state["metal_site_q"]  # [M], integrated elementary charges
+```
+
+The numerical origin above is illustrative. XYZ coordinates and origin must
+already use the liquid grid's length units; no Angstrom/reduced-unit conversion
+is inferred. The reader subtracts `origin`, does not wrap positions or change
+the field, and ignores chemical symbols as a source of electrode labels.
+Example two-site EXTXYZ (software illustration, not a physical parameterization):
+
+```text
+2
+Properties=species:S:1:pos:R:3:metal_site_groups:I:1 metal_group_ids="0 3" metal_total_charge="0.1 -0.1" metal_charge_units=e
+X 0.2 0.4 0.7 0
+X 1.6 0.4 0.7 3
+```
+
+Plain XYZ files can instead declare metadata in the call:
+`read_metal_sites(path, site_groups=0, group_ids=[0], total_charge=[0.0],
+charge_units="e")`. A scalar `site_groups` assigns that explicitly selected
+group to every site. Explicit arguments override corresponding frame metadata.
+The default `origin=(0,0,0)` means positions are already relative to grid zero.
+
+All energies, group outputs and `q_liquid` retain their meanings. Explicit
+mode returns `metal_site_q[...,M]`, `metal_positions[...,M,3]` and
+`metal_site_groups[...,M]`. It does **not** return grid-only `metal_q` or `q_mw`:
+off-grid charge coefficients cannot be added elementwise to liquid voxel
+coefficients. These site outputs pass through the model and inverse solver.
+The original grid-mode outputs and shapes are unchanged.
+
 ### Optional constant field
 
 To allow charge transfer between two metal regions while constraining their
@@ -77,6 +149,10 @@ fills absent fields with zero when batching biased and unbiased frames.
   If physical grid centers are `(g+1/2)*dx` and the desired wrapping center is
   the physical cell origin, supply `origin=-dx/2`. This metadata does not move
   charge centers in the Coulomb/FFT calculation.
+  With explicit sites replace `g*dx` by `metal_positions`; the origin keeps
+  exactly the same grid-relative meaning. XYZ reader `origin` and
+  `metal_field_origin` are distinct: one converts coordinate frames; the other
+  selects the periodic field branch.
 - Place each active field component's branch cut away from the metal sites.
   This is a sawtooth field-potential convention for periodic cells, not a
   globally single-valued periodic linear potential. Moving a branch cut across
@@ -246,6 +322,37 @@ the charge-solve residual checks and metal energy `q dot Aq/2`, avoiding a
 second matrix-vector product and a full-grid metal-potential FFT per evaluation.
 This remains a dense electrode solver, not a large-electrode scalable method.
 
+### Off-grid spectral evaluation
+
+Explicit sites use the same finite reciprocal domain, Gaussian widths, k=0
+omission, self interaction and charge solve. Each position is decomposed into
+an integer grid index and a fractional offset. For sites sharing an offset,
+one shifted inverse FFT samples the liquid potential; density autograd supplies
+its exact adjoint. Matrix blocks sample the Green function shifted by the
+**difference** of the two offsets, not by a product of separately interpolated
+fields. Thus metal self terms do not spuriously depend on sub-voxel position.
+
+On each even axis the Nyquist phase is `cos(k_Nyquist*delta)`, corresponding
+to half-weighted positive and negative Nyquist endpoints. This is a declared
+real, symmetric continuation away from the original grid nodes. On-grid
+values agree with the original real FFT operator. It is not real-space
+interpolation, nearest-grid assignment or a continuum Ewald implementation.
+Check reciprocal-cutoff convergence at fixed physical source/site positions.
+
+Only float64-roundoff-equivalent fractional offsets are grouped: maximum
+per-axis discrepancy is bounded by `32*eps64*max(grid_size)` in grid units.
+The first actual offset is retained, not rounded to a mesh; this bounded
+roundoff reconciliation is the only position approximation. Original
+coordinates remain in outputs, cache identity and field work. Already-float32
+coordinates are not grouped using a looser float32 tolerance.
+
+For C distinct offsets, shifted-phase storage is O(C*G), matrix storage O(M²),
+and matrix construction requires O(C²) grid transforms before dense LU.
+Regular layered geometries can have only two offsets even with many sites.
+Arbitrary irregular geometries are supported but many offsets can be expensive;
+there is no M-by-G probe matrix or M-by-M-by-G array. The legacy grid path
+keeps its original fast lookup and output contract.
+
 ## Integration without double counting
 
 `MetalElectrodeReadout(..., contribution="correction")` adds **only** `qᵀb +
@@ -296,6 +403,11 @@ on odd/even and anisotropic grids, sparse sites, reordered group IDs and both
 floating-point dtypes, including first/second density derivatives. The original compact LJ checkpoint and tolerances are
 unchanged. These are software tests, not constant-charge electrode MD or
 continuum-limit image-charge validation.
+
+Explicit-site tests additionally compare independent symmetric reciprocal
+sums on odd/even anisotropic grids, site constraints, energies and first/second
+density derivatives; translation/gauge/field behavior; on-grid equivalence;
+XYZ metadata, geometry precision, batching and model/solver propagation.
 
 See the [LAMMPS electrode documentation](https://docs.lammps.org/latest/fix_electrode.html)
 for the distinction between fixed total electrode charge and fixed potential.
