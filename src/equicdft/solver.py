@@ -52,6 +52,13 @@ class GridSolver:
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
+        if getattr(model, "requires_dipole_density", False):
+            raise ValueError(
+                "GridSolver only supports scalar-density thermodynamics; "
+                "dipole-density models require an orientational ideal free "
+                "energy and coupled density/polarization solver. Evaluate "
+                "their excess free energy and derivatives with the model directly."
+            )
         self.model = model
         self.device = (
             _module_device(model)

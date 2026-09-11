@@ -12,6 +12,7 @@ from ._argument_checks import (
 from ._component_pairs import symmetric_component_pairs
 from ._nn import build_mlp
 from .energy import EnergyReadout, density_weighted_integral
+from .polarization_features import PolarizationFeatures
 from .reciprocal import ReciprocalFeatures
 
 
@@ -89,6 +90,69 @@ class LocalReadout(EnergyReadout):
         return density_weighted_integral(
             rho,
             per_particle,
+            context["voxel_volume"],
+        )
+
+
+class PolarizationReadout(EnergyReadout):
+    """Integrate a local excess free energy from scalar/vector invariants.
+
+    ``features`` constructs invariant combinations of the live number-density
+    and electric dipole-density fields. A shared MLP receives these invariants
+    followed by normalized temperature and returns one reduced free energy
+    per particle and component. No orientational ideal entropy or external
+    electric-field coupling is included here.
+    """
+
+    requires_dipole_density = True
+
+    def __init__(
+        self,
+        features: PolarizationFeatures,
+        hidden_sizes: Sequence[int] = (32, 16),
+    ) -> None:
+        super().__init__()
+        if not isinstance(features, PolarizationFeatures):
+            raise TypeError("features must be PolarizationFeatures")
+        self.features = features
+        self.mlp = build_mlp(
+            features.n_features + 1,
+            hidden_sizes,
+            features.n_types,
+        )
+
+    @property
+    def n_types(self) -> int:
+        """Number of physical number-density/dipole-density components."""
+
+        return self.features.n_types
+
+    @property
+    def mean_density(self) -> torch.Tensor:
+        """Fixed number-density normalization used by the descriptor."""
+
+        return self.features.mean_density
+
+    @property
+    def cutoff_grid(self) -> int:
+        """Inclusive stencil cutoff, measured in grid steps."""
+
+        return self.features.cutoff_grid
+
+    def forward(self, context: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return per-particle outputs with shape ``[..., n_grid, n_types]``."""
+
+        invariants = self.features(context)
+        temperature = context["normalized_temperature"][..., None, None]
+        temperature = temperature.expand(*invariants.shape[:-1], 1)
+        return self.mlp(torch.cat((invariants, temperature), dim=-1))
+
+    def energy(self, context: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return ``Delta V * sum_(g,a) rho[g,a] * a_exc[g,a]``."""
+
+        return density_weighted_integral(
+            context["rho"],
+            self(context),
             context["voxel_volume"],
         )
 

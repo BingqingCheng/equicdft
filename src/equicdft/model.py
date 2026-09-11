@@ -44,6 +44,13 @@ class GridCACEModel(nn.Module):
     ``beta * mu_average``; despite their established key names, they are not
     energy-valued chemical potentials. Constructor response flags provide
     defaults that individual forward calls may override.
+
+    With a polarization readout, ``dipole_density`` is an independent polar
+    vector field. Density derivatives hold that field fixed. The optional
+    ``polarization_derivative`` output is the positive functional derivative
+    ``delta(beta_F_exc)/delta(dipole_density)``, not an external electric
+    field or a complete orientational chemical potential. Polarization
+    descriptors require cubic voxels; the box dimensions may differ.
     """
 
     def __init__(
@@ -65,12 +72,17 @@ class GridCACEModel(nn.Module):
         rho_min: float = 0.0,
         free_energy_mode: str = "beta",
         message_layers: Optional[Sequence[BChiMessage]] = None,
+        compute_polarization_derivative: bool = False,
     ) -> None:
         super().__init__()
 
         compute_c1 = boolean(compute_c1, "compute_c1")
         compute_c2 = boolean(compute_c2, "compute_c2")
         compute_local_mu = boolean(compute_local_mu, "compute_local_mu")
+        compute_polarization_derivative = boolean(
+            compute_polarization_derivative,
+            "compute_polarization_derivative",
+        )
         if compute_local_mu and not (compute_c1 or compute_c2):
             raise ValueError("compute_local_mu requires compute_c1=True")
         if free_energy_mode not in ("beta", "physical"):
@@ -127,6 +139,26 @@ class GridCACEModel(nn.Module):
             raise ValueError("readout must contain at least one energy readout")
         if not all(isinstance(module, EnergyReadout) for module in readouts):
             raise TypeError("every readout must be an EnergyReadout module")
+        polar_readouts = [
+            item for item in readouts
+            if getattr(item, "requires_dipole_density", False)
+        ]
+        if compute_polarization_derivative and not polar_readouts:
+            raise ValueError(
+                "compute_polarization_derivative requires a dipole-density readout"
+            )
+        if compute_local_mu and polar_readouts:
+            raise ValueError(
+                "compute_local_mu is unavailable for dipole-density models: "
+                "the orientational ideal free energy must first be specified"
+            )
+        cutoffs = [item.cutoff_grid for item in polar_readouts]
+        if a_features is not None:
+            cutoffs.append(a_features.cutoff_grid)
+        if cutoffs and any(value != cutoffs[0] for value in cutoffs):
+            raise ValueError(
+                "local and polarization features must use the same cutoff_grid"
+            )
         if (
             any(item.requires_local_features for item in readouts)
             and a_features is None
@@ -166,6 +198,7 @@ class GridCACEModel(nn.Module):
         self.compute_c1 = compute_c1 or compute_c2
         self.compute_c2 = compute_c2
         self.compute_local_mu = compute_local_mu
+        self.compute_polarization_derivative = compute_polarization_derivative
         self.rho_min = rho_min
         self.free_energy_mode = free_energy_mode
 
@@ -173,6 +206,13 @@ class GridCACEModel(nn.Module):
             grid_spacing,
             dtype=torch.get_default_dtype(),
         )
+        if polar_readouts and not torch.allclose(
+            spacing, spacing[0].expand_as(spacing)
+        ):
+            raise ValueError(
+                "dipole-density models require equal grid_spacing along all "
+                "three axes (cubic voxels, not necessarily a cubic box)"
+            )
 
         mean_temperature_tensor = torch.as_tensor(
             mean_temperature,
@@ -231,7 +271,12 @@ class GridCACEModel(nn.Module):
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
 
-        return self.a_features.cutoff_grid if self.has_local_features else 0
+        if self.has_local_features:
+            return self.a_features.cutoff_grid
+        for item in self.readout:
+            if getattr(item, "requires_dipole_density", False):
+                return item.cutoff_grid
+        return 0
 
     @property
     def n_types(self) -> int:
@@ -265,6 +310,8 @@ class GridCACEModel(nn.Module):
     def requires_local_density_index(self) -> bool:
         """Whether any configured local operator uses explicit gathering."""
 
+        if self.requires_dipole_density:
+            return True
         if not self.has_local_features:
             return False
         if (
@@ -275,6 +322,15 @@ class GridCACEModel(nn.Module):
         return any(
             getattr(message, "convolution_backend", "gather") == "gather"
             for message in getattr(self, "message_layers", ())
+        )
+
+    @property
+    def requires_dipole_density(self) -> bool:
+        """Whether the functional contains a polarization-dependent readout."""
+
+        return any(
+            getattr(item, "requires_dipole_density", False)
+            for item in self.readout
         )
 
     @property
@@ -423,6 +479,7 @@ class GridCACEModel(nn.Module):
         compute_c1: Optional[bool] = None,
         compute_c2: Optional[bool] = None,
         c2_reference: Tuple[int, int] = (0, 0),
+        compute_polarization_derivative: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
@@ -433,12 +490,32 @@ class GridCACEModel(nn.Module):
         if compute_c1 is None:
             compute_c1 = self.compute_c1
         compute_c1 = compute_c1 or compute_c2
+        compute_polarization_derivative = optional_boolean(
+            compute_polarization_derivative,
+            "compute_polarization_derivative",
+        )
+        if compute_polarization_derivative is None:
+            compute_polarization_derivative = getattr(
+                self, "compute_polarization_derivative", False
+            )
+        has_polarization = self.requires_dipole_density
+        if compute_polarization_derivative and not has_polarization:
+            raise ValueError(
+                "compute_polarization_derivative requires a dipole-density readout"
+            )
+        if has_polarization and self.compute_local_mu:
+            raise ValueError(
+                "compute_local_mu is unavailable for dipole-density models: "
+                "the orientational ideal free energy must first be specified"
+            )
 
         # A requested functional derivative requires gradient tracking even
         # when surrounding evaluation code uses torch.no_grad(). Energy-only
         # evaluation respects the caller's existing gradient context.
         gradient_context = (
-            torch.enable_grad() if compute_c1 else nullcontext()
+            torch.enable_grad()
+            if compute_c1 or compute_polarization_derivative
+            else nullcontext()
         )
         with gradient_context:
             if "grid_spacing" in data:
@@ -446,8 +523,15 @@ class GridCACEModel(nn.Module):
                     data["grid_spacing"],
                     self.grid_spacing,
                 )
+            if has_polarization and "dipole_density" not in data:
+                raise ValueError("dipole_density is required by this model")
+            response_fields = []
             if compute_c1:
-                data["rho"].requires_grad_(True)
+                response_fields.append(data["rho"])
+            if compute_polarization_derivative:
+                response_fields.append(data["dipole_density"])
+            for field in response_fields:
+                field.requires_grad_(True)
 
             rho = data["rho"]
             temperature = data["temperature"].to(
@@ -521,8 +605,9 @@ class GridCACEModel(nn.Module):
                 context["local_features"] = local_features
             if state_features is not None:
                 context["state_features"] = state_features
-            if "grid_size" in data:
-                context["grid_size"] = data["grid_size"]
+            for name in ("grid_size", "dipole_density", "local_density_index"):
+                if name in data:
+                    context[name] = data[name]
 
             readout_energies = []
             for item in self.readout:
@@ -557,24 +642,39 @@ class GridCACEModel(nn.Module):
                 beta_F_exc = readout_energy
                 outputs = {"beta_F_exc": beta_F_exc}
 
-            if compute_c1:
-                # beta_F_exc_derivative and c1 have the same shape as rho:
-                #     [..., n_grid, n_types].
-                # The generic helper returns the derivative with respect to a
-                # discrete rho value; the minus sign and division by Delta V
-                # produce the continuum-normalized first direct correlation.
-                # Summing independent batch outputs supplies the scalar that
-                # torch.autograd requires without embedding batch semantics in
-                # the derivative helper.
-                beta_F_exc_derivative = compute_grid_derivative(
+            if response_fields:
+                # One backward pass differentiates the same scalar energy
+                # with respect to the requested independent grid fields.
+                # Summing batch energies does not couple independent fields.
+                derivatives = torch.autograd.grad(
                     beta_F_exc.sum(),
-                    data["rho"],
+                    response_fields,
                     create_graph=(self.training or compute_c2),
+                    allow_unused=compute_polarization_derivative,
                 )
-                outputs["c1"] = (
-                    -beta_F_exc_derivative
-                    / volume_element
+
+            if compute_polarization_derivative:
+                # Positive beta-free-energy response to P, with shape
+                # [..., n_grid, n_types, 3]; this is not the external field.
+                polarization_derivative = derivatives[-1]
+                if polarization_derivative is None:
+                    # A low-order invariant selection may be independent of
+                    # P. Its exact zero response can still enter a loss.
+                    polarization_derivative = torch.zeros_like(
+                        data["dipole_density"]
+                    )
+                    if self.training or compute_c2:
+                        polarization_derivative = (
+                            0.0 * data["dipole_density"] + 0.0 * beta_F_exc.sum()
+                        )
+                outputs["polarization_derivative"] = (
+                    polarization_derivative / volume_element
                 )
+            if compute_c1:
+                # c1 has rho's shape [..., n_grid, n_types]. The minus sign
+                # and division by Delta V convert its discrete derivative
+                # into -delta(beta_F_exc)/delta(rho), holding P fixed.
+                outputs["c1"] = -derivatives[0] / volume_element
 
                 if compute_c2:
                     reference_grid, reference_type = (
@@ -605,6 +705,10 @@ class GridCACEModel(nn.Module):
                         # c2. Match the graph-free evaluation semantics of a
                         # c1-only forward call before returning it.
                         outputs["c1"] = outputs["c1"].detach()
+                        if compute_polarization_derivative:
+                            outputs["polarization_derivative"] = outputs[
+                                "polarization_derivative"
+                            ].detach()
 
                 # Chemical-potential response is controlled by one model flag.
                 # Both returned chemical-potential fields are dimensionless

@@ -162,6 +162,16 @@ def process_atoms(
                 "rho and V_ext must contain the same number of columns"
             )
 
+    dipole_density = _ordered_optional_field(
+        atoms, data_key["dipole_density"], order, "dipole_density"
+    )
+    if dipole_density is not None:
+        if dipole_density.shape != (n_grid, 3 * n_types):
+            raise ValueError(
+                "EXTXYZ dipole_density must have shape [n_grid, 3*n_types]"
+            )
+        dipole_density = dipole_density.reshape(n_grid, n_types, 3)
+
     grid_spacing = _metadata_grid_spacing(
         _required_source_value(
             atoms,
@@ -173,6 +183,16 @@ def process_atoms(
         fields_to_coarsen = [
             field for field in (rho, V_ext) if field is not None
         ]
+        if dipole_density is not None:
+            # Validate before averaging: opposite invalid dipoles in an
+            # excluded block must not cancel into a valid coarse field.
+            _normalize_dipole_density(
+                dipole_density,
+                n_grid,
+                n_types,
+                _normalize_excluded_mask(excluded_mask, n_grid),
+            )
+            fields_to_coarsen.append(dipole_density.reshape(n_grid, -1))
         if excluded_mask is not None:
             fields_to_coarsen.append(excluded_mask[:, None].astype(float))
         fields, grid_positions, grid_spacing = coarsen_grid(
@@ -188,6 +208,11 @@ def process_atoms(
         if V_ext is not None:
             V_ext = fields[:, field_start : field_start + n_types]
             field_start += n_types
+        if dipole_density is not None:
+            dipole_density = fields[
+                :, field_start : field_start + 3 * n_types
+            ].reshape(-1, n_types, 3)
+            field_start += 3 * n_types
         if excluded_mask is not None:
             coarse_excluded_fraction = fields[:, field_start]
             uniform_exclusion = np.isclose(
@@ -226,6 +251,7 @@ def process_atoms(
         thermal_wavelength=thermal_wavelength,
         rho=rho,
         V_ext=V_ext,
+        dipole_density=dipole_density,
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
         geometry_cache=geometry_cache,
@@ -250,6 +276,7 @@ def build_grid_data(
     geometry_cache: Optional[Dict[Any, Any]] = None,
     include_thermal_wavelength: bool = True,
     include_local_density_index: bool = True,
+    dipole_density: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -288,6 +315,12 @@ def build_grid_data(
     )
     mu_values = _normalize_optional_mu(mu, n_type_values)
     excluded_mask_values = _normalize_excluded_mask(excluded_mask, n_grid)
+    dipole_density_values = _normalize_dipole_density(
+        dipole_density,
+        n_grid,
+        n_type_values,
+        excluded_mask_values,
+    )
     if rho_values is not None and np.any(
         np.abs(rho_values[excluded_mask_values]) > 1.0e-12
     ):
@@ -332,6 +365,9 @@ def build_grid_data(
         data["rho"] = torch.tensor(rho_values, dtype=dtype)
     if V_ext_values is not None:
         data["V_ext"] = torch.tensor(V_ext_values, dtype=dtype)
+    if dipole_density_values is not None:
+        # Unlike torch.tensor(...), .to(...) retains a supplied live graph.
+        data["dipole_density"] = dipole_density_values.to(dtype=dtype)
     if wavelength_values is not None:
         data["thermal_wavelength"] = torch.tensor(
             wavelength_values,
@@ -339,7 +375,10 @@ def build_grid_data(
         )
     _add_thermodynamic_fields(
         data=data,
-        rho=rho_values,
+        # With independent polarization, the ideal orientational functional
+        # must be specified before equilibrium c1 targets can be constructed.
+        # Preserve beta_mu metadata, but do not apply the scalar-fluid formula.
+        rho=rho_values if dipole_density_values is None else None,
         V_ext=V_ext_values,
         mu=mu_values,
         beta=beta,
@@ -487,6 +526,10 @@ def _get_source_value(atoms: Atoms, source_key: str) -> Optional[Any]:
         return atoms.info[source_key]
     if source_key in atoms.arrays:
         return atoms.arrays[source_key]
+    # ASE moves reserved EXTXYZ properties (e.g. polarization) into a stored
+    # calculator result even when they were serialized as per-grid columns.
+    if atoms.calc is not None and source_key in atoms.calc.results:
+        return atoms.calc.results[source_key]
     return None
 
 
@@ -592,6 +635,29 @@ def _normalize_excluded_mask(
             "excluded_mask must leave at least one accessible grid point"
         )
     return excluded_mask
+
+
+def _normalize_dipole_density(
+    value: Optional[Any],
+    n_grid: int,
+    n_types: int,
+    excluded_mask: np.ndarray,
+) -> Optional[torch.Tensor]:
+    """Validate a signed polar-vector field without detaching tensor inputs."""
+
+    if value is None:
+        return None
+    field = torch.as_tensor(value)
+    if field.shape != (n_grid, n_types, 3):
+        raise ValueError(
+            "dipole_density must have shape [n_grid, n_types, 3]"
+        )
+    if field.is_complex() or not torch.all(torch.isfinite(field)).item():
+        raise ValueError("dipole_density must contain only finite real values")
+    mask = torch.as_tensor(excluded_mask, device=field.device)
+    if torch.any(field[mask] != 0.0).item():
+        raise ValueError("dipole_density must be zero at excluded grid points")
+    return field
 
 
 def _normalize_optional_mu(

@@ -9,7 +9,8 @@ from .loss import FourierResponseLoss, Loss, TensorLoss
 from .metrics import FourierResponseMetrics, Metrics
 from .model import GridCACEModel
 from .pairwise import PairwiseReadout
-from .readout import BulkReadout, LocalReadout, LongRangeReadout
+from .polarization_features import PolarizationFeatures
+from .readout import BulkReadout, LocalReadout, LongRangeReadout, PolarizationReadout
 from .reciprocal import ReciprocalFeatures
 from .response import FourierResponse
 from .semilocal import (
@@ -42,6 +43,8 @@ __all__ = [
     "Loss",
     "Metrics",
     "PairwiseReadout",
+    "PolarizationFeatures",
+    "PolarizationReadout",
     "ReciprocalFeatures",
     "TensorLoss",
     "Trainer",

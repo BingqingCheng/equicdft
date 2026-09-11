@@ -45,6 +45,7 @@ default_data_key = {
     "grid_positions": "positions",
     "V_ext": "V_ext",
     "rho": "density",
+    "dipole_density": "dipole_density",
     "excluded_mask": "excluded_mask",
 }
 
@@ -89,6 +90,7 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
+        dipole_density              [n_grid, n_types, 3] (optional, polar vector)
         excluded_mask               [n_grid] bool; true grid points are excluded
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
@@ -101,6 +103,14 @@ class GridData(dict):
     tensor, preserving the functional-derivative graph. FFT/conv3d local
     operators do not use this potentially large table, so callers may omit it
     explicitly with ``include_local_density_index=False``.
+
+    ``dipole_density`` is dipole moment per physical volume, not dipole per
+    particle. Its Cartesian components are signed and use one shared unit.
+    EXTXYZ stores each type's x/y/z consecutively in ``3*n_types`` columns;
+    coarsening averages components, preserving the integrated dipole vector.
+    Polarized frames do not receive automatic scalar-fluid ``c1`` targets:
+    their ideal orientational free energy must first be specified. Temperature,
+    beta, and any supplied chemical-potential metadata are still retained.
     """
 
     @classmethod
@@ -206,7 +216,9 @@ class GridData(dict):
         ``values`` requires ``grid_size``, ``grid_spacing``, ``n_types``, and
         either ``temperature`` or ``T``. Matching model metadata may instead
         be supplied through ``grid_info``. Density and external-potential
-        fields can be assigned to the returned dictionary afterward. Set
+        fields can be assigned to the returned dictionary afterward. Optional
+        ``dipole_density`` may be supplied with shape ``[n_grid, n_types, 3]``;
+        tensor inputs retain their differentiation graph. Set
         ``include_local_density_index=False`` only for models whose local
         operators all use non-gather backends.
         """
@@ -259,6 +271,7 @@ class GridData(dict):
             "T",
             "n_types",
             "excluded_mask",
+            "dipole_density",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -297,6 +310,7 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
+                dipole_density=values.get("dipole_density"),
                 include_local_density_index=include_local_density_index,
             )
         )
