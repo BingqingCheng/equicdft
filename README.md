@@ -15,7 +15,9 @@ electrode masks or independent XYZ site coordinates, explicit group-total
 charges, and differentiable
 Gaussian charge equilibration with 3D-periodic Coulomb energy. The initial
 fixed-charge capability is experimental; it does not select an electrode model
-or replace the liquid functional's SR/LR convention.
+or replace the liquid functional's SR/LR convention. The same guide covers
+[homogeneous-density solver constraints](METAL_WALL.md#5-solver-constraints),
+including the distinction between constrained and full-3D convergence.
 
 ## Method in one page
 
