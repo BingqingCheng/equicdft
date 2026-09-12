@@ -113,14 +113,49 @@ class ReciprocalFeatures(nn.Module):
         rho: torch.Tensor,
         grid_size: torch.Tensor,
         grid_spacing: torch.Tensor,
+        dipole_density: Optional[torch.Tensor] = None,
+        charges: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return features with shape ``[..., n_kernels, n_type_pairs]``."""
+        """Return features with shape ``[..., n_kernels, n_type_pairs]``.
+
+        Optional ``charges`` weights each density component before the pair
+        contraction. With ``dipole_density`` (shape ``rho.shape + (3,)``),
+        the Coulomb source for component a is instead
+        ``q_a * rho_hat_a - i k.P_hat_a``. Charges are then required, including
+        explicit zeros for neutral polar molecules. P already includes the
+        electric dipole magnitude; it is not multiplied by q or by a moment.
+        This uses the same kernels and pair contraction as density-only mode.
+        No individual-particle self energy is subtracted.
+
+        The real spectral divergence zeros each even-axis Nyquist derivative
+        component, preserving Hermitian symmetry. The radial kernel retains
+        the ordinary FFT wavevectors, including Nyquist frequencies.
+        """
 
         if rho.ndim < 2 or rho.shape[-1] != self.n_types:
             raise ValueError(
                 "rho must have shape [..., n_grid, n_types] with the "
                 "configured n_types"
             )
+        if dipole_density is not None:
+            if self.kernel != "coulomb" or charges is None:
+                raise ValueError(
+                    "dipole_density requires a Coulomb kernel and charges"
+                )
+            if dipole_density.shape != rho.shape + (3,):
+                raise ValueError("dipole_density must have shape rho.shape + (3,)")
+            if (dipole_density.dtype != rho.dtype
+                    or dipole_density.device != rho.device):
+                raise ValueError("dipole_density must match rho dtype and device")
+            if not torch.isfinite(dipole_density).all().item():
+                raise ValueError("dipole_density must be finite")
+        if charges is not None:
+            charges = torch.as_tensor(
+                charges, dtype=rho.dtype, device=rho.device,
+            )
+            if (charges.shape != (self.n_types,)
+                    or not torch.isfinite(charges).all().item()):
+                raise ValueError("charges must contain one finite value per type")
         nx, ny, nz = common_grid_size(grid_size, rho.shape[:-2])
         if nx * ny * nz != rho.shape[-2]:
             raise ValueError("grid_size product does not match rho n_grid")
@@ -135,17 +170,17 @@ class ReciprocalFeatures(nn.Module):
             self.n_types,
         )
         spatial_dims = (-4, -3, -2)
-        density_fluctuation = rho_grid - rho_grid.mean(
-            dim=spatial_dims,
-            keepdim=True,
-        )
-
         volume_element = voxel_volume(spacing)
         volume = volume_element * float(nx * ny * nz)
-        fourier_density = volume_element * torch.fft.fftn(
-            density_fluctuation,
-            dim=spatial_dims,
+        fourier_source = self._fluctuation_fft(
+            rho_grid, spatial_dims, volume_element,
         )
+        if charges is not None:
+            fourier_source = fourier_source * charges
+        if dipole_density is not None:
+            fourier_source = fourier_source + self._bound_charge_hat(
+                dipole_density, (nx, ny, nz), spacing, volume_element,
+            )
 
         kernels = self._kernel_values(
             grid_size=(nx, ny, nz),
@@ -153,7 +188,7 @@ class ReciprocalFeatures(nn.Module):
             device=rho.device,
             dtype=rho.dtype,
         ).reshape(self.n_kernels, -1)
-        fourier_density = fourier_density.reshape(
+        fourier_source = fourier_source.reshape(
             *leading_shape,
             nx * ny * nz,
             self.n_types,
@@ -162,8 +197,8 @@ class ReciprocalFeatures(nn.Module):
         pair_features = []
         for first, second in symmetric_component_pairs(self.n_types):
             cross_power = torch.real(
-                torch.conj(fourier_density[..., first])
-                * fourier_density[..., second]
+                torch.conj(fourier_source[..., first])
+                * fourier_source[..., second]
             )
             multiplicity = 1.0 if first == second else 2.0
             contracted = torch.einsum(
@@ -176,6 +211,29 @@ class ReciprocalFeatures(nn.Module):
             )
         return torch.stack(pair_features, dim=-1)
 
+    @staticmethod
+    def _fluctuation_fft(field, spatial_dims, volume_element):
+        """Continuum-normalized FFT with the homogeneous mode removed."""
+
+        fluctuation = field - field.mean(dim=spatial_dims, keepdim=True)
+        return volume_element * torch.fft.fftn(fluctuation, dim=spatial_dims)
+
+    def _bound_charge_hat(self, polarization, grid_size, spacing, volume_element):
+        """Fourier bound charge -i k_D.P_hat, retaining component indices."""
+
+        p_grid = polarization.reshape(
+            *polarization.shape[:-3], *grid_size, self.n_types, 3,
+        )
+        fourier_p = self._fluctuation_fft(
+            p_grid, (-5, -4, -3), volume_element,
+        )
+        axes = self._wavevector_axes(
+            grid_size, spacing, polarization.device, polarization.dtype,
+            derivative=True,
+        )
+        wavevector = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+        return -1j * (fourier_p * wavevector[..., None, :]).sum(dim=-1)
+
     def _kernel_values(
         self,
         grid_size: Tuple[int, int, int],
@@ -185,18 +243,7 @@ class ReciprocalFeatures(nn.Module):
     ) -> torch.Tensor:
         """Return ``[n_kernels, nx, ny, nz]`` radial kernel values."""
 
-        nx, ny, nz = grid_size
-        k_axes = [
-            2.0
-            * math.pi
-            * torch.fft.fftfreq(
-                n,
-                d=float(grid_spacing[axis].detach().cpu().item()),
-                device=device,
-                dtype=dtype,
-            )
-            for axis, n in enumerate((nx, ny, nz))
-        ]
+        k_axes = self._wavevector_axes(grid_size, grid_spacing, device, dtype)
         kx, ky, kz = torch.meshgrid(*k_axes, indexing="ij")
         squared_wavevector = kx.square() + ky.square() + kz.square()
         exponents = self.radial_exponents.to(device=device, dtype=dtype)
@@ -239,6 +286,29 @@ class ReciprocalFeatures(nn.Module):
             values,
             torch.zeros_like(values),
         )
+
+    @staticmethod
+    def _wavevector_axes(
+        grid_size, grid_spacing, device, dtype, *, derivative=False,
+    ):
+        """FFT wavevectors, optionally zeroing even-axis Nyquist derivatives."""
+
+        axes = [
+            2.0
+            * math.pi
+            * torch.fft.fftfreq(
+                n,
+                d=float(grid_spacing[axis].detach().cpu().item()),
+                device=device,
+                dtype=dtype,
+            )
+            for axis, n in enumerate(grid_size)
+        ]
+        if derivative:
+            for n, axis in zip(grid_size, axes):
+                if n % 2 == 0:
+                    axis[n // 2] = 0.0
+        return axes
 
     @staticmethod
     def _spacing(

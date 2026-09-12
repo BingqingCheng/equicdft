@@ -37,6 +37,15 @@ class LDAReadout(EnergyReadout):
     ``E_exc_lda`` follows the free-energy convention selected by the
     containing model.
 
+    When ``dipole_density_scale`` is supplied, append one local squared
+    dipole-density magnitude per component before temperature. The input is
+    then ``(rho_a/mean_density, |P_a|^2/dipole_density_scale^2, T/mean_T)``.
+    This is an excess contribution only: translational and orientational
+    ideal entropy must still be supplied separately. Squared magnitudes keep
+    derivatives smooth at P=0 and never divide by the local density. For
+    mixtures this magnitude-only branch does not resolve relative directions
+    between different species' dipoles.
+
     No neighboring density enters this module, so it is a strict local-density
     approximation. Supplying the complete local component vector still permits
     composition-dependent mixture free energies.
@@ -51,7 +60,12 @@ class LDAReadout(EnergyReadout):
         Width of each hidden layer. An empty sequence gives a linear mapping.
     zero_init
         If true, initialize the final layer to zero.
+    dipole_density_scale
+        Optional fixed positive scalar, shared by all Cartesian components
+        and species. Omit to preserve the density-only architecture.
     """
+
+    requires_local_density_index = False
 
     def __init__(
         self,
@@ -59,6 +73,7 @@ class LDAReadout(EnergyReadout):
         n_types: int = 1,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = False,
+        dipole_density_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
@@ -66,6 +81,12 @@ class LDAReadout(EnergyReadout):
         self.n_state_features = self.n_types + 1
         density_scale = positive_scalar_tensor(mean_density, "mean_density")
         self.register_buffer("mean_density", density_scale)
+        if dipole_density_scale is not None:
+            self.register_buffer(
+                "dipole_density_scale",
+                positive_scalar_tensor(dipole_density_scale, "dipole_density_scale"),
+            )
+            self.n_state_features += self.n_types
         self.mlp = build_mlp(
             self.n_state_features,
             hidden_sizes,
@@ -73,13 +94,19 @@ class LDAReadout(EnergyReadout):
             zero_init=zero_init,
         )
 
+    @property
+    def requires_dipole_density(self) -> bool:
+        """Old density-only serialized readouts remain density-only."""
+
+        return getattr(self, "dipole_density_scale", None) is not None
+
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
         """Return ``a_exc_lda`` with shape ``[..., n_grid, 1]``."""
 
         if local_state.shape[-1] != self.n_state_features:
             raise ValueError(
-                "local_state must end with all normalized component "
-                "densities and normalized temperature"
+                "local_state must end with the configured normalized densities, "
+                "optional squared dipole magnitudes, and temperature"
             )
         return self.mlp(local_state)
 
@@ -90,12 +117,27 @@ class LDAReadout(EnergyReadout):
         """Return the integrated pointwise LDA contribution."""
 
         rho = context["rho"]
+        if rho.ndim < 2 or rho.shape[-1] != self.n_types:
+            raise ValueError("rho must have shape [..., n_grid, n_types]")
         normalized_density = rho / self.mean_density.to(rho)
+        inputs = [normalized_density]
+        if self.requires_dipole_density:
+            if "dipole_density" not in context:
+                raise ValueError("dipole_density is required by this LDAReadout")
+            dipole = context["dipole_density"]
+            if dipole.shape != (*rho.shape, 3):
+                raise ValueError("dipole_density must have shape [..., n_grid, n_types, 3]")
+            if dipole.dtype != rho.dtype or dipole.device != rho.device:
+                raise ValueError("rho and dipole_density must share dtype and device")
+            if not torch.isfinite(dipole).all():
+                raise ValueError("dipole_density must be finite")
+            normalized_dipole = dipole / self.dipole_density_scale.to(rho)
+            inputs.append(normalized_dipole.square().sum(dim=-1))
         temperature_feature = context["normalized_temperature"][
             ..., None, None
         ].expand(*rho.shape[:-1], 1)
         local_state = torch.cat(
-            (normalized_density, temperature_feature),
+            (*inputs, temperature_feature),
             dim=-1,
         )
         scalar_per_particle = self(local_state)

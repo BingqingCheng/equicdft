@@ -306,7 +306,9 @@ neighbor environments. The normalized local averages contain **no** voxel
 volume; $\Delta V$ enters once through the energy quadrature.
 
 Other readouts may be added before differentiation, for example a scalar CACE
-or LDA contribution. The polarization readout itself includes density-only
+or LDA contribution. The optional [polarization-aware LDA](POLARIZATION_LDA.md)
+uses local squared dipole magnitudes together with local densities; ideal
+entropy remains separate. The polarization readout itself includes density-only
 features, so this is an additive model decomposition, not a unique physical
 separation: it need not vanish when $\mathbf P=0$. A complete long-range
 dipolar electrostatic functional is not supplied by the local descriptors.

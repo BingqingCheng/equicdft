@@ -152,7 +152,10 @@ class GridCACEModel(nn.Module):
                 "compute_local_mu is unavailable for dipole-density models: "
                 "the orientational ideal free energy must first be specified"
             )
-        cutoffs = [item.cutoff_grid for item in polar_readouts]
+        # Pointwise polarized LDA needs P but has no neighborhood cutoff.
+        # The fallback preserves earlier serialized polarization readouts.
+        cutoffs = [item.cutoff_grid for item in polar_readouts
+                   if getattr(item, "requires_local_density_index", True)]
         if a_features is not None:
             cutoffs.append(a_features.cutoff_grid)
         if cutoffs and any(value != cutoffs[0] for value in cutoffs):
@@ -274,7 +277,8 @@ class GridCACEModel(nn.Module):
         if self.has_local_features:
             return self.a_features.cutoff_grid
         for item in self.readout:
-            if getattr(item, "requires_dipole_density", False):
+            if (getattr(item, "requires_dipole_density", False)
+                    and getattr(item, "requires_local_density_index", True)):
                 return item.cutoff_grid
         return 0
 
@@ -310,7 +314,9 @@ class GridCACEModel(nn.Module):
     def requires_local_density_index(self) -> bool:
         """Whether any configured local operator uses explicit gathering."""
 
-        if self.requires_dipole_density:
+        if any(getattr(item, "requires_dipole_density", False)
+               and getattr(item, "requires_local_density_index", True)
+               for item in self.readout):
             return True
         if not self.has_local_features:
             return False

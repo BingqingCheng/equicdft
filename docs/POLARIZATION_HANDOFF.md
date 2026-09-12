@@ -3,6 +3,15 @@
 Verified 12 September 2026. Scope: the optional particle-/dipole-density
 extension, not the earlier LJ fitting campaigns or a complete polar-fluid cDFT.
 
+Latest optional extension: [shared charge/dipole Coulomb](POLARIZATION_COULOMB.md)
+generalizes the existing reciprocal source, with mixed interactions and
+unchanged charge-only defaults. This implementation does not start a new fit.
+
+Subsequent optional extensions: [squared-P LDA](POLARIZATION_LDA.md) and
+[one joint-invariant Bχ message](POLARIZATION_MESSAGE.md). The latter passes
+polarization-dependent scalar invariant information, not explicit vector
+messages. The historical baseline description below remains unchanged.
+
 Subsequent implementation: the user approved the fixed-dipole ideal reference
 and coupled canonical solver. See [the new implementation record](POLARIZATION_IDEAL_SOLVER.md)
 for this addition and its validation. The original handoff below records the

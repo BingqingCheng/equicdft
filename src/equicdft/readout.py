@@ -5,6 +5,7 @@ from typing import Dict, Optional, Sequence
 import torch
 
 from ._argument_checks import (
+    boolean,
     finite_scalar,
     optional_positive_integer,
     positive_integer,
@@ -12,8 +13,10 @@ from ._argument_checks import (
 from ._component_pairs import symmetric_component_pairs
 from ._nn import build_mlp
 from .energy import EnergyReadout, density_weighted_integral
+from .interaction import BChiMessage
 from .polarization_features import PolarizationFeatures
 from .reciprocal import ReciprocalFeatures
+from .symmetrize import CartesianBFeatures
 
 
 class LocalReadout(EnergyReadout):
@@ -102,21 +105,47 @@ class PolarizationReadout(EnergyReadout):
     followed by normalized temperature and returns one reduced free energy
     per particle and component. No orientational ideal entropy or external
     electric-field coupling is included here.
+
+    Optional ``message`` adds one B-chi aggregation of the complete joint
+    invariant vector B0. A single scalar latent gate h(B0)-h(0) is convolved
+    into Cartesian moments and contracted by CartesianBFeatures into B1.
+    The readout receives [B0, B1, T/T_ref]. This passes polarization-dependent
+    invariant information, not explicit vector-valued messages. The descriptor
+    receptive radius doubles; the strictly local LDA is unaffected.
     """
 
     requires_dipole_density = True
+    requires_local_density_index = True
 
     def __init__(
         self,
         features: PolarizationFeatures,
         hidden_sizes: Sequence[int] = (32, 16),
+        message: Optional[BChiMessage] = None,
     ) -> None:
         super().__init__()
         if not isinstance(features, PolarizationFeatures):
             raise TypeError("features must be PolarizationFeatures")
         self.features = features
+        width = features.n_features + 1
+        if message is not None:
+            if not isinstance(message, BChiMessage):
+                raise TypeError("message must be a BChiMessage")
+            if (message.n_radial_channels, message.n_invariant_features,
+                    message.n_channels) != (1, features.n_features, 1):
+                raise ValueError("joint message requires one radial/latent channel and all joint invariants")
+            if message.convolution_backend != "gather":
+                raise ValueError("polarization messages currently require the gather backend")
+            if (message._radial_basis_kind() == "shared"
+                    and features.radial_exponents.numel() != 1):
+                raise ValueError("shared joint-message basis requires one radial channel")
+            message._bind_bessel_basis(features.scalar_features)
+            self.message = message
+            self.message_invariants = CartesianBFeatures(
+                features.max_power, features.max_product_order)
+            width += self.message_invariants.n_features
         self.mlp = build_mlp(
-            features.n_features + 1,
+            width,
             hidden_sizes,
             features.n_types,
         )
@@ -143,6 +172,14 @@ class PolarizationReadout(EnergyReadout):
         """Return per-particle outputs with shape ``[..., n_grid, n_types]``."""
 
         invariants = self.features(context)
+        message = getattr(self, "message", None)
+        if message is not None:
+            geometry = self.features.scalar_features
+            basis = message._stencil_basis(geometry, geometry.stencil_basis())
+            moments = message(invariants.unsqueeze(-2).unsqueeze(-1),
+                              context["local_density_index"], basis)
+            next_invariants = self.message_invariants(moments).flatten(start_dim=-3)
+            invariants = torch.cat((invariants, next_invariants), dim=-1)
         temperature = context["normalized_temperature"][..., None, None]
         temperature = temperature.expand(*invariants.shape[:-1], 1)
         return self.mlp(torch.cat((invariants, temperature), dim=-1))
@@ -264,9 +301,27 @@ class LongRangeReadout(EnergyReadout):
     features
         Reciprocal feature module used by :meth:`energy`. It may be omitted
         when the readout is used only as a standalone coefficient contraction.
+    include_polarization
+        If true, require ``dipole_density`` and use the same Coulomb kernel
+        on ``q_a rho_hat_a - i k.P_hat_a``. Requires explicit ``charges``
+        and Coulomb ``features``. Pair features already contain the charges,
+        so every pair coefficient is the shared amplitude A, not A*q_i*q_j.
+        With ``free_energy_mode="beta"``, use A=beta*C in compatible physical
+        units at fixed temperature. For variable temperatures, use the
+        model's physical mode with A=C/(k_B*T_ref). No dielectric scaling,
+        dipole-magnitude factor, or particle self subtraction is implicit.
     """
 
-    requires_state_features = True
+    requires_local_density_index = False
+
+    @property
+    def requires_state_features(self) -> bool:
+        return getattr(self, "coulomb_amplitude", None) is None
+
+    @property
+    def requires_dipole_density(self) -> bool:
+        # Old serialized charge-only readouts have no include_polarization.
+        return getattr(self, "include_polarization", False)
 
     def __init__(
         self,
@@ -277,9 +332,21 @@ class LongRangeReadout(EnergyReadout):
         charges: Optional[Sequence[float]] = None,
         coulomb_amplitude: Optional[float] = None,
         features: Optional[ReciprocalFeatures] = None,
+        include_polarization: bool = False,
     ) -> None:
         super().__init__()
 
+        self.include_polarization = boolean(
+            include_polarization, "include_polarization",
+        )
+        if self.include_polarization and (
+            charges is None
+            or not isinstance(features, ReciprocalFeatures)
+            or features.kernel != "coulomb"
+        ):
+            raise ValueError(
+                "include_polarization requires charges and Coulomb features"
+            )
         self.n_kernels = positive_integer(n_kernels, "n_kernels")
         self.n_types = positive_integer(n_types, "n_types")
         type_pairs = symmetric_component_pairs(self.n_types)
@@ -380,7 +447,12 @@ class LongRangeReadout(EnergyReadout):
                 1,
                 1,
             )
-        return amplitude * self.pair_charge_products.to(state_features).view(
+        pair_weights = self.pair_charge_products.to(state_features)
+        if self.requires_dipole_density:
+            # q is already in each source; applying q_i*q_j here would both
+            # double-count charge factors and erase neutral-molecule dipoles.
+            pair_weights = torch.ones_like(pair_weights)
+        return amplitude * pair_weights.view(
             1,
             self.n_type_pairs,
         )
@@ -423,12 +495,26 @@ class LongRangeReadout(EnergyReadout):
             raise KeyError(
                 "long-range evaluation requires data['grid_size']"
             )
+        source_options = {}
+        if self.requires_dipole_density:
+            source_options = {
+                "dipole_density": context["dipole_density"],
+                "charges": self.charges,
+            }
         reciprocal_features = self.features(
             rho=context["rho"],
             grid_size=context["grid_size"],
             grid_spacing=context["grid_spacing"],
+            **source_options,
         )
-        energy = self(reciprocal_features, context["state_features"])
+        if self.requires_state_features:
+            state_features = context["state_features"]
+        else:
+            # Fixed electrostatics needs no learned density normalization.
+            state_features = context["rho"].new_zeros(
+                *context["rho"].shape[:-2], self.n_state_features,
+            )
+        energy = self(reciprocal_features, state_features)
         if energy.shape != context["rho"].shape[:-2]:
             raise ValueError(
                 "LongRangeReadout must return one scalar per field"
