@@ -2,12 +2,18 @@
 
 Theory and implementation · 11 September 2026
 
+For branch status, API details, validation commands and remaining work, see the
+[implementation handoff](POLARIZATION_HANDOFF.md).
+The subsequently approved fixed-dipole ideal reference and coupled canonical
+solver are now implemented; see [their API and validation](POLARIZATION_IDEAL_SOLVER.md).
+
 This note describes the exploratory implementation in `equicdft`, branch
 `feature/polarization-density`, commit `c7d7f03`. It learns one scalar excess
 free energy from a number-density field and an electric dipole-density field.
 Its derivatives follow from that same energy. The descriptor and derivative
-machinery is implemented and tested; a complete polar-fluid equilibrium model
-is not yet implemented.
+machinery is implemented and tested. A fixed-magnitude point-dipole ideal
+reference and coupled canonical solver were added on 12 September; applying
+this thermodynamic contract to liquid water remains a separate scientific gate.
 
 ## 1. What are the two density fields?
 
@@ -39,8 +45,9 @@ $$
 |\mathbf P_t(\mathbf r)|\leq m_t\rho_t(\mathbf r).
 $$
 
-This bound is system-specific and is not imposed by the current code, because
-no molecular moment magnitude is supplied. These two fields also do not
+This bound is system-specific and is not imposed by the excess descriptor,
+which has no molecular moment input. The new `PolarizationSolver` takes explicit
+magnitudes and enforces the strict finite-entropy interior. These two fields also do not
 resolve every possible molecular ordering: higher orientational moments may
 be needed for, for example, nematic order at zero polarization. Molecular DFT
 provides a precedent for using number and polarization fields, but the
@@ -141,11 +148,10 @@ $$
 =\frac{\xi}{m}\widehat{\mathbf P}.
 $$
 
-Both orientational corrections have regular zero-polarization limits. This is
-a possible **future reference**, not a term present in the implementation and
-not an assertion that fixed-magnitude point dipoles suffice for every molecular
-fluid. The ideal/excess split must be defined consistently with the selected
-resolved fields.
+Both orientational corrections have regular zero-polarization limits. This
+reference is now implemented in `FixedDipoleIdeal` and tested against independent
+angular integration. Its use requires the explicit fixed-dipole assumptions;
+the ideal/excess split must still be defined consistently for a molecular fluid.
 
 ## 3. Symmetry: rotate positions and dipoles together
 
@@ -435,12 +441,14 @@ species channels, derivative signs and voxel factors, mixed derivatives,
 trainable radials, coarsening, exclusions and saved-model round trips. This
 establishes the tested numerical properties, not accuracy for a polar liquid.
 
-The orientational ideal functional, realizability enforcement, external
-electric-field data/units, coupled equilibrium loss, coupled solver and vector
-long-range physics remain to be specified or implemented. Consequently,
-`compute_local_mu` and the existing `GridSolver` reject polarization models;
-the model can currently be evaluated directly for excess energies and
-derivatives. No polar-fluid model has been fitted in this branch.
+A fixed-dipole ideal functional, realizability enforcement, explicit
+`V_ext`/`E_ext` coupling, and coupled canonical solver are now implemented and
+validated in the [noninteracting benchmark](POLARIZATION_IDEAL_SOLVER.md).
+A coupled equilibrium training loss, molecular charge-site field mapping,
+and vector long-range physics remain open. `compute_local_mu` and the scalar
+`GridSolver` retain their polarization guards; use the separate
+`PolarizationSolver` with an explicit moment magnitude for this ideal reference.
+No polar-fluid model has been fitted in this branch.
 
 The central design principle is simple: **keep scalar and vector fields
 distinct while constructing moments, make the local energy scalar by tensor

@@ -4,6 +4,14 @@ Status: **exploratory implementation**, not a trained or validated polar-fluid
 model. Branch `feature/polarization-density` starts from local main `e401a47`.
 The existing scalar-density representation and saved LJ model remain usable.
 
+See the [handoff](../../docs/POLARIZATION_HANDOFF.md) for the current branch
+state, API contract, reproducible checks and unresolved work.
+
+The approved fixed-dipole ideal reference and coupled canonical solver are now
+implemented. Run `PYTHONPATH=src python examples/polarization_density/noninteracting.py`
+for the analytic benchmark; see [API, physics, and validation](../../docs/POLARIZATION_IDEAL_SOLVER.md).
+The descriptor-only scope below describes the original implementation.
+
 Run the small synthetic example from the repository root:
 
 ```bash
