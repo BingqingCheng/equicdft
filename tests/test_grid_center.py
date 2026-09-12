@@ -41,8 +41,6 @@ class TestGridCenter(unittest.TestCase):
                 torch.testing.assert_close(frame["grid_center"], _centers(frame, [.125, .25, -.5]))
                 self.assertEqual(frame["grid_center"].dtype, torch.float64)
                 self.assertEqual(frame["grid_positions"].dtype, torch.long)
-                torch.testing.assert_close(frame["metal_positions"],
-                                           torch.tensor(atoms.info["metal_positions"], dtype=torch.float64))
 
     def test_from_dict_preserves_double_precision_and_legacy_missing_centers(self):
         values = _grid_values()
@@ -223,13 +221,18 @@ class TestGridCenter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "metal.xyz"
             write(path, Atoms("XX", positions=sites), format="xyz")
-            frame.update(read_metal_sites(path, site_groups=0, group_ids=[0],
-                                          total_charge=[0.], charge_units="e"))
-        torch.testing.assert_close(frame["metal_positions"], torch.tensor(sites, dtype=torch.float64))
-        physical = _run(_wall(), dict(frame, rho=frame["rho"].double()))
-        legacy = dict(frame, rho=frame["rho"].double(), metal_positions=frame["metal_positions"] - .125)
+            metal = read_metal_sites(
+                path, site_groups=0, group_ids=[0],
+                total_charge=[0.], charge_units="e",
+            )
+        torch.testing.assert_close(
+            metal["metal_positions"], torch.tensor(sites, dtype=torch.float64),
+        )
+        physical = _run(_wall(sites=metal), dict(frame, rho=frame["rho"].double()))
+        legacy = dict(frame, rho=frame["rho"].double())
         del legacy["grid_center"]
-        expected = _run(_wall(), legacy)
+        shifted_metal = dict(metal, metal_positions=metal["metal_positions"] - .125)
+        expected = _run(_wall(sites=shifted_metal), legacy)
         torch.testing.assert_close(physical["metal_site_q"], expected["metal_site_q"], atol=3e-11, rtol=3e-11)
 
 

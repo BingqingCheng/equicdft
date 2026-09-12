@@ -1,7 +1,7 @@
 """Electrode-only electrostatics for Gaussian metals coupled to density grids."""
 
 import math
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -10,7 +10,7 @@ from ._argument_checks import nonnegative_scalar, positive_scalar
 from ._grid import (
     common_grid_size, grid_spacing_tensor, _flat_grid_positions, _grid_center_origin,
 )
-from ._metal_data import normalize_metal_metadata
+from ._metal_data import METAL_DATA_KEYS, normalize_metal_sites
 from ._metal_sites import ExplicitSiteGrid
 from .energy import EnergyReadout
 from .reciprocal import _coulomb_values, _squared_wavevectors
@@ -45,19 +45,18 @@ class MetalWall(nn.Module):
     V_ext; this module adds only metal field work. Do not put field settings
     in data. No independent fixed-potential electrode ensemble is implemented.
 
-    Inputs: rho[...,G,S], grid_size, grid_spacing, optional physical
-    grid_center[...,G,3], metal_positions[...,M,3] in the same physical frame,
-    metal_site_groups[...,M], metal_group_ids[...,K], metal_total_charge[...,K]
-    and metal_charge_units="e". Every group total must be explicit; liquid
-    accessibility is controlled independently by excluded_mask. Sites and
-    centers are fixed geometry. Without grid_center, grid zero is physical zero.
+    ``metal_sites`` defines one immutable electrode geometry and its charge
+    constraints. Runtime inputs contain only the liquid density and grid:
+    rho[...,G,S], grid_size, grid_spacing, optional physical
+    grid_center[...,G,3], and optional excluded_mask. Electrode positions and
+    grid centers use the same physical coordinate frame. Without grid_center,
+    grid zero is physical zero.
 
     Outputs include liquid_charge_density (e/length³), q_liquid and
     metal_site_q (integrated e), physical metal_positions, group charges and
     potentials, charge/equipotential residuals, separate cross/metal Coulomb
     energies, electrode_coulomb_energy (their sum), and metal_external_energy.
-    No liquid-liquid energy is evaluated. With no electrodes the electrode
-    energy is zero.
+    No liquid-liquid energy is evaluated.
 
     The neutral periodic cell uses k=0 omitted and retains Gaussian metal
     self interaction. This finite-grid mean-density model is not a complete
@@ -69,6 +68,7 @@ class MetalWall(nn.Module):
 
     def __init__(
         self,
+        metal_sites: Mapping[str, Any],
         liquid_charges: Sequence[float],
         metal_sigma: float,
         liquid_sigma: float,
@@ -91,6 +91,29 @@ class MetalWall(nn.Module):
         if not torch.all(torch.isfinite(valencies)).item():
             raise ValueError("liquid_charges must be finite")
         self.register_buffer("liquid_charges", valencies.detach().clone())
+        if not isinstance(metal_sites, Mapping):
+            raise TypeError("metal_sites must be a mapping")
+        required = {
+            "metal_positions", "metal_site_groups", "metal_group_ids",
+            "metal_total_charge", "metal_charge_units",
+        }
+        missing = required - set(metal_sites)
+        unknown = set(metal_sites) - required
+        if missing:
+            raise ValueError("metal_sites is missing: " + ", ".join(sorted(missing)))
+        if unknown:
+            raise ValueError("unknown metal_sites entries: " + ", ".join(sorted(unknown)))
+        sites = normalize_metal_sites(
+            metal_sites["metal_group_ids"], metal_sites["metal_total_charge"],
+            metal_sites["metal_charge_units"],
+            metal_positions=metal_sites["metal_positions"],
+            metal_site_groups=metal_sites["metal_site_groups"],
+        )
+        for name in (
+            "metal_positions", "metal_site_groups", "metal_group_ids",
+            "metal_total_charge",
+        ):
+            self.register_buffer(name, sites[name].detach().clone())
         self.metal_sigma = positive_scalar(metal_sigma, "metal_sigma")
         self.liquid_sigma = nonnegative_scalar(liquid_sigma, "liquid_sigma")
         self.coulomb_amplitude = positive_scalar(
@@ -149,18 +172,18 @@ class MetalWall(nn.Module):
             return self._cache
         with torch.inference_mode(False), torch.no_grad():
             kernels = self._kernels(shape, spacing, rho)
-            sampling = system = None
-            if positions.shape[0]:
-                sampling = ExplicitSiteGrid(positions, shape, spacing, rho.dtype, rho.device)
-                A = sampling.matrix(kernels[1])
-                C = (groups[:, None] == ids[None, :]).to(rho)
-                system = self._factor_system(A, C)
+            sampling = ExplicitSiteGrid(
+                positions, shape, spacing, rho.dtype, rho.device,
+            )
+            A = sampling.matrix(kernels[1])
+            C = (groups[:, None] == ids[None, :]).to(rho)
+            system = self._factor_system(A, C)
         self._cache_key = key
         self._cache = (kernels, sampling, system)
         return self._cache
 
     def _prepare_fields(self, data):
-        """Validate inputs and normalize shared or per-field batch metadata."""
+        """Validate liquid inputs and expand the fixed electrode over a batch."""
 
         rho = data["rho"]
         if not torch.is_tensor(rho) or rho.ndim < 2:
@@ -183,14 +206,6 @@ class MetalWall(nn.Module):
             )
             if not canonical:
                 raise ValueError("MetalWall requires canonical C-order grid rows")
-        metadata = normalize_metal_metadata(
-            data.get("metal_group_ids"),
-            data.get("metal_total_charge"), data.get("metal_charge_units"),
-            dtype=rho.dtype, device=rho.device,
-            batch_shape=leading,
-            metal_positions=data.get("metal_positions"),
-            metal_site_groups=data.get("metal_site_groups"),
-        )
         excluded = data.get("excluded_mask")
         if excluded is not None:
             excluded = torch.as_tensor(excluded, device=rho.device)
@@ -198,13 +213,7 @@ class MetalWall(nn.Module):
                 raise ValueError("excluded_mask must be Boolean with shape [n_grid] or [..., n_grid]")
             if torch.any(rho[excluded.expand(*leading, n_grid)] != 0.0).item():
                 raise ValueError("rho must be zero at excluded grid points")
-        ids = metadata.get(
-            "metal_group_ids", torch.empty(
-                (*leading, 0), dtype=torch.long, device=rho.device,
-            ),
-        )
-        totals = metadata.get("metal_total_charge", rho.new_empty(*leading, 0))
-        n_fields, n_groups = math.prod(leading) if leading else 1, ids.shape[-1]
+        n_fields = math.prod(leading) if leading else 1
         raw_spacing = torch.as_tensor(
             data["grid_spacing"], dtype=rho.dtype, device=rho.device,
         )
@@ -234,21 +243,11 @@ class MetalWall(nn.Module):
                 raise ValueError(name + " must be [3] or match rho batch shape")
         external = self.external_field.to(rho).expand(*leading, 3)
         origins = self.field_origin.to(rho).expand(*leading, 3)
-        positions = metadata.get(
-            "metal_positions", torch.empty((*leading, 0, 3), dtype=torch.float64, device=rho.device),
-        )
-        groups = metadata.get(
-            "metal_site_groups", torch.empty((*leading, 0), dtype=torch.long, device=rho.device),
-        )
         fields = {
             "density": rho.reshape(n_fields, n_grid, -1),
-            "group_ids": ids.reshape(n_fields, n_groups),
-            "group_totals": totals.reshape(n_fields, n_groups),
             "spacing": spacings,
             "external_field": external.reshape(n_fields, 3),
             "field_origin": origins.reshape(n_fields, 3),
-            "site_positions": positions.reshape(n_fields, positions.shape[-2], 3),
-            "site_groups": groups.reshape(n_fields, groups.shape[-1]),
             "grid_origin": grid_origins,
         }
         return shape, leading, (
@@ -303,39 +302,37 @@ class MetalWall(nn.Module):
                 potential_residual, metal_energy)
 
     def _evaluate_field(
-        self, shape, density, group_ids, group_totals, spacing,
-        external_field, field_origin, site_positions, site_groups, grid_origin,
+        self, shape, density, spacing, external_field, field_origin, grid_origin,
     ):
         """Form voxel charges, solve the electrodes, and evaluate their energy."""
+        group_ids = self.metal_group_ids.to(device=density.device)
+        group_totals = self.metal_total_charge.to(density)
+        site_positions = self.metal_positions.to(device=density.device)
+        site_groups = self.metal_site_groups.to(device=density.device)
         kernels, sampling, system = self._geometry(
             shape, spacing, site_positions - grid_origin, site_groups, group_ids, density,
         )
         liquid_charge_density = (density * self.liquid_charges.to(density)).sum(-1)
         q_liquid = spacing.prod() * liquid_charge_density
-        zero = density.square().sum() * 0.0
-        q = density.new_empty(0) + zero
-        metal_charge = group_totals + zero
-        metal_potential = group_totals * 0.0 + zero
-        charge_residual = potential_residual = zero
-        cross_energy = metal_energy = metal_external_energy = zero
-        if system is not None:
-            phi_liquid = sampling.potential(q_liquid, kernels[0])
-            coordinates = site_positions - field_origin
-            cell = spacing * spacing.new_tensor(shape)
-            wrapped = coordinates - cell * torch.round(coordinates / cell)
-            external_potential = -(wrapped * external_field).sum(-1).to(density)
-            (q, metal_charge, metal_potential, charge_residual,
-             potential_residual, metal_energy) = self._solve_charges(
-                q_liquid, phi_liquid + external_potential, group_totals, system,
-            )
-            cross_energy = torch.sum(q * phi_liquid)
-            metal_external_energy = torch.sum(q * external_potential)
+        phi_liquid = sampling.potential(q_liquid, kernels[0])
+        coordinates = site_positions - field_origin
+        cell = spacing * spacing.new_tensor(shape)
+        wrapped = coordinates - cell * torch.round(coordinates / cell)
+        external_potential = -(wrapped * external_field).sum(-1).to(density)
+        (q, metal_charge, metal_potential, charge_residual,
+         potential_residual, metal_energy) = self._solve_charges(
+            q_liquid, phi_liquid + external_potential, group_totals, system,
+        )
+        cross_energy = torch.sum(q * phi_liquid)
+        metal_external_energy = torch.sum(q * external_potential)
         return {
             "liquid_charge_density": liquid_charge_density,
             "q_liquid": q_liquid,
             "metal_site_q": q,
             "metal_positions": site_positions,
             "metal_site_groups": site_groups,
+            "metal_group_ids": group_ids,
+            "metal_total_charge": group_totals,
             "metal_charge": metal_charge, "metal_potential": metal_potential,
             "charge_residual": charge_residual,
             "potential_residual": potential_residual,
@@ -346,8 +343,8 @@ class MetalWall(nn.Module):
         }
 
     def forward(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        if {"metal_external_field", "metal_field_origin"} & data.keys():
-            raise ValueError("Set external_field and field_origin on MetalWall, not in data")
+        if METAL_DATA_KEYS & data.keys():
+            raise ValueError("Set electrode geometry, constraints, and field on MetalWall, not in data")
         shape, leading, fields = self._prepare_fields(data)
         outputs = [self._evaluate_field(shape, **field) for field in fields]
         if not leading:

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from metal_helpers import _run
+from metal_helpers import _run, metal_sites
 
 from equicdft import MetalWall
 from test_metalwall import _field, _site_rows
@@ -42,7 +42,8 @@ class _ProbeMetalWall(MetalWall):
         out = super()._evaluate_field(shape, **field)
         kernels, _, _ = self._cache
         spacing = field["spacing"]
-        coordinates = (field["site_positions"] / spacing).round().long()
+        site_positions = self.metal_positions.to(device=spacing.device)
+        coordinates = (site_positions / spacing).round().long()
         index = (coordinates[:, 0]*shape[1] + coordinates[:, 1])*shape[2] + coordinates[:, 2]
         grid_charge = torch.zeros_like(out["q_liquid"]).index_copy(0, index, out["metal_site_q"])
         out['coulomb_metal_energy'] = .5 * torch.sum(
@@ -52,7 +53,8 @@ class _ProbeMetalWall(MetalWall):
 
 
 def _wall(cls=MetalWall, dtype=torch.float64, **options):
-    kwargs = dict(liquid_charges=[1., -1.], metal_sigma=.35, liquid_sigma=.12,
+    kwargs = dict(metal_sites=metal_sites(_field()), liquid_charges=[1., -1.],
+                  metal_sigma=.35, liquid_sigma=.12,
                   coulomb_amplitude=1.7, boundary='periodic')
     kwargs.update(options)
     return cls(**kwargs).to(dtype=dtype)

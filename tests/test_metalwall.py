@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from metal_helpers import _run
+from metal_helpers import _run, metal_sites
 
 from equicdft import MetalWall
 
@@ -47,6 +47,7 @@ def _site_rows(data):
 
 def _module(sigma=0.35, liquid_sigma=0.12, amplitude=1.7, charges=(1.0, -1.0)):
     return MetalWall(
+        metal_sites=metal_sites(_field()),
         liquid_charges=charges,
         metal_sigma=sigma,
         liquid_sigma=liquid_sigma,
@@ -215,7 +216,7 @@ class TestMetalWall(unittest.TestCase):
         del first["metal_external_field"]
         self.assertEqual(_run(wall, first)["metal_external_energy"].item(), 0.)
 
-    def test_constant_field_float32_and_no_metal(self):
+    def test_constant_field_float32(self):
         data = self._biased_field()
         expected = _run(_module(), data)
         single = {key: value.float() if torch.is_tensor(value) and value.is_floating_point()
@@ -223,17 +224,10 @@ class TestMetalWall(unittest.TestCase):
         result = _run(_module().float(), single)
         for key in ("metal_site_q", "metal_potential", "metal_external_energy"):
             torch.testing.assert_close(result[key].double(), expected[key], atol=2e-6, rtol=2e-6)
-        for key in ("metal_positions", "metal_site_groups", "metal_group_ids", "metal_total_charge", "metal_charge_units"):
-            data.pop(key)
-        # The field is metal-only, even when the input contains liquid charges.
-        data["rho"].requires_grad_()
-        result = _run(_module(), data)
-        self.assertEqual(result["metal_external_energy"].item(), 0.)
-        gradient = torch.autograd.grad(result["metal_external_energy"], data["rho"])[0]
-        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
 
     def test_physical_parameters_and_boundary_must_be_valid(self):
         arguments = {
+            "metal_sites": metal_sites(_field()),
             "liquid_charges": (1.0, -1.0), "metal_sigma": 0.35, "liquid_sigma": 0.0,
             "coulomb_amplitude": 1.7, "boundary": "periodic",
         }
@@ -322,19 +316,6 @@ class TestMetalWall(unittest.TestCase):
                     "coulomb_metal_energy", "electrode_coulomb_energy"):
             torch.testing.assert_close(result[key], actual[key], atol=1e-10, rtol=1e-10)
 
-    def test_no_metal_has_zero_electrode_energy(self):
-        data = _field()
-        data = {k: v for k, v in data.items() if not k.startswith("metal_")}
-        for liquid_sigma in (0.0, 0.2):
-            with self.subTest(liquid_sigma=liquid_sigma):
-                result = _run(_module(liquid_sigma=liquid_sigma), data)
-                liquid = data["rho"] @ torch.tensor((1.0, -1.0), dtype=DTYPE) * data["grid_spacing"].prod()
-
-                self.assertEqual(result["electrode_coulomb_energy"].item(), 0.0)
-                torch.testing.assert_close(result["q_liquid"], liquid)
-                self.assertEqual(result["metal_charge"].numel(), 0)
-                self.assertEqual(result["metal_site_q"].numel(), 0)
-
     def test_electrode_only_outputs_and_no_liquid_energy_fft(self):
         data = _field()
         wall = _module()
@@ -393,13 +374,18 @@ class TestMetalWall(unittest.TestCase):
         with self.assertRaises(TypeError):
             _run(_module(), data)
 
-    def test_missing_charge_metadata_is_not_silently_zero(self):
+    def test_invalid_or_incomplete_metal_sites_are_rejected_at_construction(self):
+        sites = metal_sites(_field())
         for key in ("metal_group_ids", "metal_total_charge", "metal_charge_units"):
             with self.subTest(key=key):
-                data = _field()
-                del data[key]
-                with self.assertRaisesRegex(ValueError, "explicit"):
-                    _run(_module(), data)
+                incomplete = dict(sites)
+                del incomplete[key]
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    MetalWall(
+                        metal_sites=incomplete, liquid_charges=[1., -1.],
+                        metal_sigma=.35, liquid_sigma=.12,
+                        coulomb_amplitude=1.7, boundary="periodic",
+                    )
         for key, value in (
             ("metal_charge_units", "C"),
             ("metal_group_ids", torch.tensor((2, 2))),
@@ -407,10 +393,13 @@ class TestMetalWall(unittest.TestCase):
             ("metal_total_charge", torch.tensor((0.1,))),
         ):
             with self.subTest(key=key):
-                data = _field()
-                data[key] = value
+                invalid = dict(sites, **{key: value})
                 with self.assertRaises(ValueError):
-                    _run(_module(), data)
+                    MetalWall(
+                        metal_sites=invalid, liquid_charges=[1., -1.],
+                        metal_sigma=.35, liquid_sigma=.12,
+                        coulomb_amplitude=1.7, boundary="periodic",
+                    )
 
     def test_geometry_cache_is_excluded_from_serialization_and_dtype_migration(self):
         data = _field()
@@ -432,33 +421,20 @@ class TestMetalWall(unittest.TestCase):
         self.assertEqual(result["metal_site_q"].dtype, torch.float32)
         torch.testing.assert_close(result["metal_site_q"].double(), expected["metal_site_q"], atol=2e-6, rtol=2e-5)
 
-    def test_absent_electrodes_do_not_add_liquid_energy(self):
-        data = _field()
-        data = {key: value for key, value in data.items() if not key.startswith("metal_")}
-        data.pop("excluded_mask")
-        data["rho"][:, 0] += 0.1
-        result = _run(_module(liquid_sigma=0.0), data)
-
-        liquid = data["grid_spacing"].prod() * (data["rho"][:, 0] - data["rho"][:, 1])
-        self.assertGreater(liquid.sum().item(), 0)
-        self.assertEqual(result["electrode_coulomb_energy"].item(), 0.0)
-        torch.testing.assert_close(result["q_liquid"], liquid)
-
     def test_multiaxis_batch_matches_single_field_outputs(self):
         data = _field()
         factors = torch.tensor([[1.0, 1.1], [0.9, 1.2]], dtype=DTYPE)
         densities = factors[..., None, None] * data["rho"]
         spacings = factors[..., None] * data["grid_spacing"]
-        totals = factors[..., None] * data["metal_total_charge"]
         module = _module()
-        # Positions, groups and grid size are shared; spacing and totals vary.
+        # One module-owned electrode is shared across the density batch.
         for spacing in (data["grid_spacing"], spacings):
             with self.subTest(shared_spacing=spacing.ndim == 1):
                 actual = _run(module, dict(data, rho=densities, grid_spacing=spacing,
-                                     metal_total_charge=totals))
+                                     ))
                 for i, j in itertools.product(range(2), repeat=2):
                     expected = _run(_module(), dict(
-                        data, rho=densities[i, j], metal_total_charge=totals[i, j],
+                        data, rho=densities[i, j],
                         grid_spacing=spacing if spacing.ndim == 1 else spacing[i, j],
                     ))
                     self.assertEqual(actual.keys(), expected.keys())
@@ -466,7 +442,7 @@ class TestMetalWall(unittest.TestCase):
                         self.assertEqual(actual[key].shape, (2, 2) + expected[key].shape)
                         torch.testing.assert_close(actual[key][i, j], expected[key], atol=0, rtol=0)
 
-    def test_multiaxis_liquid_only_batch_preserves_outputs_and_gradients(self):
+    def test_multiaxis_liquid_batch_uses_one_fixed_wall(self):
         data = {key: value for key, value in _field().items()
                 if not key.startswith("metal_")}
         densities = data["rho"].expand(2, 2, -1, -1).clone().requires_grad_(True)
@@ -500,20 +476,6 @@ class TestMetalWall(unittest.TestCase):
             actual = _run(module, data)
             torch.testing.assert_close(actual["metal_site_q"], expected["metal_site_q"], atol=2e-7, rtol=2e-7)
             torch.testing.assert_close(actual["electrode_coulomb_energy"], expected["electrode_coulomb_energy"], atol=2e-7, rtol=2e-7)
-
-    def test_batched_fields_keep_distinct_group_labels_and_constraints(self):
-        fields = [_field(), _field(group_ids=(5, 3))]
-        fields[1]["metal_total_charge"] *= -2
-        batched = {
-            key: torch.stack([data[key] for data in fields]) if torch.is_tensor(fields[0][key]) else fields[0][key]
-            for key in fields[0]
-        }
-        module = _module()
-        actual = _run(module, batched)
-        for index, data in enumerate(fields):
-            expected = _dense_solution(data)
-            for key in ("metal_site_q", "metal_potential", "electrode_coulomb_energy"):
-                torch.testing.assert_close(actual[key][index], expected[key], atol=2e-7, rtol=2e-7)
 
     def test_first_and_second_derivatives_include_electrode_response(self):
         data = _field()

@@ -22,6 +22,7 @@ from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout, log_dimensionless_density
 from .features import CartesianAFeatures
 from .interaction import BChiMessage
+from ._metal_data import METAL_DATA_KEYS
 from .symmetrize import CartesianBFeatures
 
 
@@ -428,6 +429,11 @@ class GridCACEModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
+        if METAL_DATA_KEYS & data.keys():
+            raise ValueError(
+                "Set electrode geometry, constraints, and field on MetalWall, not in data"
+            )
+
         compute_c2 = optional_boolean(compute_c2, "compute_c2")
         if compute_c2 is None:
             compute_c2 = self.compute_c2
@@ -531,10 +537,7 @@ class GridCACEModel(nn.Module):
             if "grid_size" in data:
                 context["grid_size"] = data["grid_size"]
             for key in (
-                "grid_positions", "grid_center", "excluded_mask", "metal_group_ids",
-                "metal_positions", "metal_site_groups",
-                "metal_total_charge", "metal_charge_units",
-                "metal_external_field", "metal_field_origin",
+                "grid_positions", "grid_center", "excluded_mask",
             ):
                 if key in data:
                     context[key] = data[key]

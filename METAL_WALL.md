@@ -11,7 +11,12 @@ couples this response to a liquid-density solve.
 ### Construct the module
 
 ```python
+metal_sites = read_metal_sites(
+    "metal.extxyz",
+    site_groups=0, group_ids=[0], total_charge=[0.0], charge_units="e",
+)
 wall = MetalWall(
+    metal_sites=metal_sites,
     liquid_charges=valencies,
     metal_sigma=metal_sigma,
     liquid_sigma=0.0,
@@ -21,8 +26,14 @@ wall = MetalWall(
 )
 ```
 
+`MetalWall` copies the electrode specification into module buffers, so it moves
+and serializes with the model. Use a separate `MetalWall` for a different
+electrode geometry or charge constraint. `E_z` is the applied field; the 2 V
+example below shows how to calculate it.
+
 | Argument | Meaning |
 |---|---|
+| `metal_sites` | Electrode coordinates, site groups, and prescribed group charges returned by `read_metal_sites` |
 | `liquid_charges` | Charge per liquid species, in e and density-channel order |
 | `metal_sigma` | Gaussian standard deviation of a metal charge site, in length units |
 | `liquid_sigma` | Gaussian standard deviation of a liquid voxel source; zero means no Gaussian smearing |
@@ -32,25 +43,18 @@ wall = MetalWall(
 | `field_origin` | Physical wrapping center of the metal field, default `(0, 0, 0)` |
 | `tolerance` | Electrode charge/equipotential tolerance, default `1e-6` with scale and roundoff allowances |
 
-### Supply electrodes and evaluate
-
-Starting from the liquid field `data`, read electrode coordinates and set their
-charge constraints:
+### Evaluate a liquid density
 
 ```python
-data.update(read_metal_sites(
-    "metal.extxyz",
-    site_groups=0, group_ids=[0], total_charge=[0.0], charge_units="e",
-))
 state = wall(data)
 q_metal = state["metal_site_q"]
 U_electrode = state["electrode_coulomb_energy"] + state["metal_external_energy"]
 ```
 
-Here all sites share one group with zero combined charge. This permits charge
-transfer between electrode regions. To constrain electrodes separately, assign
-different group labels and a total charge to each. If these are already in the
-file, use `read_metal_sites("metal.extxyz")` without overrides.
+The example assigns all sites to one neutral group, permitting charge transfer
+between electrode regions. To constrain electrodes separately, assign different
+group labels and a total charge to each. If these are already in the file, use
+`read_metal_sites("metal.extxyz")` without overrides.
 
 Electrode positions use the same physical coordinates as the liquid grid
 centers; they need not lie on grid points. Liquid exclusion is specified
@@ -59,6 +63,7 @@ separately by `excluded_mask`.
 `wall(data)` evaluates the current density without changing it. Its main outputs are:
 
 - `metal_site_q`: integrated charge of each site, in e.
+- `metal_group_ids` and `metal_total_charge`: configured constraint labels and totals.
 - `metal_charge` and `metal_potential`: charge and potential of each constraint group.
 - `liquid_charge_density` and `q_liquid`: liquid charge density and integrated voxel charges.
 - `electrode_coulomb_energy`: liquid–metal plus metal–metal energy.
@@ -116,8 +121,8 @@ density changes, its potential $b$ and the relaxed charges $q$ are updated.
 
 ## Use in a density solve: 2 V
 
-Assume the liquid model and unbiased field `data` are loaded and electrode
-coordinates have been added as above. Use one combined neutral metal group.
+Assume the liquid model, unbiased field `data`, and `metal_sites` above are loaded.
+Use one combined neutral metal group.
 For electrodes near opposite periodic cell ends, apply
 $\Delta\Phi = \Phi_{\mathrm{top}}-\Phi_{\mathrm{bottom}} = 2\ \mathrm{V}$:
 
@@ -137,11 +142,12 @@ and metal wrapping center zero, so the upper metal image is shifted by $-L_z$.
 It is not an independently prescribed electrode-potential ensemble.
 Add the liquid field only once; `V_ext` here starts from the unbiased wall potential.
 
-Attach MetalWall with the same field, then minimize the liquid density:
+Construct and attach the wall with the same field, then minimize the liquid density:
 
 ```python
 wall = MetalWall(
-    liquid_charges=valencies, metal_sigma=metal_sigma, liquid_sigma=0.0,
+    metal_sites=metal_sites, liquid_charges=valencies,
+    metal_sigma=metal_sigma, liquid_sigma=0.0,
     coulomb_amplitude=physical_prefactor, boundary="periodic",
     external_field=(0.0, 0.0, E_z),
 )

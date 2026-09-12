@@ -6,7 +6,7 @@ import math
 import unittest
 
 import torch
-from metal_helpers import _run
+from metal_helpers import _run, metal_sites
 
 from equicdft import GridSolver, MetalWall
 
@@ -14,8 +14,10 @@ from equicdft import GridSolver, MetalWall
 DTYPE = torch.float64
 
 
-def _wall(charges=(1., -1.)):
-    return MetalWall(liquid_charges=charges, metal_sigma=.35, liquid_sigma=.12,
+def _wall(charges=(1., -1.), sites=None):
+    return MetalWall(metal_sites=metal_sites(_data()) if sites is None else sites,
+                     liquid_charges=charges,
+                     metal_sigma=.35, liquid_sigma=.12,
                      coulomb_amplitude=1.7, boundary="periodic").double()
 
 
@@ -267,23 +269,6 @@ class TestExplicitMetalSites(unittest.TestCase):
             for key in single:
                 torch.testing.assert_close(actual[key][i, j], single[key], atol=3e-11, rtol=3e-11)
 
-    def test_per_frame_positions_groups_totals_and_fields_match_single_calls(self):
-        first = _data()
-        second = dict(first, metal_positions=first["metal_positions"] + .037,
-                      metal_site_groups=torch.tensor([9, 4, 9, 4]),
-                      metal_group_ids=torch.tensor([4, 9]),
-                      metal_total_charge=torch.tensor([.22, -.22], dtype=DTYPE))
-        first["metal_external_field"] = torch.tensor([.1, .02, -.03], dtype=DTYPE)
-        second["metal_external_field"] = -first["metal_external_field"]
-        batch = {key: torch.stack((first[key], second[key])) if torch.is_tensor(first[key]) else first[key]
-                 for key in first}
-        wall = _wall()
-        actual = _run(wall, batch)
-        for index, frame in enumerate((first, second)):
-            expected = _run(wall, frame)
-            for key in expected:
-                torch.testing.assert_close(actual[key][index], expected[key], atol=3e-11, rtol=3e-11)
-
     def test_cache_updates_for_position_and_group_changes_not_density_or_field(self):
         data = _data()
         wall = _wall()
@@ -400,10 +385,9 @@ class TestExplicitMetalSites(unittest.TestCase):
         solver = GridSolver(model)
         result = _run(solver.evaluate, data)
         self.assert_outputs_close(result, _model_reference(data))
-        for key in ("excluded_mask", "metal_positions", "metal_site_groups", "metal_group_ids",
-                    "metal_total_charge"):
+        for key in ("excluded_mask", "metal_positions", "metal_site_groups",
+                    "metal_group_ids", "metal_total_charge"):
             torch.testing.assert_close(result[key], data[key])
-        self.assertEqual(result["metal_charge_units"], "e")
         torch.testing.assert_close(result["euler_lagrange_residual"], torch.zeros_like(data["rho"]),
                                    atol=3e-11, rtol=0)
         expected_external = data["beta"] * model.voxel_volume * (data["rho"] * data["V_ext"]).sum()

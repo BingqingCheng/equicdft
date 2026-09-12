@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from metal_helpers import _run
+from metal_helpers import _run, liquid_data, metal_sites
 
 from equicdft import (
     GridCACEModel,
@@ -44,6 +44,7 @@ class TestMetalModel(unittest.TestCase):
     @staticmethod
     def _wall():
         return MetalWall(
+            metal_sites=metal_sites(TestMetalModel._data()),
             liquid_charges=[1.0, -1.0],
             metal_sigma=0.6,
             liquid_sigma=0.0,
@@ -265,34 +266,14 @@ class TestMetalModel(unittest.TestCase):
                     torch.testing.assert_close(outputs[1][key], outputs[0][key] + outputs[2][key],
                                                atol=1e-12, rtol=1e-12)
 
-    def test_correction_without_metal_preserves_existing_readout(self):
-        augmented = self._model()
-        previous = self._model(with_metal=False)
-        # Make the original LDA nonzero so equality is not just a zero test.
-        for model in (augmented, previous):
-            with torch.no_grad():
-                model.readout[0].mlp[-1].weight.fill_(0.2)
-                model.readout[0].mlp[-1].bias.fill_(0.1)
-        data = {k: v for k, v in self._data().items() if not k.startswith("metal_")}
-        expected = _run(previous, data, compute_c2=True)
-        actual = _run(augmented, data, compute_c2=True)
-        for key in ("beta_F_exc", "c1", "c2"):
-            self.assertTrue(torch.equal(actual[key], expected[key]))
-        self.assertEqual(actual["metal_site_q"].numel(), 0)
-        self.assertEqual(actual["metal_charge"].numel(), 0)
-        torch.testing.assert_close(
-            actual["q_liquid"], augmented.voxel_volume * actual["liquid_charge_density"],
-        )
-
-    def test_batched_fields_preserve_independent_temperature_and_constraints(self):
+    def test_batched_fields_preserve_independent_temperature(self):
         fields = [self._data(), self._data()]
         fields[1]["temperature"] = torch.tensor(3.0, dtype=torch.float64)
-        fields[1]["metal_total_charge"] = torch.tensor([0.03, -0.03], dtype=torch.float64)
-        batch = {
+        batch = liquid_data({
             key: torch.stack([item[key] for item in fields])
             if torch.is_tensor(fields[0][key]) else fields[0][key]
             for key in fields[0]
-        }
+        })
         model = self._model()
         outputs = _run(model, batch, compute_c2=True, c2_reference=(2, 0))
         for index, data in enumerate(fields):

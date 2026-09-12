@@ -27,7 +27,7 @@ from ._data_helpers import (
     validate_frame_grid_info,
 )
 from ._fourier import canonical_mode_triplets, integer_mode_tensor
-from ._metal_data import normalize_metal_metadata
+from ._metal_data import normalize_metal_sites
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -48,13 +48,6 @@ default_data_key = {
     "V_ext": "V_ext",
     "rho": "density",
     "excluded_mask": "excluded_mask",
-    "metal_positions": "metal_positions",
-    "metal_site_groups": "metal_site_groups",
-    "metal_group_ids": "metal_group_ids",
-    "metal_total_charge": "metal_total_charge",
-    "metal_charge_units": "metal_charge_units",
-    "metal_external_field": "metal_external_field",
-    "metal_field_origin": "metal_field_origin",
 }
 
 
@@ -87,11 +80,11 @@ def read_metal_sites(
     labels = atoms.arrays.get("metal_site_groups") if site_groups is None else site_groups
     if site_groups is not None and np.ndim(site_groups) == 0:
         labels = np.full(len(atoms), site_groups)
-    return normalize_metal_metadata(
+    return normalize_metal_sites(
         atoms.info.get("metal_group_ids") if group_ids is None else group_ids,
         atoms.info.get("metal_total_charge") if total_charge is None else total_charge,
         atoms.info.get("metal_charge_units") if charge_units is None else charge_units,
-        batch_shape=(), metal_positions=positions, metal_site_groups=labels,
+        metal_positions=positions, metal_site_groups=labels,
     )
 
 
@@ -137,13 +130,6 @@ class GridData(dict):
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
         excluded_mask               [n_grid] bool; true grid points are excluded
-        metal_positions             [n_sites, 3], same physical frame as grid_center
-        metal_site_groups           [n_sites], nonnegative integer group labels
-        metal_group_ids             [n_groups] unique IDs in charge order
-        metal_total_charge          [n_groups] prescribed total charge per group
-        metal_charge_units          "e" (required when metal is present)
-        metal_external_field        [3], energy/(e * length), metal only (optional)
-        metal_field_origin          [3], physical wrapping center (default zero)
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors] (optional)
@@ -155,10 +141,6 @@ class GridData(dict):
     tensor, preserving the functional-derivative graph. FFT/conv3d local
     operators do not use this potentially large table, so callers may omit it
     explicitly with ``include_local_density_index=False``.
-    Fixed ``metal_positions`` and ``metal_site_groups`` define the electrode
-    charge basis, on or off the liquid grid. They are frame metadata, not
-    per-voxel arrays, and never imply fluid exclusion. Use ``excluded_mask``
-    for the full inaccessible volume and declare every group charge explicitly.
     Optional grid_center gives fixed physical voxel centers in float64. It
     must describe a translated regular grid with the declared grid_spacing.
     Without it, physical centers are grid_positions * grid_spacing (no offset).
@@ -321,13 +303,6 @@ class GridData(dict):
             "T",
             "n_types",
             "excluded_mask",
-            "metal_positions",
-            "metal_site_groups",
-            "metal_group_ids",
-            "metal_total_charge",
-            "metal_charge_units",
-            "metal_external_field",
-            "metal_field_origin",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -367,13 +342,6 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
-                metal_positions=values.get("metal_positions"),
-                metal_site_groups=values.get("metal_site_groups"),
-                metal_group_ids=values.get("metal_group_ids"),
-                metal_total_charge=values.get("metal_total_charge"),
-                metal_charge_units=values.get("metal_charge_units"),
-                metal_external_field=values.get("metal_external_field"),
-                metal_field_origin=values.get("metal_field_origin"),
                 include_local_density_index=include_local_density_index,
             )
         )

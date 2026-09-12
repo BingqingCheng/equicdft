@@ -224,7 +224,12 @@ class TestHomogeneousSolver(unittest.TestCase):
         d["metal_external_field"] = torch.tensor([0., 0., -.1])
         d["metal_field_origin"] = torch.tensor([0., 0., 0.])
         d["metal_charge_units"] = "e"
-        wall = MetalWall(liquid_charges=[1., -1.], metal_sigma=.4, liquid_sigma=0.,
+        wall = MetalWall(
+                         metal_sites={key: d[key] for key in (
+                             "metal_positions", "metal_site_groups", "metal_group_ids",
+                             "metal_total_charge", "metal_charge_units",
+                         )},
+                         liquid_charges=[1., -1.], metal_sigma=.4, liquid_sigma=0.,
                          coulomb_amplitude=.02, boundary="periodic").double()
         model = GridCACEModel(a_features=None, b_features=None,
             readout=[LDAReadout(mean_density=1., n_types=2, hidden_sizes=(), zero_init=True),
