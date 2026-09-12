@@ -97,27 +97,16 @@ U(q) = \frac{1}{2} q^{\mathsf T} A q + q^{\mathsf T}(b+v),
 \qquad C^{\mathsf T} q = Q.
 $$
 
-This gives the constrained linear system
+The stationary conditions are
 
 $$
-\begin{pmatrix}
-A & C \\
-C^{\mathsf T} & 0
-\end{pmatrix}
-\begin{pmatrix}
-q \\
-\lambda
-\end{pmatrix}
-=
-\begin{pmatrix}
--(b+v) \\
-Q
-\end{pmatrix}.
+Aq + C\lambda = -(b+v), \qquad C^{\mathsf T}q = Q.
 $$
 
-The code solves this system using a cached LU factorization, without forming
-the inverse explicitly. Group potentials are $-\lambda$. As the liquid
-density changes, its potential $b$ and the relaxed charges $q$ are updated.
+The code assembles these equations as one block linear system and solves it
+using a cached LU factorization, without forming the inverse explicitly.
+Group potentials are $-\lambda$. As the liquid density changes, its potential
+$b$ and the relaxed charges $q$ are updated.
 
 ## Use in a density solve: 2 V
 
@@ -133,8 +122,10 @@ E_z = -delta_phi_V / (energy_unit_eV * Lz)
 valencies = model.readout[2].charges
 z = data["grid_center"][:, 2, None]
 data["V_ext"] = data["V_ext"] - z * E_z * valencies.to(data["V_ext"])
-data["V_ext"][data["excluded_mask"]] = 0.0
 ```
+
+`excluded_mask` fixes the liquid density to zero and removes those points from
+solver residuals, so the values of `V_ext` at excluded points are irrelevant.
 
 `energy_unit_eV` is one input energy unit expressed in eV. This finite-field
 construction uses the full periodic length, liquid coordinates $z\in[0,L_z)$,
