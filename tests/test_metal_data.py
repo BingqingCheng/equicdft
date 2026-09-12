@@ -20,6 +20,7 @@ def _metal_atoms(single_group=False):
     mask[[0, 1]] = [2, 2 if single_group else 9]
     excluded = np.zeros(len(positions), dtype=bool)
     excluded[2] = True
+    excluded |= mask >= 0
     rho = np.full((len(positions), 2), 0.2)
     rho[(mask >= 0) | excluded] = 0.0
     order = np.random.default_rng(11).permutation(len(positions))
@@ -27,10 +28,12 @@ def _metal_atoms(single_group=False):
                   cell=np.diag(shape), pbc=True)
     atoms.arrays.update({
         "density": rho[order], "V_ext": np.zeros_like(rho),
-        "metal_mask": mask[order], "excluded_mask": excluded[order],
+        "excluded_mask": excluded[order],
     })
     atoms.info.update({
         "grid_size": np.array(shape), "grid_spacing": 1.0, "T": 1.0,
+        "metal_positions": positions[mask >= 0].astype(float),
+        "metal_site_groups": mask[mask >= 0],
         "metal_group_ids": 2 if single_group else np.array([9, 2]),
         "metal_total_charge": 0.0 if single_group else np.array([-0.3, 0.3]),
         "metal_charge_units": "e",
@@ -59,10 +62,10 @@ class TestMetalData(unittest.TestCase):
             return GridData.from_xyz(path, cutoff_grid=0,
                                      boltzmann_constant=1.0, **kwargs)
 
-    def test_extxyz_preserves_group_charge_order_and_separate_masks(self):
+    def test_extxyz_preserves_site_group_order_and_exclusions(self):
         atoms, mask, excluded = _metal_atoms()
         frame = self._read(atoms)[0]
-        self.assertTrue(torch.equal(frame["metal_mask"], torch.tensor(mask)))
+        self.assertTrue(torch.equal(frame["metal_site_groups"], torch.tensor(mask[mask >= 0])))
         self.assertTrue(torch.equal(frame["excluded_mask"], torch.tensor(excluded)))
         self.assertEqual(frame["metal_group_ids"].tolist(), [9, 2])
         torch.testing.assert_close(frame["metal_total_charge"],
@@ -83,7 +86,8 @@ class TestMetalData(unittest.TestCase):
         torch.testing.assert_close(batch["metal_field_origin"][1], torch.tensor([0., 0., -0.5]))
         direct = GridData.from_dict({
             "grid_size": [4, 2, 2], "grid_spacing": 1., "temperature": 1.,
-            "n_types": 2, "metal_mask": mask, "metal_group_ids": 2,
+            "n_types": 2, "metal_positions": [[0.,0.,0.], [0.,0.,1.]],
+            "metal_site_groups": [2, 2], "metal_group_ids": 2,
             "metal_total_charge": 0., "metal_charge_units": "e",
             "metal_external_field": [0., 0., -0.2],
         }, cutoff_grid=0)
@@ -100,7 +104,8 @@ class TestMetalData(unittest.TestCase):
         self.assertEqual(frame["metal_total_charge"].shape, (1,))
         direct = GridData.from_dict({
             "grid_size": [4, 2, 2], "grid_spacing": 1.0,
-            "temperature": 1.0, "n_types": 2, "metal_mask": mask,
+            "temperature": 1.0, "n_types": 2,
+            "metal_positions": [[0.,0.,0.], [0.,0.,1.]], "metal_site_groups": [2, 2],
             "metal_group_ids": 2, "metal_total_charge": 0.0,
             "metal_charge_units": "e",
         }, cutoff_grid=0)
@@ -124,39 +129,40 @@ class TestMetalData(unittest.TestCase):
             ({"metal_total_charge": [0.0]}, "one value"),
             ({"metal_total_charge": [0.0, float("nan")]}, "finite"),
             ({"metal_charge_units": "C"}, "must be 'e'"),
-            ({"metal_mask": [-1, 2.5, 9]}, "integers"),
-            ({"metal_mask": [-1, 1.0e30, 9]}, "integers"),
+            ({"metal_site_groups": [2.5, 9]}, "integers"),
+            ({"metal_site_groups": [1.0e30, 9]}, "integers"),
         ]
         for changes, message in cases:
             with self.subTest(changes=changes):
-                values = dict(metal_mask=[-1, 2, 9], metal_group_ids=[9, 2],
+                values = dict(metal_positions=[[0.,0.,0.],[1.,0.,0.]],
+                              metal_site_groups=[2, 9], metal_group_ids=[9, 2],
                               metal_total_charge=[0.0, 0.0], metal_charge_units="e")
                 values.update(changes)
                 with self.assertRaisesRegex(ValueError, message):
-                    normalize_metal_metadata(**values, n_grid=3)
+                    normalize_metal_metadata(**values)
 
-    def test_nonzero_fluid_density_on_metal_is_rejected(self):
+    def test_nonzero_fluid_density_on_exclusions_is_rejected(self):
         atoms, _, _ = _metal_atoms()
-        atoms.arrays["density"][atoms.arrays["metal_mask"] >= 0] = 0.01
+        atoms.arrays["density"][atoms.arrays["excluded_mask"]] = 0.01
         with self.assertRaisesRegex(ValueError, "rho must be zero"):
             self._read(atoms)
 
-    def test_categorical_mask_cannot_be_coarsened(self):
+    def test_site_coordinate_coarsening_requires_explicit_target(self):
         atoms, mask, _ = _metal_atoms()
-        with self.assertRaisesRegex(ValueError, "coarsening metal_mask"):
+        with self.assertRaisesRegex(ValueError, "coarsening explicit metal sites"):
             self._read(atoms, target_grid_spacing=2.0)
         unchanged = self._read(atoms, target_grid_spacing=1.0)[0]
-        self.assertTrue(torch.equal(unchanged["metal_mask"], torch.tensor(mask)))
+        self.assertTrue(torch.equal(unchanged["metal_site_groups"], torch.tensor(mask[mask >= 0])))
 
     def test_batching_stacks_metadata_and_rejects_different_group_counts(self):
         atoms, _, _ = _metal_atoms()
         frames = self._read([atoms, atoms.copy()])
         batch = next(iter(DataLoader(frames, batch_size=2)))
-        self.assertEqual(batch["metal_mask"].shape, (2, 16))
+        self.assertEqual(batch["metal_positions"].shape, (2, 2, 3))
         self.assertEqual(batch["metal_total_charge"].shape, (2, 2))
         validated = normalize_metal_metadata(
-            batch["metal_mask"], batch["metal_group_ids"],
-            batch["metal_total_charge"], batch["metal_charge_units"], n_grid=16,
+            batch["metal_group_ids"], batch["metal_total_charge"], batch["metal_charge_units"],
+            metal_positions=batch["metal_positions"], metal_site_groups=batch["metal_site_groups"],
         )
         self.assertEqual(validated["metal_group_ids"].shape, (2, 2))
         one_group, _, _ = _metal_atoms(single_group=True)
@@ -165,34 +171,36 @@ class TestMetalData(unittest.TestCase):
 
     def test_shared_metadata_broadcasts_without_reordering(self):
         metadata = normalize_metal_metadata(
-            [-1, 2, 9], [9, 2], [-0.4, 0.4], "e", n_grid=3,
-            dtype=torch.float64, batch_shape=(2,),
+            [9, 2], [-0.4, 0.4], "e", dtype=torch.float64, batch_shape=(2,),
+            metal_positions=[[0.,0.,0.],[1.,0.,0.]], metal_site_groups=[2, 9],
         )
-        self.assertEqual(metadata["metal_mask"].shape, (2, 3))
+        self.assertEqual(metadata["metal_positions"].shape, (2, 2, 3))
         self.assertEqual(metadata["metal_group_ids"].tolist(), [[9, 2], [9, 2]])
         self.assertEqual(metadata["metal_total_charge"].dtype, torch.float64)
         self.assertEqual(metadata["metal_total_charge"][0, 0].item(), -0.4)
 
-    def test_batched_solver_evaluation_accepts_shared_metal_mask(self):
+    def test_batched_solver_evaluation_accepts_shared_sites(self):
         atoms, metal, excluded = _metal_atoms()
         frames = self._read([atoms, atoms.copy()])
         batch = next(iter(DataLoader(frames, batch_size=2)))
-        batch["metal_mask"] = frames[0]["metal_mask"]
+        batch["metal_positions"] = frames[0]["metal_positions"]
+        batch["metal_site_groups"] = frames[0]["metal_site_groups"]
         result = GridSolver(_IdealGas()).evaluate(batch)
         self.assertEqual(result["beta_F"].shape, (2,))
         self.assertTrue(torch.all(result["rho"][:, (metal >= 0) | excluded] == 0))
 
-    def test_union_cannot_exclude_every_fluid_grid_point(self):
+    def test_exclusions_cannot_cover_every_fluid_grid_point(self):
         with self.assertRaisesRegex(ValueError, "accessible"):
             GridData.from_dict({
                 "grid_size": [2, 1, 1], "grid_spacing": 1.0,
                 "temperature": 1.0, "n_types": 1,
-                "metal_mask": [3, -1], "excluded_mask": [False, True],
+                "metal_positions": [[0.,0.,0.]], "metal_site_groups": [3],
+                "excluded_mask": [True, True],
                 "metal_group_ids": 3, "metal_total_charge": 0.0,
                 "metal_charge_units": "e",
             }, cutoff_grid=0)
 
-    def test_solver_enforces_union_without_rewriting_masks(self):
+    def test_solver_enforces_exclusion_without_rewriting_geometry(self):
         for method in ("euler", "minimize"):
             with self.subTest(method=method):
                 atoms, metal, excluded = _metal_atoms()
@@ -208,7 +216,7 @@ class TestMetalData(unittest.TestCase):
                 self.assertTrue(torch.all(result["euler_lagrange_residual"][inaccessible] == 0))
                 torch.testing.assert_close(result["rho"].sum(dim=0), target_N)
                 self.assertTrue(torch.equal(result["excluded_mask"], data["excluded_mask"]))
-                self.assertTrue(torch.equal(result["metal_mask"], data["metal_mask"]))
+                self.assertTrue(torch.equal(result["metal_positions"], data["metal_positions"]))
                 data["rho"][metal >= 0] = 0.1
                 with self.assertRaisesRegex(ValueError, "rho must be zero"):
                     GridSolver(_IdealGas()).evaluate(data)

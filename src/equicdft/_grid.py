@@ -7,6 +7,41 @@ import torch
 from torch.nn import functional as F
 
 
+def _grid_center_origin(grid_center, grid_positions, grid_spacing):
+    """Validate physical centers = origin + integer indices * spacing.
+
+    Geometry is fixed and evaluated in float64. Permit file roundoff (1e-8
+    length units) and roundoff from the supplied coordinate/spacing dtypes,
+    not a distorted or rotated grid. Leading batch dimensions may broadcast.
+    """
+    spacing = torch.as_tensor(grid_spacing)
+    centers = torch.as_tensor(grid_center, device=spacing.device)
+    if centers.requires_grad:
+        raise ValueError("grid_center must be fixed geometry")
+    if centers.dtype == torch.bool or centers.is_complex():
+        raise ValueError("grid_center must contain real finite coordinates")
+    indices = torch.as_tensor(grid_positions, device=centers.device)
+    if centers.ndim < 2 or centers.shape[-2:] != indices.shape[-2:]:
+        raise ValueError("grid_center must have shape [..., n_grid, 3]")
+    if centers.shape[-1] != 3 or centers.shape[-2] == 0:
+        raise ValueError("grid_center must have shape [..., n_grid, 3]")
+    if not torch.all(torch.isfinite(centers)).item():
+        raise ValueError("grid_center must contain real finite coordinates")
+    # Python float lists carry double precision even under a float32 default.
+    center_eps = (torch.finfo(centers.dtype).eps if centers.is_floating_point()
+                  and hasattr(grid_center, "dtype") else torch.finfo(torch.float64).eps)
+    spacing_eps = torch.finfo(spacing.dtype).eps if spacing.is_floating_point() else 0.0
+    steps = indices.double() * spacing.double()[..., None, :]
+    centers = torch.as_tensor(grid_center, dtype=torch.float64, device=centers.device)
+    offsets = centers - steps
+    origin = offsets[..., 0, :]
+    tolerance = 1e-8 + 8 * (center_eps * centers.abs().max()
+                            + spacing_eps * steps.abs().max())
+    if torch.any((offsets - origin[..., None, :]).abs() > tolerance).item():
+        raise ValueError("grid_center must match grid_positions and grid_spacing on a regular grid")
+    return origin
+
+
 def common_grid_size(
     grid_size: torch.Tensor,
     leading_shape: torch.Size,

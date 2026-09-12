@@ -18,7 +18,7 @@ class ExplicitSiteGrid:
         self.shape = shape
         self.spacing = spacing
         self.dtype, self.device = dtype, device
-        self.volume = spacing.prod()
+        self.voxel_volume = spacing.prod()
         self.n_sites = positions.shape[0]
         # Group in float64 even when density/FFT arithmetic uses float32.
         scaled = positions.detach().cpu().double() / spacing.detach().cpu().double()
@@ -79,7 +79,7 @@ class ExplicitSiteGrid:
         spectrum = torch.fft.fftn(charge.reshape(self.shape))*kernel
         result = charge.new_zeros(self.n_sites)
         for group, phase in zip(self.groups, self.phases):
-            values = torch.fft.ifftn(spectrum*phase).real.reshape(-1)/self.volume
+            values = torch.fft.ifftn(spectrum*phase).real.reshape(-1)/self.voxel_volume
             result = result.index_copy(0, group[0], values[group[2]])
         return result
 
@@ -92,7 +92,7 @@ class ExplicitSiteGrid:
                 # the latter would spuriously change self terms with position.
                 response = torch.fft.ifftn(
                     kernel*self.phase(delta_a-delta_b),
-                ).real/self.volume
+                ).real/self.voxel_volume
                 offsets = tuple(
                     (base_a[:, axis, None]-base_b[None, :, axis]) % size
                     for axis, size in enumerate(self.shape)

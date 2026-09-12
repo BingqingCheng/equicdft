@@ -10,7 +10,8 @@ def normalize_metal_field(field=None, origin=None, *, dtype=None, device=None,
     """Optional metal-only field and wrapping origin, shared or per frame.
 
     Vectors are Cartesian [3], in energy/(e*length) and length respectively.
-    The origin is relative to grid index zero; it defaults to that grid point.
+    The origin is the wrapping center in the physical coordinate frame;
+    it defaults to coordinate zero, independently of the first grid center.
     """
     if field is None:
         if origin is not None:
@@ -48,22 +49,11 @@ def _integer_tensor(value: Any, name: str, device=None) -> torch.Tensor:
     return integers
 
 
-def metal_mask_tensor(value: Any, n_grid: int, device=None) -> torch.Tensor:
-    """Return integer group labels; every negative label means nonmetal."""
-
-    mask = _integer_tensor(value, "metal_mask", device)
-    if mask.ndim < 1 or mask.shape[-1] != n_grid:
-        raise ValueError("metal_mask must have shape [..., n_grid]")
-    return mask
-
-
 def normalize_metal_metadata(
-    metal_mask: Any,
     metal_group_ids: Any = None,
     metal_total_charge: Any = None,
     metal_charge_units: Any = None,
     *,
-    n_grid: int,
     dtype=None,
     device=None,
     batch_shape: Optional[Sequence[int]] = None,
@@ -77,71 +67,46 @@ def normalize_metal_metadata(
     shared by a batch, but each frame must contain exactly its declared IDs.
     Charge totals are in elementary-charge units, explicitly labeled ``e``.
     Explicit fixed positions have shape ``[n_sites, 3]`` or
-    ``[..., n_sites, 3]`` and remain float64, relative to grid index zero.
-    Their nonnegative ``metal_site_groups`` replace grid-mask group labels;
-    they never imply an accessibility mask. The two representations cannot
-    both contain charge sites.
+    ``[..., n_sites, 3]`` and remain float64, in the physical grid_center frame.
+    Their nonnegative ``metal_site_groups`` label the charge sites; coordinates
+    may be on or off grid and never imply a liquid exclusion mask.
     """
 
-    explicit = metal_positions is not None or metal_site_groups is not None
-    geometry = {}
-    if explicit:
-        if metal_positions is None or metal_site_groups is None:
-            raise ValueError("metal_positions and metal_site_groups are required together")
-        if torch.is_tensor(metal_positions) and metal_positions.requires_grad:
-            raise ValueError("metal_positions must be fixed geometry (requires_grad=False)")
-        raw_positions = torch.as_tensor(metal_positions, device=device)
-        if raw_positions.dtype == torch.bool or raw_positions.is_complex():
-            raise ValueError("metal_positions must contain real finite coordinates")
-        # Geometry remains float64 even for a lower-precision density field.
-        # Converting an already rounded tensor cannot recover lost precision.
-        positions = torch.as_tensor(metal_positions, dtype=torch.float64, device=device)
-        if positions.ndim < 2 or positions.shape[-1] != 3 or positions.shape[-2] == 0:
-            raise ValueError("metal_positions must have shape [..., n_sites, 3] with n_sites > 0")
-        if not torch.all(torch.isfinite(positions)).item():
-            raise ValueError("metal_positions must contain real finite coordinates")
-        leading = tuple(positions.shape[:-2]) if batch_shape is None else tuple(batch_shape)
-        if positions.shape[:-2] not in ((), leading):
-            raise ValueError("metal_positions batch shape does not match the field")
-        n_sites = positions.shape[-2]
-        labels = _integer_tensor(metal_site_groups, "metal_site_groups", device)
-        if labels.ndim < 1 or labels.shape[-1] != n_sites:
-            raise ValueError("metal_site_groups must have shape [..., n_sites]")
-        if labels.shape[:-1] not in ((), leading):
-            raise ValueError("metal_site_groups batch shape does not match the field")
-        if torch.any(labels < 0).item():
-            raise ValueError("metal_site_groups must be nonnegative")
-        mask = labels.expand(*leading, n_sites)
-        geometry = {"metal_positions": positions.expand(*leading, n_sites, 3),
-                    "metal_site_groups": mask}
-        if metal_mask is not None:
-            grid_mask = metal_mask_tensor(metal_mask, n_grid, device)
-            if grid_mask.shape[:-1] not in ((), leading):
-                raise ValueError("metal_mask batch shape does not match the field")
-            if torch.any(grid_mask >= 0).item():
-                raise ValueError("metal_positions cannot coexist with nonnegative metal_mask entries")
-            geometry["metal_mask"] = grid_mask.expand(*leading, n_grid)
-        label_count = n_sites
-        has_metal = True
-    elif metal_mask is None:
+    if metal_positions is None and metal_site_groups is None:
         if any(value is not None for value in (
             metal_group_ids, metal_total_charge, metal_charge_units,
         )):
-            raise ValueError("metal metadata requires metal_mask")
+            raise ValueError("metal metadata requires metal_positions and metal_site_groups")
         return {}
-
-    else:
-        mask = metal_mask_tensor(metal_mask, n_grid, device)
-        leading = tuple(mask.shape[:-1]) if batch_shape is None else tuple(batch_shape)
-        if mask.shape[:-1] not in ((), leading):
-            raise ValueError("metal_mask batch shape does not match the field")
-        mask = mask.expand(*leading, n_grid)
-        geometry = {"metal_mask": mask}
-        label_count = n_grid
-        has_metal = torch.any(mask >= 0).item()
+    if metal_positions is None or metal_site_groups is None:
+        raise ValueError("metal_positions and metal_site_groups are required together")
+    if torch.is_tensor(metal_positions) and metal_positions.requires_grad:
+        raise ValueError("metal_positions must be fixed geometry (requires_grad=False)")
+    raw_positions = torch.as_tensor(metal_positions, device=device)
+    if raw_positions.dtype == torch.bool or raw_positions.is_complex():
+        raise ValueError("metal_positions must contain real finite coordinates")
+    # Geometry remains float64 even for a lower-precision density field.
+    # Converting an already rounded tensor cannot recover lost precision.
+    positions = torch.as_tensor(metal_positions, dtype=torch.float64, device=device)
+    if positions.ndim < 2 or positions.shape[-1] != 3 or positions.shape[-2] == 0:
+        raise ValueError("metal_positions must have shape [..., n_sites, 3] with n_sites > 0")
+    if not torch.all(torch.isfinite(positions)).item():
+        raise ValueError("metal_positions must contain real finite coordinates")
+    leading = tuple(positions.shape[:-2]) if batch_shape is None else tuple(batch_shape)
+    if positions.shape[:-2] not in ((), leading):
+        raise ValueError("metal_positions batch shape does not match the field")
+    n_sites = positions.shape[-2]
+    labels = _integer_tensor(metal_site_groups, "metal_site_groups", device)
+    if labels.ndim < 1 or labels.shape[-1] != n_sites:
+        raise ValueError("metal_site_groups must have shape [..., n_sites]")
+    if labels.shape[:-1] not in ((), leading):
+        raise ValueError("metal_site_groups batch shape does not match the field")
+    if torch.any(labels < 0).item():
+        raise ValueError("metal_site_groups must be nonnegative")
+    labels = labels.expand(*leading, n_sites)
+    geometry = {"metal_positions": positions.expand(*leading, n_sites, 3),
+                "metal_site_groups": labels}
     supplied = (metal_group_ids, metal_total_charge, metal_charge_units)
-    if not has_metal and all(value is None for value in supplied):
-        return {"metal_mask": mask}
     if any(value is None for value in supplied):
         raise ValueError(
             "metal requires explicit metal_group_ids, metal_total_charge, "
@@ -155,13 +120,13 @@ def normalize_metal_metadata(
     if not valid_units:
         raise ValueError("metal_charge_units must be 'e'")
 
-    ids = _integer_tensor(metal_group_ids, "metal_group_ids", mask.device)
-    charge_values = torch.as_tensor(metal_total_charge, device=mask.device)
+    ids = _integer_tensor(metal_group_ids, "metal_group_ids", labels.device)
+    charge_values = torch.as_tensor(metal_total_charge, device=labels.device)
     if charge_values.dtype == torch.bool or charge_values.is_complex():
         raise ValueError("metal_total_charge must contain real finite values")
     totals = torch.as_tensor(
         metal_total_charge, dtype=dtype or torch.get_default_dtype(),
-        device=mask.device,
+        device=labels.device,
     )
     if ids.ndim == 0:
         ids = ids.reshape(1)
@@ -181,14 +146,14 @@ def normalize_metal_metadata(
     if torch.any(ids < 0).item():
         raise ValueError("metal_group_ids must be nonnegative")
 
-    n_fields = mask.numel() // label_count
-    for field_mask, field_ids in zip(
-        mask.reshape(n_fields, label_count), ids.reshape(n_fields, n_groups),
+    n_fields = labels.numel() // n_sites
+    for field_labels, field_ids in zip(
+        labels.reshape(n_fields, n_sites), ids.reshape(n_fields, n_groups),
     ):
         unique_ids = torch.unique(field_ids)
         if unique_ids.numel() != n_groups:
             raise ValueError("metal_group_ids must be unique in every field")
-        present = torch.unique(field_mask[field_mask >= 0])
+        present = torch.unique(field_labels)
         if not torch.equal(present, unique_ids):
             raise ValueError(
                 "metal_group_ids must exactly cover the groups in metal geometry"

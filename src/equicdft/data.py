@@ -44,10 +44,10 @@ default_data_key = {
     "grid_size": "grid_size",
     "grid_indexing": "grid_indexing",
     "grid_positions": "positions",
+    "grid_center": "grid_center",
     "V_ext": "V_ext",
     "rho": "density",
     "excluded_mask": "excluded_mask",
-    "metal_mask": "metal_mask",
     "metal_positions": "metal_positions",
     "metal_site_groups": "metal_site_groups",
     "metal_group_ids": "metal_group_ids",
@@ -64,10 +64,11 @@ def read_metal_sites(
 ) -> Dict[str, Any]:
     """Read one XYZ/ASE metal geometry without inferring units or charges.
 
-    XYZ positions and ``origin`` must already use the density grid's length
-    units. The returned ``metal_positions`` are ``positions - origin``, where
-    ``origin`` is the physical position of grid index zero. No wrapping,
-    rescaling, density mask, or field origin is inferred.
+    XYZ positions use the same physical frame and length units as grid_center.
+    By default coordinates are unchanged. Optional ``origin`` explicitly
+    translates the file by returning ``positions - origin``; use it only to
+    align a differently referenced file, not to subtract the liquid grid origin.
+    No wrapping, rescaling, density mask, or field origin is inferred.
 
     Site labels come from ``site_groups`` (a scalar assigns every site to one
     group) or the ASE array ``metal_site_groups``. Group constraints come from
@@ -87,11 +88,10 @@ def read_metal_sites(
     if site_groups is not None and np.ndim(site_groups) == 0:
         labels = np.full(len(atoms), site_groups)
     return normalize_metal_metadata(
-        None,
         atoms.info.get("metal_group_ids") if group_ids is None else group_ids,
         atoms.info.get("metal_total_charge") if total_charge is None else total_charge,
         atoms.info.get("metal_charge_units") if charge_units is None else charge_units,
-        n_grid=1, batch_shape=(), metal_positions=positions, metal_site_groups=labels,
+        batch_shape=(), metal_positions=positions, metal_site_groups=labels,
     )
 
 
@@ -133,17 +133,17 @@ class GridData(dict):
         grid_spacing                [3]
         index                       [n_grid]
         grid_positions              [n_grid, 3]
+        grid_center                 [n_grid, 3], physical coordinates (optional)
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
         excluded_mask               [n_grid] bool; true grid points are excluded
-        metal_mask                  [n_grid] integer; negative nonmetal (optional)
-        metal_positions             [n_sites, 3], length relative to grid zero
+        metal_positions             [n_sites, 3], same physical frame as grid_center
         metal_site_groups           [n_sites], nonnegative integer group labels
         metal_group_ids             [n_groups] unique IDs in charge order
         metal_total_charge          [n_groups] prescribed total charge per group
         metal_charge_units          "e" (required when metal is present)
         metal_external_field        [3], energy/(e * length), metal only (optional)
-        metal_field_origin          [3], length from grid index zero (default zero)
+        metal_field_origin          [3], physical wrapping center (default zero)
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors] (optional)
@@ -155,13 +155,13 @@ class GridData(dict):
     tensor, preserving the functional-derivative graph. FFT/conv3d local
     operators do not use this potentially large table, so callers may omit it
     explicitly with ``include_local_density_index=False``.
-    Metal points additionally exclude fluid density without changing the
-    separately retained ``excluded_mask``. Group charge metadata is mandatory
-    when ``metal_mask`` contains any nonnegative group ID.
-    Alternatively, fixed explicit ``metal_positions`` and ``metal_site_groups``
-    define a charge basis independent of the density grid. They are frame
-    metadata, not per-voxel arrays, and do not imply fluid exclusion. An active
-    grid ``metal_mask`` and explicit positions cannot be combined.
+    Fixed ``metal_positions`` and ``metal_site_groups`` define the electrode
+    charge basis, on or off the liquid grid. They are frame metadata, not
+    per-voxel arrays, and never imply fluid exclusion. Use ``excluded_mask``
+    for the full inaccessible volume and declare every group charge explicitly.
+    Optional grid_center gives fixed physical voxel centers in float64. It
+    must describe a translated regular grid with the declared grid_spacing.
+    Without it, physical centers are grid_positions * grid_spacing (no offset).
     """
 
     @classmethod
@@ -316,11 +316,11 @@ class GridData(dict):
         allowed_keys = {
             "grid_size",
             "grid_spacing",
+            "grid_center",
             "temperature",
             "T",
             "n_types",
             "excluded_mask",
-            "metal_mask",
             "metal_positions",
             "metal_site_groups",
             "metal_group_ids",
@@ -360,13 +360,13 @@ class GridData(dict):
                 grid_positions=grid_positions,
                 grid_size=grid_size,
                 grid_spacing=grid_spacing,
+                grid_center=values.get("grid_center"),
                 temperature=temperature,
                 n_types=n_types,
                 cutoff_grid=cutoff_grid,
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
-                metal_mask=values.get("metal_mask"),
                 metal_positions=values.get("metal_positions"),
                 metal_site_groups=values.get("metal_site_groups"),
                 metal_group_ids=values.get("metal_group_ids"),

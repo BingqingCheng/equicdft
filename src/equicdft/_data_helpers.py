@@ -14,6 +14,7 @@ from ._argument_checks import (
 )
 from .stencil import coarsen_grid, get_neighbor_indices, make_stencil
 from ._metal_data import normalize_metal_field, normalize_metal_metadata
+from ._grid import _grid_center_origin
 
 
 GRID_INFO_KEYS = {
@@ -142,18 +143,19 @@ def process_atoms(
         raise ValueError("grid positions do not cover the complete grid")
     grid_positions = grid_positions[order]
 
+    grid_center = _get_source_value(atoms, data_key["grid_center"])
+    if grid_center is not None:
+        grid_center = np.asarray(grid_center)
+        if grid_center.shape != (n_grid, 3):
+            raise ValueError("grid_center must have shape [n_grid, 3]")
+        grid_center = grid_center[order]
+
     rho = _ordered_optional_field(atoms, data_key["rho"], order, "rho")
     excluded_mask = _ordered_optional_excluded_mask(
         atoms,
         data_key["excluded_mask"],
         order,
     )
-    metal_mask = _get_source_value(atoms, data_key["metal_mask"])
-    if metal_mask is not None:
-        metal_mask = np.asarray(metal_mask)
-        if metal_mask.shape != (n_grid,):
-            raise ValueError("metal_mask must have shape [n_grid]")
-        metal_mask = metal_mask[order]
     # Site geometry is per-frame metadata and must not follow voxel ordering.
     metal_positions = _get_source_value(atoms, data_key["metal_positions"])
     metal_site_groups = _get_source_value(atoms, data_key["metal_site_groups"])
@@ -179,26 +181,23 @@ def process_atoms(
             "grid_spacing",
         )
     )
+    if grid_center is not None:
+        _grid_center_origin(grid_center, grid_positions, grid_spacing)
     if target_grid_spacing is not None:
         if (metal_positions is not None or metal_site_groups is not None) and not np.allclose(
             grid_spacing, _metadata_grid_spacing(target_grid_spacing),
         ):
             raise ValueError(
                 "coarsening explicit metal sites is unsupported; supply positions "
-                "relative to grid index zero on the target grid"
-            )
-        if metal_mask is not None and not np.allclose(
-            grid_spacing, _metadata_grid_spacing(target_grid_spacing),
-        ):
-            raise ValueError(
-                "coarsening metal_mask is unsupported; supply metal data "
-                "on the target grid"
+                "in the same physical frame as the target grid centers"
             )
         fields_to_coarsen = [
             field for field in (rho, V_ext) if field is not None
         ]
         if excluded_mask is not None:
             fields_to_coarsen.append(excluded_mask[:, None].astype(float))
+        if grid_center is not None:
+            fields_to_coarsen.append(grid_center)
         fields, grid_positions, grid_spacing = coarsen_grid(
             values=np.column_stack(fields_to_coarsen),
             grid_positions=grid_positions,
@@ -227,6 +226,9 @@ def process_atoms(
                     "points; supply excluded_mask on the target grid"
                 )
             excluded_mask = np.isclose(coarse_excluded_fraction, 1.0)
+            field_start += 1
+        if grid_center is not None:
+            grid_center = fields[:, field_start : field_start + 3]
         grid_size = grid_positions.max(axis=0) + 1
         if excluded_mask is None:
             excluded_mask = np.zeros(len(grid_positions), dtype=bool)
@@ -243,6 +245,7 @@ def process_atoms(
         grid_positions=grid_positions,
         grid_size=grid_size,
         grid_spacing=grid_spacing,
+        grid_center=grid_center,
         temperature=temperature,
         n_types=n_types,
         cutoff_grid=cutoff_grid,
@@ -252,7 +255,6 @@ def process_atoms(
         V_ext=V_ext,
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
-        metal_mask=metal_mask,
         metal_positions=metal_positions,
         metal_site_groups=metal_site_groups,
         metal_group_ids=_get_source_value(atoms, data_key["metal_group_ids"]),
@@ -282,7 +284,6 @@ def build_grid_data(
     geometry_cache: Optional[Dict[Any, Any]] = None,
     include_thermal_wavelength: bool = True,
     include_local_density_index: bool = True,
-    metal_mask: Optional[Any] = None,
     metal_group_ids: Optional[Any] = None,
     metal_total_charge: Optional[Any] = None,
     metal_charge_units: Optional[Any] = None,
@@ -290,6 +291,7 @@ def build_grid_data(
     metal_field_origin: Optional[Any] = None,
     metal_positions: Optional[Any] = None,
     metal_site_groups: Optional[Any] = None,
+    grid_center: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -329,22 +331,19 @@ def build_grid_data(
     mu_values = _normalize_optional_mu(mu, n_type_values)
     excluded_mask_values = _normalize_excluded_mask(excluded_mask, n_grid)
     metal_data = normalize_metal_metadata(
-        metal_mask, metal_group_ids, metal_total_charge, metal_charge_units,
-        n_grid=n_grid, batch_shape=(),
+        metal_group_ids, metal_total_charge, metal_charge_units,
+        batch_shape=(),
         metal_positions=metal_positions, metal_site_groups=metal_site_groups,
     )
-    effective_exclusion = excluded_mask_values.copy()
-    if "metal_mask" in metal_data:
-        effective_exclusion |= metal_data["metal_mask"].cpu().numpy() >= 0
-    if np.all(effective_exclusion):
+    if np.all(excluded_mask_values):
         raise ValueError("masks must leave at least one accessible grid point")
     if rho_values is not None and np.any(
-        np.abs(rho_values[effective_exclusion]) > 1.0e-12
+        np.abs(rho_values[excluded_mask_values]) > 1.0e-12
     ):
         raise ValueError("rho must be zero at excluded grid points")
     if rho_values is not None:
         rho_values = rho_values.copy()
-        rho_values[effective_exclusion] = 0.0
+        rho_values[excluded_mask_values] = 0.0
     wavelength_values = None
     if include_thermal_wavelength:
         wavelength_values = _metadata_per_type_positive_values(
@@ -377,6 +376,12 @@ def build_grid_data(
         "local_density_positions": local_density_positions,
     }
     data.update(metal_data)
+    if grid_center is not None:
+        centers = torch.as_tensor(grid_center)
+        if centers.shape != (n_grid, 3):
+            raise ValueError("grid_center must have shape [n_grid, 3]")
+        _grid_center_origin(grid_center, positions, grid_spacing_values)
+        data["grid_center"] = torch.as_tensor(grid_center, dtype=torch.float64)
     data.update(normalize_metal_field(metal_external_field, metal_field_origin, dtype=dtype))
     if local_density_index is not None:
         data["local_density_index"] = local_density_index
@@ -396,7 +401,7 @@ def build_grid_data(
         mu=mu_values,
         beta=beta,
         thermal_wavelength=wavelength_values,
-        excluded_mask=effective_exclusion,
+        excluded_mask=excluded_mask_values,
     )
     return data
 
@@ -404,13 +409,18 @@ def build_grid_data(
 def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
     """Make optional target keys compatible with default PyTorch collation."""
 
+    if any("grid_center" in frame for frame in data):
+        for frame in data:
+            if "grid_center" not in frame:
+                frame["grid_center"] = frame["grid_positions"].double() * frame["grid_spacing"].double()
+
     if any("metal_external_field" in frame for frame in data):
         for frame in data:
             for key in ("metal_external_field", "metal_field_origin"):
                 frame.setdefault(key, frame["grid_spacing"].new_zeros(3))
 
     metal_keys = {
-        "metal_mask", "metal_group_ids", "metal_total_charge", "metal_charge_units",
+        "metal_group_ids", "metal_total_charge", "metal_charge_units",
         "metal_positions", "metal_site_groups",
     }
     if data and any(metal_keys & set(frame) for frame in data):

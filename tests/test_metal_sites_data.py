@@ -66,7 +66,6 @@ class TestMetalSitesData(unittest.TestCase):
         self.assertEqual(frame["metal_site_groups"].tolist(), [9, 2])
         self.assertEqual(frame["metal_group_ids"].tolist(), [2, 9])
         self.assertEqual(frame["excluded_mask"].sum().item(), 1)
-        self.assertNotIn("metal_mask", frame)
 
     def test_extxyz_metadata_is_not_sorted_as_voxel_data(self):
         frame = self._read(_atoms())[0]
@@ -87,28 +86,28 @@ class TestMetalSitesData(unittest.TestCase):
         frames = self._read([_atoms(), _atoms()])
         batch = next(iter(DataLoader(frames, batch_size=2)))
         self.assertEqual(batch["metal_positions"].shape, (2, 2, 3))
-        data = normalize_metal_metadata(None, [2, 9], [-.3, .3], "e", n_grid=16,
+        data = normalize_metal_metadata([2, 9], [-.3, .3], "e",
             batch_shape=(2,), dtype=torch.float64, metal_positions=frames[0]["metal_positions"],
             metal_site_groups=frames[0]["metal_site_groups"])
         self.assertEqual(data["metal_positions"].shape, (2, 2, 3))
         self.assertEqual(data["metal_site_groups"].tolist(), [[9, 2], [9, 2]])
-        single = normalize_metal_metadata(None, [2, 9], [-.3, .3], "e", n_grid=16,
+        single = normalize_metal_metadata([2, 9], [-.3, .3], "e",
             dtype=torch.float32, metal_positions=_metadata()["metal_positions"],
             metal_site_groups=[9, 2])
         self.assertEqual(single["metal_positions"].dtype, torch.float64)
         self.assertEqual(single["metal_positions"][0, 2].item(), .216690617966578)
         self.assertEqual(single["metal_total_charge"].dtype, torch.float32)
 
-    def test_batch_requires_same_site_count_and_representation(self):
+    def test_batch_requires_same_site_count_and_metadata(self):
         first, second = _atoms(), _atoms()
         second.info["metal_positions"] = np.vstack((second.info["metal_positions"], [2., .5, .75]))
         second.info["metal_site_groups"] = np.array([9, 2, 2])
         with self.assertRaisesRegex(ValueError, "same metal site count"):
             self._read([first, second])
         second = _atoms()
-        del second.info["metal_positions"], second.info["metal_site_groups"]
-        second.arrays["metal_mask"] = np.array([2, 9] + [-1] * 14)
-        second.arrays["density"][:2] = 0.
+        for key in list(second.info):
+            if key.startswith("metal_"):
+                del second.info[key]
         with self.assertRaisesRegex(ValueError, "share metal metadata keys"):
             self._read([first, second])
 
@@ -116,15 +115,6 @@ class TestMetalSitesData(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coarsening explicit metal sites"):
             self._read(_atoms(), target_grid_spacing=2.)
         self.assertEqual(self._read(_atoms(), target_grid_spacing=1.)[0]["metal_positions"].shape, (2, 3))
-
-    def test_all_negative_legacy_mask_can_coexist(self):
-        values = _grid_values()
-        values["metal_mask"] = [-1] * 16
-        frame = GridData.from_dict(values, cutoff_grid=0)
-        self.assertTrue(torch.all(frame["metal_mask"] == -1))
-        values["metal_mask"][0] = 2
-        with self.assertRaisesRegex(ValueError, "cannot coexist"):
-            GridData.from_dict(values, cutoff_grid=0)
 
     def test_invalid_explicit_metadata_is_rejected(self):
         cases = [
