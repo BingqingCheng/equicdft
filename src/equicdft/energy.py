@@ -86,6 +86,7 @@ class EnergyReadout(nn.Module):
 
     requires_local_features = False
     requires_state_features = False
+    requires_local_density_index = False
 
     def energy(
         self,

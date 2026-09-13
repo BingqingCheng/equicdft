@@ -80,7 +80,13 @@ class MetalWall(EnergyReadout):
     field, and induced-charge solve.
     """
 
-    requires_state_features = True
+    @property
+    def requires_state_features(self):
+        return self.liquid_coulomb.requires_state_features
+
+    @property
+    def requires_dipole_density(self):
+        return self.liquid_coulomb.requires_dipole_density
 
     def __init__(
         self,
@@ -215,6 +221,10 @@ class MetalWall(EnergyReadout):
                 )
             if torch.any(rho[excluded.expand(*leading, n_grid)] != 0.0).item():
                 raise ValueError("rho must be zero at excluded grid points")
+            if self.requires_dipole_density and torch.any(
+                context["dipole_density"][excluded.expand(*leading, n_grid)] != 0.0
+            ).item():
+                raise ValueError("dipole_density must be zero at excluded grid points")
 
         n_fields = math.prod(leading) if leading else 1
         if self.external_field.shape not in ((3,), (*leading, 3)):

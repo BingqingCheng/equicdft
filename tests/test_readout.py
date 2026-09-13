@@ -7,7 +7,10 @@ from equicdft import (
     BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
+    GridCACEModel,
     LocalReadout,
+    LongRangeReadout,
+    ReciprocalFeatures,
 )
 from equicdft.derivatives import compute_grid_derivative
 from equicdft.stencil import get_neighbor_indices
@@ -44,6 +47,41 @@ class TestBulkReadout(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "state_features"):
             readout(torch.ones(4, 2))
+
+
+class TestFixedLongRangeReadout(unittest.TestCase):
+    def test_non_coulomb_fixed_amplitudes_need_no_state_features(self):
+        for kernel in ("gaussian", "screened_inverse_laplacian"):
+            with self.subTest(kernel=kernel):
+                rho = torch.linspace(
+                    .1, .8, 108, dtype=torch.float64,
+                ).reshape(2, 27, 2).requires_grad_()
+                data = {
+                    "rho": rho,
+                    "grid_size": torch.tensor([3, 3, 3]),
+                    "grid_spacing": torch.full((3,), .5, dtype=rho.dtype),
+                    "temperature": torch.tensor([1., 2.], dtype=rho.dtype),
+                }
+                features = ReciprocalFeatures(
+                    (.25,), n_types=2, kernel=kernel, screening=.4,
+                ).double()
+                readout = LongRangeReadout(
+                    1, n_types=2, charges=(1., -2.),
+                    coulomb_amplitude=1.5, features=features,
+                ).double()
+                self.assertFalse(readout.requires_state_features)
+                expected = 1.5 * features(
+                    rho, data["grid_size"], data["grid_spacing"],
+                    charges=readout.charges,
+                ).sum(dim=(-2, -1))
+                torch.testing.assert_close(readout.energy(data), expected)
+                expected_c1 = -torch.autograd.grad(expected.sum(), rho)[0] / .5**3
+                model = GridCACEModel(
+                    None, None, [readout], grid_spacing=.5,
+                ).double().eval()
+                output = model(data)
+                torch.testing.assert_close(output["beta_F_exc"], expected)
+                torch.testing.assert_close(output["c1"], expected_c1)
 
 
 class TestLocalReadout(unittest.TestCase):

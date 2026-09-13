@@ -5,6 +5,7 @@ from typing import Dict, NamedTuple, Optional, Sequence
 import torch
 
 from ._argument_checks import (
+    boolean,
     finite_scalar,
     optional_positive_integer,
     positive_integer,
@@ -209,9 +210,27 @@ class LongRangeReadout(EnergyReadout):
     features
         Reciprocal feature module used by :meth:`energy`. It may be omitted
         when the readout is used only as a standalone coefficient contraction.
+    include_polarization
+        If true, require ``dipole_density`` and use the same Coulomb kernel
+        on ``q_a rho_hat_a - i k.P_hat_a``. Requires explicit ``charges``
+        and Coulomb ``features``. Pair features already contain the charges,
+        so every pair coefficient is the shared amplitude A, not A*q_i*q_j.
+        With ``free_energy_mode="beta"``, use A=beta*C in compatible physical
+        units at fixed temperature. For variable temperatures, use the
+        model's physical mode with A=C/(k_B*T_ref). No dielectric scaling,
+        dipole-magnitude factor, or particle self subtraction is implicit.
     """
 
-    requires_state_features = True
+    requires_local_density_index = False
+
+    @property
+    def requires_state_features(self) -> bool:
+        return getattr(self, "coulomb_amplitude", None) is None
+
+    @property
+    def requires_dipole_density(self) -> bool:
+        # Old serialized charge-only readouts have no include_polarization.
+        return getattr(self, "include_polarization", False)
 
     def __init__(
         self,
@@ -222,9 +241,21 @@ class LongRangeReadout(EnergyReadout):
         charges: Optional[Sequence[float]] = None,
         coulomb_amplitude: Optional[float] = None,
         features: Optional[ReciprocalFeatures] = None,
+        include_polarization: bool = False,
     ) -> None:
         super().__init__()
 
+        self.include_polarization = boolean(
+            include_polarization, "include_polarization",
+        )
+        if self.include_polarization and (
+            charges is None
+            or not isinstance(features, ReciprocalFeatures)
+            or features.kernel != "coulomb"
+        ):
+            raise ValueError(
+                "include_polarization requires charges and Coulomb features"
+            )
         self.n_kernels = positive_integer(n_kernels, "n_kernels")
         self.n_types = positive_integer(n_types, "n_types")
         type_pairs = symmetric_component_pairs(self.n_types)
@@ -313,7 +344,12 @@ class LongRangeReadout(EnergyReadout):
             )
 
         amplitude = self.amplitude(state_features)[..., None, None]
-        return amplitude * self.pair_charge_products.to(state_features).view(
+        pair_weights = self.pair_charge_products.to(state_features)
+        if self.requires_dipole_density:
+            # q is already in each source; applying q_i*q_j here would both
+            # double-count charge factors and erase neutral-molecule dipoles.
+            pair_weights = torch.ones_like(pair_weights)
+        return amplitude * pair_weights.view(
             1,
             self.n_type_pairs,
         )
@@ -330,7 +366,7 @@ class LongRangeReadout(EnergyReadout):
             )
         amplitude = getattr(self, "coulomb_amplitude", None)
         if amplitude is None:
-            return self.mlp(state_features).reshape(*state_features.shape[:-1])
+            return self.mlp(state_features).reshape(state_features.shape[:-1])
         target_shape = state_features.shape[:-1]
         if not target_shape:
             return amplitude.to(state_features)
@@ -366,12 +402,22 @@ class LongRangeReadout(EnergyReadout):
             grid_size=context["grid_size"],
             grid_spacing=context["grid_spacing"],
             charges=self.charges,
+            dipole_density=(
+                context["dipole_density"] if self.requires_dipole_density else None
+            ),
         )
-        amplitude = self.amplitude(context["state_features"])
         expected_shape = context["rho"].shape[:-2]
+        amplitude = self.amplitude(self._state_features(context))
         if state.base_energy.shape != expected_shape or amplitude.shape != expected_shape:
             raise ValueError("LongRangeReadout must return one scalar per field")
         return state, amplitude
+
+    def _state_features(self, context):
+        if self.requires_state_features:
+            return context["state_features"]
+        return context["rho"].new_zeros(
+            *context["rho"].shape[:-2], self.n_state_features,
+        )
 
     def coulomb_at(
         self,
@@ -381,6 +427,7 @@ class LongRangeReadout(EnergyReadout):
     ) -> _LiquidCoulombResult:
         """Evaluate the liquid Coulomb state at physical positions.
 
+        The source includes bound charge when include_polarization is enabled.
         The potential includes the configured amplitude and the sum of the
         damped long-range kernel and its full-Coulomb complement.
         ``target_sigma`` is the Gaussian width of the sampling sites; zero
@@ -430,6 +477,9 @@ class LongRangeReadout(EnergyReadout):
     ) -> torch.Tensor:
         """Return the reciprocal-space contribution for a complete field."""
 
+        if self.provides_coulomb_potential:
+            state, amplitude = self._coulomb_state(context)
+            return amplitude * state.base_energy
         if self.features is None:
             raise ValueError(
                 "LongRangeReadout requires ReciprocalFeatures for model use"
@@ -443,7 +493,7 @@ class LongRangeReadout(EnergyReadout):
             grid_size=context["grid_size"],
             grid_spacing=context["grid_spacing"],
         )
-        energy = self(reciprocal_features, context["state_features"])
+        energy = self(reciprocal_features, self._state_features(context))
         if energy.shape != context["rho"].shape[:-2]:
             raise ValueError(
                 "LongRangeReadout must return one scalar per field"
