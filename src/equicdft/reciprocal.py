@@ -165,7 +165,9 @@ class ReciprocalFeatures(nn.Module):
     ----------
     radial_exponents
         Positive ``alpha_n`` values in squared-length units for the Gaussian
-        factor ``exp(-alpha_n * |k|^2)``.
+        factor ``exp(-alpha_n * |k|^2)``. For ``kernel="coulomb"``, zero is
+        also allowed and gives the full nonzero-mode Coulomb kernel on the
+        finite grid, without an LR/SR split.
     screening
         Nonnegative ``kappa_n`` values in inverse-length units. One scalar is
         broadcast over kernels. These values are used only by the
@@ -203,9 +205,10 @@ class ReciprocalFeatures(nn.Module):
         if (
             exponents.numel() == 0
             or not torch.all(torch.isfinite(exponents)).item()
-            or torch.any(exponents <= 0.0).item()
+            or torch.any(exponents < 0.0).item()
+            or (kernel != "coulomb" and torch.any(exponents == 0.0).item())
         ):
-            raise ValueError("radial_exponents must contain positive values")
+            raise ValueError("radial_exponents must be positive (or zero for Coulomb)")
 
         n_types = positive_integer(n_types, "n_types")
 

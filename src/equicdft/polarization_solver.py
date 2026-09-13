@@ -38,11 +38,14 @@ def _accept_trial(current, trial, volume):
 class PolarizationSolver:
     """Minimize ideal + optional excess + integral(rho*V_ext - P.E_ext).
 
-    One unbatched, fully accessible field is supported, with any number of
+    One unbatched field is supported, with any number of
     fixed-dipole species. V_ext [grid,species] is energy/particle and E_ext
     [grid,species,3] is energy/dipole. beta is scalar inverse energy. The model,
     if supplied, uses the GridCACEModel energy-only API and returns beta_F_exc.
-    The solver does not differentiate through its optimization trajectory.
+    A boolean excluded_mask [grid] fixes both rho and P to zero. Ideal entropy,
+    canonical normalization and residuals use accessible voxels only; the
+    excess model still sees the complete grid. The solver does not
+    differentiate through its optimization trajectory.
     """
 
     def __init__(self, dipole_magnitude, model=None, thermal_wavelength=1.0):
@@ -63,8 +66,15 @@ class PolarizationSolver:
             raise ValueError("E_ext must match V_ext dtype/device with shape [grid,species,3]")
         if not torch.isfinite(potential).all() or not torch.isfinite(field).all():
             raise ValueError("external fields must be finite")
-        if "excluded_mask" in data and torch.as_tensor(data["excluded_mask"]).any():
-            raise ValueError("PolarizationSolver currently requires fully accessible grids")
+        excluded = torch.as_tensor(
+            data.get("excluded_mask", torch.zeros(potential.shape[0], dtype=torch.bool)),
+            device=potential.device,
+        )
+        if excluded.dtype != torch.bool or excluded.shape != potential.shape[:1]:
+            raise ValueError("excluded_mask must be boolean [grid]")
+        accessible = ~excluded
+        if not accessible.any():
+            raise ValueError("at least one voxel must be accessible")
         beta = torch.as_tensor(
             data["beta"], dtype=potential.dtype, device=potential.device
         )
@@ -92,10 +102,17 @@ class PolarizationSolver:
         moment = _positive_components(
             self.ideal.dipole_magnitude, potential, "dipole_magnitude"
         )
-        return beta, volume, moment
+        return beta, volume, moment, accessible
 
-    def _energy(self, data, rho, polarization, beta, volume):
-        ideal = self.ideal(rho, polarization, volume)["beta_F_id"]
+    def _ideal(self, rho, polarization, volume, accessible):
+        if polarization.shape != (*rho.shape, 3):
+            raise ValueError("dipole_density must have shape rho.shape + (3,)")
+        if torch.any(rho[~accessible] != 0) or torch.any(polarization[~accessible] != 0):
+            raise ValueError("rho and dipole_density must be zero in excluded voxels")
+        return self.ideal(rho[accessible], polarization[accessible], volume)
+
+    def _energy(self, data, rho, polarization, beta, volume, accessible):
+        ideal = self._ideal(rho, polarization, volume, accessible)["beta_F_id"]
         excess = rho.new_zeros(())
         if self.model is not None:
             values = dict(data, rho=rho, dipole_density=polarization)
@@ -118,19 +135,19 @@ class PolarizationSolver:
         (canonical gauge). Polarization residual is also reported multiplied
         by m, giving a dimensionless vector comparable across dipole units.
         """
-        beta, volume, moment = self._inputs(data)
+        beta, volume, moment, accessible = self._inputs(data)
         rho = data["rho"].detach().clone().requires_grad_(True)
         polarization = data["dipole_density"].detach().clone().requires_grad_(True)
         if rho.shape != data["V_ext"].shape:
             raise ValueError("rho must match V_ext shape")
-        energy = self._energy(data, rho, polarization, beta, volume)
+        energy = self._energy(data, rho, polarization, beta, volume, accessible)
         if not torch.isfinite(energy):
             raise FloatingPointError("nonfinite polarization objective")
         derivative_rho, derivative_p = torch.autograd.grad(energy, (rho, polarization))
         local_mu = derivative_rho / volume
-        chemical_potential = local_mu.mean(dim=0)
-        density_residual = local_mu - chemical_potential
-        polarization_residual = derivative_p / volume
+        chemical_potential = local_mu[accessible].mean(dim=0)
+        density_residual = torch.where(accessible[:, None], local_mu - chemical_potential, 0.)
+        polarization_residual = torch.where(accessible[:, None, None], derivative_p / volume, 0.)
         scaled = polarization_residual * moment[..., None]
         maximum = torch.maximum(density_residual.abs().max(), scaled.abs().max())
         result = {
@@ -143,7 +160,9 @@ class PolarizationSolver:
             "scaled_polarization_residual": scaled,
             "maximum_residual": maximum,
             "particle_numbers": volume * rho.sum(dim=0),
-            "maximum_alignment": (polarization.norm(dim=-1) / (rho * moment)).max(),
+            "maximum_alignment": (
+                polarization[accessible].norm(dim=-1) / (rho[accessible] * moment)
+            ).max(),
         }
         return {key: value.detach() for key, value in result.items()}
 
@@ -163,14 +182,15 @@ class PolarizationSolver:
         max_backtracks = positive_integer(max_backtracks, "max_backtracks")
         step_size = positive_scalar(step_size, "step_size")
         tolerance_residual = positive_scalar(tolerance_residual, "tolerance_residual")
-        _, volume, moment = self._inputs(data)
+        _, volume, moment, accessible = self._inputs(data)
         potential = data["V_ext"]
         numbers = _positive_components(
             particle_numbers, potential, "particle_numbers"
         ).expand(potential.shape[-1])
         rho0 = initial_rho if initial_rho is not None else data.get("rho")
         if rho0 is None:
-            rho0 = torch.ones_like(potential) * numbers / (volume * potential.shape[0])
+            rho0 = torch.zeros_like(potential)
+            rho0[accessible] = numbers / (volume * accessible.sum())
         else:
             rho0 = torch.as_tensor(
                 rho0, dtype=potential.dtype, device=potential.device
@@ -190,7 +210,7 @@ class PolarizationSolver:
             p0 = torch.as_tensor(
                 p0, dtype=potential.dtype, device=potential.device
             ).detach().clone()
-        initial_ideal = self.ideal(rho0, p0, volume)  # validates both fields
+        initial_ideal = self._ideal(rho0, p0, volume, accessible)
         # m * d(beta f_id)/dP is precisely the conjugate alignment vector.
         alignment = (initial_ideal["polarization_derivative"] * moment[..., None]).detach()
         rho, polarization = rho0, p0
@@ -215,19 +235,21 @@ class PolarizationSolver:
             log_z = log_sinhc(alignment.norm(dim=-1))
             accepted = False
             for _ in range(max_backtracks):
-                trial_alignment = alignment - step * result["scaled_polarization_residual"]
+                trial_alignment = alignment - step * result["scaled_polarization_residual"][accessible]
                 log_weights = (
-                    rho.log() - step * result["density_residual"]
+                    rho[accessible].log() - step * result["density_residual"][accessible]
                     + log_sinhc(trial_alignment.norm(dim=-1)) - log_z
                 )
-                trial_rho = torch.softmax(log_weights, dim=0) * numbers / volume
-                trial_p = (trial_rho * moment)[..., None] * dipole_alignment(trial_alignment)
+                trial_rho = torch.zeros_like(rho)
+                trial_p = torch.zeros_like(polarization)
+                trial_rho[accessible] = torch.softmax(log_weights, dim=0) * numbers / volume
+                trial_p[accessible] = (trial_rho[accessible] * moment)[..., None] * dipole_alignment(trial_alignment)
                 # Very large trial steps can underflow rho or round |P|/(m*rho)
                 # to one. Backtrack these inadmissible trials without clipping.
                 interior = (
-                    torch.isfinite(trial_rho).all() and torch.all(trial_rho > 0)
+                    torch.isfinite(trial_rho).all() and torch.all(trial_rho[accessible] > 0)
                     and torch.isfinite(trial_p).all()
-                    and torch.all(trial_p.norm(dim=-1) < trial_rho * moment)
+                    and torch.all(trial_p[accessible].norm(dim=-1) < trial_rho[accessible] * moment)
                 )
                 if interior:
                     trial = self.evaluate(dict(

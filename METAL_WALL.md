@@ -113,6 +113,11 @@ $\phi_{\mathrm{LR}}+\phi_{\mathrm{SR}}$. The electrode positions and their
 `metal_sigma` are arguments to this evaluation; MetalWall does not define a
 separate liquid charge width.
 
+For a purely analytical fluid with no compensating short-range functional,
+`ReciprocalFeatures(kernel="coulomb", radial_exponents=(0.0,))` instead uses
+the full Coulomb kernel for liquid energy as well. This is an explicit model
+choice, not a change to a fitted model's reciprocal split.
+
 Each voxel carries integrated free charge
 $p_g=\Delta V\sum_i z_i\rho_{gi}$. The relaxed electrode charges solve
 
@@ -174,3 +179,10 @@ result = GridSolver(model).solve(
     homogeneous_axes=["x", "y"],
 )
 ```
+
+For a neutral fixed-dipole fluid, the liquid coupling is instead
+`data["E_ext"]` with shape `[grid, species, 3]`, in energy per dipole units;
+set its z component to the same `E_z`. Use `PolarizationSolver(m, model)` to
+minimize density and polarization together, with `m` the molecular dipole
+magnitude. It supports `excluded_mask` and keeps both fields zero there.
+No charge-based scalar voltage term is needed for neutral molecules.
