@@ -10,8 +10,6 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
-For joint density–polarization descriptors, see [the polarization API and mathematics](polarization.md).
-
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
@@ -124,69 +122,6 @@ The data split acts on complete fields and is reproducible from the seed. For
 scientific benchmarks, thermodynamic states intended for testing should be
 placed in a separately constructed test dataset rather than left to the random
 validation split.
-
-### Fourier stability amplitudes and mode counts
-
-`FourierStabilityLoss(relative_amplitude=0.05, ...)` keeps the existing fixed
-5% perturbation. To sample a range instead, use a tuple or list:
-
-```python
-FourierStabilityLoss(
-    random_modes_per_field=1,
-    mixture_mode="full_matrix",
-    mode_domain="cube",
-    relative_amplitude=(0.02, 0.10),
-)
-```
-
-The interval must satisfy `0 < lower <= upper < 1`. Each training call draws
-uniformly per field/wavevector, reusing that amplitude for both real phases,
-both signs, and all component/pair probes of the same matrix. Amplitude means
-the maximum fractional density change after fixed-number projection. Counts
-and zero-density masks remain unchanged by the Fourier perturbations. Equal
-endpoints behave as a scalar and consume no additional random draws.
-
-Sampling uses PyTorch RNG, including the Trainer's existing checkpoint RNG
-recovery. Reconstruct the loss with the same amplitude configuration when
-resuming; record it with the other training settings. With the default
-`training_only=True`, validation remains deterministic and has zero stability
-loss. No extra energy evaluations are added compared with fixed amplitude.
-
-The interval above is illustrative, not a physical default: very small
-amplitudes can cause finite-difference cancellation, while large amplitudes
-probe nonlinear finite excursions rather than the infinitesimal Hessian.
-The full matrix covers component couplings at a sampled mode; it does not
-certify cross-wavevector stability of an inhomogeneous field. Direct
-`FourierResponse` calls remain fixed by default; optional keyword-only
-`relative_amplitude` accepts a scalar or `[field, mode]` tensor for one call.
-
-`random_modes_per_field=(1, 3)` samples an inclusive integer count once per
-training batch; `3` fixes that count. Fields sample their wavevectors independently,
-without replacement. A count of **one** retains separate cosine/sine evaluation.
-For **two or more**, independently phased equal-weight waves are **summed into
-one spatial pattern per field**, then projected to fixed component counts and
-normalized by the maximum absolute fractional change. One amplitude per field
-scales the combined perturbation, shared by every component/pair probe in
-`full_matrix`. There is no independent amplitude on each constituent wave.
-
-The positive upper endpoint must fit every field's feasible set after
-domain/range filtering; it is never silently clipped. Equal endpoints are
-identical to the corresponding integer, including RNG consumption. Explicit
-`modes` still require zero random count and retain separate-mode evaluation
-for per-wavevector diagnostics. The loss averages over fields and component
-directions, not over separately evaluated constituent modes. Summing more
-waves increases wave-construction work, not the number of energy evaluations.
-The summed curvature includes cross-wavevector contributions in heterogeneous
-fields; it is not S(k) at one k or a guarantee of complete spatial stability.
-Direct `FourierResponse` calls can supply `mode_phases` in radians [field, mode]
-to select a summed pattern with one [field, 1] amplitude and singleton mode/phase
-output axes. Omission preserves the original response API and output shapes.
-
-**Migration:** random integer counts greater than one formerly evaluated modes
-separately; they now superimpose them, as requested. Count one and explicit
-per-mode response/S(k) evaluation are unchanged. Old runs must keep their pinned
-code and must not resume under this revision silently. Record both intervals
-and the code revision on continuation; existing Trainer RNG restoration applies.
 
 ## Data format
 
