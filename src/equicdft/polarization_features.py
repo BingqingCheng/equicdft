@@ -1,4 +1,4 @@
-"""Scalar contractions of particle-density and electric-dipole moments."""
+"""Joint density/dipole A moments and their scalar B contractions."""
 
 from itertools import product
 from typing import Dict, Mapping, Sequence, Union
@@ -54,11 +54,12 @@ _CONTRACTIONS = (
 )
 
 
-class PolarizationFeatures(nn.Module):
-    """Invariant local features of scalar density and a polar vector field.
+class PolarizationAFeatures(nn.Module):
+    """Equivariant Cartesian moments of scalar density and a polar vector field.
 
-    The calculation has three steps: gather neighboring fields, form their
-    Cartesian moments, and contract all Cartesian indices to obtain scalars.
+    Gather both fields and form their moments on one shared spatial basis.
+    Pass the returned moment dictionary to :class:`PolarizationBFeatures`
+    for scalar contractions, then use an ordinary ``LocalReadout``.
 
     Inputs are ``rho[..., G, t]``, ``dipole_density[..., G, t, 3]`` and the
     canonical ``local_density_index[..., G, J]``. Dipole density means dipole
@@ -73,18 +74,22 @@ class PolarizationFeatures(nn.Module):
     stencil. The latter retains an independent, final dipole-vector index.
     No voxel-volume factor enters these normalized local averages.
 
-    Spatial powers 0--2 and moment product orders 1--3 are supported. All
+    Spatial powers 0--2 are supported. All
     channels (radial index first, species second) can interact. Unsmeared
     center rho and P are appended to the scalar and vector channels, so
     contractions retain the center's orientation relative to its neighbors.
-    ``feature_names`` records every flattened contraction in output order.
+    The returned dictionary keeps Cartesian indices explicit; it is not a
+    stack of scalar species channels.
 
     Delta contractions are O(3)-invariant algebraically. On a fixed cubic
     voxel lattice, exact field covariance is limited to lattice-preserving
     signed axis permutations; arbitrary rotations require resampling.
-    ``dipole_reversal_symmetry=True`` additionally removes odd-P terms.
-    This is a separate physical assumption, not implied by spatial inversion.
+    Product order and optional dipole-reversal symmetry belong to the B stage.
     """
+
+    requires_dipole_density = True
+    convolution_backend = "gather"
+    supports_message_layers = False
 
     def __init__(
         self,
@@ -92,22 +97,14 @@ class PolarizationFeatures(nn.Module):
         dipole_density_scale: Union[float, torch.Tensor],
         cutoff_grid: int = 3,
         max_power: int = 2,
-        max_product_order: int = 3,
         radial_exponents: Sequence[float] = (0.125,),
         trainable_radial_exponents: bool = True,
         n_types: int = 1,
-        dipole_reversal_symmetry: bool = False,
     ) -> None:
         super().__init__()
         self.max_power = nonnegative_integer(max_power, "max_power")
-        self.max_product_order = positive_integer(
-            max_product_order, "max_product_order"
-        )
-        if self.max_power > 2 or self.max_product_order > 3:
-            raise ValueError("supported max_power <= 2 and max_product_order <= 3")
-        self.dipole_reversal_symmetry = boolean(
-            dipole_reversal_symmetry, "dipole_reversal_symmetry"
-        )
+        if self.max_power > 2:
+            raise ValueError("supported max_power <= 2")
         # Reuse the scalar implementation's stencil, Gaussian parameters and
         # monomials. Only moment accumulation is shared, not symmetrization.
         self.scalar_features = CartesianAFeatures(
@@ -139,28 +136,6 @@ class PolarizationFeatures(nn.Module):
                 indices.append(powers.index(power))
             self.register_buffer("matrix_indices", torch.tensor(indices))
 
-        channels = self.scalar_features.radial_exponents.numel() * self.n_types
-        sizes = {key: channels for key in ("v", "Q", "D", "H", "u", "w")}
-        sizes.update(s=channels + self.n_types, p=channels + self.n_types)
-        contractions, feature_names = [], []
-        for rule in _CONTRACTIONS:
-            name, equation, operands, minimum_power, dipole_factors = rule
-            if minimum_power > self.max_power:
-                continue
-            if len(operands) > self.max_product_order:
-                continue
-            if self.dipole_reversal_symmetry and dipole_factors % 2:
-                continue
-            contractions.append(rule)
-            channel_ranges = [range(sizes[key]) for key in operands]
-            for indices in product(*channel_ranges):
-                feature_names.append(
-                    "{}[{}]".format(name, ",".join(map(str, indices)))
-                )
-        self.contractions = tuple(contractions)
-        self.feature_names = tuple(feature_names)
-        self.n_features = len(self.feature_names)
-
     @property
     def mean_density(self) -> torch.Tensor:
         return self.scalar_features.mean_density
@@ -178,7 +153,7 @@ class PolarizationFeatures(nn.Module):
         """The shared, optionally trainable positive Gaussian exponents."""
         return self.scalar_features.radial_exponents
 
-    def _moments(self, data: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, data: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Form scalar and vector moments using the same Gaussian basis."""
 
         rho = data["rho"]
@@ -229,18 +204,129 @@ class PolarizationFeatures(nn.Module):
             moments["w"] = torch.einsum("...aijj->...ai", moments["H"])
         return moments
 
-    def _contract(self, moments: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """3. Contract each retained tensor product and flatten its channels."""
 
-        leading_shape = moments["s"].shape[:-1]  # includes central-grid axis
-        values = []
-        for _, equation, operands, _, _ in self.contractions:
-            tensors = [moments[key] for key in operands]
-            invariant = torch.einsum(equation, *tensors)
-            values.append(invariant.reshape(*leading_shape, -1))
-        return torch.cat(values, dim=-1)
+    @property
+    def n_radial_channels(self) -> int:
+        return self.radial_exponents.numel()
+
+    # Retain the historical inspection helper for compatibility.
+    _moments = forward
+
+
+def _contract_moments(contractions, moments):
+    """Contract Cartesian indices and flatten radial/species products."""
+    leading_shape = moments["s"].shape[:-1]
+    values = []
+    for _, equation, operands, _, _ in contractions:
+        invariant = torch.einsum(equation, *(moments[key] for key in operands))
+        values.append(invariant.reshape(*leading_shape, -1))
+    return torch.cat(values, dim=-1)
+
+
+class PolarizationBFeatures(nn.Module):
+    """Scalar contractions of :class:`PolarizationAFeatures` moments.
+
+    The A module supplies only dimensions: it is not registered or evaluated
+    here. Each radial/species channel can interact with every other channel.
+    Output is ``[..., n_grid, n_features]``; ``feature_names`` records its
+    exact ordering. This is the existing finite invariant set, not a claim
+    of a complete or minimal basis. Optional dipole reversal removes odd-P
+    terms; it is an additional physical symmetry, not spatial inversion.
+    """
+
+    # GridCACEModel flattens this many trailing feature axes for LocalReadout.
+    n_feature_axes = 1
+
+    def __init__(
+        self,
+        a_features: PolarizationAFeatures,
+        max_product_order: int = 3,
+        dipole_reversal_symmetry: bool = False,
+    ) -> None:
+        super().__init__()
+        if not isinstance(a_features, PolarizationAFeatures):
+            raise TypeError("a_features must be PolarizationAFeatures")
+        self.max_power = a_features.max_power
+        self.n_types = a_features.n_types
+        self.n_radial_channels = a_features.n_radial_channels
+        self.max_product_order = positive_integer(max_product_order, "max_product_order")
+        if self.max_product_order > 3:
+            raise ValueError("supported max_product_order <= 3")
+        self.dipole_reversal_symmetry = boolean(
+            dipole_reversal_symmetry, "dipole_reversal_symmetry"
+        )
+        channels = self.n_radial_channels * self.n_types
+        sizes = {key: channels for key in ("v", "Q", "D", "H", "u", "w")}
+        sizes.update(s=channels + self.n_types, p=channels + self.n_types)
+        contractions, feature_names = [], []
+        for rule in _CONTRACTIONS:
+            name, equation, operands, minimum_power, dipole_factors = rule
+            if minimum_power > self.max_power:
+                continue
+            if len(operands) > self.max_product_order:
+                continue
+            if self.dipole_reversal_symmetry and dipole_factors % 2:
+                continue
+            contractions.append(rule)
+            channel_ranges = [range(sizes[key]) for key in operands]
+            for indices in product(*channel_ranges):
+                feature_names.append(
+                    "{}[{}]".format(name, ",".join(map(str, indices)))
+                )
+        self.contractions = tuple(contractions)
+        self.feature_names = tuple(feature_names)
+        self.n_features = len(self.feature_names)
+
+    def validate_a_features(self, a_features) -> None:
+        """Reject incompatible moment layouts before evaluating a model."""
+        if (not isinstance(a_features, PolarizationAFeatures)
+                or isinstance(a_features, PolarizationFeatures)):
+            raise TypeError("PolarizationBFeatures requires PolarizationAFeatures moments")
+        for name in ("max_power", "n_types", "n_radial_channels"):
+            if getattr(a_features, name) != getattr(self, name):
+                raise ValueError("A/B polarization {} must match".format(name))
+
+    def forward(self, moments: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return _contract_moments(self.contractions, moments)
+
+
+class PolarizationFeatures(PolarizationAFeatures):
+    """Compatibility composition of joint A moments and B contractions.
+
+    New models should supply separate PolarizationAFeatures and
+    PolarizationBFeatures to GridCACEModel, with LocalReadout. This wrapper
+    preserves the constructor, state-dict paths and full-object checkpoints
+    of the original all-in-one feature module, including legacy messages.
+    """
+
+    def __init__(
+        self,
+        mean_density: Union[float, torch.Tensor],
+        dipole_density_scale: Union[float, torch.Tensor],
+        cutoff_grid: int = 3,
+        max_power: int = 2,
+        max_product_order: int = 3,
+        radial_exponents: Sequence[float] = (0.125,),
+        trainable_radial_exponents: bool = True,
+        n_types: int = 1,
+        dipole_reversal_symmetry: bool = False,
+    ) -> None:
+        super().__init__(
+            mean_density=mean_density, dipole_density_scale=dipole_density_scale,
+            cutoff_grid=cutoff_grid, max_power=max_power,
+            radial_exponents=radial_exponents,
+            trainable_radial_exponents=trainable_radial_exponents, n_types=n_types,
+        )
+        b_features = PolarizationBFeatures(
+            self, max_product_order, dipole_reversal_symmetry
+        )
+        # Keep the old serialized layout. B has no parameters or buffers.
+        for name in ("max_product_order", "dipole_reversal_symmetry",
+                     "contractions", "feature_names", "n_features"):
+            setattr(self, name, getattr(b_features, name))
+
+    def _contract(self, moments: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return _contract_moments(self.contractions, moments)
 
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Return invariant features with shape ``[..., n_grid, n_features]``."""
-        moments = self._moments(data)
-        return self._contract(moments)
+        return self._contract(self._moments(data))

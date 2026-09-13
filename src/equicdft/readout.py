@@ -106,6 +106,10 @@ class PolarizationReadout(EnergyReadout):
     per particle and component. No orientational ideal entropy or external
     electric-field coupling is included here.
 
+    Compatibility path for existing checkpoints and scalar-invariant messages.
+    New zero-message models should pass PolarizationAFeatures and
+    PolarizationBFeatures to GridCACEModel and use ordinary LocalReadout.
+
     Optional ``message`` adds one B-chi aggregation of the complete joint
     invariant vector B0. A single scalar latent gate h(B0)-h(0) is convolved
     into Cartesian moments and contracted by CartesianBFeatures into B1.

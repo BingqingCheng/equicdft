@@ -153,6 +153,8 @@ class CartesianBFeatures(nn.Module):
     ``B: [..., n_grid, n_radial_channels, n_B, n_channels]``.
     """
 
+    n_feature_axes = 3  # radial, invariant, density/channel
+
     def __init__(self, max_power: int, max_product_order: int = 3) -> None:
         super().__init__()
 

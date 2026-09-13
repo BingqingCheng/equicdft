@@ -20,9 +20,7 @@ from ._grid import (
 )
 from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout, log_dimensionless_density
-from .features import CartesianAFeatures
 from .interaction import BChiMessage
-from .symmetrize import CartesianBFeatures
 
 
 class GridCACEModel(nn.Module):
@@ -45,7 +43,7 @@ class GridCACEModel(nn.Module):
     energy-valued chemical potentials. Constructor response flags provide
     defaults that individual forward calls may override.
 
-    With a polarization readout, ``dipole_density`` is an independent polar
+    With polarization features or readouts, ``dipole_density`` is an independent polar
     vector field. Density derivatives hold that field fixed. The optional
     ``polarization_derivative`` output is the positive functional derivative
     ``delta(beta_F_exc)/delta(dipole_density)``, not an external electric
@@ -55,8 +53,8 @@ class GridCACEModel(nn.Module):
 
     def __init__(
         self,
-        a_features: Optional[CartesianAFeatures],
-        b_features: Optional[CartesianBFeatures],
+        a_features: Optional[nn.Module],
+        b_features: Optional[nn.Module],
         readout: Sequence[EnergyReadout],
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
         mean_temperature: Union[float, torch.Tensor] = 1.0,
@@ -94,6 +92,8 @@ class GridCACEModel(nn.Module):
             raise ValueError(
                 "a_features and b_features must be supplied together"
             )
+        if hasattr(b_features, "validate_a_features"):
+            b_features.validate_a_features(a_features)
         if message_layers is None:
             messages = []
         elif isinstance(message_layers, BChiMessage):
@@ -107,6 +107,11 @@ class GridCACEModel(nn.Module):
         if messages and a_features is None:
             raise ValueError(
                 "a_features and b_features are required by message_layers"
+            )
+        if messages and not getattr(a_features, "supports_message_layers", True):
+            raise ValueError(
+                "message_layers do not support joint polarization moments; "
+                "use PolarizationReadout for the legacy scalar-invariant message"
             )
         for module in messages:
             expected = (
@@ -143,19 +148,23 @@ class GridCACEModel(nn.Module):
             item for item in readouts
             if getattr(item, "requires_dipole_density", False)
         ]
-        if compute_polarization_derivative and not polar_readouts:
+        has_polarization = (
+            getattr(a_features, "requires_dipole_density", False) or bool(polar_readouts)
+        )
+        if compute_polarization_derivative and not has_polarization:
             raise ValueError(
-                "compute_polarization_derivative requires a dipole-density readout"
+                "compute_polarization_derivative requires a dipole-density readout "
+                "or feature module"
             )
-        if compute_local_mu and polar_readouts:
+        if compute_local_mu and has_polarization:
             raise ValueError(
                 "compute_local_mu is unavailable for dipole-density models: "
                 "the orientational ideal free energy must first be specified"
             )
-        # Pointwise polarized LDA needs P but has no neighborhood cutoff.
-        # The fallback preserves earlier serialized polarization readouts.
-        cutoffs = [item.cutoff_grid for item in polar_readouts
-                   if getattr(item, "requires_local_density_index", True)]
+        # Neighborhood requirements are independent of which fields are read.
+        # Only legacy PolarizationReadout still builds its own local features.
+        cutoffs = [item.cutoff_grid for item in readouts
+                   if item.requires_local_density_index]
         if a_features is not None:
             cutoffs.append(a_features.cutoff_grid)
         if cutoffs and any(value != cutoffs[0] for value in cutoffs):
@@ -209,7 +218,7 @@ class GridCACEModel(nn.Module):
             grid_spacing,
             dtype=torch.get_default_dtype(),
         )
-        if polar_readouts and not torch.allclose(
+        if has_polarization and not torch.allclose(
             spacing, spacing[0].expand_as(spacing)
         ):
             raise ValueError(
@@ -277,8 +286,7 @@ class GridCACEModel(nn.Module):
         if self.has_local_features:
             return self.a_features.cutoff_grid
         for item in self.readout:
-            if (getattr(item, "requires_dipole_density", False)
-                    and getattr(item, "requires_local_density_index", True)):
+            if item.requires_local_density_index:
                 return item.cutoff_grid
         return 0
 
@@ -314,9 +322,7 @@ class GridCACEModel(nn.Module):
     def requires_local_density_index(self) -> bool:
         """Whether any configured local operator uses explicit gathering."""
 
-        if any(getattr(item, "requires_dipole_density", False)
-               and getattr(item, "requires_local_density_index", True)
-               for item in self.readout):
+        if any(item.requires_local_density_index for item in self.readout):
             return True
         if not self.has_local_features:
             return False
@@ -332,9 +338,9 @@ class GridCACEModel(nn.Module):
 
     @property
     def requires_dipole_density(self) -> bool:
-        """Whether the functional contains a polarization-dependent readout."""
+        """Whether configured features or readouts depend on polarization."""
 
-        return any(
+        return getattr(self.a_features, "requires_dipole_density", False) or any(
             getattr(item, "requires_dipole_density", False)
             for item in self.readout
         )
@@ -455,7 +461,10 @@ class GridCACEModel(nn.Module):
 
         A = self.a_features(data)
         B = self.b_features(A)
-        levels = [B.flatten(start_dim=-3)]
+        # Cartesian B has radial/invariant/channel axes; joint B has already
+        # flattened its channel products. Older B checkpoints default to three.
+        feature_axes = getattr(self.b_features, "n_feature_axes", 3)
+        levels = [B.flatten(start_dim=-feature_axes)]
 
         # getattr keeps full-model checkpoints saved before message passing
         # loadable as ordinary zero-message models.
@@ -476,7 +485,7 @@ class GridCACEModel(nn.Module):
                     stencil_positions=self.a_features.local_density_positions,
                 )
                 B = self.b_features(A)
-                levels.append(B.flatten(start_dim=-3))
+                levels.append(B.flatten(start_dim=-feature_axes))
         return torch.cat(levels, dim=-1)
 
     def forward(
