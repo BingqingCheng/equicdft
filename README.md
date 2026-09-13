@@ -10,6 +10,8 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
+For joint density–polarization descriptors, see [the polarization API and mathematics](polarization.md).
+
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
