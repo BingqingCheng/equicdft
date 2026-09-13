@@ -33,19 +33,16 @@ total charge per label. Labels may be stored in the EXTXYZ
 ```python
 metal_sites = read_metal_sites(
     "metal.extxyz",
-    total_charge=[-0.5, 0.5],
+    total_charge={0: -0.5, 1: 0.5},
 )
 ```
 
 If the file contains labels 0 and 1, these totals constrain groups 0 and 1,
-respectively. Without explicit `group_ids`, the reader uses the sorted unique
-site labels. Labels can instead be supplied directly, for example
-`site_groups=[0, 0, 1, 1]`. Use `group_ids` only when an explicit charge order
-different from sorted label order is required. An EXTXYZ may alternatively
-store `metal_group_ids`, `metal_total_charge`, and `metal_charge_units`; then
-`read_metal_sites("metal.extxyz")` reads the complete definition. Multiple
-independently constrained groups are currently supported with zero applied
-field; constant-field mode requires one constrained group.
+respectively. The dictionary maps each label directly to its total charge, so
+there is no separate group ordering. Labels can instead be supplied directly,
+for example `site_groups=[0, 0, 1, 1]`. Multiple independently constrained
+groups are currently supported with zero applied field; constant-field mode
+requires one constrained group.
 
 Then replace the model's liquid Coulomb readout with `MetalWall`:
 
@@ -167,7 +164,3 @@ result = GridSolver(model).solve(
     homogeneous_axes=["x", "y"],
 )
 ```
-
-The liquid field belongs in `V_ext`; the electrode field belongs in
-`MetalWall`. Each is added once to the charges it acts on. The fitted model,
-wall, data, and initial density must share a device and dtype.

@@ -53,7 +53,7 @@ default_data_key = {
 
 def read_metal_sites(
     path: Union[str, Path], *, origin=(0.0, 0.0, 0.0), site_groups=None,
-    group_ids=None, total_charge=None, charge_units=None, index=0,
+    total_charge=None, index=0,
 ) -> Dict[str, Any]:
     """Read one XYZ/ASE metal geometry and its charge constraints.
 
@@ -64,11 +64,10 @@ def read_metal_sites(
     No wrapping, rescaling, density mask, or field origin is inferred.
 
     Site labels come from ``site_groups`` or the ASE array
-    ``metal_site_groups``. Group IDs are normally inferred from those labels.
-    If neither is present, a scalar total charge defines one group containing
-    every site. Charge constraints may instead be read from
-    ``metal_group_ids``, ``metal_total_charge`` and ``metal_charge_units``
-    frame metadata. Charge units default to elementary-charge units, ``"e"``.
+    ``metal_site_groups``. A scalar total charge defines one group; a mapping
+    such as ``{0: 1.0, 1: -1.0}`` assigns total charge by site label. If no
+    labels are present, the scalar case places every site in group 0. Charges
+    are expressed in elementary-charge units.
     """
     atoms = read(str(Path(path).expanduser()), index=index)
     if not isinstance(atoms, Atoms):
@@ -83,25 +82,20 @@ def read_metal_sites(
         atoms.arrays.get("metal_site_groups")
         if site_groups is None else site_groups
     )
-    ids = atoms.info.get("metal_group_ids") if group_ids is None else group_ids
-    totals = (
-        atoms.info.get("metal_total_charge")
-        if total_charge is None else total_charge
-    )
-    units = (
-        atoms.info.get("metal_charge_units", "e")
-        if charge_units is None else charge_units
-    )
+    if total_charge is None:
+        raise ValueError("total_charge must be supplied")
+    if isinstance(total_charge, Mapping):
+        ids = list(total_charge)
+        totals = list(total_charge.values())
+    else:
+        totals = total_charge
+        ids = None
     if labels is None:
-        raw_ids = None if ids is None else np.asarray(ids).reshape(-1)
         raw_totals = None if totals is None else np.asarray(totals).reshape(-1)
-        if raw_ids is None:
-            if raw_totals is None or raw_totals.size != 1:
-                raise ValueError(
-                    "site_groups are required for multiple electrode groups"
-                )
-            raw_ids = np.array([0])
-        if raw_ids.size != 1:
+        if ids is None and raw_totals is not None and raw_totals.size == 1:
+            ids = [0]
+        raw_ids = None if ids is None else np.asarray(ids).reshape(-1)
+        if raw_ids is None or raw_ids.size != 1:
             raise ValueError(
                 "site_groups are required for multiple electrode groups"
             )
@@ -111,9 +105,16 @@ def read_metal_sites(
         if np.ndim(labels) == 0:
             labels = np.full(len(atoms), labels)
         if ids is None:
-            ids = np.unique(np.asarray(labels))
+            unique_labels = np.unique(np.asarray(labels))
+            raw_totals = None if totals is None else np.asarray(totals).reshape(-1)
+            if unique_labels.size != 1 or raw_totals is None or raw_totals.size != 1:
+                raise ValueError(
+                    "multiple electrode groups require total_charge as a "
+                    "{label: charge} mapping"
+                )
+            ids = unique_labels
     return normalize_metal_sites(
-        ids, totals, units,
+        ids, totals, "e",
         metal_positions=positions, metal_site_groups=labels,
     )
 

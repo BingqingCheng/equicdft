@@ -66,7 +66,7 @@ class TestMetalSitesData(unittest.TestCase):
             result = read_metal_sites(
                 path,
                 site_groups=[7, 2, 7],
-                total_charge=[-.3, .3],
+                total_charge={2: -.3, 7: .3},
             )
         self.assertEqual(result["metal_site_groups"].tolist(), [7, 2, 7])
         self.assertEqual(result["metal_group_ids"].tolist(), [2, 7])
@@ -77,26 +77,43 @@ class TestMetalSitesData(unittest.TestCase):
             path = Path(directory) / "sites.xyz"
             write(path, Atoms("XX", positions=np.zeros((2, 3))))
             with self.assertRaisesRegex(ValueError, "site_groups"):
-                read_metal_sites(path, total_charge=[-.3, .3])
+                read_metal_sites(path, total_charge={2: -.3, 7: .3})
 
-    def test_extxyz_uses_declared_metadata_without_reordering(self):
+    def test_multiple_group_charge_sequence_is_rejected_as_ambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sites.xyz"
+            write(path, Atoms("XX", positions=np.zeros((2, 3))))
+            with self.assertRaisesRegex(ValueError, "mapping"):
+                read_metal_sites(
+                    path, site_groups=[0, 1], total_charge=[-.3, .3],
+                )
+
+    def test_extxyz_uses_site_labels_and_charge_mapping(self):
         atoms = Atoms("XX", positions=_metadata()["metal_positions"])
         atoms.arrays["metal_site_groups"] = np.array([9, 2])
-        atoms.info.update(
-            metal_group_ids=np.array([2, 9]),
-            metal_total_charge=np.array([-.3, .3]),
-            metal_charge_units="e",
-        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sites.extxyz"
             write(path, atoms, format="extxyz")
-            result = read_metal_sites(path)
+            result = read_metal_sites(path, total_charge={2: -.3, 9: .3})
             with self.assertRaisesRegex(ValueError, "one selected XYZ frame"):
-                read_metal_sites(path, index=":")
+                read_metal_sites(
+                    path, index=":", total_charge={2: -.3, 9: .3},
+                )
         self.assertEqual(result["metal_group_ids"].tolist(), [2, 9])
         self.assertEqual(result["metal_site_groups"].tolist(), [9, 2])
         self.assertEqual(result["metal_positions"].dtype, torch.float64)
         self.assertAlmostEqual(result["metal_positions"][0, 2].item(), .216690617966578, places=8)
+
+    def test_obsolete_group_order_and_units_arguments_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sites.xyz"
+            write(path, Atoms("X", positions=np.zeros((1, 3))))
+            for arguments in (
+                {"group_ids": [0], "total_charge": 0.},
+                {"charge_units": "e", "total_charge": 0.},
+            ):
+                with self.subTest(arguments=arguments), self.assertRaises(TypeError):
+                    read_metal_sites(path, **arguments)
 
     def test_invalid_metadata_is_rejected(self):
         cases = [
