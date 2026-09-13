@@ -10,16 +10,6 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
-An optional [polarizable metal-wall module](METAL_WALL.md) supports explicit
-electrode coordinates (including XYZ files), group-total charge constraints,
-and differentiable Gaussian charge equilibration with 3D-periodic electrostatics.
-It adds only liquid–metal, metal–metal and imposed metal-field energies;
-liquid–liquid interactions remain in the liquid functional. The initial
-fixed-charge capability is experimental; it does not select an electrode model
-or replace the liquid functional's SR/LR convention. The same guide covers
-[homogeneous-density solver constraints](METAL_WALL.md#use-in-a-density-solve-2-v),
-including the distinction between constrained and full-3D convergence.
-
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
@@ -211,7 +201,6 @@ default field names and requirements are:
 | per-grid array | `density` | conditional | density component(s) |
 | per-grid array | `V_ext` | conditional | external-potential component(s) |
 | per-grid array | `excluded_mask` | no | Boolean hard exclusion; `True` means inaccessible |
-| per-grid array | `grid_center` | no | Physical voxel coordinates in the same frame as electrode coordinates |
 
 Each EXTXYZ frame has the usual three-part structure: the number of grid
 points, one metadata/property line, and one record per grid point. An
@@ -230,10 +219,7 @@ exactly $N_xN_yN_z$ distinct sites. The three `pos` values are integer grid
 indices, not physical Cartesian coordinates. They must cover the complete
 regular grid; input row order is arbitrary because `GridData` sorts sites into
 C order (the last index varies fastest). Physical displacements are obtained by
-multiplying index differences by `grid_spacing`. Optional `grid_center`
-records absolute physical voxel coordinates, including the origin offset;
-it must describe the same regular grid. Without it the physical origin is zero.
-The ASE species and `Lattice`
+multiplying these indices by `grid_spacing`. The ASE species and `Lattice`
 fields are container bookkeeping and are not used to build neighborhoods.
 
 At least one of `density` and `V_ext` must be present. Training the equilibrium
