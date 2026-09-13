@@ -1,166 +1,173 @@
 # MetalWall
 
-MetalWall computes induced charges on fixed electrode sites in response to a
-liquid charge density and an applied electric field. Charges redistribute while
-each electrode group retains its prescribed total charge. The module returns
-the relaxed charges and electrode energy; attaching it to a learned functional
-couples this response to a liquid-density solve.
+`MetalWall` adds polarizable Gaussian electrode sites to a liquid model that
+already contains a charge-factorized Coulomb `LongRangeReadout`. The liquid
+Coulomb readout remains the single owner of species charges, the Coulomb
+amplitude, reciprocal split, and liquid-generated potential. `MetalWall`
+passes it the electrode positions, receives the liquid potential at those
+positions, relaxes the electrode charges, and contributes the electrode energy
+to the functional.
 
-## API
+## Adding a conducting metal
 
-### Construct the module
+First load the electrode coordinates and charge constraints. For the usual
+constant-field cell, all sites belong to one neutral constrained group:
 
 ```python
 metal_sites = read_metal_sites(
     "metal.extxyz",
-    site_groups=0, group_ids=[0], total_charge=[0.0], charge_units="e",
+    total_charge=0.0,
 )
-wall = MetalWall(
+```
+
+Here `metal.extxyz` only needs atomic positions. A scalar `total_charge`
+assigns every site to group 0. The group is a charge constraint, not a
+geometrical electrode label: sites in two separate slabs may belong to this
+same group. Their lower- and upper-slab charges can later be summed from
+`metal_site_q` using their positions.
+
+For several independently constrained groups, label every site and give one
+total charge per label. Labels may be stored in the EXTXYZ
+`metal_site_groups` array:
+
+```python
+metal_sites = read_metal_sites(
+    "metal.extxyz",
+    total_charge=[-0.5, 0.5],
+)
+```
+
+If the file contains labels 0 and 1, these totals constrain groups 0 and 1,
+respectively. Without explicit `group_ids`, the reader uses the sorted unique
+site labels. Labels can instead be supplied directly, for example
+`site_groups=[0, 0, 1, 1]`. Use `group_ids` only when an explicit charge order
+different from sorted label order is required. An EXTXYZ may alternatively
+store `metal_group_ids`, `metal_total_charge`, and `metal_charge_units`; then
+`read_metal_sites("metal.extxyz")` reads the complete definition. Multiple
+independently constrained groups are currently supported with zero applied
+field; constant-field mode requires one constrained group.
+
+Then replace the model's liquid Coulomb readout with `MetalWall`:
+
+```python
+liquid_coulomb = model.readout[2]
+model.readout[2] = MetalWall(
+    liquid_coulomb=liquid_coulomb,
     metal_sites=metal_sites,
-    liquid_charges=valencies,
     metal_sigma=metal_sigma,
-    liquid_sigma=0.0,
-    coulomb_amplitude=physical_prefactor,
-    boundary="periodic",
     external_field=(0.0, 0.0, E_z),
 )
 ```
 
-`MetalWall` copies the electrode specification into module buffers, so it moves
-and serializes with the model. Use a separate `MetalWall` for a different
-electrode geometry or charge constraint. `E_z` is the applied field; the 2 V
-example below shows how to calculate it.
+`MetalWall` wraps and evaluates the existing `liquid_coulomb` readout. Replace
+the original entry as shown above. If the original entry is left in the model
+and `MetalWall` is appended as another entry, the liquid long-range energy is
+evaluated twice.
+
+Constructor arguments:
 
 | Argument | Meaning |
 |---|---|
-| `metal_sites` | Electrode coordinates, site groups, and prescribed group charges returned by `read_metal_sites` |
-| `liquid_charges` | Charge per liquid species, in e and density-channel order |
-| `metal_sigma` | Gaussian standard deviation of a metal charge site, in length units |
-| `liquid_sigma` | Gaussian standard deviation of a liquid voxel source; zero means no Gaussian smearing |
-| `coulomb_amplitude` | Physical Coulomb coefficient, in energy × length / e² |
-| `boundary` | `"periodic"` |
-| `external_field` | Applied field in energy / (e × length), default zero |
-| `field_origin` | Physical wrapping center of the metal field, default `(0, 0, 0)` |
-| `tolerance` | Electrode charge/equipotential tolerance, default `1e-6` with scale and roundoff allowances |
+| `liquid_coulomb` | One charge-factorized `LongRangeReadout` with a Coulomb kernel |
+| `metal_sites` | Coordinates, site groups, and prescribed group charges from `read_metal_sites` |
+| `metal_sigma` | Gaussian standard deviation of each electrode site, in model length units |
+| `external_field` | Applied field acting on electrode charges, in model energy per charge per length; default zero |
+| `tolerance` | Charge and equipotential residual tolerance; default `1e-6` |
 
-### Evaluate a liquid density
+Electrode coordinates and liquid `grid_center` use the same physical coordinate
+system. Electrode sites need not coincide with liquid grid points. A separate
+`excluded_mask` marks grid points at which liquid density must remain zero.
 
-```python
-state = wall(data)
-q_metal = state["metal_site_q"]
-U_electrode = state["electrode_coulomb_energy"] + state["metal_external_energy"]
-```
+A nonzero `external_field` currently requires exactly one constrained electrode
+group. `MetalWall` automatically places the periodic sawtooth discontinuity in
+the largest site-free gap along each field direction and unwraps all electrode
+sites onto the remaining contiguous branch. No field origin is supplied by the
+caller. With zero field, multiple independently constrained groups remain
+supported.
 
-The example assigns all sites to one neutral group, permitting charge transfer
-between electrode regions. To constrain electrodes separately, assign different
-group labels and a total charge to each. If these are already in the file, use
-`read_metal_sites("metal.extxyz")` without overrides.
+## Electrostatic coupling
 
-Electrode positions use the same physical coordinates as the liquid grid
-centers; they need not lie on grid points. Liquid exclusion is specified
-separately by `excluded_mask`.
-
-`wall(data)` evaluates the current density without changing it. Its main outputs are:
-
-- `metal_site_q`: integrated charge of each site, in e.
-- `metal_group_ids` and `metal_total_charge`: configured constraint labels and totals.
-- `metal_charge` and `metal_potential`: charge and potential of each constraint group.
-- `liquid_charge_density` and `q_liquid`: liquid charge density and integrated voxel charges.
-- `electrode_coulomb_energy`: liquid–metal plus metal–metal energy.
-- `metal_external_energy`: work in the imposed metal field.
-- `charge_residual` and `potential_residual`: errors in the charge constraints and equipotential condition.
-
-For a shared constraint group, sum site charges by physical electrode region
-to obtain the charge accumulated on each electrode.
-
-## Charge solve
-
-Each liquid voxel contributes integrated charge
-$p_g = \Delta V \sum_i z_i \rho_{gi}$. Metal charges $q_m$ are also integrated
-charges, not densities, so they need no additional voxel-volume factor.
-
-The electrostatic calculation uses:
-
-- $A$: interaction matrix between Gaussian metal sites, including self interaction.
-- $b$: potential generated by the liquid charges at those sites.
-- $v$: applied-field potential at those sites.
-- $C$: group-membership matrix; $Q$: prescribed group charges.
-
-These interactions are evaluated on the periodic FFT grid. With
-`liquid_sigma=0`, liquid charges are unsmeared voxel-center sources;
-the metal charges retain their Gaussian width.
-
-The electrode charges minimize
+For a set of positions, the liquid Coulomb readout forms one charge spectrum.
+Its damped kernel supplies the liquid–liquid long-range free energy. The full
+Coulomb kernel is used only to evaluate the liquid potential at electrode
+positions:
 
 $$
-U(q) = \frac{1}{2} q^{\mathsf T} A q + q^{\mathsf T}(b+v),
-\qquad C^{\mathsf T} q = Q.
+\widehat{\phi}_{\mathrm{LR}} = K_{\mathrm{LR}}\widehat{q}_{\mathrm{liq}},
+\qquad
+\widehat{\phi}_{\mathrm{SR}}
+= (K_{\mathrm{full}}-K_{\mathrm{LR}})\widehat{q}_{\mathrm{liq}}.
 $$
 
-The stationary conditions are
+The complementary analytical kernel does not enter the liquid–liquid free
+energy because the learned short-range branch represents that physics. It is
+used only to complete the liquid–metal site potential
+$\phi_{\mathrm{LR}}+\phi_{\mathrm{SR}}$. The electrode positions and their
+`metal_sigma` are arguments to this evaluation; MetalWall does not define a
+separate liquid charge width.
+
+Each voxel carries integrated charge
+$p_g=\Delta V\sum_i z_i\rho_{gi}$. The relaxed electrode charges solve
 
 $$
-Aq + C\lambda = -(b+v), \qquad C^{\mathsf T}q = Q.
+Aq+C\lambda=-(b+v), \qquad C^{\mathsf T}q=Q,
 $$
 
-The code assembles these equations as one block linear system and solves it
-using a cached LU factorization, without forming the inverse explicitly.
-Group potentials are $-\lambda$. As the liquid density changes, its potential
-$b$ and the relaxed charges $q$ are updated.
+where `A` is the metal–metal interaction matrix, `b` is the liquid potential at
+the sites, `v` is the applied-field potential, and `C` imposes the prescribed
+group totals `Q`. The geometry-dependent system is factorized once and reused
+as the liquid density changes.
 
-## Use in a density solve: 2 V
+The corresponding electrode contribution is
 
-Assume the liquid model, unbiased field `data`, and `metal_sites` above are loaded.
-Use one combined neutral metal group.
-For electrodes near opposite periodic cell ends, apply
-$\Delta\Phi = \Phi_{\mathrm{top}}-\Phi_{\mathrm{bottom}} = 2\ \mathrm{V}$:
+$$
+U_{\mathrm{electrode}}
+=q^{\mathsf T}b+\frac{1}{2}q^{\mathsf T}Aq+q^{\mathsf T}v.
+$$
+
+The liquid charge field and its integrated scalar remain owned by the Coulomb
+readout. MetalWall receives
+$Q_{\mathrm{liquid}}=\Delta V\sum_{g,i}z_i\rho_{gi}$ to require
+$Q_{\mathrm{liquid}}+\sum_a Q_a=0$ in the periodic cell; it does not add a
+neutralizing background or return liquid charge fields.
+
+Liquid–metal and metal–metal interactions use the same finite reciprocal grid.
+The zero mode is omitted, the Gaussian metal self interaction is retained, and
+off-grid electrode coordinates are evaluated spectrally rather than rounded or
+interpolated onto liquid voxels. Electrode relaxation remains differentiable
+with respect to liquid density. Check reciprocal-grid and `metal_sigma`
+convergence for scientific calculations.
+
+## Using a 2 V finite field in a density solve
+
+For a cell of length `Lz`, convert the desired voltage to the model's field
+units and apply the same field to the liquid and electrode charges:
 
 ```python
 delta_phi_V = 2.0
 Lz = float(data["grid_size"][2] * data["grid_spacing"][2])
 E_z = -delta_phi_V / (energy_unit_eV * Lz)
-valencies = model.readout[2].charges
+
+charges = liquid_coulomb.charges.to(data["V_ext"])
 z = data["grid_center"][:, 2, None]
-data["V_ext"] = data["V_ext"] - z * E_z * valencies.to(data["V_ext"])
-```
+data["V_ext"] = data["V_ext"] - z * E_z * charges
 
-`excluded_mask` fixes the liquid density to zero and removes those points from
-solver residuals, so the values of `V_ext` at excluded points are irrelevant.
-
-`energy_unit_eV` is one input energy unit expressed in eV. This finite-field
-construction uses the full periodic length, liquid coordinates $z\in[0,L_z)$,
-and metal wrapping center zero, so the upper metal image is shifted by $-L_z$.
-It is not an independently prescribed electrode-potential ensemble.
-Add the liquid field only once; `V_ext` here starts from the unbiased wall potential.
-
-Construct and attach the wall with the same field, then minimize the liquid density:
-
-```python
-wall = MetalWall(
-    metal_sites=metal_sites, liquid_charges=valencies,
-    metal_sigma=metal_sigma, liquid_sigma=0.0,
-    coulomb_amplitude=physical_prefactor, boundary="periodic",
+model.readout[2] = MetalWall(
+    liquid_coulomb=liquid_coulomb,
+    metal_sites=metal_sites,
+    metal_sigma=metal_sigma,
     external_field=(0.0, 0.0, E_z),
 )
-model.readout.append(MetalElectrodeReadout(wall))
+
 result = GridSolver(model).solve(
-    data, method="minimize", particle_numbers=particle_numbers,
-    initial_rho=initial_rho, homogeneous_axes=["x", "y"],
+    data,
+    method="minimize",
+    particle_numbers=particle_numbers,
+    initial_rho=initial_rho,
+    homogeneous_axes=["x", "y"],
 )
 ```
 
-The snippets assume a common model/module device and dtype, frozen fitted
-parameters, and a uniform `initial_rho` normalized to the prescribed particle
-numbers on accessible voxels. Choose liquid stopping criteria through the
-solver options. `homogeneous_axes=["x", "y"]` gives a planar density;
-`None` permits full 3D, and `"x"` restricts only x.
-
-The solver combines the liquid functional, liquid external potential and
-relaxed electrode energy. Liquid–liquid interactions remain in the liquid
-functional.
-
-Metal charges relax at every density evaluation, and their response is included
-in the functional derivatives. `MetalElectrodeReadout` converts electrode
-energy to the model's free-energy convention; the caller supplies physical,
-not beta-scaled, fields and prefactors. The final `result` contains both the
-liquid density and the electrode outputs described above.
+The liquid field belongs in `V_ext`; the electrode field belongs in
+`MetalWall`. Each is added once to the charges it acts on. The fitted model,
+wall, data, and initial density must share a device and dtype.

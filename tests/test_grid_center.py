@@ -11,9 +11,11 @@ from ase import Atoms
 from ase.io import write
 from torch.utils.data import DataLoader
 
-from equicdft import GridData, GridSolver, read_metal_sites
+from equicdft import GridData, GridSolver, MetalWall, read_metal_sites
 from test_metal_sites_data import _atoms, _grid_values
-from test_metalwall_sites import _data, _wall, _reference, _inverse_fixture
+from test_metalwall_sites import (
+    _data, _inverse_fixture, _one_electrode, _reference, _wall,
+)
 
 
 def _centers(data, origin):
@@ -101,21 +103,22 @@ class TestGridCenter(unittest.TestCase):
                 with self.subTest(biased=biased, shape=shape):
                     legacy = _data(shape=shape)
                     if biased:
+                        legacy = _one_electrode(legacy)
                         legacy["metal_external_field"] = torch.tensor([.12, -.05, .08], dtype=torch.float64)
-                        legacy["metal_field_origin"] = torch.tensor([-.1, .2, .3], dtype=torch.float64)
                     origin = torch.tensor([.125, -.2375, .43], dtype=torch.float64)
                     physical = dict(legacy, grid_center=_centers(legacy, origin),
                                     metal_positions=legacy["metal_positions"] + origin)
-                    if biased:
-                        physical["metal_field_origin"] = legacy["metal_field_origin"] + origin
                     expected, actual = _run(_wall(), legacy), _run(_wall(), physical)
                     for key in expected:
-                        if key != "metal_positions":
-                            torch.testing.assert_close(actual[key], expected[key], atol=3e-11, rtol=3e-11)
+                        torch.testing.assert_close(
+                            actual[key], expected[key], atol=3e-11, rtol=3e-11,
+                        )
                     reference = _reference(physical)
-                    for key in reference.keys() - {"B", "S"}:
+                    for key in reference.keys() - {
+                        "B", "S", "q_liquid", "liquid_charge_density",
+                    }:
                         torch.testing.assert_close(actual[key], reference[key], atol=3e-11, rtol=3e-11)
-                    torch.testing.assert_close(actual["metal_positions"], physical["metal_positions"])
+                    self.assertNotIn("metal_positions", actual)
                     derivatives = []
                     for data in (legacy, physical):
                         rho = data["rho"].clone().requires_grad_()
@@ -135,21 +138,24 @@ class TestGridCenter(unittest.TestCase):
         cache = wall._cache
         shifted = dict(data, grid_center=_centers(data, [.125, .2, .3]))
         after = _run(wall, shifted)
-        self.assertIsNot(wall._cache, cache)
+        # The liquid readout owns site sampling and its grid origin. The
+        # metal-only matrix is translation invariant and remains cached.
+        self.assertIs(wall._cache, cache)
         self.assertGreater((after["metal_site_q"] - before["metal_site_q"]).abs().max().item(), 1e-6)
         torch.testing.assert_close(after["metal_site_q"], _reference(shifted)["metal_site_q"], atol=3e-11, rtol=3e-11)
 
-    def test_physical_zero_field_origin_needs_no_manual_half_voxel_shift(self):
-        physical = _data(shape=(4, 2, 4))
-        origin = physical["grid_spacing"] / 2
+    def test_automatic_field_branch_needs_no_grid_origin_input(self):
+        legacy = _one_electrode(_data(shape=(4, 2, 4)))
+        origin = legacy["grid_spacing"] / 2
+        physical = dict(
+            legacy,
+            metal_positions=legacy["metal_positions"] + origin,
+        )
         physical["grid_center"] = _centers(physical, origin)
         length_z = physical["grid_size"][2] * physical["grid_spacing"][2]
         field_z = -2. / (5.217262802666367 * length_z)
         physical["metal_external_field"] = torch.tensor([0., 0., field_z], dtype=torch.float64)
-        # Default wrapping center is physical zero, not grid_center[0].
-        expected = dict(physical, metal_positions=physical["metal_positions"] - origin,
-                        metal_field_origin=-origin)
-        del expected["grid_center"]
+        expected = dict(legacy, metal_external_field=physical["metal_external_field"])
         actual, reference = _run(_wall(), physical), _run(_wall(), expected)
         for key in ("metal_site_q", "metal_potential", "electrode_coulomb_energy", "metal_external_energy"):
             torch.testing.assert_close(actual[key], reference[key], atol=3e-11, rtol=3e-11)
@@ -194,14 +200,15 @@ class TestGridCenter(unittest.TestCase):
         legacy["mu"] = torch.zeros(2, dtype=torch.float64)
         origin = torch.tensor([.125, .25, -.5], dtype=torch.float64)
         physical = dict(legacy, grid_center=_centers(legacy, origin),
-                        metal_positions=legacy["metal_positions"] + origin,
-                        metal_field_origin=legacy["metal_field_origin"] + origin)
+                        metal_positions=legacy["metal_positions"] + origin)
         solver = GridSolver(model)
         old, new = _run(solver.evaluate, legacy), _run(solver.evaluate, physical)
         for key in ("beta_F_exc", "c1", "metal_site_q", "euler_lagrange_residual"):
             torch.testing.assert_close(new[key], old[key], atol=3e-11, rtol=3e-11)
         torch.testing.assert_close(new["grid_center"], physical["grid_center"])
-        torch.testing.assert_close(new["metal_positions"], physical["metal_positions"])
+        wall = next(module for module in model.modules() if isinstance(module, MetalWall))
+        torch.testing.assert_close(wall.metal_positions, physical["metal_positions"])
+        self.assertNotIn("metal_positions", new)
         target = physical.pop("rho")
         numbers = model.voxel_volume * target.sum(0)
         for initial in (None, target.flip(0) + .05):
@@ -211,7 +218,8 @@ class TestGridCenter(unittest.TestCase):
             self.assertTrue(result["converged"])
             torch.testing.assert_close(result["rho"], target, atol=1e-9, rtol=0)
             torch.testing.assert_close(result["grid_center"], physical["grid_center"])
-            torch.testing.assert_close(result["metal_positions"], physical["metal_positions"])
+            torch.testing.assert_close(wall.metal_positions, physical["metal_positions"])
+            self.assertNotIn("metal_positions", result)
 
     def test_xyz_reader_keeps_physical_electrode_coordinates(self):
         atoms = _atoms()
@@ -221,10 +229,7 @@ class TestGridCenter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "metal.xyz"
             write(path, Atoms("XX", positions=sites), format="xyz")
-            metal = read_metal_sites(
-                path, site_groups=0, group_ids=[0],
-                total_charge=[0.], charge_units="e",
-            )
+            metal = read_metal_sites(path, total_charge=0.)
         torch.testing.assert_close(
             metal["metal_positions"], torch.tensor(sites, dtype=torch.float64),
         )

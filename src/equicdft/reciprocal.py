@@ -1,14 +1,20 @@
 """Differentiable reciprocal-space features of periodic density fields."""
 
 import math
-from typing import Optional, Sequence, Tuple, Union
+from typing import NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
 from ._component_pairs import symmetric_component_pairs
-from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
+from ._fourier_sites import FourierSites
+from ._grid import (
+    _grid_center_origin,
+    common_grid_size,
+    grid_spacing_tensor,
+    voxel_volume,
+)
 
 
 def _squared_wavevectors(grid_size, grid_spacing, device, dtype):
@@ -39,6 +45,91 @@ def _coulomb_values(squared_wavevector, exponents):
     return torch.where(
         squared_wavevector[None, ...] > 0.0, values, torch.zeros_like(values),
     )
+
+
+class _CoulombEvaluation(NamedTuple):
+    """Internal unit-amplitude Coulomb evaluation for one liquid charge field."""
+
+    long_range_potential_spectrum: torch.Tensor
+    full_potential_spectrum: torch.Tensor
+    base_energy: torch.Tensor
+    total_charge: torch.Tensor
+    grid_size: Tuple[int, int, int]
+    grid_spacing: torch.Tensor
+
+    def potential_at(
+        self,
+        positions: torch.Tensor,
+        *,
+        grid_center: Optional[torch.Tensor] = None,
+        target_sigma: float = 0.0,
+    ) -> torch.Tensor:
+        """Return the unit-amplitude full Coulomb potential at fixed sites."""
+
+        sigma = float(target_sigma)
+        if not math.isfinite(sigma) or sigma < 0.0:
+            raise ValueError("target_sigma must be finite and nonnegative")
+
+        raw_positions = torch.as_tensor(positions)
+        if (
+            raw_positions.dtype == torch.bool
+            or raw_positions.is_complex()
+            or raw_positions.requires_grad
+            or raw_positions.ndim != 2
+            or raw_positions.shape[1] != 3
+            or not torch.all(torch.isfinite(raw_positions)).item()
+        ):
+            raise ValueError(
+                "positions must be a fixed finite real [n_sites, 3] array"
+            )
+        positions = raw_positions.to(self.grid_spacing)
+
+        spectrum = self.full_potential_spectrum
+        if sigma:
+            k2 = _squared_wavevectors(
+                self.grid_size,
+                self.grid_spacing,
+                spectrum.device,
+                self.grid_spacing.dtype,
+            )
+            spectrum = spectrum * torch.exp(-0.5 * sigma ** 2 * k2)
+
+        leading = spectrum.shape[:-3]
+        n_fields = math.prod(leading) if leading else 1
+        origins = self.grid_spacing.new_zeros((n_fields, 3))
+        if grid_center is not None:
+            n_grid = math.prod(self.grid_size)
+            centers = torch.as_tensor(grid_center, device=spectrum.device)
+            if centers.shape not in ((n_grid, 3), (*leading, n_grid, 3)):
+                raise ValueError(
+                    "grid_center must have shape [n_grid, 3] or match rho batch shape"
+                )
+            indices = torch.cartesian_prod(*(
+                torch.arange(n, device=spectrum.device) for n in self.grid_size
+            ))
+            spacing = (
+                self.grid_spacing.expand(*leading, 3)
+                if leading else self.grid_spacing
+            )
+            origins = _grid_center_origin(
+                centers, indices, spacing,
+            ).reshape(n_fields, 3).to(self.grid_spacing)
+
+        spectra = spectrum.reshape(n_fields, *self.grid_size)
+        potential = [
+            FourierSites(
+                positions - origin,
+                self.grid_size,
+                self.grid_spacing,
+                self.grid_spacing.dtype,
+                spectrum.device,
+            ).sample_spectrum(field_spectrum)
+            for field_spectrum, origin in zip(spectra, origins)
+        ]
+        potential = torch.stack(potential)
+        if leading:
+            return potential.reshape(*leading, positions.shape[0])
+        return potential[0]
 
 
 class ReciprocalFeatures(nn.Module):
@@ -205,6 +296,64 @@ class ReciprocalFeatures(nn.Module):
                 multiplicity * contracted / (2.0 * volume)
             )
         return torch.stack(pair_features, dim=-1)
+
+    def _coulomb_evaluation(
+        self,
+        rho: torch.Tensor,
+        grid_size: torch.Tensor,
+        grid_spacing: torch.Tensor,
+        charges: torch.Tensor,
+    ) -> _CoulombEvaluation:
+        """Return private intermediates for one charge-factorized Coulomb kernel."""
+
+        if self.kernel != "coulomb" or self.n_kernels != 1:
+            raise ValueError(
+                "a reusable Coulomb field requires one Coulomb kernel"
+            )
+        if rho.ndim < 2 or rho.shape[-1] != self.n_types:
+            raise ValueError(
+                "rho must have shape [..., n_grid, n_types] with the "
+                "configured n_types"
+            )
+        charges = torch.as_tensor(charges, device=rho.device, dtype=rho.dtype)
+        if charges.shape != (self.n_types,):
+            raise ValueError("charges must contain one value per density component")
+
+        shape = common_grid_size(grid_size, rho.shape[:-2])
+        if math.prod(shape) != rho.shape[-2]:
+            raise ValueError("grid_size product does not match rho n_grid")
+        spacing = self._spacing(grid_spacing, rho)
+        volume_element = voxel_volume(spacing)
+        volume = volume_element * float(math.prod(shape))
+
+        charge_density = torch.sum(rho * charges, dim=-1)
+        q_liquid = volume_element * charge_density
+        charge_spectrum = torch.fft.fftn(
+            q_liquid.reshape(*rho.shape[:-2], *shape),
+            dim=(-3, -2, -1),
+        )
+        kernel = self._kernel_values(
+            grid_size=shape,
+            grid_spacing=spacing,
+            device=rho.device,
+            dtype=rho.dtype,
+        )[0]
+        k2 = _squared_wavevectors(shape, spacing, rho.device, rho.dtype)
+        full_kernel = _coulomb_values(k2, k2.new_zeros(1))[0]
+        long_potential = charge_spectrum * kernel
+        full_potential = charge_spectrum * full_kernel
+        base_energy = 0.5 * torch.sum(
+            torch.real(torch.conj(charge_spectrum) * long_potential),
+            dim=(-3, -2, -1),
+        ) / volume
+        return _CoulombEvaluation(
+            long_range_potential_spectrum=long_potential,
+            full_potential_spectrum=full_potential,
+            base_energy=base_energy,
+            total_charge=q_liquid.sum(dim=-1),
+            grid_size=shape,
+            grid_spacing=spacing,
+        )
 
     def _kernel_values(
         self,

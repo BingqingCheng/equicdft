@@ -1,11 +1,11 @@
-"""Finite-Fourier sampling at fixed sites independent of the liquid grid."""
+"""Finite-Fourier sampling at arbitrary sites."""
 
 import math
 
 import torch
 
 
-class ExplicitSiteGrid:
+class FourierSites:
     """Reuse shifted FFTs for sites sharing a fractional grid offset.
 
     Coordinates are fixed, double-precision geometry relative to grid zero.
@@ -77,7 +77,14 @@ class ExplicitSiteGrid:
     def potential(self, charge, kernel):
         """Liquid voxel charges -> potential conjugate to metal site charges."""
         spectrum = torch.fft.fftn(charge.reshape(self.shape))*kernel
-        result = charge.new_zeros(self.n_sites)
+        return self.sample_spectrum(spectrum)
+
+    def sample_spectrum(self, spectrum):
+        """Evaluate an existing potential spectrum at the explicit sites."""
+
+        if spectrum.shape != self.shape:
+            raise ValueError("spectrum shape must match the electrostatic grid")
+        result = spectrum.real.new_zeros(self.n_sites)
         for group, phase in zip(self.groups, self.phases):
             values = torch.fft.ifftn(spectrum*phase).real.reshape(-1)/self.voxel_volume
             result = result.index_copy(0, group[0], values[group[2]])

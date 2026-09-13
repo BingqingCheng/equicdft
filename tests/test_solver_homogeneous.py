@@ -6,7 +6,8 @@ import torch
 from metal_helpers import _run
 from torch import nn
 
-from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall, MetalElectrodeReadout
+from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
+from metal_helpers import liquid_coulomb
 from equicdft._solver_symmetry import _HomogeneousDensityProjection
 
 
@@ -222,18 +223,17 @@ class TestHomogeneousSolver(unittest.TestCase):
         d["metal_group_ids"] = torch.tensor([0])
         d["metal_total_charge"] = torch.tensor([0.])
         d["metal_external_field"] = torch.tensor([0., 0., -.1])
-        d["metal_field_origin"] = torch.tensor([0., 0., 0.])
         d["metal_charge_units"] = "e"
         wall = MetalWall(
                          metal_sites={key: d[key] for key in (
                              "metal_positions", "metal_site_groups", "metal_group_ids",
                              "metal_total_charge", "metal_charge_units",
                          )},
-                         liquid_charges=[1., -1.], metal_sigma=.4, liquid_sigma=0.,
-                         coulomb_amplitude=.02, boundary="periodic").double()
+                         liquid_coulomb=liquid_coulomb(amplitude=.02),
+                         metal_sigma=.4).double()
         model = GridCACEModel(a_features=None, b_features=None,
             readout=[LDAReadout(mean_density=1., n_types=2, hidden_sizes=(), zero_init=True),
-                     MetalElectrodeReadout(wall)],
+                     wall],
             grid_spacing=.5, mean_temperature=1., boltzmann_constant=1., free_energy_mode="beta").double()
         solver = GridSolver(model)
         r = _run(solver.solve, d, particle_numbers=[2., 2.], method="minimize", homogeneous_axes=(0, 1),

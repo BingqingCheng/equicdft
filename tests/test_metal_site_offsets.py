@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from equicdft._metal_sites import ExplicitSiteGrid
+from equicdft._fourier_sites import FourierSites
 
 
 SHAPE = (4, 3, 2)
@@ -14,7 +14,7 @@ TOLERANCE = 32 * torch.finfo(torch.float64).eps * max(SHAPE)
 
 def _sampling(scaled_positions, dtype=torch.float64):
     positions = scaled_positions * SPACING
-    return ExplicitSiteGrid(positions, SHAPE, SPACING, dtype, torch.device("cpu"))
+    return FourierSites(positions, SHAPE, SPACING, dtype, torch.device("cpu"))
 
 
 class TestMetalSiteOffsets(unittest.TestCase):
@@ -24,7 +24,7 @@ class TestMetalSiteOffsets(unittest.TestCase):
         scaled[1, 0] += TOLERANCE / 4
         positions = scaled * SPACING
         before = positions.clone()
-        sampling = ExplicitSiteGrid(positions, SHAPE, SPACING, torch.float64,
+        sampling = FourierSites(positions, SHAPE, SPACING, torch.float64,
                                     torch.device("cpu"))
 
         self.assertEqual(len(sampling.groups), 1)

@@ -41,21 +41,43 @@ def _atoms():
 
 
 class TestMetalSitesData(unittest.TestCase):
-    def test_plain_xyz_requires_explicit_labels_and_constraints(self):
+    def test_plain_xyz_infers_one_group_from_scalar_total_charge(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sites.xyz"
             write(path, Atoms("XX", positions=[[1., 2., 3.], [4., 5., 6.]]))
             with self.assertRaises((TypeError, ValueError)):
                 read_metal_sites(path)
             result = read_metal_sites(
-                path, origin=(.125, .25, .5), site_groups=7,
-                group_ids=7, total_charge=0., charge_units="e",
+                path, origin=(.125, .25, .5), total_charge=0.,
             )
-        self.assertEqual(result["metal_site_groups"].tolist(), [7, 7])
+        self.assertEqual(result["metal_site_groups"].tolist(), [0, 0])
+        self.assertEqual(result["metal_group_ids"].tolist(), [0])
+        self.assertEqual(result["metal_total_charge"].tolist(), [0.])
+        self.assertEqual(result["metal_charge_units"], "e")
         torch.testing.assert_close(
             result["metal_positions"],
             torch.tensor([[.875, 1.75, 2.5], [3.875, 4.75, 5.5]], dtype=torch.float64),
         )
+
+    def test_group_ids_are_inferred_from_site_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sites.xyz"
+            write(path, Atoms("XXX", positions=np.zeros((3, 3))))
+            result = read_metal_sites(
+                path,
+                site_groups=[7, 2, 7],
+                total_charge=[-.3, .3],
+            )
+        self.assertEqual(result["metal_site_groups"].tolist(), [7, 2, 7])
+        self.assertEqual(result["metal_group_ids"].tolist(), [2, 7])
+        self.assertEqual(result["metal_total_charge"].tolist(), [-.3, .3])
+
+    def test_multiple_groups_require_site_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sites.xyz"
+            write(path, Atoms("XX", positions=np.zeros((2, 3))))
+            with self.assertRaisesRegex(ValueError, "site_groups"):
+                read_metal_sites(path, total_charge=[-.3, .3])
 
     def test_extxyz_uses_declared_metadata_without_reordering(self):
         atoms = Atoms("XX", positions=_metadata()["metal_positions"])

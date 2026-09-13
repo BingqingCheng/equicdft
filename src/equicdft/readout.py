@@ -1,6 +1,6 @@
-"""Local readout for invariant grid features."""
+"""Energy readouts for grid features."""
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -13,6 +13,15 @@ from ._component_pairs import symmetric_component_pairs
 from ._nn import build_mlp
 from .energy import EnergyReadout, density_weighted_integral
 from .reciprocal import ReciprocalFeatures
+
+
+class _LiquidCoulombResult(NamedTuple):
+    """Coulomb quantities needed to couple a liquid to external charges."""
+
+    energy: torch.Tensor
+    potential: torch.Tensor
+    amplitude: torch.Tensor
+    total_charge: torch.Tensor
 
 
 class LocalReadout(EnergyReadout):
@@ -303,22 +312,92 @@ class LongRangeReadout(EnergyReadout):
                 self.n_type_pairs,
             )
 
-        amplitude = getattr(self, "coulomb_amplitude", None)
-        if amplitude is None:
-            amplitude = self.mlp(state_features).reshape(
-                *state_features.shape[:-1],
-                1,
-                1,
-            )
-        else:
-            amplitude = amplitude.to(state_features).expand(
-                *state_features.shape[:-1],
-                1,
-                1,
-            )
+        amplitude = self.amplitude(state_features)[..., None, None]
         return amplitude * self.pair_charge_products.to(state_features).view(
             1,
             self.n_type_pairs,
+        )
+
+    def amplitude(self, state_features: torch.Tensor) -> torch.Tensor:
+        """Return the shared scalar in charge-factorized mode."""
+
+        if getattr(self, "charges", None) is None:
+            raise ValueError("a scalar amplitude requires fixed component charges")
+        if state_features.shape[-1] != self.n_state_features:
+            raise ValueError(
+                "state_features must end with normalized temperature and "
+                "one mean density per type"
+            )
+        amplitude = getattr(self, "coulomb_amplitude", None)
+        if amplitude is None:
+            return self.mlp(state_features).reshape(*state_features.shape[:-1])
+        target_shape = state_features.shape[:-1]
+        if not target_shape:
+            return amplitude.to(state_features)
+        return amplitude.to(state_features).expand(*target_shape)
+
+    @property
+    def provides_coulomb_potential(self) -> bool:
+        """Whether this readout can evaluate its Coulomb potential in space."""
+
+        features = getattr(self, "features", None)
+        return (
+            getattr(self, "charges", None) is not None
+            and features is not None
+            and features.kernel == "coulomb"
+            and self.n_kernels == 1
+        )
+
+    def _coulomb_state(
+        self,
+        context: Dict[str, torch.Tensor],
+    ):
+        """Return the unit-amplitude Coulomb state and configured amplitude."""
+
+        if not self.provides_coulomb_potential:
+            raise ValueError(
+                "a reusable Coulomb potential requires fixed charges and one "
+                "Coulomb kernel"
+            )
+        if "grid_size" not in context:
+            raise KeyError("long-range evaluation requires data['grid_size']")
+        state = self.features._coulomb_evaluation(
+            rho=context["rho"],
+            grid_size=context["grid_size"],
+            grid_spacing=context["grid_spacing"],
+            charges=self.charges,
+        )
+        amplitude = self.amplitude(context["state_features"])
+        expected_shape = context["rho"].shape[:-2]
+        if state.base_energy.shape != expected_shape or amplitude.shape != expected_shape:
+            raise ValueError("LongRangeReadout must return one scalar per field")
+        return state, amplitude
+
+    def coulomb_at(
+        self,
+        context: Dict[str, torch.Tensor],
+        positions: torch.Tensor,
+        target_sigma: float = 0.0,
+    ) -> _LiquidCoulombResult:
+        """Evaluate the liquid Coulomb state at physical positions.
+
+        The potential includes the configured amplitude and the sum of the
+        damped long-range kernel and its full-Coulomb complement.
+        ``target_sigma`` is the Gaussian width of the sampling sites; zero
+        evaluates point sites.
+        """
+
+        state, amplitude = self._coulomb_state(context)
+        potential = state.potential_at(
+            positions,
+            grid_center=context.get("grid_center"),
+            target_sigma=target_sigma,
+        )
+        return _LiquidCoulombResult(
+            energy=amplitude * state.base_energy,
+            potential=amplitude[..., None] * potential,
+            amplitude=amplitude,
+            total_charge=state.total_charge,
         )
 
     def forward(

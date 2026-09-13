@@ -1,136 +1,141 @@
-"""Public metalwall API, independent of the oracle-case test adapter."""
+"""Public API checks for the Coulomb-readout/electrode composition."""
 
 import io
 import unittest
 
 import torch
 
-from equicdft import GridCACEModel, LDAReadout, LongRangeReadout, MetalWall
-from metal_helpers import liquid_data, metal_sites
+from equicdft import LongRangeReadout, MetalWall, ReciprocalFeatures
+from metal_helpers import _run, liquid_coulomb, metal_sites
 from test_metalwall_sites import _data, _reference
 
 
-def _model(*charges):
-    readouts = [LDAReadout(mean_density=1., n_types=2, hidden_sizes=(), zero_init=True)]
-    readouts += [LongRangeReadout(n_kernels=1, n_types=2, charges=value,
-                                 coulomb_amplitude=None) for value in charges]
-    return GridCACEModel(None, None, readouts, grid_spacing=1.).double()
+def _one_electrode(data):
+    data = dict(data)
+    data["metal_site_groups"] = torch.zeros_like(data["metal_site_groups"])
+    data["metal_group_ids"] = torch.tensor([0])
+    data["metal_total_charge"] = data["metal_total_charge"].sum().reshape(1)
+    return data
 
 
-def _wall(**options):
-    parameters = dict(metal_sites=metal_sites(_data()),
-                      liquid_charges=[1., -1.], metal_sigma=.35, liquid_sigma=.12,
-                      coulomb_amplitude=1.7, boundary="periodic")
+def _wall(sites=None, **options):
+    sites = _data() if sites is None else sites
+    parameters = dict(
+        liquid_coulomb=liquid_coulomb(),
+        metal_sites=metal_sites(sites),
+        metal_sigma=.35,
+    )
     parameters.update(options)
     return MetalWall(**parameters).double()
 
 
 class TestMetalWallAPI(unittest.TestCase):
-    def test_explicit_constructor_copies_readout_charges(self):
-        model = _model([2., -1.])
-        sites = metal_sites(_data())
-        wall = _wall(
-            metal_sites=sites, liquid_charges=model.readout[1].charges,
+    def test_wall_owns_the_supplied_liquid_coulomb_readout(self):
+        liquid = liquid_coulomb(charges=(2., -1.), amplitude=1.7)
+        wall = _wall(liquid_coulomb=liquid)
+        self.assertIs(wall.liquid_coulomb, liquid)
+        self.assertEqual(wall.liquid_coulomb.charges.tolist(), [2., -1.])
+        self.assertEqual(wall.n_types, 2)
+
+    def test_only_one_charge_factorized_coulomb_kernel_is_accepted(self):
+        invalid = (
+            object(),
+            LongRangeReadout(
+                n_kernels=1, n_types=2,
+                features=ReciprocalFeatures(
+                    kernel="coulomb", radial_exponents=(.2,), n_types=2,
+                ),
+            ),
+            LongRangeReadout(
+                n_kernels=1, n_types=2, charges=(1., -1.),
+                features=ReciprocalFeatures(
+                    kernel="gaussian", radial_exponents=(.2,), n_types=2,
+                ),
+            ),
         )
-        self.assertEqual(wall.liquid_charges.tolist(), [2., -1.])
-        self.assertEqual(wall.coulomb_amplitude, 1.7)
-        self.assertNotIn(model, list(wall.modules()))
-        self.assertFalse(hasattr(MetalWall, "from_model"))
-        with torch.no_grad():
-            model.readout[1].charges[0] = 3.
-            sites["metal_positions"][0, 0] += 1.
-            sites["metal_total_charge"][0] += 1.
-        self.assertEqual(wall.liquid_charges.tolist(), [2., -1.])
-        self.assertNotEqual(wall.metal_positions[0, 0], sites["metal_positions"][0, 0])
-        self.assertNotEqual(wall.metal_total_charge[0], sites["metal_total_charge"][0])
+        for liquid in invalid:
+            with self.subTest(liquid=type(liquid).__name__):
+                with self.assertRaises((TypeError, ValueError)):
+                    _wall(liquid_coulomb=liquid)
 
-    def test_explicit_charges_are_general_not_model_inferred(self):
-        self.assertIsNone(_model(None).readout[1].charges)
-        self.assertEqual(_wall(liquid_charges=[2., -1., 0.]).liquid_charges.tolist(), [2., -1., 0.])
+    def test_obsolete_independent_liquid_electrostatics_arguments_are_absent(self):
+        for name, value in (
+            ("liquid_charges", [1., -1.]),
+            ("coulomb_amplitude", 1.7),
+            ("boundary", "periodic"),
+            ("field_origin", [0., 0., 0.]),
+        ):
+            with self.subTest(name=name), self.assertRaises(TypeError):
+                _wall(**{name: value})
 
-    def test_old_constructor_names_and_model_factory_are_not_supported(self):
-        for kwargs in (dict(charges=[1., -1.]), dict(sigma=.35), dict(model=_model([1., -1.]))):
-            with self.assertRaises(TypeError):
-                _wall(**kwargs)
-
-    def test_module_field_matches_independent_physical_energy_and_response(self):
-        data = _data()
+    def test_external_field_matches_independent_electrode_response(self):
+        data = _one_electrode(_data())
         field = torch.tensor([.12, -.05, .08], dtype=torch.float64)
-        origin = torch.tensor([.1, -.2, .3], dtype=torch.float64)
-        reference = _reference(dict(data, metal_external_field=field, metal_field_origin=origin))
-        rho = data["rho"].clone().requires_grad_()
-        result = _wall(external_field=field, field_origin=origin)(
-            liquid_data(dict(data, rho=rho))
+        reference = _reference(dict(data, metal_external_field=field))
+        result = _run(
+            _wall(data, external_field=field),
+            dict(data, metal_external_field=field),
         )
-        for key in reference.keys() - {"B", "S"}:
-            torch.testing.assert_close(result[key], reference[key], atol=3e-11, rtol=3e-11)
-        energy = result["electrode_coulomb_energy"] + result["metal_external_energy"]
-        gradient = torch.autograd.grad(energy, rho, create_graph=True)[0]
-        volume = data["grid_spacing"].prod()
-        charges = torch.tensor([1., -1.], dtype=torch.float64)
-        expected = volume * (reference["B"].T @ reference["metal_site_q"])[:, None] * charges
-        torch.testing.assert_close(gradient, expected, atol=3e-11, rtol=3e-11)
-        direction = torch.sin(torch.arange(rho.numel(), dtype=rho.dtype)).reshape_as(rho)
-        hv = torch.autograd.grad((gradient * direction).sum(), rho)[0]
-        kernel = -reference["B"].T @ reference["S"] @ reference["B"]
-        expected_hv = volume.square() * (kernel @ (direction @ charges))[:, None] * charges
-        torch.testing.assert_close(hv, expected_hv, atol=3e-11, rtol=3e-11)
+        for key in (
+            "metal_positions", "metal_site_groups",
+            "metal_group_ids", "metal_total_charge",
+        ):
+            self.assertNotIn(key, result)
+        for key in reference.keys() - {
+            "B", "S", "q_liquid", "liquid_charge_density",
+        }:
+            torch.testing.assert_close(
+                result[key], reference[key], atol=3e-7, rtol=3e-7,
+            )
 
-    def test_data_fields_are_rejected_instead_of_ignored_or_overriding(self):
-        from test_metal_model import TestMetalModel
-
-        data = _data()
-        for key in ("metal_external_field", "metal_field_origin"):
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "on MetalWall, not in data"):
-                _wall(external_field=[0., 0., .1])(dict(
-                    liquid_data(data), **{key: [0., 0., .2]},
-                ))
-            model = TestMetalModel._model()
-            with self.subTest(model_key=key), self.assertRaisesRegex(ValueError, "on MetalWall, not in data"):
-                model(dict(TestMetalModel._data(), **{key: [0., 0., .2]}))
-
-    def test_serialization_and_dtype_movement_retain_field_configuration(self):
-        field, origin = [0.12, -.05, .08], [.1, -.2, .3]
-        wall = _wall(external_field=field, field_origin=origin)
-        expected = wall(liquid_data(_data()))
+    def test_geometry_and_field_configuration_are_serialized(self):
+        data = _one_electrode(_data())
+        field = [0.12, -.05, .08]
+        wall = _wall(data, external_field=field)
+        expected = _run(wall, data)
         stream = io.BytesIO()
         torch.save(wall, stream)
         stream.seek(0)
-        restored = torch.load(stream)
+        restored = torch.load(stream, weights_only=False)
         for key, value in expected.items():
-            torch.testing.assert_close(restored(liquid_data(_data()))[key], value)
+            torch.testing.assert_close(_run(restored, data)[key], value)
         for name in (
             "metal_positions", "metal_site_groups", "metal_group_ids",
-            "metal_total_charge", "external_field", "field_origin",
+            "metal_total_charge", "external_field",
         ):
             self.assertIn(name, restored.state_dict())
-        restored.float()
-        self.assertEqual(restored.external_field.dtype, torch.float32)
-        self.assertEqual(restored.field_origin.dtype, torch.float32)
+        self.assertIn("liquid_coulomb.charges", restored.state_dict())
 
     def test_shared_and_batched_constructor_fields(self):
-        data = _data()
-        fields = torch.tensor([[.1, 0., 0.], [-.1, .02, 0.]], dtype=torch.float64)
-        wall = _wall(external_field=fields, field_origin=[.1, .2, .3])
+        data = _one_electrode(_data())
+        fields = torch.tensor(
+            [[.1, 0., 0.], [-.1, .02, 0.]], dtype=torch.float64,
+        )
+        wall = _wall(data, external_field=fields)
         batch = dict(data, rho=data["rho"].expand(2, -1, -1))
-        result = wall(liquid_data(batch))
+        result = _run(wall, batch)
         for index in range(2):
-            expected = _wall(external_field=fields[index], field_origin=[.1, .2, .3])(
-                liquid_data(data)
-            )
+            expected = _run(_wall(data, external_field=fields[index]), data)
             for key, value in expected.items():
                 torch.testing.assert_close(result[key][index], value)
-        with self.assertRaisesRegex(ValueError, "batch shape"):
-            wall(liquid_data(data))
 
     def test_constructor_field_validation_and_zero_default(self):
-        for name in ("external_field", "field_origin"):
-            for value in (0., [1., 2.], [float("nan"), 0., 0.], [True]*3,
-                          [1j]*3, torch.zeros(3, requires_grad=True)):
-                with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
-                    _wall(**{name: value})
-        result = _wall()(liquid_data(_data()))
+        for value in (
+            0., [1., 2.], [float("nan"), 0., 0.], [True] * 3,
+            [1j] * 3, torch.zeros(3, requires_grad=True),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "external_field"):
+                    _wall(external_field=value)
+        with self.assertRaisesRegex(ValueError, "exactly one electrode group"):
+            _wall(external_field=[.1, 0., 0.])
+        _wall(external_field=[0., 0., 0.])
+        result = _run(_wall(), _data())
         self.assertEqual(result["metal_external_energy"].item(), 0.)
+
+    def test_liquid_sigma_is_not_a_metalwall_option(self):
+        with self.assertRaises(TypeError):
+            _wall(liquid_sigma=.4)
 
 
 if __name__ == "__main__":

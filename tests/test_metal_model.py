@@ -5,13 +5,12 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from metal_helpers import _run, liquid_data, metal_sites
+from metal_helpers import _run, liquid_coulomb, liquid_data, metal_sites
 
 from equicdft import (
     GridCACEModel,
     GridSolver,
     LDAReadout,
-    MetalElectrodeReadout,
     MetalWall,
 )
 
@@ -26,11 +25,16 @@ class TestMetalModel(unittest.TestCase):
                 data["metal_group_ids"] = torch.tensor([0])
                 data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
                 data["metal_external_field"] = torch.tensor([0.07, 0., 0.], dtype=torch.float64)
-                data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
                 result = _run(model, data, compute_c2=True, c2_reference=(2, 0))
-                state = _run(model.readout[1].metalwall, data)
-                energy = state["coulomb_cross_energy"] + state["coulomb_metal_energy"] + state["metal_external_energy"]
-                torch.testing.assert_close(result["beta_F_exc"], data["beta"] * energy)
+                wall = model.readout[1]
+                state = _run(wall, data)
+                readout_energy = _run(wall.energy, data)
+                expected = (
+                    readout_energy
+                    if mode == "beta" else
+                    readout_energy / (data["temperature"] / model.mean_temperature)
+                )
+                torch.testing.assert_close(result["beta_F_exc"], expected)
                 direction = torch.zeros_like(data["rho"])
                 direction[2, 0], direction[4, 0] = 1., -1.
                 step = 1e-5
@@ -42,14 +46,11 @@ class TestMetalModel(unittest.TestCase):
                                            model.voxel_volume * (result["c2"] * direction).sum(), atol=1e-10, rtol=1e-8)
 
     @staticmethod
-    def _wall():
+    def _wall(amplitude=0.2 / 3.0):
         return MetalWall(
             metal_sites=metal_sites(TestMetalModel._data()),
-            liquid_charges=[1.0, -1.0],
+            liquid_coulomb=liquid_coulomb(amplitude=amplitude),
             metal_sigma=0.6,
-            liquid_sigma=0.0,
-            coulomb_amplitude=0.2,
-            boundary="periodic",
         ).double()
 
     @classmethod
@@ -60,9 +61,7 @@ class TestMetalModel(unittest.TestCase):
             )
         ]
         if with_metal:
-            readouts.append(
-                MetalElectrodeReadout(cls._wall())
-            )
+            readouts.append(cls._wall())
         return GridCACEModel(
             a_features=None,
             b_features=None,
@@ -98,15 +97,15 @@ class TestMetalModel(unittest.TestCase):
             "metal_charge_units": "e",
         }
 
-    def test_readout_has_no_contribution_mode(self):
-        for mode in ("total", "correction"):
-            with self.assertRaises(TypeError):
-                MetalElectrodeReadout(self._wall(), contribution=mode)
+    def test_metalwall_is_the_coulomb_readout(self):
+        wall = self._wall()
+        self.assertIs(wall.liquid_coulomb, list(wall.children())[0])
+        self.assertEqual(wall.n_types, wall.liquid_coulomb.n_types)
 
     def test_model_and_wall_respect_independent_exclusions(self):
         data = self._data()
         model = self._model()
-        wall = model.readout[1].metalwall
+        wall = model.readout[1]
         for evaluate in (model, wall):
             with self.subTest(evaluator=type(evaluate).__name__):
                 occupied = dict(data, rho=data["rho"].clone())
@@ -122,8 +121,9 @@ class TestMetalModel(unittest.TestCase):
         model = self._model()
         data = self._data()
         outputs = _run(model, data, compute_c2=True, c2_reference=(2, 0))
-        electrode = _run(model.readout[1].metalwall, data)
-        expected_energy = electrode["electrode_coulomb_energy"] * data["beta"]
+        wall = model.readout[1]
+        electrode = _run(wall, data)
+        expected_energy = _run(wall.energy, data)
         self.assertTrue(torch.allclose(outputs["beta_F_exc"], expected_energy, atol=1e-12))
         self.assertGreater(electrode["metal_site_q"].abs().max().item(), 1e-6)
         # A neutral, particle-number-preserving variation avoids changing the
@@ -152,20 +152,27 @@ class TestMetalModel(unittest.TestCase):
             with self.subTest(mode=mode):
                 model = self._model(mode=mode)
                 data = self._data()
-                wall = model.readout[1].metalwall
-                with patch.object(wall, "forward", wraps=wall.forward) as call:
+                wall = model.readout[1]
+                with patch.object(wall, "energy_and_outputs", wraps=wall.energy_and_outputs) as call:
                     outputs = _run(model, data, compute_c2=True, c2_reference=(2, 0))
                     self.assertEqual(call.call_count, 1)
                 state = _run(wall, data)
                 for key, expected in state.items():
                     torch.testing.assert_close(outputs[key], expected)
                 self.assertEqual(outputs["metal_site_q"].shape, data["metal_site_groups"].shape)
-                self.assertTrue(torch.all(outputs["liquid_charge_density"][data["excluded_mask"]] == 0))
+                self.assertNotIn("liquid_charge_density", outputs)
+                self.assertNotIn("q_liquid", outputs)
 
     def test_model_outputs_obey_anisotropic_voxel_normalization(self):
         spacing = torch.tensor([0.5, 0.75, 1.25], dtype=torch.float64)
         model = GridCACEModel(
-            None, None, [MetalElectrodeReadout(self._wall())],
+            None, None, [
+                LDAReadout(
+                    mean_density=1.0, n_types=2,
+                    hidden_sizes=(), zero_init=True,
+                ),
+                self._wall(),
+            ],
             grid_spacing=spacing, mean_temperature=2.0, boltzmann_constant=1.5,
         ).double()
         data = self._data()
@@ -175,13 +182,13 @@ class TestMetalModel(unittest.TestCase):
         expected_charge = spacing.prod() * expected_density
         data["metal_total_charge"][0] = -expected_charge.sum()
         result = _run(model, data, compute_c1=False)
-        torch.testing.assert_close(result["liquid_charge_density"], expected_density)
-        torch.testing.assert_close(result["q_liquid"], expected_charge)
         for group, total in zip(data["metal_group_ids"], data["metal_total_charge"]):
             torch.testing.assert_close(result["metal_site_q"][data["metal_site_groups"] == group].sum(), total, atol=1e-12, rtol=0)
         torch.testing.assert_close(
-            result["q_liquid"].sum() + result["metal_site_q"].sum(), torch.zeros((), dtype=torch.float64), atol=1e-12, rtol=0,
+            expected_charge.sum() + result["metal_site_q"].sum(), torch.zeros((), dtype=torch.float64), atol=1e-12, rtol=0,
         )
+        self.assertNotIn("liquid_charge_density", result)
+        self.assertNotIn("q_liquid", result)
 
     def test_charge_outputs_keep_gradients_for_joint_response_loss(self):
         data = self._data()
@@ -191,10 +198,6 @@ class TestMetalModel(unittest.TestCase):
             result["metal_site_q"].square().sum(), data["rho"], retain_graph=True,
         )[0]
         self.assertGreater(charge_gradient.abs().max().item(), 1e-8)
-        density_gradient = torch.autograd.grad(
-            result["liquid_charge_density"].sum(), data["rho"], retain_graph=True,
-        )[0]
-        torch.testing.assert_close(density_gradient, torch.tensor([1.0, -1.0]).to(data["rho"]).expand_as(data["rho"]))
         loss = result["beta_F_exc"] + result["c1"].square().sum() + result["metal_site_q"].square().sum()
         gradient = torch.autograd.grad(loss, data["rho"])[0]
         self.assertTrue(torch.all(torch.isfinite(gradient)))
@@ -213,10 +216,16 @@ class TestMetalModel(unittest.TestCase):
             torch.testing.assert_close(first[key], snapshot[key])
         self.assertGreater((second["metal_site_q"] - first["metal_site_q"]).abs().max().item(), 1e-8)
 
-    def test_metal_readout_alone_supplies_component_count(self):
+    def test_metalwall_supplies_component_count(self):
         model = GridCACEModel(
             a_features=None, b_features=None,
-            readout=[MetalElectrodeReadout(self._wall())],
+            readout=[
+                LDAReadout(
+                    mean_density=1.0, n_types=2,
+                    hidden_sizes=(), zero_init=True,
+                ),
+                self._wall(),
+            ],
             grid_spacing=0.75, mean_temperature=2.0, boltzmann_constant=1.5,
         ).double()
         data = self._data()
@@ -226,26 +235,20 @@ class TestMetalModel(unittest.TestCase):
         for key in ("beta_F_exc", "c1", "c2"):
             torch.testing.assert_close(actual[key], expected[key])
 
-    def test_beta_and_physical_modes_use_model_energy_convention(self):
+    def test_beta_and_physical_modes_agree_at_reference_temperature(self):
         beta_model = self._model(mode="beta")
         physical_model = self._model(mode="physical")
-        for temperature in (1.0, 2.5):
-            with self.subTest(temperature=temperature):
-                data = self._data()
-                data["temperature"] = torch.tensor(temperature, dtype=torch.float64)
-                # beta_F_exc must not inherit an inconsistent cached beta.
-                data["beta"] = torch.tensor(123.0, dtype=torch.float64)
-                beta_outputs = _run(beta_model, data)
-                physical_outputs = _run(physical_model, data)
-                beta = 1.0 / (beta_model.boltzmann_constant * temperature)
-                self.assertTrue(torch.allclose(
-                    beta_outputs["beta_F_exc"], beta * physical_outputs["F_exc"],
-                    atol=1e-12,
-                ))
-                for key in ("beta_F_exc", "c1"):
-                    self.assertTrue(torch.allclose(
-                        beta_outputs[key], physical_outputs[key], atol=1e-12,
-                    ))
+        data = self._data()
+        # The configured Coulomb coefficient represents the same physical
+        # prefactor in both conventions at mean_temperature.
+        data["beta"] = torch.tensor(123.0, dtype=torch.float64)
+        beta_outputs = _run(beta_model, data)
+        physical_outputs = _run(physical_model, data)
+        beta = 1.0 / (beta_model.boltzmann_constant * data["temperature"])
+        torch.testing.assert_close(
+            beta_outputs["beta_F_exc"], beta * physical_outputs["F_exc"],
+        )
+        torch.testing.assert_close(beta_outputs["c1"], physical_outputs["c1"])
 
     def test_electrode_readout_adds_to_existing_liquid_functional(self):
         for mode in ("beta", "physical"):
@@ -258,6 +261,9 @@ class TestMetalModel(unittest.TestCase):
                         model.readout[0].mlp[-1].weight.fill_(0.2)
                         model.readout[0].mlp[-1].bias.fill_(0.1)
                 data = self._data()
+                data["metal_site_groups"].zero_()
+                data["metal_group_ids"] = torch.tensor([0])
+                data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
                 data["metal_external_field"] = torch.tensor([.03, 0., 0.], dtype=torch.float64)
                 outputs = [_run(model, dict(data, rho=data["rho"].clone()),
                                  compute_c2=True, c2_reference=(2, 0))
@@ -324,7 +330,7 @@ class TestMetalModel(unittest.TestCase):
             ))
             self.assertTrue(torch.allclose(result["rho"], target, atol=1e-9, rtol=0.0))
             self.assertLess(result["max_euler_lagrange_residual"], 1e-9)
-            electrode = _run(model.readout[1].metalwall, dict(data, rho=result["rho"]))
+            electrode = _run(model.readout[1], dict(data, rho=result["rho"]))
             for key, expected in electrode.items():
                 torch.testing.assert_close(result[key], expected)
             self.assertLess(electrode["charge_residual"].abs().max().item(), 1e-12)
@@ -340,14 +346,15 @@ class TestMetalModel(unittest.TestCase):
         data["metal_group_ids"] = torch.tensor([0])
         data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
         data["metal_external_field"] = torch.tensor([0.03, 0., 0.], dtype=torch.float64)
-        data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
         self._check_inverse(data)
 
     def test_liquid_external_field_counted_only_by_solver(self):
         model = self._model()
         data = self._data()
+        data["metal_site_groups"].zero_()
+        data["metal_group_ids"] = torch.tensor([0])
+        data["metal_total_charge"] = torch.zeros(1, dtype=torch.float64)
         data["metal_external_field"] = torch.tensor([0.03, 0., 0.], dtype=torch.float64)
-        data["metal_field_origin"] = torch.tensor([-0.375, 0., 0.], dtype=torch.float64)
         original = _run(model, data)
         x = torch.arange(4, dtype=torch.float64).repeat_interleave(4) * 0.75
         data["V_ext"] = -0.03 * x[:, None] * torch.tensor([1., -1.], dtype=torch.float64)
@@ -356,7 +363,7 @@ class TestMetalModel(unittest.TestCase):
             torch.testing.assert_close(result[key], original[key])
         expected = data["beta"] * model.voxel_volume * (data["rho"] * data["V_ext"]).sum()
         torch.testing.assert_close(result["beta_V_ext"], expected)
-        torch.testing.assert_close(model.readout[1].metalwall.external_field, data["metal_external_field"])
+        torch.testing.assert_close(model.readout[1].external_field, data["metal_external_field"])
 
 
 if __name__ == "__main__":

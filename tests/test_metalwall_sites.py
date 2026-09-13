@@ -6,7 +6,7 @@ import math
 import unittest
 
 import torch
-from metal_helpers import _run, metal_sites
+from metal_helpers import _run, liquid_coulomb, metal_sites
 
 from equicdft import GridSolver, MetalWall
 
@@ -16,9 +16,9 @@ DTYPE = torch.float64
 
 def _wall(charges=(1., -1.), sites=None):
     return MetalWall(metal_sites=metal_sites(_data()) if sites is None else sites,
-                     liquid_charges=charges,
-                     metal_sigma=.35, liquid_sigma=.12,
-                     coulomb_amplitude=1.7, boundary="periodic").double()
+                     liquid_coulomb=liquid_coulomb(charges, 1.7),
+                     metal_sigma=.35,
+                     ).double()
 
 
 def _data(shape=(3, 3, 3), spacing=(.7, .9, 1.1)):
@@ -35,8 +35,32 @@ def _data(shape=(3, 3, 3), spacing=(.7, .9, 1.1)):
                 metal_charge_units="e")
 
 
-def _reference(data, charges=(1., -1.), sigma=.35, liquid_sigma=.12,
-               coulomb_amplitude=1.7):
+def _one_electrode(data):
+    data = dict(data)
+    data["metal_site_groups"] = torch.zeros_like(data["metal_site_groups"])
+    data["metal_group_ids"] = torch.tensor([0])
+    data["metal_total_charge"] = data["metal_total_charge"].sum().reshape(1)
+    return data
+
+
+def _field_coordinates(sites, cell):
+    """Independent compact periodic branch used by the test oracle."""
+    wrapped = torch.remainder(sites, cell)
+    coordinates = torch.empty_like(wrapped)
+    for axis in range(3):
+        values = torch.sort(wrapped[:, axis]).values
+        gaps = torch.cat((values[1:] - values[:-1],
+                          values[:1] + cell[axis] - values[-1:]))
+        cut = values[torch.argmax(gaps)] + 0.5 * gaps.max()
+        center = torch.remainder(cut + 0.5 * cell[axis], cell[axis])
+        displacement = wrapped[:, axis] - center
+        coordinates[:, axis] = displacement - cell[axis] * torch.round(
+            displacement / cell[axis]
+        )
+    return coordinates
+
+
+def _reference(data, charges=(1., -1.), sigma=.35, coulomb_amplitude=1.7):
     """Pairwise cosine sums, independent of production FFT/site machinery.
 
     Even axes retain both Nyquist signs with half weights on each endpoint;
@@ -68,17 +92,14 @@ def _reference(data, charges=(1., -1.), sigma=.35, liquid_sigma=.12,
         phases = (target[:, None, :] - source[None, :, :]) @ wavevectors.T
         return (torch.cos(phases) * (coefficients * torch.exp(-exponent * k2))).sum(-1)
 
-    bmatrix = kernel(sites, grid, (liquid_sigma**2 + sigma**2) / 2)
+    bmatrix = kernel(sites, grid, sigma**2 / 2)
     a = kernel(sites, sites, sigma**2)
     valencies = torch.tensor(charges, dtype=DTYPE)
     liquid = data["rho"] @ valencies * spacing.prod()
     constraints = (data["metal_site_groups"][:, None]
                    == data["metal_group_ids"][None, :]).to(DTYPE)
     field = torch.as_tensor(data.get("metal_external_field", [0., 0., 0.]), dtype=DTYPE)
-    origin = torch.as_tensor(data.get("metal_field_origin", [0., 0., 0.]), dtype=DTYPE)
-    relative = sites - origin
-    wrapped = relative - cell * torch.round(relative / cell)
-    external = -(wrapped * field).sum(-1)
+    external = -(_field_coordinates(sites, cell) * field).sum(-1)
     b = bmatrix @ liquid
     m, groups = constraints.shape
     kkt = torch.cat((torch.cat((a, constraints), dim=1),
@@ -113,20 +134,18 @@ def _model_fixture(mode="beta"):
     data["excluded_mask"][7] = True
     data["rho"][data["excluded_mask"]] = 0
     data["rho"][:, 1] *= data["rho"][:, 0].sum() / data["rho"][:, 1].sum()
-    data["metal_external_field"] = torch.tensor([.03, .015, -.02], dtype=DTYPE)
-    data["metal_field_origin"] = torch.tensor([-.375, 0., 0.], dtype=DTYPE)
+    data = _one_electrode(data)
+    data["metal_external_field"] = torch.tensor([.03, 0., 0.], dtype=DTYPE)
     return model, data
 
 
 def _model_reference(data):
-    return _reference(data, sigma=.6, liquid_sigma=0., coulomb_amplitude=.2)
+    return _reference(data, sigma=.6, coulomb_amplitude=.2)
 
 
 def _inverse_fixture():
     model, data = _model_fixture()
-    reference = _model_reference(data)
-    potential = reference["B"].T @ reference["metal_site_q"]
-    c1 = -data["beta"] * potential[:, None] * torch.tensor([1., -1.], dtype=DTYPE)
+    c1 = _run(model, data)["c1"].detach()
     accessible = ~data["excluded_mask"]
     data["V_ext"] = torch.zeros_like(data["rho"])
     data["V_ext"][accessible] = (c1[accessible] - torch.log(data["rho"][accessible])) / data["beta"]
@@ -136,7 +155,7 @@ def _inverse_fixture():
 class TestExplicitMetalSites(unittest.TestCase):
     def assert_outputs_close(self, actual, expected):
         for key in expected:
-            if key in ("B", "S"):
+            if key in ("B", "S", "q_liquid", "liquid_charge_density"):
                 continue
             with self.subTest(output=key):
                 torch.testing.assert_close(actual[key], expected[key], atol=3e-11, rtol=3e-11)
@@ -154,6 +173,7 @@ class TestExplicitMetalSites(unittest.TestCase):
                                ((3, 4, 2), (.91, .73, 1.27))):
             with self.subTest(shape=shape):
                 data = _data(shape, spacing)
+                data = _one_electrode(data)
                 data["metal_external_field"] = torch.tensor([.12, -.05, .08], dtype=DTYPE)
                 self.assert_outputs_close(_run(_wall(), data), _reference(data))
                 # Python coordinates must not first round through default float32.
@@ -169,10 +189,12 @@ class TestExplicitMetalSites(unittest.TestCase):
         data["metal_total_charge"][0] -= liquid_total
         actual = _run(_wall(charges=(2., -1., 0.)), data)
         self.assert_outputs_close(actual, _reference(data, charges=(2., -1., 0.)))
-        self.assertLess(abs(float(actual["q_liquid"].sum() + actual["metal_site_q"].sum())), 1e-12)
+        self.assertLess(abs(float(liquid_total + actual["metal_site_q"].sum())), 1e-12)
+        self.assertNotIn("q_liquid", actual)
+        self.assertNotIn("liquid_charge_density", actual)
 
     def test_density_gradient_matches_independent_envelope_and_voxel_factor(self):
-        data = _data()
+        data = _one_electrode(_data())
         data["metal_external_field"] = torch.tensor([.12, -.05, .08], dtype=DTYPE)
         reference = _reference(data)
         data["rho"].requires_grad_()
@@ -183,7 +205,7 @@ class TestExplicitMetalSites(unittest.TestCase):
         torch.testing.assert_close(gradient, expected, atol=3e-11, rtol=3e-11)
 
     def test_second_density_derivative_includes_constrained_electrode_response(self):
-        data = _data()
+        data = _one_electrode(_data())
         data["metal_external_field"] = torch.tensor([.12, -.05, .08], dtype=DTYPE)
         reference = _reference(data)
         directions = torch.zeros((27, 2, 2), dtype=DTYPE)
@@ -224,40 +246,31 @@ class TestExplicitMetalSites(unittest.TestCase):
         torch.testing.assert_close(negative["metal_site_q"], -positive["metal_site_q"])
         torch.testing.assert_close(_correction(negative), _correction(positive))
 
-    def test_field_origin_gauge_and_individual_periodic_site_translations(self):
-        data = _data()
+    def test_automatic_branch_and_individual_periodic_site_translations(self):
+        data = _one_electrode(_data())
         field = torch.tensor([.12, -.05, .08], dtype=DTYPE)
         data["metal_external_field"] = field
         expected = _run(_wall(), data)
-        offset = torch.full((3,), .01, dtype=DTYPE)
-        shifted = _run(_wall(), dict(data, metal_field_origin=offset))
-        torch.testing.assert_close(shifted["metal_site_q"], expected["metal_site_q"], atol=2e-12, rtol=2e-12)
-        torch.testing.assert_close(shifted["metal_potential"], expected["metal_potential"] + field @ offset)
-        torch.testing.assert_close(_correction(shifted), _correction(expected))
         cell = data["grid_size"] * data["grid_spacing"]
         translated = data["metal_positions"] + cell * torch.tensor([[1, 0, -1], [0, 2, 0], [-2, 0, 1], [1, 1, 1]])
-        translated_expected = dict(expected, metal_positions=translated)
-        self.assert_outputs_close(_run(_wall(), dict(data, metal_positions=translated)), translated_expected)
+        self.assert_outputs_close(
+            _run(_wall(), dict(data, metal_positions=translated)), expected,
+        )
 
-    def test_joint_lattice_translation_of_source_sites_and_field_origin(self):
-        data = _data()
+    def test_joint_lattice_translation_of_source_and_sites(self):
+        data = _one_electrode(_data())
         data["metal_external_field"] = torch.tensor([.12, -.05, .08], dtype=DTYPE)
         shift = torch.tensor([float(data["grid_spacing"][0]), 0., 0.], dtype=DTYPE)
         translated_rho = torch.roll(data["rho"].reshape(3, 3, 3, 2), 1, 0).reshape(-1, 2)
-        moved = dict(data, rho=translated_rho, metal_positions=data["metal_positions"] + shift,
-                     metal_field_origin=shift)
+        moved = dict(data, rho=translated_rho, metal_positions=data["metal_positions"] + shift)
         old, new = _run(_wall(), data), _run(_wall(), moved)
         for key in old:
-            if key in ("q_liquid", "liquid_charge_density"):
-                expected = torch.roll(old[key].reshape(3, 3, 3), 1, 0).reshape(-1)
-            elif key == "metal_positions":
-                expected = moved["metal_positions"]
-            else:
-                expected = old[key]
-            torch.testing.assert_close(new[key], expected, atol=3e-11, rtol=3e-11)
+            torch.testing.assert_close(
+                new[key], old[key], atol=3e-11, rtol=3e-11,
+            )
 
     def test_shared_site_geometry_broadcasts_across_multiple_batch_axes(self):
-        data = _data()
+        data = _one_electrode(_data())
         factors = torch.tensor([[1., .8], [1.1, .9]], dtype=DTYPE)
         fields = torch.tensor([[[.1, 0., 0.], [.2, 0., 0.]],
                                [[-.1, .05, 0.], [0., 0., .07]]], dtype=DTYPE)
@@ -270,7 +283,7 @@ class TestExplicitMetalSites(unittest.TestCase):
                 torch.testing.assert_close(actual[key][i, j], single[key], atol=3e-11, rtol=3e-11)
 
     def test_cache_updates_for_position_and_group_changes_not_density_or_field(self):
-        data = _data()
+        data = _one_electrode(_data())
         wall = _wall()
         _run(wall, data)
         cached = wall._cache
@@ -280,7 +293,12 @@ class TestExplicitMetalSites(unittest.TestCase):
         moved["metal_positions"][0, 0] += .051
         self.assert_outputs_close(_run(wall, moved), _reference(moved))
         self.assertIsNot(wall._cache, cached)
-        regrouped = dict(moved, metal_site_groups=torch.tensor([2, 7, 2, 7]))
+        regrouped = dict(
+            moved,
+            metal_site_groups=torch.tensor([2, 7, 2, 7]),
+            metal_group_ids=torch.tensor([2, 7]),
+            metal_total_charge=torch.zeros(2, dtype=DTYPE),
+        )
         self.assert_outputs_close(_run(wall, regrouped), _reference(regrouped))
 
     def test_cache_serialization_dtype_migration_and_inference_then_derivatives(self):
@@ -349,23 +367,27 @@ class TestExplicitMetalSites(unittest.TestCase):
                 self.assertEqual(data[key], before[key])
 
     def test_model_explicit_state_c1_and_c2_match_independent_response(self):
-        valencies = torch.tensor([1., -1.], dtype=DTYPE)
         for mode in ("beta", "physical"):
             with self.subTest(mode=mode):
                 model, data = _model_fixture(mode)
                 reference = _model_reference(data)
                 result = _run(model, data, compute_c2=True, c2_reference=(2, 0))
                 self.assert_outputs_close(result, reference)
-                torch.testing.assert_close(result["metal_positions"], data["metal_positions"])
-                torch.testing.assert_close(result["metal_site_groups"], data["metal_site_groups"])
-                potential = reference["B"].T @ reference["metal_site_q"]
-                response = -reference["B"].T @ reference["S"] @ reference["B"]
-                energy = _correction(reference)
-                torch.testing.assert_close(result["beta_F_exc"], data["beta"] * energy, atol=3e-11, rtol=3e-11)
-                torch.testing.assert_close(result["c1"], -data["beta"] * potential[:, None] * valencies,
-                                           atol=3e-11, rtol=3e-11)
-                torch.testing.assert_close(result["c2"], -data["beta"] * response[2, :, None] * valencies,
-                                           atol=3e-11, rtol=3e-11)
+                for key in (
+                    "metal_positions", "metal_site_groups",
+                    "metal_group_ids", "metal_total_charge",
+                ):
+                    self.assertNotIn(key, result)
+                wall_energy = _run(model.readout[1].energy, data)
+                expected_energy = (
+                    wall_energy
+                    if mode == "beta" else
+                    wall_energy / (data["temperature"] / model.mean_temperature)
+                )
+                torch.testing.assert_close(
+                    result["beta_F_exc"], expected_energy,
+                    atol=3e-11, rtol=3e-11,
+                )
                 direction = torch.zeros_like(data["rho"])
                 direction[2, 0], direction[4, 0] = 1., -1.
                 step = 1e-5
@@ -385,9 +407,12 @@ class TestExplicitMetalSites(unittest.TestCase):
         solver = GridSolver(model)
         result = _run(solver.evaluate, data)
         self.assert_outputs_close(result, _model_reference(data))
-        for key in ("excluded_mask", "metal_positions", "metal_site_groups",
-                    "metal_group_ids", "metal_total_charge"):
-            torch.testing.assert_close(result[key], data[key])
+        torch.testing.assert_close(result["excluded_mask"], data["excluded_mask"])
+        for key in (
+            "metal_positions", "metal_site_groups",
+            "metal_group_ids", "metal_total_charge",
+        ):
+            self.assertNotIn(key, result)
         torch.testing.assert_close(result["euler_lagrange_residual"], torch.zeros_like(data["rho"]),
                                    atol=3e-11, rtol=0)
         expected_external = data["beta"] * model.voxel_volume * (data["rho"] * data["V_ext"]).sum()

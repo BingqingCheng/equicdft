@@ -1,15 +1,17 @@
 """Validation for one fixed set of electrode sites and charge constraints."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import torch
 
 
-METAL_DATA_KEYS = frozenset({
+METAL_SITE_KEYS = frozenset({
     "metal_positions", "metal_site_groups", "metal_group_ids",
-    "metal_total_charge", "metal_charge_units", "metal_external_field",
-    "metal_field_origin",
+    "metal_total_charge", "metal_charge_units",
 })
+METAL_DATA_KEYS = METAL_SITE_KEYS | {
+    "metal_external_field", "metal_field_origin",
+}
 
 
 def _integer_tensor(value: Any, name: str, device=None) -> torch.Tensor:
@@ -105,3 +107,29 @@ def normalize_metal_sites(
         "metal_total_charge": totals,
         "metal_charge_units": "e",
     }
+
+
+def normalize_metal_site_mapping(
+    metal_sites: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Validate the complete mapping accepted by :class:`MetalWall`."""
+
+    if not isinstance(metal_sites, Mapping):
+        raise TypeError("metal_sites must be a mapping")
+    missing = METAL_SITE_KEYS - metal_sites.keys()
+    unknown = metal_sites.keys() - METAL_SITE_KEYS
+    if missing:
+        raise ValueError(
+            "metal_sites is missing: " + ", ".join(sorted(missing))
+        )
+    if unknown:
+        raise ValueError(
+            "unknown metal_sites entries: " + ", ".join(sorted(unknown))
+        )
+    return normalize_metal_sites(
+        metal_sites["metal_group_ids"],
+        metal_sites["metal_total_charge"],
+        metal_sites["metal_charge_units"],
+        metal_positions=metal_sites["metal_positions"],
+        metal_site_groups=metal_sites["metal_site_groups"],
+    )
