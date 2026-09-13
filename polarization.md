@@ -212,7 +212,7 @@ Examples of generated features include
 
 $$
 s,\qquad
-\frac{\operatorname{tr}D}{3},\qquad
+\frac{D_{xx}+D_{yy}+D_{zz}}{3},\qquad
 \frac{\mathbf v\cdot\mathbf v}{3},\qquad
 \frac{\mathbf v\cdot\mathbf p}{3},\qquad
 \frac{|\mathbf p|^2}{3}.
