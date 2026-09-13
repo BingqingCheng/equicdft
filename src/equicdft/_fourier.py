@@ -1,11 +1,12 @@
 """Shared numerical helpers for projected periodic Fourier curvatures."""
 
 import math
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
+from ._argument_checks import finite_scalar
 from ._grid import voxel_volume
 from .energy import ideal_free_energy
 
@@ -43,6 +44,32 @@ def mode_triplets(
     return modes
 
 
+def expand_mode_amplitudes(amplitude, rho, modes, n_directions, n_phases=2):
+    """Broadcast one amplitude per field/mode to its phases and probes.
+
+    Keep the scalar path scalar to preserve existing numerical behavior.
+    Explicit tensors must have shape [field, mode]; amplitudes are not learned.
+    """
+    if not torch.is_tensor(amplitude):
+        amplitude = finite_scalar(amplitude, "relative_amplitude")
+        if not 0.0 < amplitude < 1.0:
+            raise ValueError("relative_amplitude must lie in (0, 1)")
+        return amplitude
+    if amplitude.shape != modes.shape[:2]:
+        raise ValueError("relative_amplitude tensor must have shape [field, mode]")
+    if (
+        amplitude.dtype == torch.bool or torch.is_complex(amplitude)
+        or not torch.all(torch.isfinite(amplitude) & (amplitude > 0) & (amplitude < 1))
+    ):
+        raise ValueError("relative_amplitude tensor values must lie in (0, 1)")
+    return amplitude.detach().to(rho).repeat_interleave(n_phases * n_directions, dim=1)
+
+
+def real_mode_shape(modes, mode_phases):
+    """A supplied phase per wave selects one summed spatial pattern."""
+    return (modes.shape[1], 2) if mode_phases is None else (1, 1)
+
+
 def projected_fourier_curvature(
     model: nn.Module,
     outputs: Dict[str, torch.Tensor],
@@ -51,7 +78,7 @@ def projected_fourier_curvature(
     directions: torch.Tensor,
     valid_directions: torch.Tensor,
     mean_densities: torch.Tensor,
-    relative_amplitude: float,
+    relative_amplitude: Union[float, torch.Tensor],
     perturbations_per_forward: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Evaluate normalized total intrinsic curvature along fixed directions."""
@@ -80,12 +107,16 @@ def _symmetric_energy_difference(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     directions: torch.Tensor,
-    relative_amplitude: float,
+    relative_amplitude: Union[float, torch.Tensor],
     perturbations_per_forward: int = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return central energy differences and squared perturbation norms."""
 
-    delta_rho = relative_amplitude * directions
+    scale = (
+        relative_amplitude[..., None, None]
+        if torch.is_tensor(relative_amplitude) else relative_amplitude
+    )
+    delta_rho = scale * directions
     rho_plus = rho[:, None, :, :] + delta_rho
     rho_minus = rho[:, None, :, :] - delta_rho
     if torch.any(rho_plus < -1.0e-7).item() or torch.any(
@@ -142,16 +173,19 @@ def fourier_curvature_matrix(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     modes: torch.Tensor,
-    relative_amplitude: float,
+    relative_amplitude: Union[float, torch.Tensor],
     perturbations_per_forward: int = None,
+    mode_phases: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return the ideal-metric component Hessian for every real mode.
 
     The returned matrix has shape ``[field, mode, phase, type, type]``.
     For a homogeneous mixture it is the dimensionless inverse OZ response
     ``I - sqrt(R) c(k) sqrt(R)``. Around an inhomogeneous density it is the
-    component Hessian projected onto the selected real Fourier perturbations;
-    cosine-sine and inter-mode Hessian blocks are not included. Pair
+    component Hessian projected onto the selected real Fourier perturbations.
+    With ``mode_phases`` supplied, waves are summed before projection and the
+    output has shape [field, 1, 1, type, type]; it includes cross-wavevector
+    contributions but does not reconstruct the complete spatial Hessian. Pair
     polarization adds numerical cancellation, so matrix applications should
     check convergence with respect to ``relative_amplitude``.
     """
@@ -160,6 +194,7 @@ def fourier_curvature_matrix(
         batch,
         rho,
         modes,
+        mode_phases=mode_phases,
     )
     n_fields, n_real_modes, _, n_types = component_directions.shape
     identity = torch.eye(n_types, device=rho.device, dtype=rho.dtype)
@@ -173,6 +208,10 @@ def fourier_curvature_matrix(
         identity[pair_indices[0]] + identity[pair_indices[1]]
     )
     weights = torch.cat((identity, pair_weights), dim=0)
+    n_patterns, n_phases = real_mode_shape(modes, mode_phases)
+    amplitude = expand_mode_amplitudes(
+        relative_amplitude, rho, modes[:, :n_patterns], weights.shape[0], n_phases,
+    )
     directions = (
         component_directions[:, :, None, :, :]
         * weights[None, None, :, None, :]
@@ -184,14 +223,18 @@ def fourier_curvature_matrix(
         batch=batch,
         rho=rho,
         directions=directions,
-        relative_amplitude=relative_amplitude,
+        relative_amplitude=amplitude,
         perturbations_per_forward=perturbations_per_forward,
+    )
+    scale_squared = (
+        amplitude.reshape(n_fields, n_real_modes, weights.shape[0]).square()
+        if torch.is_tensor(amplitude) else amplitude**2
     )
     quadratic_forms = second_difference.reshape(
         n_fields,
         n_real_modes,
         weights.shape[0],
-    ) / relative_amplitude**2
+    ) / scale_squared
     diagonal = quadratic_forms[..., :n_types]
     matrix = torch.diag_embed(diagonal)
     pair_values = 0.5 * (
@@ -221,7 +264,7 @@ def fourier_curvature_matrix(
     active_matrix = active[..., :, None] & active[..., None, :]
     matrix = torch.where(active_matrix, matrix, torch.zeros_like(matrix))
 
-    shape = (n_fields, modes.shape[1], 2)
+    shape = (n_fields, n_patterns, n_phases)
     return (
         matrix.reshape(*shape, n_types, n_types),
         active.reshape(*shape, n_types),
@@ -233,6 +276,7 @@ def fourier_directions(
     rho: torch.Tensor,
     modes: torch.Tensor,
     mixture_weights: torch.Tensor,
+    mode_phases: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return fixed-number Fourier directions, validity, and density scale."""
 
@@ -241,6 +285,7 @@ def fourier_directions(
         batch,
         rho,
         modes,
+        mode_phases=mode_phases,
     )
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12
@@ -251,10 +296,11 @@ def fourier_directions(
             "mixture weights must have shape [n_directions, n_types]"
         )
     active_components = torch.abs(mixture_weights) > 0.0
+    n_patterns, n_phases = real_mode_shape(modes, mode_phases)
     valid_by_mode = valid_component.reshape(
         n_fields,
-        modes.shape[1],
-        2,
+        n_patterns,
+        n_phases,
         n_types,
     ).any(dim=2)
     required_components = (
@@ -300,6 +346,7 @@ def component_fourier_directions(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     modes: torch.Tensor,
+    mode_phases: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return one fixed-number real Fourier direction per component."""
 
@@ -329,8 +376,24 @@ def component_fourier_directions(
         dim=-1,
     )
     sine = torch.sin(phase).masked_fill(self_conjugate[:, :, None], 0.0)
-    waves = torch.stack((torch.cos(phase), sine), dim=2)
-    waves = waves.flatten(start_dim=1, end_dim=2)
+    if mode_phases is None:
+        waves = torch.stack((torch.cos(phase), sine), dim=2)
+        waves = waves.flatten(start_dim=1, end_dim=2)
+    else:
+        if (
+            not torch.is_tensor(mode_phases)
+            or mode_phases.shape != modes.shape[:2]
+            or mode_phases.dtype == torch.bool
+            or torch.is_complex(mode_phases)
+            or not torch.all(torch.isfinite(mode_phases)).item()
+        ):
+            raise ValueError("mode_phases must be a finite real [field, mode] tensor")
+        offsets = mode_phases.detach().to(rho)[..., None]
+        # Sum BEFORE projecting/normalizing. Keep exact zero sine at Nyquist
+        # rather than amplifying sin(m*pi) roundoff into a spurious wave.
+        waves = (
+            torch.cos(phase) * torch.cos(offsets) - sine * torch.sin(offsets)
+        ).sum(dim=1, keepdim=True)
 
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12

@@ -1,15 +1,17 @@
 """Projected Fourier response evaluation for grid density functionals."""
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import boolean, finite_scalar, optional_positive_integer
 from ._fourier import (
+    expand_mode_amplitudes,
     fourier_curvature_matrix,
     fourier_directions,
     projected_fourier_curvature,
+    real_mode_shape,
     validate_explicit_modes,
     validate_response,
     validated_mode_domain,
@@ -57,8 +59,18 @@ class FourierResponse(nn.Module):
         modes: torch.Tensor,
         directions: torch.Tensor,
         outputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
+        mode_phases: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return curvature and validity as ``[field, mode, phase, direction]``."""
+        """Return curvature and validity as ``[field, mode, phase, direction]``.
+
+        An optional scalar or [field, mode] amplitude overrides the fixed
+        constructor value for this call only, without mutating the module.
+        With ``mode_phases`` supplied as radians [field, mode], sum the waves
+        into one pattern before projection/normalization. The output shape
+        becomes [field, 1, 1, direction] and amplitude tensors use [field, 1].
+        """
 
         if outputs is None:
             outputs = model(batch, compute_c1=False)
@@ -77,7 +89,9 @@ class FourierResponse(nn.Module):
             rho,
             modes,
             directions,
+            mode_phases=mode_phases,
         )
+        n_patterns, n_phases = real_mode_shape(modes, mode_phases)
         curvature, valid = projected_fourier_curvature(
             model=model,
             outputs=outputs,
@@ -86,10 +100,13 @@ class FourierResponse(nn.Module):
             directions=perturbations,
             valid_directions=valid,
             mean_densities=mean_densities,
-            relative_amplitude=self.relative_amplitude,
+            relative_amplitude=expand_mode_amplitudes(
+                self.relative_amplitude if relative_amplitude is None else relative_amplitude,
+                rho, modes[:, :n_patterns], n_directions, n_phases,
+            ),
             perturbations_per_forward=self.perturbations_per_forward,
         )
-        shape = (rho.shape[0], modes.shape[1], 2, n_directions)
+        shape = (rho.shape[0], n_patterns, n_phases, n_directions)
         return curvature.reshape(shape), valid.reshape(shape)
 
     def matrix(
@@ -98,6 +115,9 @@ class FourierResponse(nn.Module):
         batch: Dict[str, torch.Tensor],
         modes: torch.Tensor,
         outputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
+        mode_phases: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return the phase-resolved physical-component curvature matrix.
 
@@ -106,6 +126,12 @@ class FourierResponse(nn.Module):
         mask has shape ``[field, mode, phase, type]``. For homogeneous fields,
         the matrix is the dimensionless inverse OZ response
         ``I - sqrt(R) c(k) sqrt(R)``.
+        The optional scalar or [field, mode] amplitude override is shared by
+        all probes reconstructing the same matrix and does not change state.
+        With radians ``mode_phases`` [field, mode], all component probes share
+        one sum of waves; output is [field, 1, 1, type, type], amplitudes are
+        scalar or [field, 1]. This is a projected composite Hessian, not S(k)
+        at any single wavevector.
         """
 
         if outputs is None:
@@ -134,6 +160,9 @@ class FourierResponse(nn.Module):
             batch=batch,
             rho=rho,
             modes=modes,
-            relative_amplitude=self.relative_amplitude,
+            relative_amplitude=(
+                self.relative_amplitude if relative_amplitude is None else relative_amplitude
+            ),
             perturbations_per_forward=self.perturbations_per_forward,
+            mode_phases=mode_phases,
         )
