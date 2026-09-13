@@ -1,15 +1,19 @@
+"""Unified rho/vector Cartesian moments and generated cubic invariants."""
+
+import io
 import itertools
 import unittest
-from unittest import mock
 
 import numpy as np
 import torch
 
-from equicdft import PolarizationFeatures
+from equicdft import (
+    BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LocalReadout,
+)
 from equicdft.stencil import get_neighbor_indices
 
 
-def periodic_field(size=5, cutoff=2, n_types=1):
+def periodic_field(size=3, cutoff=1, n_types=1):
     positions = np.indices((size, size, size)).reshape(3, -1).T
     neighbors, _ = get_neighbor_indices(positions, cutoff_grid=cutoff)
     generator = torch.Generator().manual_seed(38)
@@ -17,157 +21,247 @@ def periodic_field(size=5, cutoff=2, n_types=1):
         "rho": 0.2 + torch.rand(len(positions), n_types, generator=generator, dtype=torch.float64),
         "dipole_density": torch.randn(len(positions), n_types, 3, generator=generator, dtype=torch.float64),
         "local_density_index": torch.tensor(neighbors),
+        "grid_positions": torch.tensor(positions),
+        "grid_size": torch.tensor([size, size, size]),
+        "temperature": torch.tensor(1.3, dtype=torch.float64),
     }, torch.tensor(positions)
 
 
 class TestPolarizationFeatures(unittest.TestCase):
+    def setUp(self):
+        self.dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float64)
+        torch.manual_seed(38)
+
+    def tearDown(self):
+        torch.set_default_dtype(self.dtype)
+
     def features(self, **kwargs):
-        arguments = dict(
-            mean_density=0.7, dipole_density_scale=2.0,
-            cutoff_grid=2, radial_exponents=(0.125, 0.5),
-        )
-        arguments.update(kwargs)
-        return PolarizationFeatures(**arguments).double()
+        args = dict(mean_density=.7, dipole_density_scale=2.,
+                    include_polarization=True, cutoff_grid=1, max_power=1,
+                    radial_basis="gaussian", radial_exponents=(.125, .5),
+                    trainable_radial_exponents=True)
+        args.update(kwargs)
+        a = CartesianAFeatures(**args)
+        b = CartesianBFeatures(a.max_power, 3, include_polarization=True,
+                               separate_center=a.separate_center)
+        return a, b
 
-    def test_all_48_signed_axis_permutations(self):
-        data, positions = periodic_field(n_types=2)
-        features = self.features(n_types=2, radial_exponents=(0.25,))
-        reference = features(data)
-        self.assertEqual(reference.shape, (125, features.n_features))
-        self.assertEqual(len(set(features.feature_names)), features.n_features)
-        for permutation in itertools.permutations(range(3)):
-            for signs in itertools.product((-1, 1), repeat=3):
-                rotation = torch.eye(3, dtype=torch.float64)[list(permutation)]
-                rotation = rotation * torch.tensor(signs)[:, None]
-                transformed_positions = (positions @ rotation.long().T) % 5
-                index = (transformed_positions[:, 0] * 5 + transformed_positions[:, 1]) * 5 + transformed_positions[:, 2]
-                rho = torch.empty_like(data["rho"])
-                dipole = torch.empty_like(data["dipole_density"])
-                rho[index] = data["rho"]
-                dipole[index] = data["dipole_density"] @ rotation.T
-                transformed = dict(data, rho=rho, dipole_density=dipole)
-                torch.testing.assert_close(features(transformed)[index], reference, atol=2e-12, rtol=2e-12)
+    def test_all_48_actions_on_moments_and_invariants(self):
+        for center, power in itertools.product((False, True), (0, 1, 2)):
+            a, b = self.features(separate_center=center, max_power=power, n_types=2)
+            data, positions = periodic_field(n_types=2)
+            moments = a(data)
+            reference = b(moments)
+            group = 0
+            for permutation in itertools.permutations(range(3)):
+                for signs in itertools.product((1, -1), repeat=3):
+                    rotation = torch.eye(3)[list(permutation)] * torch.tensor(signs)[:, None]
+                    transformed_positions = (positions @ rotation.long().T) % 3
+                    index = (transformed_positions[:, 0] * 3 + transformed_positions[:, 1]) * 3 + transformed_positions[:, 2]
+                    rho = torch.empty_like(data["rho"])
+                    dipole = torch.empty_like(data["dipole_density"])
+                    rho[index] = data["rho"]
+                    dipole[index] = data["dipole_density"] @ rotation.T
+                    actual = a(dict(data, rho=rho, dipole_density=dipole))[index]
+                    expected = moments.index_select(-2, b.component_indices[group])
+                    expected = expected * b.component_signs[group][..., None]
+                    torch.testing.assert_close(actual, expected, atol=2e-12, rtol=2e-12)
+                    torch.testing.assert_close(b(actual), reference, atol=2e-12, rtol=2e-12)
+                    group += 1
 
-    def test_contractions_under_arbitrary_orthogonal_rotations(self):
-        # This checks tensor algebra only, not a nonexistent arbitrary
-        # rotation/permutation of a fixed lattice without interpolation.
+    def test_generated_recipes_equal_independent_group_average(self):
+        # Direct Reynolds averages, independently applying every group element
+        # to each representative product rather than evaluating sparse recipes.
+        b = CartesianBFeatures(1, 3, include_polarization=True)
+        a = torch.randn(2, 3, 2, b.n_components, 2)
+        transformed = a[..., b.component_indices, :] * b.component_signs[..., None]
+        expected = []
+        for order in (1, 2, 3):
+            for representative in getattr(b, "representatives_" + str(order)):
+                product = transformed.index_select(-2, representative).prod(-2).mean(-2)
+                expected.append(product)
+        expected = torch.stack(expected, dim=-2)
+        torch.testing.assert_close(b(a), expected, atol=2e-12, rtol=2e-12)
+
+    def test_mixed_products_and_no_extra_dipole_reversal_symmetry(self):
+        a, _ = self.features(radial_exponents=(.125,), separate_center=False)
+        b = CartesianBFeatures(1, 2, include_polarization=True, separate_center=False)
         data, _ = periodic_field()
-        features = self.features()
-        moments = features._moments(data)
-        rotation, _ = torch.linalg.qr(torch.tensor(
-            [[0.4, 0.7, -0.1], [0.9, -0.2, 0.3], [0.5, 0.1, 0.8]],
-            dtype=torch.float64,
-        ))
-        for parity in (-1, 1):
-            orthogonal = rotation.clone()
-            orthogonal[:, 0] *= parity
-            rotated = {"s": moments["s"]}
-            for key in ("v", "p", "u", "w"):
-                rotated[key] = torch.einsum("...ai,ji->...aj", moments[key], orthogonal)
-            for key in ("Q", "D"):
-                rotated[key] = torch.einsum("...aij,ki,lj->...akl", moments[key], orthogonal, orthogonal)
-            rotated["H"] = torch.einsum(
-                "...aijk,li,mj,nk->...almn", moments["H"], orthogonal, orthogonal, orthogonal
+        moments = a(data)
+        result = b(moments)
+        # K=4; zeroth vector slots Px/Py/Pz are 4,8,12. Spatial rho vector
+        # slots are 1,2,3. The orbit of rho_x * P_x is v.P / 3.
+        reps = getattr(b, "representatives_2").tolist()
+        col = b.n_features_by_order[0] + reps.index([1, 4])
+        expected = (moments[..., [1, 2, 3], :] * moments[..., [4, 8, 12], :]).sum(-2) / 3
+        torch.testing.assert_close(result[..., col, :], expected)
+        self.assertFalse(torch.allclose(b(a(dict(data, dipole_density=-data["dipole_density"]))), result))
+
+    def test_shared_basis_direct_sums_center_and_species_transform(self):
+        from unittest.mock import patch
+        data, _ = periodic_field(n_types=2)
+        for center in (False, True):
+            a, _ = self.features(
+                n_types=2, n_channels=3,
+                density_transform=((1., 1.), (1., -1.), (.2, .7)),
+                separate_center=center,
             )
-            torch.testing.assert_close(features._contract(rotated), features(data), atol=2e-12, rtol=2e-12)
+            with patch.object(a, "stencil_basis", wraps=a.stencil_basis) as basis:
+                actual = a(data)
+            basis.assert_called_once()
+            fields = [a.transform_density(data["rho"]) / .7]
+            fields.extend(a.transform_density(data["dipole_density"][..., axis]) / 2.
+                          for axis in range(3))
+            expected = []
+            for field in fields:
+                summed = torch.einsum("gjc,jnk->gnkc", field[data["local_density_index"]], a.stencil_basis())
+                if center:
+                    local = field[:, None, None, :].expand(-1, a.n_radial_channels, 1, -1)
+                    summed = torch.cat((summed, local), dim=-2)
+                expected.append(summed)
+            torch.testing.assert_close(actual, torch.cat(expected, dim=-2))
+            if center:
+                width = a.powers.shape[0] + 1
+                for component, field in enumerate(fields):
+                    torch.testing.assert_close(actual[..., component * width + width - 1, :],
+                                               field[:, None, :].expand(-1, a.n_radial_channels, -1))
+
+    def test_fft_gather_all_radial_bases_values_and_gradients(self):
+        data, _ = periodic_field(size=5, cutoff=2, n_types=2)
+        for basis, center in itertools.product(("none", "gaussian", "bessel"), (False, True)):
+            args = dict(max_power=1, cutoff_grid=2, mean_density=.7,
+                        include_polarization=True, dipole_density_scale=2.,
+                        n_types=2, radial_basis=basis, separate_center=center,
+                        density_transform=((1., 1.), (1., -1.)))
+            if basis == "gaussian":
+                args.update(radial_exponents=(.125, .4), radial_centers=(0., .3),
+                            trainable_radial_exponents=True, trainable_radial_centers=True,
+                            n_radial_channels=1)
+            elif basis == "bessel":
+                args.update(n_radial_functions=2, n_radial_channels=1)
+            gather = CartesianAFeatures(**args)
+            fft = CartesianAFeatures(**args, convolution_backend="fft")
+            fft.load_state_dict(gather.state_dict(), strict=True)
+            b = CartesianBFeatures(1, 2, include_polarization=True, separate_center=center)
+            outputs, gradients = [], []
+            for module in (gather, fft):
+                inputs = {key: value.detach().clone() for key, value in data.items()}
+                inputs["rho"].requires_grad_()
+                inputs["dipole_density"].requires_grad_()
+                if module is fft:
+                    inputs.pop("local_density_index")
+                output = b(module(inputs))
+                targets = (inputs["rho"], inputs["dipole_density"], *module.parameters())
+                grad = torch.autograd.grad(output.square().sum(), targets, create_graph=True)
+                second = torch.autograd.grad(sum(g.square().sum() for g in grad), targets)
+                outputs.append(output)
+                gradients.append((*grad, *second))
+            torch.testing.assert_close(*outputs, atol=2e-11, rtol=2e-11)
+            for left, right in zip(*gradients):
+                torch.testing.assert_close(left, right, atol=2e-8, rtol=2e-10)
 
     def test_translation_and_batching(self):
         data, positions = periodic_field()
-        features = self.features()
-        shifted_positions = (positions + torch.tensor([1, -1, 2])) % 5
-        index = (shifted_positions[:, 0] * 5 + shifted_positions[:, 1]) * 5 + shifted_positions[:, 2]
+        a, b = self.features()
+        shifted_positions = (positions + torch.tensor([1, -1, 2])) % 3
+        index = (shifted_positions[:, 0] * 3 + shifted_positions[:, 1]) * 3 + shifted_positions[:, 2]
         shifted = dict(data)
         for key in ("rho", "dipole_density"):
             shifted[key] = torch.empty_like(data[key])
             shifted[key][index] = data[key]
-        torch.testing.assert_close(features(shifted)[index], features(data))
+        torch.testing.assert_close(b(a(shifted))[index], b(a(data)))
         batch = {key: torch.stack((data[key], shifted[key])) for key in data}
-        actual = features(batch)
-        torch.testing.assert_close(actual[0], features(data))
-        torch.testing.assert_close(actual[1], features(shifted))
+        torch.testing.assert_close(b(a(batch))[0], b(a(data)))
+        torch.testing.assert_close(b(a(batch))[1], b(a(shifted)))
 
-    def test_spatial_and_dipole_indices_are_not_symmetrized_together(self):
+    def test_empty_fields_finite_first_and_second_derivatives(self):
+        a, b = self.features()
         data, _ = periodic_field()
-        features = self.features(radial_exponents=(0.2,))
-        moments = features._moments(data)
-        self.assertFalse(torch.allclose(moments["D"][..., 0, 1], moments["D"][..., 1, 0]))
-        torch.testing.assert_close(moments["Q"], moments["Q"].transpose(-1, -2))
-        torch.testing.assert_close(moments["H"], moments["H"].transpose(-2, -3))
-        self.assertFalse(torch.allclose(moments["H"], moments["H"].transpose(-1, -2)))
+        data["rho"] = torch.zeros_like(data["rho"], requires_grad=True)
+        data["dipole_density"] = torch.zeros_like(data["dipole_density"], requires_grad=True)
+        value = b(a(data)).sum()
+        gradients = torch.autograd.grad(value, (data["rho"], data["dipole_density"]), create_graph=True)
+        second = torch.autograd.grad(sum(g.square().sum() for g in gradients),
+                                     (data["rho"], data["dipole_density"]))
+        for value in (*gradients, *second):
+            self.assertTrue(torch.isfinite(value).all())
 
-    def test_moments_match_direct_neighbor_sums_with_one_shared_basis(self):
+    def test_toggle_off_preserves_state_and_ignores_polarization(self):
         data, _ = periodic_field(n_types=2)
-        features = self.features(n_types=2)
-        with mock.patch.object(
-            features.scalar_features, "stencil_basis",
-            wraps=features.scalar_features.stencil_basis,
-        ) as basis:
-            moments = features._moments(data)
-        basis.assert_called_once()
+        for center in (False, True):
+            args = dict(max_power=2, mean_density=.7, n_types=2, cutoff_grid=1,
+                        radial_basis="gaussian", radial_exponents=(.125, .5),
+                        trainable_radial_exponents=True, separate_center=center)
+            default = CartesianAFeatures(**args)
+            explicit = CartesianAFeatures(**args, include_polarization=False)
+            self.assertEqual(default.state_dict().keys(), explicit.state_dict().keys())
+            self.assertNotIn("dipole_density_scale", explicit.state_dict())
+            explicit.load_state_dict(default.state_dict(), strict=True)
+            b = CartesianBFeatures(2, 3)
+            off = CartesianBFeatures(2, 3, include_polarization=False)
+            off.load_state_dict(b.state_dict(), strict=True)
+            corrupted = dict(data, dipole_density=torch.tensor(float("nan")))
+            torch.testing.assert_close(off(explicit(corrupted)), b(default(data)), atol=0, rtol=0)
+            # Full objects predating the new toggle have neither new flag.
+            del explicit.include_polarization
+            del off.include_polarization
+            stream = io.BytesIO()
+            torch.save((explicit, off), stream)
+            stream.seek(0)
+            restored_a, restored_b = torch.load(stream, weights_only=False)
+            torch.testing.assert_close(restored_b(restored_a(data)), b(default(data)), atol=0, rtol=0)
 
-        # Independent reference using full coordinate tensors, without the
-        # implementation's monomial indices or axis expansion. This checks
-        # every radial/species channel and the independent dipole index.
-        q = features.scalar_features.local_density_positions.double()
-        weights = torch.exp(-q.square().sum(-1, keepdim=True) * features.radial_exponents)
-        weights = weights / weights.sum(0, keepdim=True)
-        neighbors = data["local_density_index"]
-        rho = data["rho"][neighbors] / features.mean_density
-        dipole = data["dipole_density"][neighbors] / features.dipole_density_scale
-        Q = torch.einsum("jn,gjt,ja,jb->gntab", weights, rho, q, q)
-        D = torch.einsum("jn,gjti,ja->gntai", weights, dipole, q)
-        H = torch.einsum("jn,gjti,ja,jb->gntabi", weights, dipole, q, q)
-        torch.testing.assert_close(moments["Q"], Q.flatten(1, 2))
-        torch.testing.assert_close(moments["D"], D.flatten(1, 2))
-        torch.testing.assert_close(moments["H"], H.flatten(1, 2))
-
-    def test_center_vector_cross_contractions_and_optional_reversal(self):
+    def test_fft_model_derivatives_without_neighbor_table(self):
+        a, b = self.features()
+        fft_a, fft_b = self.features(convolution_backend="fft")
+        models = [
+            GridCACEModel(af, bf, [LocalReadout(n_features=2*bf.n_features + 1, hidden_sizes=(4,))],
+                          grid_spacing=.5, compute_polarization_derivative=True)
+            for af, bf in ((a, b), (fft_a, fft_b))
+        ]
+        models[1].load_state_dict(models[0].state_dict(), strict=True)
+        self.assertFalse(models[1].requires_local_density_index)
         data, _ = periodic_field()
-        features = self.features(radial_exponents=(0.2,))
-        moments = features._moments(data)
-        torch.testing.assert_close(moments["p"][..., -1, :], data["dipole_density"][..., 0, :] / 2)
-        column = features.feature_names.index("p_dot_p[0,1]")
-        expected = (moments["p"][..., 0, :] * moments["p"][..., 1, :]).sum(-1)
-        torch.testing.assert_close(features(data)[..., column], expected)
-        reversed_data = dict(data, dipole_density=-data["dipole_density"])
-        self.assertFalse(torch.allclose(features(data), features(reversed_data)))
-        even = self.features(dipole_reversal_symmetry=True)
-        torch.testing.assert_close(even(data), even(reversed_data))
+        outputs = []
+        for i, model in enumerate(models):
+            inputs = {key: value.detach().clone() for key, value in data.items()}
+            if i:
+                inputs.pop("local_density_index")
+            outputs.append(model(inputs))
+        for key in outputs[0]:
+            torch.testing.assert_close(outputs[0][key], outputs[1][key], atol=2e-11, rtol=2e-11)
 
-    def test_gradients_include_radial_parameters_and_are_finite_at_zero_dipole(self):
+    def test_shape_and_configuration_validation(self):
+        for args in (dict(include_polarization=True),
+                     dict(include_polarization="yes"),
+                     dict(dipole_density_scale=1.),
+                     dict(include_polarization=True, dipole_density_scale=0.)):
+            with self.assertRaises((ValueError, TypeError)):
+                CartesianAFeatures(1, .7, **args)
+        a, b = self.features()
+        for wrong in (CartesianBFeatures(1, 3),
+                      CartesianBFeatures(2, 3, include_polarization=True),
+                      CartesianBFeatures(1, 3, include_polarization=True, separate_center=False)):
+            with self.assertRaisesRegex(ValueError, "A/B"):
+                GridCACEModel(a, wrong, [LocalReadout()], grid_spacing=.5)
+        with self.assertRaisesRegex(ValueError, "polarized Cartesian moments"):
+            GridCACEModel(a, b, [LocalReadout()], grid_spacing=.5,
+                          message_layers=[BChiMessage(b.n_features, 2, 1)])
         data, _ = periodic_field()
-        data["rho"].requires_grad_()
-        data["dipole_density"].requires_grad_()
-        features = self.features()
-        objective = features(data)[7].square().sum()
-        targets = (data["rho"], data["dipole_density"], features.scalar_features.log_radial_exponents)
-        gradients = torch.autograd.grad(objective, targets, create_graph=True)
-        for gradient in gradients:
-            self.assertTrue(torch.isfinite(gradient).all())
-            self.assertGreater(gradient.abs().max().item(), 0)
-        zero = torch.zeros_like(data["dipole_density"], requires_grad=True)
-        second = features(dict(data, dipole_density=zero))[7].sum()
-        derivative = torch.autograd.grad(second, zero, create_graph=True)[0]
-        self.assertTrue(torch.isfinite(derivative).all())
-
-    def test_configuration_and_shapes(self):
-        data, _ = periodic_field()
-        for power in (0, 1, 2):
-            for order in (1, 2, 3):
-                features = self.features(max_power=power, max_product_order=order)
-                self.assertEqual(features(data).shape[-1], features.n_features)
-        for arguments in (
-            {"max_power": 3}, {"max_product_order": 4},
-            {"dipole_density_scale": 0}, {"dipole_density_scale": float("nan")},
-        ):
+        missing = dict(data)
+        del missing["dipole_density"]
+        with self.assertRaisesRegex(ValueError, "dipole_density is required"):
+            a(missing)
+        for dipole in (data["rho"], data["dipole_density"].float(),
+                       torch.full_like(data["dipole_density"], float("nan"))):
             with self.assertRaises(ValueError):
-                self.features(**arguments)
-        with self.assertRaisesRegex(ValueError, "shape"):
-            self.features()(dict(data, dipole_density=data["dipole_density"].squeeze(-2)))
-        with self.assertRaisesRegex(ValueError, "dtype"):
-            self.features()(dict(data, dipole_density=data["dipole_density"].float()))
-        with self.assertRaisesRegex(ValueError, "finite"):
-            self.features()(dict(data, dipole_density=data["dipole_density"] * float("nan")))
+                a(dict(data, dipole_density=dipole))
+        model = GridCACEModel(a, b, [LocalReadout(n_features=2*b.n_features + 1)],
+                              grid_spacing=.5, compute_polarization_derivative=True)
+        self.assertTrue(model.requires_dipole_density)
+        self.assertTrue(model.requires_local_density_index)
+        self.assertFalse(getattr(model.readout[0], "requires_dipole_density", False))
 
 
 if __name__ == "__main__":

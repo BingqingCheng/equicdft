@@ -8,22 +8,26 @@ import torch
 
 from equicdft import (
     GridCACEModel, GridData, LocalReadout,
-    PolarizationAFeatures, PolarizationBFeatures,
+    CartesianAFeatures, CartesianBFeatures,
 )
 
 
 def main():
     torch.set_default_dtype(torch.float64)
     torch.manual_seed(7)
-    a_features = PolarizationAFeatures(
+    a_features = CartesianAFeatures(
         mean_density=0.7,
         dipole_density_scale=0.1,  # dipole moment per volume, in the data's units
         cutoff_grid=1,
         max_power=2,
+        include_polarization=True,
+        radial_basis="gaussian",
         radial_exponents=(0.125,),
         trainable_radial_exponents=True,
     )
-    b_features = PolarizationBFeatures(a_features, max_product_order=3)
+    b_features = CartesianBFeatures(
+        max_power=2, max_product_order=3, include_polarization=True,
+    )
     model = GridCACEModel(
         a_features=a_features,
         b_features=b_features,

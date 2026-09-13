@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from equicdft import GridCACEModel, LDAReadout, PolarizationFeatures, PolarizationReadout, PolarizationSolver
+from equicdft import GridCACEModel, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout, PolarizationSolver
 from equicdft.stencil import get_neighbor_indices
 import numpy as np
 
@@ -141,13 +141,21 @@ class TestPolarizationLDA(unittest.TestCase):
 
     def test_additive_neighbor_branch_in_either_order(self):
         lda = self.readout()
-        polar = PolarizationReadout(PolarizationFeatures(.5, .3, cutoff_grid=1, max_power=1), hidden_sizes=(4,))
+        a = CartesianAFeatures(1, .5, cutoff_grid=1,
+                              include_polarization=True, dipole_density_scale=.3)
+        b = CartesianBFeatures(1, 2, include_polarization=True)
+        polar = LocalReadout(n_features=b.n_features + 1, hidden_sizes=(4,))
         data = self.data()
         indices, _ = get_neighbor_indices(np.indices((2, 2, 2)).reshape(3, -1).T, cutoff_grid=1)
         data["local_density_index"] = torch.tensor(indices)
-        separate = [self.model([readout]).eval()(self.clone(data)) for readout in (lda, polar)]
+        separate = [
+            self.model([lda]).eval()(self.clone(data)),
+            GridCACEModel(a, b, [polar], grid_spacing=.5, mean_temperature=1.5,
+                          compute_polarization_derivative=True).eval()(self.clone(data)),
+        ]
         for readouts in ([lda, polar], [polar, lda]):
-            model = self.model(readouts).eval()
+            model = GridCACEModel(a, b, readouts, grid_spacing=.5, mean_temperature=1.5,
+                                 compute_polarization_derivative=True).eval()
             self.assertEqual(model.cutoff_grid, 1)
             self.assertTrue(model.requires_local_density_index)
             actual = model(self.clone(data))

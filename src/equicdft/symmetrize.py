@@ -11,12 +11,14 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 from torch import nn
 
-from ._argument_checks import positive_integer
+from ._argument_checks import boolean, positive_integer
 from .features import _make_powers
 
 
 def _make_group_actions(
     powers: torch.Tensor,
+    include_polarization: bool = False,
+    separate_center: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return the signed-permutation action on Cartesian monomials.
 
@@ -45,6 +47,21 @@ def _make_group_actions(
                     sign *= reflections[output_axis] ** power[output_axis]
                 indices_now.append(index_by_power[tuple(mapped_power)])
                 signs_now.append(sign)
+            if include_polarization:
+                if separate_center:
+                    # The unsmeared center is a distinct spatial-power-zero
+                    # slot, not the smeared zeroth moment.
+                    indices_now.append(len(powers_list))
+                    signs_now.append(1)
+                width = len(indices_now)
+                spatial_indices, spatial_signs = indices_now, signs_now
+                indices_now = list(spatial_indices)
+                signs_now = list(spatial_signs)
+                for axis in range(3):
+                    indices_now.extend(
+                        (permutation[axis] + 1) * width + k for k in spatial_indices
+                    )
+                    signs_now.extend(reflections[axis] * s for s in spatial_signs)
             component_indices.append(indices_now)
             component_signs.append(signs_now)
 
@@ -142,6 +159,16 @@ class CartesianBFeatures(nn.Module):
         Maximum correlation order, meaning the largest number of ``A``
         factors in one invariant product. Only values one through three are
         currently supported.
+    include_polarization
+        Extend the same signed-orbit construction to [rho, Px, Py, Pz]
+        moment blocks. Both the spatial powers and polar-vector index
+        transform. Mixed scalar/vector products are generated automatically,
+        without a hand-written contraction list. Symmetry is cubic-grid O_h,
+        not arbitrary continuous rotations.
+    separate_center
+        With polarization, include the center slots supplied by A. Must
+        match A. With density alone, center handling remains in the model
+        and this option has no effect on the original B construction.
 
     Notes
     -----
@@ -155,8 +182,13 @@ class CartesianBFeatures(nn.Module):
 
     n_feature_axes = 3  # radial, invariant, density/channel
 
-    def __init__(self, max_power: int, max_product_order: int = 3) -> None:
+    def __init__(
+        self, max_power: int, max_product_order: int = 3,
+        include_polarization: bool = False, separate_center: bool = True,
+    ) -> None:
         super().__init__()
+        self.include_polarization = boolean(include_polarization, "include_polarization")
+        self.separate_center = boolean(separate_center, "separate_center")
 
         max_product_order = positive_integer(
             max_product_order,
@@ -166,9 +198,11 @@ class CartesianBFeatures(nn.Module):
             raise ValueError("max_product_order must be between one and three")
 
         powers = _make_powers(max_power)
-        component_indices, component_signs = _make_group_actions(powers)
+        component_indices, component_signs = _make_group_actions(
+            powers, self.include_polarization, self.separate_center
+        )
         recipes = _make_product_recipes(
-            n_components=powers.shape[0],
+            n_components=component_indices.shape[1],
             max_product_order=max_product_order,
             component_indices=component_indices,
             component_signs=component_signs,
@@ -176,7 +210,7 @@ class CartesianBFeatures(nn.Module):
 
         self.max_power = int(max_power)
         self.max_product_order = max_product_order
-        self.n_components = powers.shape[0]
+        self.n_components = component_indices.shape[1]
         self.register_buffer("powers", powers)
         self.register_buffer("component_indices", component_indices)
         self.register_buffer("component_signs", component_signs)
@@ -212,6 +246,16 @@ class CartesianBFeatures(nn.Module):
             "correlation_orders",
             torch.tensor(correlation_orders, dtype=torch.long),
         )
+
+    def validate_a_features(self, a_features) -> None:
+        """Keep field membership and moment layout fixed at construction."""
+        polarized = getattr(self, "include_polarization", False)
+        if polarized != getattr(a_features, "include_polarization", False):
+            raise ValueError("A/B include_polarization must match")
+        if a_features.max_power != self.max_power:
+            raise ValueError("A/B max_power must match")
+        if polarized and a_features.separate_center != self.separate_center:
+            raise ValueError("A/B separate_center must match with polarization")
 
     def forward(self, A: torch.Tensor) -> torch.Tensor:
         """Return signed-orbit averages through ``max_product_order``."""

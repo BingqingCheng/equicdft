@@ -12,6 +12,7 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._grid import gather_neighbors, periodic_density_convolution
+from ._nn import positive_scalar_tensor
 # These imports also retain the historical package-internal access points in
 # this module while their implementations live with the radial helpers.
 from ._radial import (
@@ -164,6 +165,18 @@ class CartesianAFeatures(nn.Module):
         ``"gather"`` retains explicit periodic neighborhoods. ``"fft"``
         evaluates the same circular stencil contraction in reciprocal space
         without materializing ``[..., G, J, C]``.
+    include_polarization
+        If True, require electric dipole density ``[..., G, n_types, 3]``.
+        Use the same spatial basis and species transform for rho and each
+        vector component, retaining the vector's transformation law in B.
+        The component axis contains blocks [rho, Px, Py, Pz], each ordered
+        by spatial monomial. With separate_center, append the normalized
+        center to each block before symmetrization, rather than feeding a
+        raw vector to the readout. Radial/type axes remain independent.
+    dipole_density_scale
+        Positive scalar normalizing the entire polarization vector, required
+        only with include_polarization. This is dipole moment per volume,
+        not orientation per particle.
 
     Notes
     -----
@@ -201,8 +214,21 @@ class CartesianAFeatures(nn.Module):
         trainable_density_transform: bool = True,
         n_radial_functions: Optional[int] = None,
         convolution_backend: str = "gather",
+        include_polarization: bool = False,
+        dipole_density_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
+
+        self.include_polarization = boolean(include_polarization, "include_polarization")
+        if self.include_polarization:
+            if dipole_density_scale is None:
+                raise ValueError("include_polarization requires dipole_density_scale")
+            self.register_buffer(
+                "dipole_density_scale",
+                positive_scalar_tensor(dipole_density_scale, "dipole_density_scale"),
+            )
+        elif dipole_density_scale is not None:
+            raise ValueError("dipole_density_scale requires include_polarization=True")
 
         if not isinstance(radial_basis, str):
             raise TypeError(
@@ -595,6 +621,15 @@ class CartesianAFeatures(nn.Module):
             return rho
         return self.density_transform(rho)
 
+    @property
+    def requires_dipole_density(self) -> bool:
+        return getattr(self, "include_polarization", False)
+
+    @property
+    def supports_message_layers(self) -> bool:
+        # BChiMessage emits scalar-field moments, not scalar/vector moments.
+        return not self.requires_dipole_density
+
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
@@ -619,17 +654,51 @@ class CartesianAFeatures(nn.Module):
             ``[..., n_grid, n_radial_channels, n_monomials, n_output_channels]``.
             The final dimension equals ``n_types`` when mixing is disabled and
             ``n_channels`` when mixing is enabled.
+            With polarization, replace n_monomials by
+            ``4 * (n_monomials + int(separate_center))``.
         """
 
         descriptor_density = self.transform_density(data["rho"])
         stencil_basis = self.stencil_basis()
+        if not self.requires_dipole_density:
+            return self._convolve(descriptor_density, self.mean_density, stencil_basis, data)
+
+        rho = data["rho"]
+        if "dipole_density" not in data:
+            raise ValueError("dipole_density is required when include_polarization=True")
+        dipole = data["dipole_density"]
+        if dipole.shape != (*rho.shape, 3):
+            raise ValueError("dipole_density must have shape [..., n_grid, n_types, 3]")
+        if dipole.dtype != rho.dtype or dipole.device != rho.device:
+            raise ValueError("rho and dipole_density must share dtype and device")
+        if not torch.isfinite(dipole).all():
+            raise ValueError("dipole_density must be finite")
+        # Apply the same species mixing to each component, without mixing
+        # scalar and vector fields or treating vector axes as species.
+        vector = self.transform_density(dipole.transpose(-1, -2))
+        channels = self.n_output_channels
+        fields = torch.cat((descriptor_density, vector.flatten(-2)), dim=-1)
+        scales = torch.cat((
+            self.mean_density.expand(channels),
+            self.dipole_density_scale.expand(3 * channels),
+        ))
+        moments = self._convolve(fields, scales, stencil_basis, data)
+        if self.separate_center:
+            center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
+            center = center.expand(*moments.shape[:-2], 1, 4 * channels)
+            moments = torch.cat((moments, center), dim=-2)
+        # [..., G, N, K, 4*C] -> [..., G, N, 4*K, C], field-major.
+        return moments.unflatten(-1, (4, channels)).transpose(-3, -2).flatten(-3, -2)
+
+    def _convolve(self, fields, scales, stencil_basis, data):
+        """Shared scalar/vector field convolution with scale-only normalization."""
         if self.convolution_backend == "fft":
             if "grid_positions" not in data or "grid_size" not in data:
                 raise ValueError(
                     "fft features require grid_positions and grid_size"
                 )
             return periodic_density_convolution(
-                descriptor_density / self.mean_density,
+                fields / scales,
                 stencil_basis,
                 data["grid_positions"],
                 data["grid_size"],
@@ -646,7 +715,7 @@ class CartesianAFeatures(nn.Module):
                 "feature backend"
             )
         local_density = gather_neighbors(
-            descriptor_density,
+            fields,
             data["local_density_index"],
         )
         if local_density.shape[-2] != self.monomial_values.shape[0]:
@@ -661,7 +730,7 @@ class CartesianAFeatures(nn.Module):
         # separate.
         features = torch.einsum(
             "...gjt,jnk->...gnkt",
-            local_density / self.mean_density,
+            local_density / scales,
             stencil_basis,
         )
         return features

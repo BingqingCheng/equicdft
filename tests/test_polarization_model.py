@@ -8,8 +8,7 @@ import torch
 
 from equicdft.features import CartesianAFeatures
 from equicdft.model import GridCACEModel
-from equicdft.polarization_features import PolarizationFeatures
-from equicdft.readout import LocalReadout, PolarizationReadout
+from equicdft.readout import LocalReadout
 from equicdft.semilocal import LDAReadout
 from equicdft.solver import GridSolver
 from equicdft.stencil import get_neighbor_indices
@@ -44,29 +43,17 @@ class TestPolarizationModel(unittest.TestCase):
 
     @staticmethod
     def model(spacing=0.5, mode="beta", with_scalar=False, **kwargs):
-        features = PolarizationFeatures(
-            mean_density=0.5,
-            dipole_density_scale=0.3,
-            cutoff_grid=1,
-            max_power=2,
-            max_product_order=3,
-            radial_exponents=(0.125, 0.5),
+        a_features = CartesianAFeatures(
+            mean_density=0.5, dipole_density_scale=0.3, include_polarization=True,
+            cutoff_grid=1, max_power=2, radial_basis="gaussian",
+            radial_exponents=(0.125, 0.5), trainable_radial_exponents=True,
         )
-        readouts = [PolarizationReadout(features, hidden_sizes=(5,))]
-        a_features = b_features = None
+        b_features = CartesianBFeatures(2, 3, include_polarization=True)
+        readouts = [LocalReadout(
+            n_features=2 * b_features.n_features + 1, hidden_sizes=(5,),
+        )]
         if with_scalar:
-            a_features = CartesianAFeatures(
-                mean_density=0.5,
-                cutoff_grid=1,
-                max_power=2,
-                radial_basis="gaussian",
-                radial_exponents=(0.125,),
-            )
-            b_features = CartesianBFeatures(max_power=2, max_product_order=2)
-            readouts.extend([
-                LocalReadout(hidden_sizes=(4,)),
-                LDAReadout(mean_density=0.5, hidden_sizes=(4,)),
-            ])
+            readouts.append(LDAReadout(mean_density=0.5, hidden_sizes=(4,)))
         return GridCACEModel(
             a_features=a_features,
             b_features=b_features,
@@ -90,7 +77,7 @@ class TestPolarizationModel(unittest.TestCase):
         self.assertTrue(model.requires_local_density_index)
         self.assertEqual(model.grid_info["cutoff_grid"], 1)
         self.assertTrue(torch.allclose(model.mean_density, torch.tensor([0.5])))
-        self.assertFalse(model.readout[0].requires_local_features)
+        self.assertTrue(model.readout[0].requires_local_features)
 
     def test_finite_difference_both_fields_modes_and_voxel_volumes(self):
         # Changing one independent field holds the other fixed. The explicit
@@ -196,7 +183,7 @@ class TestPolarizationModel(unittest.TestCase):
         loss = loss + output["polarization_derivative"].square().mean()
         loss.backward()
         feature_gradients = [
-            parameter.grad for parameter in model.readout[0].features.parameters()
+            parameter.grad for parameter in model.a_features.parameters()
         ]
         self.assertTrue(feature_gradients)
         self.assertTrue(all(value is not None for value in feature_gradients))
@@ -255,15 +242,10 @@ class TestPolarizationModel(unittest.TestCase):
 
     def test_rejects_incompatible_cutoff_and_missing_polar_field(self):
         model = self.model()
-        a_features = CartesianAFeatures(mean_density=0.5, cutoff_grid=2, max_power=2)
-        b_features = CartesianBFeatures(max_power=2, max_product_order=2)
-        with self.assertRaisesRegex(ValueError, "same cutoff_grid"):
-            GridCACEModel(
-                a_features, b_features, list(model.readout), grid_spacing=0.5
-            )
         with self.assertRaisesRegex(ValueError, "cubic voxels"):
             GridCACEModel(
-                None, None, list(model.readout), grid_spacing=(0.5, 0.5, 0.8)
+                model.a_features, model.b_features, list(model.readout),
+                grid_spacing=(0.5, 0.5, 0.8),
             )
         data = self.data()
         del data["dipole_density"]
@@ -283,17 +265,14 @@ class TestPolarizationModel(unittest.TestCase):
             GridSolver(self.model())
 
     def test_zero_polarization_response_for_scalar_only_invariant_selection(self):
-        features = PolarizationFeatures(
-            mean_density=0.5,
-            dipole_density_scale=0.3,
-            cutoff_grid=1,
-            max_product_order=1,
-            dipole_reversal_symmetry=True,
+        a = CartesianAFeatures(
+            mean_density=0.5, dipole_density_scale=0.3, cutoff_grid=1,
+            max_power=0, include_polarization=True,
         )
+        b = CartesianBFeatures(0, 1, include_polarization=True)
         model = GridCACEModel(
-            None, None, [PolarizationReadout(features, hidden_sizes=(4,))],
-            grid_spacing=0.5,
-            compute_polarization_derivative=True,
+            a, b, [LocalReadout(n_features=b.n_features + 1, hidden_sizes=(4,))],
+            grid_spacing=0.5, compute_polarization_derivative=True,
         )
         for training in (False, True):
             model.train(training)

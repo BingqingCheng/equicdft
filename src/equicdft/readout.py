@@ -13,10 +13,7 @@ from ._argument_checks import (
 from ._component_pairs import symmetric_component_pairs
 from ._nn import build_mlp
 from .energy import EnergyReadout, density_weighted_integral
-from .interaction import BChiMessage
-from .polarization_features import PolarizationFeatures
 from .reciprocal import ReciprocalFeatures
-from .symmetrize import CartesianBFeatures
 
 
 class LocalReadout(EnergyReadout):
@@ -93,107 +90,6 @@ class LocalReadout(EnergyReadout):
         return density_weighted_integral(
             rho,
             per_particle,
-            context["voxel_volume"],
-        )
-
-
-class PolarizationReadout(EnergyReadout):
-    """Integrate a local excess free energy from scalar/vector invariants.
-
-    ``features`` constructs invariant combinations of the live number-density
-    and electric dipole-density fields. A shared MLP receives these invariants
-    followed by normalized temperature and returns one reduced free energy
-    per particle and component. No orientational ideal entropy or external
-    electric-field coupling is included here.
-
-    Compatibility path for existing checkpoints and scalar-invariant messages.
-    New zero-message models should pass PolarizationAFeatures and
-    PolarizationBFeatures to GridCACEModel and use ordinary LocalReadout.
-
-    Optional ``message`` adds one B-chi aggregation of the complete joint
-    invariant vector B0. A single scalar latent gate h(B0)-h(0) is convolved
-    into Cartesian moments and contracted by CartesianBFeatures into B1.
-    The readout receives [B0, B1, T/T_ref]. This passes polarization-dependent
-    invariant information, not explicit vector-valued messages. The descriptor
-    receptive radius doubles; the strictly local LDA is unaffected.
-    """
-
-    requires_dipole_density = True
-    requires_local_density_index = True
-
-    def __init__(
-        self,
-        features: PolarizationFeatures,
-        hidden_sizes: Sequence[int] = (32, 16),
-        message: Optional[BChiMessage] = None,
-    ) -> None:
-        super().__init__()
-        if not isinstance(features, PolarizationFeatures):
-            raise TypeError("features must be PolarizationFeatures")
-        self.features = features
-        width = features.n_features + 1
-        if message is not None:
-            if not isinstance(message, BChiMessage):
-                raise TypeError("message must be a BChiMessage")
-            if (message.n_radial_channels, message.n_invariant_features,
-                    message.n_channels) != (1, features.n_features, 1):
-                raise ValueError("joint message requires one radial/latent channel and all joint invariants")
-            if message.convolution_backend != "gather":
-                raise ValueError("polarization messages currently require the gather backend")
-            if (message._radial_basis_kind() == "shared"
-                    and features.radial_exponents.numel() != 1):
-                raise ValueError("shared joint-message basis requires one radial channel")
-            message._bind_bessel_basis(features.scalar_features)
-            self.message = message
-            self.message_invariants = CartesianBFeatures(
-                features.max_power, features.max_product_order)
-            width += self.message_invariants.n_features
-        self.mlp = build_mlp(
-            width,
-            hidden_sizes,
-            features.n_types,
-        )
-
-    @property
-    def n_types(self) -> int:
-        """Number of physical number-density/dipole-density components."""
-
-        return self.features.n_types
-
-    @property
-    def mean_density(self) -> torch.Tensor:
-        """Fixed number-density normalization used by the descriptor."""
-
-        return self.features.mean_density
-
-    @property
-    def cutoff_grid(self) -> int:
-        """Inclusive stencil cutoff, measured in grid steps."""
-
-        return self.features.cutoff_grid
-
-    def forward(self, context: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Return per-particle outputs with shape ``[..., n_grid, n_types]``."""
-
-        invariants = self.features(context)
-        message = getattr(self, "message", None)
-        if message is not None:
-            geometry = self.features.scalar_features
-            basis = message._stencil_basis(geometry, geometry.stencil_basis())
-            moments = message(invariants.unsqueeze(-2).unsqueeze(-1),
-                              context["local_density_index"], basis)
-            next_invariants = self.message_invariants(moments).flatten(start_dim=-3)
-            invariants = torch.cat((invariants, next_invariants), dim=-1)
-        temperature = context["normalized_temperature"][..., None, None]
-        temperature = temperature.expand(*invariants.shape[:-1], 1)
-        return self.mlp(torch.cat((invariants, temperature), dim=-1))
-
-    def energy(self, context: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Return ``Delta V * sum_(g,a) rho[g,a] * a_exc[g,a]``."""
-
-        return density_weighted_integral(
-            context["rho"],
-            self(context),
             context["voxel_volume"],
         )
 

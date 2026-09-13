@@ -110,8 +110,7 @@ class GridCACEModel(nn.Module):
             )
         if messages and not getattr(a_features, "supports_message_layers", True):
             raise ValueError(
-                "message_layers do not support joint polarization moments; "
-                "use PolarizationReadout for the legacy scalar-invariant message"
+                "message_layers do not yet support polarized Cartesian moments"
             )
         for module in messages:
             expected = (
@@ -162,7 +161,6 @@ class GridCACEModel(nn.Module):
                 "the orientational ideal free energy must first be specified"
             )
         # Neighborhood requirements are independent of which fields are read.
-        # Only legacy PolarizationReadout still builds its own local features.
         cutoffs = [item.cutoff_grid for item in readouts
                    if item.requires_local_density_index]
         if a_features is not None:
@@ -572,7 +570,8 @@ class GridCACEModel(nn.Module):
                     ..., None, None
                 ].expand(*B_flat.shape[:-1], 1)
                 feature_blocks = []
-                if getattr(self.a_features, "separate_center", False):
+                if (getattr(self.a_features, "separate_center", False)
+                        and not getattr(self.a_features, "include_polarization", False)):
                     feature_blocks.append(
                         self.a_features.transform_density(rho)
                         / self.mean_density.to(
