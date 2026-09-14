@@ -10,7 +10,6 @@ from .metrics import FourierResponseMetrics, Metrics
 from .model import GridCACEModel
 from .pairwise import PairwiseReadout
 from .polarization_ideal import FixedDipoleIdeal
-from .polarization_solver import PolarizationSolver
 from .readout import BulkReadout, LocalReadout, LongRangeReadout
 from .reciprocal import ReciprocalFeatures
 from .response import FourierResponse
@@ -45,7 +44,6 @@ __all__ = [
     "Metrics",
     "PairwiseReadout",
     "FixedDipoleIdeal",
-    "PolarizationSolver",
     "ReciprocalFeatures",
     "TensorLoss",
     "Trainer",

@@ -1,11 +1,12 @@
 """Independent thermodynamic and canonical equilibrium tests for fixed dipoles."""
 
+import itertools
 import unittest
 
 import numpy as np
 import torch
 
-from equicdft import FixedDipoleIdeal, PolarizationSolver
+from equicdft import FixedDipoleIdeal, GridSolver
 from equicdft.polarization_ideal import inverse_langevin, langevin, log_sinhc
 
 
@@ -119,7 +120,7 @@ class TestFixedDipoleIdeal(unittest.TestCase):
             FixedDipoleIdeal(1.7, thermal_wavelength=torch.tensor(1.0 + 0.2j))
 
 
-class TestPolarizationSolver(unittest.TestCase):
+class TestGridSolverPolarization(unittest.TestCase):
     def setUp(self):
         self.old_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float64)
@@ -140,7 +141,8 @@ class TestPolarizationSolver(unittest.TestCase):
                 "beta": torch.tensor(1.4), "grid_spacing": torch.full((3,), spacing)}
 
     def check_solution(self, data, numbers, moments, perturbed=False):
-        solver = PolarizationSolver(moments, thermal_wavelength=[0.8, 1.3])
+        data = dict(data, thermal_wavelength=torch.tensor([0.8, 1.3]))
+        solver = GridSolver(None, dipole_magnitude=moments)
         kwargs = {}
         if perturbed:
             rho = torch.exp(0.4*torch.randn_like(data["V_ext"]))
@@ -148,7 +150,13 @@ class TestPolarizationSolver(unittest.TestCase):
             polar = 0.1*torch.randn(*rho.shape, 3)
             polar /= 1 + polar.norm(dim=-1, keepdim=True)
             kwargs = {"initial_rho": rho, "initial_polarization": polar*(rho*torch.as_tensor(moments))[..., None]}
-        result = solver.solve(data, numbers, max_iter=350, tolerance_residual=1e-7, **kwargs)
+        result = solver.solve(
+            data,
+            particle_numbers=numbers,
+            max_iter=350,
+            tolerance_residual=1e-7,
+            **kwargs,
+        )
         self.assertTrue(result["converged"], str(result["maximum_residual"]))
         expected_rho, expected_p = exact_solution(data, numbers, moments)
         scale = expected_rho.mean(0)
@@ -191,26 +199,197 @@ class TestPolarizationSolver(unittest.TestCase):
     def test_canonical_gauge_and_unconverged_status(self):
         data = self.case()
         rho, polar = exact_solution(data, [3., 4.], [0.7, 1.9])
-        solver = PolarizationSolver([0.7, 1.9])
+        solver = GridSolver(None, dipole_magnitude=[0.7, 1.9])
         first = solver.evaluate(dict(data, rho=rho, dipole_density=polar))
         shift = torch.tensor([2., -3.])
         second = solver.evaluate(dict(data, V_ext=data["V_ext"]+shift, rho=rho, dipole_density=polar))
         torch.testing.assert_close(first["density_residual"], second["density_residual"], atol=1e-12, rtol=0)
         torch.testing.assert_close(second["beta_mu"]-first["beta_mu"], data["beta"]*shift)
-        result = solver.solve(data, [3., 4.], max_iter=1, tolerance_residual=1e-12, step_size=0.1)
+        result = solver.solve(
+            data,
+            particle_numbers=[3., 4.],
+            max_iter=1,
+            tolerance_residual=1e-12,
+            step_size=0.1,
+        )
         self.assertFalse(result["converged"])
         self.assertEqual(result["status"], "max_iter")
 
     def test_validation(self):
-        solver = PolarizationSolver([0.7, 1.9])
+        solver = GridSolver(None, dipole_magnitude=[0.7, 1.9])
         data = self.case()
         for changes in ({"beta": torch.tensor(-1.)}, {"E_ext": torch.zeros(24, 3)},
                         {"excluded_mask": torch.ones(24, dtype=torch.bool)},
                         {"grid_spacing": torch.tensor([1., 2., 1.])}):
             with self.assertRaises(ValueError):
-                solver.solve(dict(data, **changes), [3., 4.])
+                solver.solve(
+                    dict(data, **changes), particle_numbers=[3., 4.]
+                )
         with self.assertRaises(ValueError):
-            solver.solve(data, [3., 4.], initial_rho=torch.ones(24, 2))
+            solver.solve(
+                data,
+                particle_numbers=[3., 4.],
+                initial_rho=torch.ones(24, 2),
+            )
+        with self.assertRaisesRegex(ValueError, "requires particle_numbers"):
+            solver.solve(data)
+        with self.assertRaisesRegex(ValueError, "Anderson"):
+            solver.solve(data, particle_numbers=[3., 4.], anderson=True)
+
+    def test_density_cap_is_enforced_by_both_solvers(self):
+        data = {
+            "V_ext": torch.tensor([[-10.0], [0.0], [0.0], [0.0]]),
+            "E_ext": torch.tensor(
+                [[[0.2, -0.1, 0.3]], [[-0.4, 0.2, 0.1]],
+                 [[0.1, 0.5, -0.2]], [[-0.2, -0.3, 0.4]]]
+            ),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        for method in ("minimize", "euler"):
+            with self.subTest(method=method):
+                result = GridSolver(
+                    None, dipole_magnitude=0.8
+                ).solve(
+                    data,
+                    particle_numbers=[2.0],
+                    method=method,
+                    maximum_density=0.6,
+                    max_iter=500,
+                    tolerance_residual=1.0e-10,
+                    tolerance_change=1.0e-12,
+                    adaptive_mixing=False,
+                    mixing=0.2,
+                )
+                self.assertTrue(
+                    result["converged"], str(result["maximum_residual"])
+                )
+                self.assertLessEqual(
+                    result["rho"].max().item(), 0.6 + 1.0e-12
+                )
+                self.assertAlmostEqual(
+                    result["rho"].sum().item(), 2.0, places=12
+                )
+                self.assertAlmostEqual(
+                    result["rho"][0, 0].item(), 0.6, places=10
+                )
+                self.assertLess(float(result["maximum_alignment"]), 1.0)
+
+    def test_density_cap_projects_rho_and_preserves_alignment(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        rho = torch.tensor([[0.8], [0.4], [0.4], [0.4]])
+        polarization = torch.zeros(4, 1, 3)
+        polarization[..., 0] = 0.2 * 0.8 * rho
+        result = GridSolver(None, dipole_magnitude=0.8).solve(
+            data,
+            initial_rho=rho,
+            initial_polarization=polarization,
+            particle_numbers=[2.0],
+            maximum_density=0.6,
+            max_iter=1,
+            tolerance_residual=100.0,
+        )
+        self.assertEqual(result["n_iter"], 0)
+        self.assertAlmostEqual(result["rho"].max().item(), 0.6, places=12)
+        alignment = (
+            result["dipole_density"][..., 0]
+            / (0.8 * result["rho"])
+        )
+        torch.testing.assert_close(alignment, torch.full_like(alignment, 0.2))
+
+    def test_polarization_fraction_cap_is_enforced_with_kkt_residual(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.tensor(
+                [[[10.0, 0.0, 0.0]]] * 4,
+                dtype=torch.float64,
+            ),
+            "beta": torch.tensor(1.0, dtype=torch.float64),
+            "grid_spacing": torch.ones(3, dtype=torch.float64),
+        }
+        for method in ("minimize", "euler"):
+            with self.subTest(method=method):
+                result = GridSolver(
+                    None, dipole_magnitude=0.8
+                ).solve(
+                    data,
+                    particle_numbers=[2.0],
+                    method=method,
+                    maximum_polarization_fraction=0.2,
+                    max_iter=500,
+                    tolerance_residual=1.0e-8,
+                    tolerance_change=1.0e-12,
+                    adaptive_mixing=False,
+                    mixing=1.0,
+                    maximum_mixing=1.0,
+                )
+                self.assertTrue(
+                    result["converged"], str(result["maximum_residual"])
+                )
+                self.assertLessEqual(
+                    float(result["maximum_alignment"]), 0.2 + 1.0e-12
+                )
+                self.assertAlmostEqual(
+                    float(result["maximum_alignment"]), 0.2, places=10
+                )
+                self.assertGreater(
+                    float(
+                        result[
+                            "unconstrained_scaled_polarization_residual"
+                        ].abs().max()
+                    ),
+                    1.0,
+                )
+                self.assertLess(
+                    float(result["max_polarization_residual"]), 1.0e-8
+                )
+
+    def test_invalid_polarization_fraction_cap_is_rejected(self):
+        solver = GridSolver(None, dipole_magnitude=[0.7, 1.9])
+        for value in (0.0, 1.0, [0.2, 1.0]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "lie in \\(0, 1\\)"):
+                    solver.solve(
+                        self.case(),
+                        particle_numbers=[3.0, 4.0],
+                        maximum_polarization_fraction=value,
+                    )
+
+    def test_infeasible_density_cap_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "infeasible"):
+            GridSolver(None, dipole_magnitude=[0.7, 1.9]).solve(
+                self.case(),
+                particle_numbers=[3.0, 4.0],
+                maximum_density=[0.9, 1.0],
+            )
+
+    def test_initial_polarization_without_initial_density(self):
+        data = self.case()
+        numbers = torch.tensor([3.0, 4.0])
+        volume = data["grid_spacing"].prod()
+        rho = torch.ones_like(data["V_ext"]) * numbers / (24 * volume)
+        direction = torch.tensor([1.0, 0.0, 0.0])
+        initial_p = (
+            0.05
+            * rho[..., None]
+            * torch.tensor([0.7, 1.9])[..., None]
+            * direction
+        )
+        result = GridSolver(
+            None, dipole_magnitude=[0.7, 1.9]
+        ).solve(
+            data,
+            particle_numbers=numbers,
+            initial_polarization=initial_p,
+            tolerance_residual=100.0,
+        )
+        self.assertEqual(result["n_iter"], 0)
+        torch.testing.assert_close(result["dipole_density"], initial_p)
 
     def test_excess_energy_and_line_search(self):
         class Quadratic(torch.nn.Module):
@@ -233,7 +412,9 @@ class TestPolarizationSolver(unittest.TestCase):
         data["V_ext"] = -(ideal["density_derivative"] + model.strength.detach()*target_rho)/data["beta"]
         data["E_ext"] = (ideal["polarization_derivative"] + model.strength.detach()*target_p)/data["beta"]
         numbers = target_rho.sum(0)*data["grid_spacing"].prod()
-        result = PolarizationSolver(moments, model).solve(data, numbers)
+        result = GridSolver(model, dipole_magnitude=moments).solve(
+            data, particle_numbers=numbers, tolerance_residual=1.0e-7
+        )
         self.assertTrue(result["converged"], str(result["maximum_residual"]))
         torch.testing.assert_close(result["rho"], target_rho, rtol=0, atol=3e-8)
         torch.testing.assert_close(result["dipole_density"], target_p, rtol=0, atol=3e-8)
@@ -241,10 +422,101 @@ class TestPolarizationSolver(unittest.TestCase):
         self.assertGreater(result["iterations"], 1)
         self.assertEqual(float(model.strength.grad), 7.)
         self.assertTrue(model.training)
-        failure = PolarizationSolver(moments, model).solve(
-            data, numbers, step_size=100., max_backtracks=1)
+        failure = GridSolver(model, dipole_magnitude=moments).solve(
+            data,
+            particle_numbers=numbers,
+            step_size=100.,
+            minimum_step_size=100.,
+        )
         self.assertFalse(failure["converged"])
         self.assertEqual(failure["status"], "line_search_failed")
+
+    def test_coupled_euler_expression(self):
+        data = self.case()
+        moments = [0.7, 1.9]
+        numbers = [3.0, 4.0]
+        result = GridSolver(None, dipole_magnitude=moments).solve(
+            data,
+            particle_numbers=numbers,
+            method="euler",
+            mixing=1.0,
+            adaptive_mixing=False,
+            maximum_mixing=1.0,
+            max_iter=2,
+            tolerance_residual=1.0e-10,
+        )
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        self.assertTrue(result["converged"])
+        self.assertEqual(result["n_iter"], 1)
+        torch.testing.assert_close(result["rho"], expected_rho)
+        torch.testing.assert_close(result["dipole_density"], expected_p)
+
+    def test_excluded_voxels(self):
+        data = self.case()
+        data["excluded_mask"] = torch.zeros(24, dtype=torch.bool)
+        data["excluded_mask"][[0, 7, 19]] = True
+        result = GridSolver(None, dipole_magnitude=[0.7, 1.9]).solve(
+            data,
+            particle_numbers=[3.0, 4.0],
+            tolerance_residual=1.0e-9,
+        )
+        excluded = data["excluded_mask"]
+        self.assertTrue(result["converged"])
+        self.assertTrue(torch.equal(result["rho"][excluded], torch.zeros(3, 2)))
+        self.assertTrue(
+            torch.equal(
+                result["dipole_density"][excluded], torch.zeros(3, 2, 3)
+            )
+        )
+        torch.testing.assert_close(
+            result["particle_numbers"], torch.tensor([3.0, 4.0])
+        )
+
+    def test_solver_covariance_under_all_48_cubic_actions(self):
+        size = 3
+        positions = np.indices((size,) * 3).reshape(3, -1).T
+        data = {
+            "V_ext": torch.randn(size**3, 1),
+            "E_ext": torch.randn(size**3, 1, 3),
+            "beta": torch.tensor(0.8),
+            "grid_spacing": torch.ones(3),
+        }
+        solver = GridSolver(None, dipole_magnitude=1.2)
+        reference = solver.solve(
+            data, particle_numbers=[5.0], tolerance_residual=1.0e-10
+        )
+        actions = [
+            np.eye(3, dtype=int)[list(permutation)]
+            * np.asarray(signs)[:, None]
+            for permutation in itertools.permutations(range(3))
+            for signs in itertools.product((1, -1), repeat=3)
+        ]
+        self.assertEqual(len({tuple(a.flat) for a in actions}), 48)
+        for action in actions:
+            centers = ((2 * positions + 1) @ action.T) % (2 * size)
+            destination = torch.tensor(
+                np.ravel_multi_index(
+                    ((centers - 1) // 2).T, (size, size, size)
+                )
+            )
+            matrix = torch.tensor(action, dtype=torch.float64)
+            transformed = dict(data)
+            transformed["V_ext"] = torch.empty_like(data["V_ext"])
+            transformed["V_ext"][destination] = data["V_ext"]
+            transformed["E_ext"] = torch.empty_like(data["E_ext"])
+            transformed["E_ext"][destination] = data["E_ext"] @ matrix.T
+            result = solver.solve(
+                transformed,
+                particle_numbers=[5.0],
+                tolerance_residual=1.0e-10,
+            )
+            torch.testing.assert_close(
+                result["rho"][destination], reference["rho"]
+            )
+            torch.testing.assert_close(
+                result["dipole_density"][destination],
+                reference["dipole_density"] @ matrix.T,
+            )
 
     def test_grid_model_energy_integration(self):
         from equicdft import GridCACEModel, GridData, CartesianAFeatures, CartesianBFeatures, LocalReadout
@@ -261,20 +533,37 @@ class TestPolarizationSolver(unittest.TestCase):
         data = GridData.from_dict({"grid_size": [3, 3, 3], "temperature": 1.4}, grid_info=model.grid_info)
         rho = 0.4 + 0.1*torch.rand(27, 1)
         polar = 0.02*torch.randn(27, 1, 3)
-        solver = PolarizationSolver(0.8, model)
+        solver = GridSolver(model, dipole_magnitude=0.8)
         target = solver.evaluate(dict(data, rho=rho, dipole_density=polar,
                                       V_ext=torch.zeros_like(rho), E_ext=torch.zeros_like(polar)))
         data["V_ext"] = -target["density_residual"]/data["beta"]
         data["E_ext"] = target["polarization_residual"]/data["beta"]
-        with torch.no_grad():
-            result = solver.solve(data, rho.sum(0)*0.5**3)
-        self.assertTrue(result["converged"], str(result["maximum_residual"]))
-        torch.testing.assert_close(result["rho"], rho, atol=1e-7, rtol=0)
-        torch.testing.assert_close(result["dipole_density"], polar, atol=1e-7, rtol=0)
+        for method in ("minimize", "euler"):
+            with self.subTest(method=method), torch.no_grad():
+                result = solver.solve(
+                    data,
+                    particle_numbers=rho.sum(0)*0.5**3,
+                    method=method,
+                    max_iter=400,
+                    tolerance_residual=1.0e-7,
+                    tolerance_change=1.0e-10,
+                )
+                self.assertTrue(
+                    result["converged"], str(result["maximum_residual"])
+                )
+                torch.testing.assert_close(
+                    result["rho"], rho, atol=1e-7, rtol=0
+                )
+                torch.testing.assert_close(
+                    result["dipole_density"], polar, atol=1e-7, rtol=0
+                )
         self.assertFalse(model.training)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
         with self.assertRaisesRegex(ValueError, "beta must agree"):
-            solver.solve(dict(data, beta=data["beta"]*2), rho.sum(0)*0.5**3)
+            solver.solve(
+                dict(data, beta=data["beta"]*2),
+                particle_numbers=rho.sum(0)*0.5**3,
+            )
 
 
 if __name__ == "__main__":

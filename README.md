@@ -233,6 +233,20 @@ print(outputs["beta_F_exc"], outputs["c1"])
 - solve an equilibrium density at fixed particle number or fixed chemical
   potential using Euler iteration or direct free-energy minimization.
 
+An explicit fixed dipole magnitude extends the same interface to coupled
+particle- and dipole-density equilibrium:
+
+```python
+solver = GridSolver(model, dipole_magnitude=m)
+result = solver.solve(data, particle_numbers=N)
+```
+
+Here `data` supplies `V_ext` and `E_ext`; the latter couples as
+$-\int \mathbf P\cdot\mathbf E_{\mathrm{ext}}$. Fixed-dipole solves use the
+orientational ideal entropy and preserve $|\mathbf P|<m\rho$. Both coupled
+Euler iteration and free-energy minimization are available. Polarization is
+enabled only by `dipole_magnitude`, never inferred from an optional data field.
+
 The solver validates the grid against `model.grid_info`. See its docstring and
 the tests for the full option set. Both equilibrium algorithms keep excluded
 densities exactly zero, normalize fixed particle numbers over accessible grid

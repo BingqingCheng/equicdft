@@ -261,7 +261,7 @@ class TestPolarizationModel(unittest.TestCase):
         self.assertFalse(scalar.requires_dipole_density)
         with self.assertRaisesRegex(ValueError, "requires a dipole-density readout"):
             scalar(self.data(), compute_polarization_derivative=True)
-        with self.assertRaisesRegex(ValueError, "orientational ideal"):
+        with self.assertRaisesRegex(ValueError, "dipole_magnitude"):
             GridSolver(self.model())
 
     def test_zero_polarization_response_for_scalar_only_invariant_selection(self):

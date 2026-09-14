@@ -113,7 +113,13 @@ class FixedDipoleIdeal(nn.Module):
                 raise ValueError(name + " must be a positive scalar or species vector")
             self.register_buffer(name, tensor.detach().clone())
 
-    def forward(self, rho, dipole_density, voxel_volume):
+    def forward(
+        self,
+        rho,
+        dipole_density,
+        voxel_volume,
+        thermal_wavelength=None,
+    ):
         if (rho.ndim < 2 or min(rho.shape) < 1 or not rho.is_floating_point()
                 or not torch.isfinite(rho).all() or torch.any(rho <= 0)):
             raise ValueError("rho must be finite, positive, floating [..., grid, species]")
@@ -124,7 +130,13 @@ class FixedDipoleIdeal(nn.Module):
         if not torch.isfinite(dipole_density).all():
             raise ValueError("dipole_density must be finite")
         moment = _positive_components(self.dipole_magnitude, rho, "dipole_magnitude")
-        wavelength = _positive_components(self.thermal_wavelength, rho, "thermal_wavelength")
+        wavelength = _positive_components(
+            self.thermal_wavelength
+            if thermal_wavelength is None
+            else thermal_wavelength,
+            rho,
+            "thermal_wavelength",
+        )
         reduced = dipole_density / (rho * moment)[..., None]
         square = reduced.square().sum(dim=-1)
         if torch.any(square >= 1):

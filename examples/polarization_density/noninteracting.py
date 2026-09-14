@@ -10,7 +10,7 @@ import json
 import numpy as np
 import torch
 
-from equicdft import PolarizationSolver
+from equicdft import GridSolver
 
 
 def exact_solution(v, h_vector, number, volume, moment):
@@ -64,7 +64,12 @@ def main():
                 fraction = 0.15*torch.randn_like(field)
                 fraction /= 1 + fraction.norm(dim=-1, keepdim=True)
                 initial = {"initial_rho": rho, "initial_polarization": moment*rho[..., None]*fraction}
-            result = PolarizationSolver(moment).solve(data, number, tolerance_residual=1e-8, **initial)
+            result = GridSolver(None, dipole_magnitude=moment).solve(
+                data,
+                particle_numbers=number,
+                tolerance_residual=1e-8,
+                **initial,
+            )
             density_error = float((result["rho"]-reference_rho).abs().max()/reference_rho.mean())
             polar_error = float((result["dipole_density"]-reference_p).abs().max()/(moment*reference_rho.mean()))
             record = {"case": name, "start": start, "converged": result["converged"],

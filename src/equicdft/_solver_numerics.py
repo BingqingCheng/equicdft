@@ -112,6 +112,98 @@ def _maximum_relative_change(
     ).item()
 
 
+def _project_vector_norm(
+    vector: torch.Tensor,
+    maximum_norm: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Project vectors onto broadcastable Euclidean-norm bounds."""
+
+    if maximum_norm is None:
+        return vector
+    norm = vector.norm(dim=-1, keepdim=True)
+    scale = torch.minimum(
+        torch.ones_like(norm),
+        maximum_norm / norm.clamp_min(torch.finfo(vector.dtype).tiny),
+    )
+    return vector * scale
+
+
+def _fixed_dipole_bound_kkt(
+    rho: torch.Tensor,
+    polarization: torch.Tensor,
+    local_chemical_potential: torch.Tensor,
+    scaled_polarization_residual: torch.Tensor,
+    dipole_magnitude: torch.Tensor,
+    maximum_polarization_fraction: Optional[torch.Tensor],
+    accessible_mask: torch.Tensor,
+):
+    """Return gradients projected onto ``|P| <= q_max*m*rho`` KKT cones.
+
+    The polarization residual is scaled by ``dipole_magnitude``. Therefore
+    the returned nonnegative multiplier has the same dimensionless scaling,
+    and its density-gradient contribution is ``-q_max * multiplier``.
+    """
+
+    multiplier = torch.zeros_like(rho)
+    if maximum_polarization_fraction is None:
+        return (
+            local_chemical_potential,
+            scaled_polarization_residual,
+            multiplier,
+        )
+
+    norm = polarization.norm(dim=-1)
+    direction = polarization / norm.clamp_min(
+        torch.finfo(rho.dtype).tiny
+    )[..., None]
+    fraction = norm / (rho * dipole_magnitude)
+    cap_tolerance = 1.0e-6 * torch.maximum(
+        maximum_polarization_fraction,
+        torch.ones_like(maximum_polarization_fraction),
+    )
+    at_cap = accessible_mask[:, None] & (
+        fraction
+        >= (maximum_polarization_fraction - cap_tolerance)[None, :]
+    )
+    radial_residual = (
+        scaled_polarization_residual * direction
+    ).sum(dim=-1)
+    multiplier = torch.where(
+        at_cap,
+        torch.clamp(-radial_residual, min=0.0),
+        multiplier,
+    )
+    constrained_polarization_residual = (
+        scaled_polarization_residual + multiplier[..., None] * direction
+    )
+    effective_chemical_potential = (
+        local_chemical_potential
+        - maximum_polarization_fraction[None, :] * multiplier
+    )
+    return (
+        effective_chemical_potential,
+        constrained_polarization_residual,
+        multiplier,
+    )
+
+
+def _polarization_residual_norms(
+    rho: torch.Tensor,
+    scaled_polarization_residual: torch.Tensor,
+    accessible_mask: torch.Tensor,
+):
+    """Return maximum-component and density-weighted RMS residuals."""
+
+    active_rho = rho[accessible_mask]
+    active_residual = scaled_polarization_residual[accessible_mask]
+    maximum = active_residual.abs().max()
+    rms = torch.sqrt(
+        (active_rho[..., None] * active_residual.square()).sum()
+        / (3 * active_rho.sum())
+    )
+    return maximum, rms
+
+
 def _normalize_particle_numbers(
     rho: torch.Tensor,
     particle_numbers: torch.Tensor,
@@ -326,32 +418,87 @@ def _euler_residual(
         torch.zeros_like(local_chemical_potential),
     )
     if mu is None:
-        averaging_weights = torch.where(
-            accessible,
+        return _canonical_density_residual(
             rho,
-            torch.zeros_like(rho),
+            local_chemical_potential,
+            density_threshold,
+            maximum_density,
+            accessible_mask,
         )
-        if maximum_density is not None:
-            cap_tolerance = 1.0e-6 * torch.maximum(
-                maximum_density,
-                torch.ones_like(maximum_density),
-            )
-            below_cap = accessible & (rho < (
-                maximum_density - cap_tolerance
-            )[None, :])
-            free_weights = rho * below_cap
-            has_free_weight = torch.sum(free_weights, dim=0) > 0.0
-            averaging_weights = torch.where(
-                has_free_weight[None, :],
-                free_weights,
-                rho,
-            )
-        chemical_potential = torch.sum(
-            averaging_weights * local_chemical_potential,
-            dim=0,
-        ) / torch.sum(averaging_weights, dim=0)
     else:
         chemical_potential = beta * mu
+    residual = local_chemical_potential - chemical_potential[None, :]
+    residual = torch.where(accessible, residual, torch.zeros_like(residual))
+
+    constrained_residual = residual
+    if maximum_density is not None:
+        cap_tolerance = 1.0e-6 * torch.maximum(
+            maximum_density,
+            torch.ones_like(maximum_density),
+        )
+        at_cap = accessible & (
+            rho >= (maximum_density - cap_tolerance)[None, :]
+        )
+        constrained_residual = torch.where(
+            at_cap,
+            torch.clamp(residual, min=0.0),
+            residual,
+        )
+
+    active = accessible & (
+        torch.ones_like(rho, dtype=torch.bool)
+        if density_threshold == 0.0
+        else rho > density_threshold
+    )
+    if torch.any(active).item():
+        max_residual = torch.max(
+            torch.abs(constrained_residual[active])
+        ).item()
+        rms_weights = rho * active.to(rho.dtype)
+        rms_residual = torch.sqrt(
+            torch.sum(rms_weights * constrained_residual.square())
+            / torch.sum(rms_weights)
+        ).item()
+    else:
+        max_residual = float("inf")
+        rms_residual = float("inf")
+    return constrained_residual, chemical_potential, max_residual, rms_residual
+
+
+def _canonical_density_residual(
+    rho: torch.Tensor,
+    local_chemical_potential: torch.Tensor,
+    density_threshold: float,
+    maximum_density: Optional[torch.Tensor] = None,
+    accessible_mask: Optional[torch.Tensor] = None,
+):
+    """Return a canonical density residual with optional upper-bound KKT."""
+
+    accessible = _accessible_density_mask(rho, accessible_mask)
+    averaging_weights = torch.where(
+        accessible,
+        rho,
+        torch.zeros_like(rho),
+    )
+    if maximum_density is not None:
+        cap_tolerance = 1.0e-6 * torch.maximum(
+            maximum_density,
+            torch.ones_like(maximum_density),
+        )
+        below_cap = accessible & (
+            rho < (maximum_density - cap_tolerance)[None, :]
+        )
+        free_weights = rho * below_cap
+        has_free_weight = torch.sum(free_weights, dim=0) > 0.0
+        averaging_weights = torch.where(
+            has_free_weight[None, :],
+            free_weights,
+            rho,
+        )
+    chemical_potential = torch.sum(
+        averaging_weights * local_chemical_potential,
+        dim=0,
+    ) / torch.sum(averaging_weights, dim=0)
     residual = local_chemical_potential - chemical_potential[None, :]
     residual = torch.where(accessible, residual, torch.zeros_like(residual))
 
