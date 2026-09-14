@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from equicdft import (
-    CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
+    BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
     LocalReadout, LongRangeReadout, ReciprocalFeatures,
 )
 from equicdft.stencil import get_neighbor_indices
@@ -40,7 +40,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         }
 
     @staticmethod
-    def model(backend, charge):
+    def model(backend, charge, message_count=0):
         a = CartesianAFeatures(
             max_power=1, mean_density=.5, dipole_density_scale=.3,
             include_polarization=True, separate_center=True, cutoff_grid=1,
@@ -52,7 +52,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             include_polarization=True, separate_center=True,
         )
         readouts = [
-            LocalReadout(n_features=a.n_radial_channels * b.n_features + 1,
+            LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
             LDAReadout(mean_density=.5, dipole_density_scale=.3,
                        hidden_sizes=(5,), zero_init=False),
@@ -68,6 +68,12 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         return GridCACEModel(
             a, b, readouts, grid_spacing=.7, mean_temperature=1.5,
             compute_c1=True, compute_polarization_derivative=True,
+            message_layers=[BChiMessage(
+                b.n_features, a.n_radial_channels, a.n_output_channels,
+                hidden_sizes=(5,), include_polarization=True,
+                radial_exponents=(.2, .6), trainable_radial_exponents=True,
+                convolution_backend=backend,
+            ) for _ in range(message_count)],
         ).eval()
 
     @staticmethod
@@ -96,9 +102,9 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         self.assertEqual(sum(round(np.linalg.det(r)) == 1 for r in actions), 24)
 
         # Neutral dipoles and a mixed charge/dipole source; both SR backends.
-        for backend, charge in itertools.product(("gather", "fft"), (0., .7)):
-            with self.subTest(backend=backend, charge=charge):
-                full = self.model(backend, charge)
+        for backend, charge, messages in itertools.product(("gather", "fft"), (0., .7), (0, 1)):
+            with self.subTest(backend=backend, charge=charge, messages=messages):
+                full = self.model(backend, charge, messages)
                 models = {"complete": full}
                 for index, name in enumerate(("short_range", "LDA", "Coulomb_LR")):
                     branch = copy.deepcopy(full)

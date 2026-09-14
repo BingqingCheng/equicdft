@@ -260,3 +260,58 @@ An optional species-channel transform is applied identically to $\rho$ and each 
 `GridCACEModel` flattens the B features and appends $T/T_{\rm ref}$. `LocalReadout` can infer the resulting input dimension lazily.
 
 With separate-center polarization features, center information is already inside B and is not appended again.
+
+## 6. Joint field-gated message passing
+
+Use the existing `BChiMessage` with its polarization toggle matching A and B:
+
+```python
+from equicdft import BChiMessage
+
+message = BChiMessage(
+    n_invariant_features=b_features.n_features,
+    n_radial_channels=a_features.n_radial_channels,
+    n_channels=a_features.n_output_channels,
+    hidden_sizes=(16, 8),
+    include_polarization=True,
+    convolution_backend=a_features.convolution_backend,
+)
+# Pass message_layers=[message] to GridCACEModel in the example above.
+```
+
+At layer $t$, one neural map of the full joint invariant vector produces two
+scalar gates per radial/channel pair:
+
+$$
+a_i^t=h_\rho^t(B_i^t)-h_\rho^t(0),\qquad
+b_i^t=h_P^t(B_i^t)-h_P^t(0).
+$$
+
+These gates multiply the original normalized fields before stencil aggregation:
+
+$$
+u_i^t=a_i^t\tilde\rho_i,\qquad
+\mathbf w_i^t=b_i^t\tilde{\mathbf P}_i.
+$$
+
+One polarization gate is shared across x/y/z, so the gated polarization remains
+a polar vector. Species mixing and reference scales are exactly those of the
+initial A features. Each layer uses the original field carriers, not products
+of all preceding gates. The physical input fields are never overwritten.
+
+The existing radial–Cartesian convolution aggregates $u$ and $\mathbf w$ into
+the same joint A layout. With `separate_center=True`, their gated center values
+are appended within each field block. The same joint B constructor then gives
+the next invariant level. The lazy readout receives flattened
+`[B0, B1, ..., T/T_ref]`; no separate message symmetrizer is needed.
+
+Messages add no voxel-volume factor, extra density normalization or update to
+the physical fields used by energy integration, LDA, Coulomb or ideal terms.
+Shared and message-owned radial bases and the gather/conv3d/FFT message backends
+use the existing stencil machinery. Omitting message radial settings shares
+the initial basis; supplying them gives the message its own basis.
+
+The default `BChiMessage(include_polarization=False)` remains the original
+scalar gate-only message, without multiplication by rho. Its parameter layout
+and operation are unchanged. Joint field gating is an opt-in extension, not
+an identical reproduction of the historical scalar-only polarization message.

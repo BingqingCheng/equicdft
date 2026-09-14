@@ -625,11 +625,6 @@ class CartesianAFeatures(nn.Module):
     def requires_dipole_density(self) -> bool:
         return getattr(self, "include_polarization", False)
 
-    @property
-    def supports_message_layers(self) -> bool:
-        # BChiMessage emits scalar-field moments, not scalar/vector moments.
-        return not self.requires_dipole_density
-
     def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
@@ -658,11 +653,27 @@ class CartesianAFeatures(nn.Module):
             ``4 * (n_monomials + int(separate_center))``.
         """
 
-        descriptor_density = self.transform_density(data["rho"])
         stencil_basis = self.stencil_basis()
         if not self.requires_dipole_density:
+            descriptor_density = self.transform_density(data["rho"])
             return self._convolve(descriptor_density, self.mean_density, stencil_basis, data)
 
+        fields, scales = self._polarization_fields(data)
+        moments = self._convolve(fields, scales, stencil_basis, data)
+        if self.separate_center:
+            center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
+            center = center.expand(*moments.shape[:-2], 1, fields.shape[-1])
+            moments = torch.cat((moments, center), dim=-2)
+        # [..., G, N, K, 4*C] -> [..., G, N, 4*K, C], field-major.
+        moments = moments.unflatten(-1, (4, self.n_output_channels))
+        return moments.transpose(-3, -2).flatten(-3, -2)
+
+    def _polarization_fields(self, data):
+        """Pack original [rho, Px, Py, Pz] channels and their reference scales.
+
+        Initial moments and joint messages use the same species mixing and
+        normalization. These carriers remain connected to the physical inputs.
+        """
         rho = data["rho"]
         if "dipole_density" not in data:
             raise ValueError("dipole_density is required when include_polarization=True")
@@ -677,18 +688,13 @@ class CartesianAFeatures(nn.Module):
         # scalar and vector fields or treating vector axes as species.
         vector = self.transform_density(dipole.transpose(-1, -2))
         channels = self.n_output_channels
+        descriptor_density = self.transform_density(rho)
         fields = torch.cat((descriptor_density, vector.flatten(-2)), dim=-1)
         scales = torch.cat((
             self.mean_density.expand(channels),
             self.dipole_density_scale.expand(3 * channels),
         ))
-        moments = self._convolve(fields, scales, stencil_basis, data)
-        if self.separate_center:
-            center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
-            center = center.expand(*moments.shape[:-2], 1, 4 * channels)
-            moments = torch.cat((moments, center), dim=-2)
-        # [..., G, N, K, 4*C] -> [..., G, N, 4*K, C], field-major.
-        return moments.unflatten(-1, (4, channels)).transpose(-3, -2).flatten(-3, -2)
+        return fields, scales
 
     def _convolve(self, fields, scales, stencil_basis, data):
         """Shared scalar/vector field convolution with scale-only normalization."""
