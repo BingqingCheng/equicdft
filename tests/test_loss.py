@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from equicdft import (
-    FixedDipoleIdeal,
     FourierResponse,
     FourierResponseLoss,
     FourierStabilityLoss,
@@ -346,8 +345,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
 
         rho = batch["rho"]
         polarization = batch["dipole_density"]
-        ideal = FixedDipoleIdeal(1.0)
-        reference = ideal(rho, polarization, torch.ones(1))["beta_F_id"]
         phase = (
             2.0
             * torch.pi
@@ -358,15 +355,11 @@ class TestFourierStabilityLoss(unittest.TestCase):
         for wave in (torch.cos(phase), torch.sin(phase)):
             delta = torch.zeros_like(polarization)
             delta[..., 0] = common["relative_amplitude"] * rho * wave[None, :, None]
-            ideal_second = (
-                ideal(rho, delta, torch.ones(1))["beta_F_id"]
-                + ideal(rho, -delta, torch.ones(1))["beta_F_id"]
-                - 2.0 * reference
-            )
+            ideal_second = 3.0 * (delta.square() / rho[..., None]).sum()
             excess_second = -12.0 * delta.square().sum()
             expected.append((1.0 + excess_second / ideal_second).square())
         expected = torch.stack(expected).mean()
-        torch.testing.assert_close(value, expected, atol=2.0e-11, rtol=2.0e-11)
+        torch.testing.assert_close(value, expected)
         self.assertTrue(torch.all(torch.isfinite(unstable.matrix.grad)))
         self.assertGreater(torch.linalg.vector_norm(unstable.matrix.grad).item(), 0.0)
 
@@ -455,9 +448,9 @@ class TestFourierStabilityLoss(unittest.TestCase):
         supplied_modes = response.call_args.kwargs["modes"]
         self.assertTrue(torch.equal(supplied_modes[:, 0], selected[:, 0]))
 
-    def test_polarization_amplitude_shrinks_before_fixed_dipole_boundary(self):
+    def test_polarization_stability_does_not_impose_fixed_dipole_boundary(self):
         batch = self._add_polarization(self._batch())
-        batch["dipole_density"][..., 0] = 0.95 * batch["rho"]
+        batch["dipole_density"][..., 0] = 1.05 * batch["rho"]
         model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
         term = FourierStabilityLoss(
             modes=((1, 0, 0),),
@@ -469,14 +462,14 @@ class TestFourierStabilityLoss(unittest.TestCase):
 
         direction = torch.tensor([[1.0, 0.0, 0.0]], dtype=batch["rho"].dtype)
         with patch("equicdft.stability.torch.randn", return_value=direction):
-            term(model(batch), batch, model=model)
+            value = term(model(batch), batch, model=model)
 
         perturbed_q = model.last_polarization / batch["rho"][:, None, :, :, None]
-        self.assertLess(torch.linalg.vector_norm(perturbed_q, dim=-1).max().item(), 1.0)
         self.assertGreater(
             torch.linalg.vector_norm(perturbed_q, dim=-1).max().item(),
-            0.99,
+            1.0,
         )
+        self.assertTrue(torch.isfinite(value).item())
 
     def test_polarization_stability_integrates_with_grid_model(self):
         batch = self._add_polarization(self._batch())

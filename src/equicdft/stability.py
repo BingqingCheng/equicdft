@@ -69,9 +69,12 @@ class FourierStabilityLoss(nn.Module):
     Every selected polarization wavevector keeps its cosine and sine probes
     separate; random wavevectors are not superposed in polarization mode.
     The same ``u`` is used for all wavevectors and phases of one field.
-    The selected direction is normalized by its exact fixed-dipole ideal
-    curvature, so the ideal functional has unit curvature. Polarization has no
-    fixed-integral constraint, and its zero wavevector is included by default.
+    The selected direction is normalized by the isotropic small-alignment
+    fixed-dipole ideal curvature, so the ideal reference has unit curvature.
+    The probe does not impose the local ``|P| < m*rho`` bound; this keeps the
+    stochastic regularizer usable with gridded reference fields whose local
+    polarization can reach that sampling bound. Polarization has no fixed-
+    integral constraint, and its zero wavevector is included by default.
 
     Parameters
     ----------
@@ -106,8 +109,8 @@ class FourierStabilityLoss(nn.Module):
     relative_amplitude
         In density mode, the maximum pointwise fractional change after the
         fixed-number projection. In polarization mode, the requested maximum
-        change in ``P/(m*rho)``; it is reduced if needed to keep both symmetric
-        probes inside ``|P| < m*rho``. A scalar preserves fixed-amplitude
+        change in ``P/(m*rho)``. The stability probe does not constrain this
+        local alignment fraction. A scalar preserves fixed-amplitude
         evaluation. A pair ``(lower, upper)`` samples uniformly per field and
         spatial pattern on every call, with ``0 < lower <= upper < 1``.
         Cosine/sine phases share one draw for each explicit wavevector.

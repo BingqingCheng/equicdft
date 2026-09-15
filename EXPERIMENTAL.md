@@ -505,19 +505,28 @@ For each valid phase, the normalized curvature is
 $$
 \kappa_P=
 \frac{
-A[\rho,\mathbf P+\delta\mathbf P]
-+A[\rho,\mathbf P-\delta\mathbf P]
--2A[\rho,\mathbf P]
+\Delta_P^2 F_{\rm id,0}
++F_{\rm exc}[\rho,\mathbf P+\delta\mathbf P]
++F_{\rm exc}[\rho,\mathbf P-\delta\mathbf P]
+-2F_{\rm exc}[\rho,\mathbf P]
 }{
-F_{\rm id}[\rho,\mathbf P+\delta\mathbf P]
-+F_{\rm id}[\rho,\mathbf P-\delta\mathbf P]
--2F_{\rm id}[\rho,\mathbf P]
+\Delta_P^2 F_{\rm id,0}
 },
 $$
 
-where $A=F_{\rm id}+F_{\rm exc}$ and $F_{\rm id}$ is the exact freely
-rotating fixed-dipole ideal functional. An ideal-only model therefore has
-$\kappa_P=1$. The polarization loss is
+where the excess-energy second difference is combined with the isotropic
+small-alignment fixed-dipole ideal curvature
+
+$$
+\Delta_P^2 F_{\rm id,0}
+=3\,\Delta V\sum_{a,\mathbf r}
+\rho_a(\mathbf r)
+\left|\frac{\delta\mathbf P_a(\mathbf r)}
+{m_a\rho_a(\mathbf r)}\right|^2.
+$$
+
+This ideal reference gives $\kappa_P=1$ when the learned excess functional is
+zero. The polarization loss is
 
 $$
 L_{P,\mathrm{stab}}
@@ -527,9 +536,13 @@ L_{P,\mathrm{stab}}
 $$
 
 where $s$ labels cosine or sine, $w_P$ is the statistical loss weight, and
-`minimum_curvature` supplies $\kappa_{\min}$. The implementation reduces
-$\epsilon_P$ when necessary rather than clipping a perturbed field at the
-strict fixed-dipole boundary $|\mathbf P_a|<m_a\rho_a$.
+`minimum_curvature` supplies $\kappa_{\min}$. The Fourier-stability probe does
+not impose the local fixed-dipole inequality
+$|\mathbf P_a|<m_a\rho_a$ and uses the requested $\epsilon_P$ unchanged. This
+is deliberate for gridded molecular reference fields, which can reach the
+sampling bound locally. The exact ideal functional and equilibrium solver
+retain their physical-domain checks; only this stochastic regularizer omits
+the constraint.
 
 The uniform polarization mode is meaningful because total polarization is not
 conserved. It is included by default; its cosine is the constant wave and its

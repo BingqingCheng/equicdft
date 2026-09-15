@@ -9,7 +9,6 @@ from torch import nn
 from ._argument_checks import finite_scalar
 from ._grid import voxel_volume
 from .energy import ideal_free_energy
-from .polarization_ideal import FixedDipoleIdeal
 
 
 def integer_mode_tensor(
@@ -313,8 +312,7 @@ def polarization_fourier_curvature(
     if torch.any(zero_density[..., None] & (polarization != 0.0)).item():
         raise ValueError("dipole_density must be zero where rho is zero")
 
-    ideal = FixedDipoleIdeal(dipole_magnitude).to(rho)
-    moment = ideal.dipole_magnitude.reshape(-1)
+    moment = dipole_magnitude.to(rho).reshape(-1)
     if moment.numel() not in (1, rho.shape[-1]):
         raise ValueError("dipole_magnitude must contain one value per density type")
 
@@ -325,37 +323,35 @@ def polarization_fourier_curvature(
         polarization_directions, rho,
     )
 
-    ideal_rho = torch.where(zero_density, torch.ones_like(rho), rho)
     alignment_scale = rho * moment
-    ideal_alignment_scale = ideal_rho * moment
     directions = (
         waves[:, :, :, None, None]
         * alignment_scale[:, None, :, :, None]
         * selected_direction[:, None, None, None, :]
     )
 
-    reduced = polarization / ideal_alignment_scale[..., None]
-    used_amplitude = _safe_polarization_amplitudes(
-        relative_amplitude,
-        rho,
-        modes,
-        waves,
-        reduced,
-        selected_direction,
-        valid_wave,
-    )
-    total_second, ideal_second = _polarization_energy_differences(
+    used_amplitude = _validated_mode_amplitudes(relative_amplitude, rho, modes)
+    if not torch.is_tensor(used_amplitude):
+        used_amplitude = rho.new_full(modes.shape[:2], used_amplitude)
+    used_amplitude = used_amplitude.repeat_interleave(2, dim=1)
+    excess_second = _polarization_excess_energy_difference(
         model=model,
         outputs=outputs,
         batch=batch,
         rho=rho,
-        ideal_rho=ideal_rho,
         polarization=polarization,
         directions=directions,
-        ideal=ideal,
         relative_amplitude=used_amplitude,
         perturbations_per_forward=perturbations_per_forward,
     )
+    volume = voxel_volume(batch["grid_spacing"].to(rho))
+    alignment_change = used_amplitude[..., None, None] * waves[..., None]
+    ideal_second = (
+        3.0
+        * volume[:, None]
+        * torch.sum(rho[:, None] * alignment_change.square(), dim=(-2, -1))
+    )
+    total_second = ideal_second + excess_second
     ideal_denominator = ideal_second.detach()
     ideal_scale = torch.clamp(
         torch.amax(torch.abs(ideal_denominator), dim=1, keepdim=True),
@@ -395,58 +391,17 @@ def _unit_polarization_directions(directions, reference):
     return directions / norm
 
 
-def _safe_polarization_amplitudes(
-    amplitude,
-    rho,
-    modes,
-    waves,
-    reduced_polarization,
-    direction,
-    valid_wave,
-):
-    """Reduce amplitudes so both probes remain inside the dipole sphere."""
-
-    reduced_norm = torch.linalg.vector_norm(reduced_polarization, dim=-1)
-    if torch.any(reduced_norm >= 1.0).item():
-        raise ValueError("fixed dipoles require |P| < m*rho")
-    parallel = torch.abs(torch.sum(
-        reduced_polarization * direction[:, None, None, :], dim=-1,
-    ))
-    directional_limit = torch.sqrt(torch.clamp(
-        parallel.square() + 1.0 - reduced_norm.square(), min=0.0,
-    )) - parallel
-    absolute_wave = torch.abs(waves)[..., None]
-    local_limit = torch.where(
-        absolute_wave > 1.0e-12,
-        directional_limit[:, None] / absolute_wave,
-        torch.inf,
-    )
-    requested = _validated_mode_amplitudes(amplitude, rho, modes)
-    if not torch.is_tensor(requested):
-        requested = rho.new_full(modes.shape[:2], requested)
-    requested = requested.repeat_interleave(2, dim=1)
-    selected = torch.minimum(
-        requested,
-        0.9 * torch.amin(local_limit, dim=(-2, -1)),
-    )
-    if torch.any(valid_wave & (selected <= 0.0)).item():
-        raise ValueError("no finite-interior polarization displacement is available")
-    return selected
-
-
-def _polarization_energy_differences(
+def _polarization_excess_energy_difference(
     model,
     outputs,
     batch,
     rho,
-    ideal_rho,
     polarization,
     directions,
-    ideal,
     relative_amplitude,
     perturbations_per_forward=None,
 ):
-    """Return total and exact-ideal central differences for P probes."""
+    """Return excess-energy central differences for polarization probes."""
 
     delta = relative_amplitude[..., None, None, None] * directions
     plus = polarization[:, None] + delta
@@ -454,54 +409,25 @@ def _polarization_energy_differences(
     perturbed = torch.stack((plus, minus), dim=2).flatten(1, 2)
     n_perturbations = perturbed.shape[1]
     expanded_rho = rho[:, None].expand(-1, n_perturbations, -1, -1)
-    expanded_ideal_rho = ideal_rho[:, None].expand(
-        -1, n_perturbations, -1, -1
-    )
-    volume = voxel_volume(batch["grid_spacing"].to(rho))
-    reference_ideal = _orientation_ideal_energy(
-        ideal, ideal_rho, polarization, volume
-    )
 
-    ideal_chunks = []
     excess_chunks = []
     chunk_size = perturbations_per_forward or n_perturbations
     for start in range(0, n_perturbations, chunk_size):
         chunk_p = perturbed[:, start:start + chunk_size]
         chunk_rho = expanded_rho[:, start:start + chunk_size]
-        chunk_ideal_rho = expanded_ideal_rho[:, start:start + chunk_size]
         expanded_batch = _expand_batch(batch, chunk_rho)
         expanded_batch["dipole_density"] = chunk_p
         perturbed_outputs = _energy_only_model(model, expanded_batch)
         if "beta_F_exc" not in perturbed_outputs:
             raise KeyError("model outputs are missing 'beta_F_exc'")
-        ideal_energy = _orientation_ideal_energy(
-            ideal,
-            chunk_ideal_rho,
-            chunk_p,
-            volume[:, None].expand(-1, chunk_p.shape[1]),
-        )
-        ideal_chunks.append(ideal_energy)
         excess_chunks.append(perturbed_outputs["beta_F_exc"])
 
-    perturbed_ideal = torch.cat(ideal_chunks, dim=1).reshape(
-        rho.shape[0], directions.shape[1], 2
-    )
     perturbed_excess = torch.cat(excess_chunks, dim=1).reshape(
         rho.shape[0], directions.shape[1], 2
     )
-    ideal_second = perturbed_ideal.sum(dim=2) - 2.0 * reference_ideal[:, None]
-    excess_second = (
+    return (
         perturbed_excess.sum(dim=2) - 2.0 * outputs["beta_F_exc"][:, None]
     )
-    return ideal_second + excess_second, ideal_second
-
-
-def _orientation_ideal_energy(ideal, rho, polarization, volume):
-    """Return only the fixed-dipole orientational ideal contribution."""
-
-    total = ideal(rho, polarization, volume)["beta_F_id"]
-    wavelength = rho.new_ones(rho.shape[-1])
-    return total - ideal_free_energy(rho, wavelength, volume)
 
 
 def _energy_only_model(model, batch):
