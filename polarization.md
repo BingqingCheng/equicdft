@@ -386,3 +386,67 @@ are signed, like the existing density LR coefficients; neither this branch nor
 its presence alongside the ideal term guarantees positive total curvature.
 Broad Gaussians weaken at high wavevectors. Widths, regularization and any
 stability constraints remain application choices, not implicit API defaults.
+
+## Training-only SEM noise augmentation
+
+Load componentwise uncertainties on the final training grid:
+
+```python
+data = GridData.from_xyz(
+    path,
+    data_key={"dipole_density_std": "dipole_density_sem"},
+    # Usual grid and unit arguments.
+)
+trainer = Trainer(
+    model=model,
+    loss=loss,
+    polarization_noise=True,
+    noise_dipole_magnitude=m,
+)
+```
+
+Here `m` is the positive, fixed **single-particle dipole magnitude**, in the
+units of P/rho; it may be scalar or one value per species. It is not mass,
+a loss weight, or the descriptor reference scale. `dipole_density_std` has
+exactly the same shape as P: `[n_grid, n_types, 3]`, or its batched form.
+The loader requires finite nonnegative values and preserves their units.
+For SEM input, no additional beta, m, reference-density or square-root-of-
+sample-count factor is applied.
+
+Each training visit proposes `P' = P + dipole_density_std * randn_like(P)`.
+Draws are independent over voxels, species and Cartesian components. Proposals
+violating `rho > 0` or `|P| < m*rho` are rejected and redrawn as whole vectors,
+not componentwise clipped. After 1,000 unsuccessful attempts the update fails
+explicitly. If density augmentation is also enabled with `density_noise=True`
+and `rho_std` (e.g. mapped to `density_sem`), the entire `(rho', P')` proposal
+is redrawn together; `density_noise_floor` defaults to zero. The scalar-fluid
+density-noise API retains its original Gaussian-plus-floor behavior.
+
+The optional original `valid` voxel mask is kept fixed, and its false cells
+are unchanged. Excluded cells stay zero and must have zero SEM. Exact vacuum
+is unchanged. Unmasked nonvacuum inputs must already satisfy the ideal domain.
+No particle-number normalization or subtraction of mean polarization is applied.
+
+Both ideal-derived targets change when either field changes. The trainer
+refreshes recognized scalar targets `c1_plus_beta_mu`, `c1`, and `target_c1`
+by adding the change in `FixedDipoleIdeal.density_derivative`; it refreshes
+`polarization_derivative` and `target_P_derivative` by subtracting the change
+in the ideal polarization derivative. The latter names must denote **excess**
+derivative targets `beta*E_ext - ideal_P`, not electric-field values themselves.
+This preserves external fields, chemical-potential/gauge offsets and thermal-
+wavelength conventions. Targets may be full-grid tensors or packed using the
+original `valid` mask. Custom target names are untouched and must be computed
+from the live perturbed fields by the application.
+
+All flags default off. Validation, explicit evaluation and lazy initialization
+remain clean. Ordinary and per-`TrainingStream` settings and PyTorch RNG states
+are restored by checkpoints; older checkpoints without flags restore noise off.
+Turning noise on for a new fit therefore requires an explicit configuration,
+not resuming an old clean checkpoint unchanged.
+
+This is diagonal-SEM input regularization, not covariance-aware sampling or
+inverse-variance loss weighting. Truncation changes the proposal distribution
+near the physical bound. SEM components are not a polar vector; general rotated
+covariances cannot be recovered from three diagonal values. The loader refuses
+uncertainty coarsening without covariance information. Noise augmentation alone
+does not guarantee a stable or more accurate learned free energy.

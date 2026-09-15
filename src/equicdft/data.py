@@ -45,7 +45,9 @@ default_data_key = {
     "grid_positions": "positions",
     "V_ext": "V_ext",
     "rho": "density",
+    "rho_std": "density_std",
     "dipole_density": "dipole_density",
+    "dipole_density_std": "dipole_density_std",
     "excluded_mask": "excluded_mask",
 }
 
@@ -90,7 +92,9 @@ class GridData(dict):
         grid_positions              [n_grid, 3]
         V_ext                       [n_grid, n_types] (optional)
         rho                         [n_grid, n_types] (optional)
+        rho_std                     [n_grid, n_types] (optional, density units)
         dipole_density              [n_grid, n_types, 3] (optional, polar vector)
+        dipole_density_std          [n_grid, n_types, 3] (optional, P units)
         excluded_mask               [n_grid] bool; true grid points are excluded
         c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
         c1                          [n_grid, n_types] (optional)
@@ -139,6 +143,12 @@ class GridData(dict):
         supplied from a trained model to configure and validate its grid and
         unit metadata. Set ``include_local_density_index=False`` only when the
         consuming model reports ``requires_local_density_index=False``.
+        Optional ``rho_std`` and ``dipole_density_std`` specify componentwise
+        Gaussian noise sigma in their corresponding field units, without
+        statistical rescaling. To use uncertainty of the mean, map them to
+        SEM properties, e.g. ``data_key={"rho_std": "density_sem",
+        "dipole_density_std": "dipole_density_sem"}``. Supply uncertainties
+        on the final grid; coarsening requires covariance information.
         """
 
         resolved_grid_info = None
@@ -211,13 +221,15 @@ class GridData(dict):
         grid_info: Optional[Mapping[str, Any]] = None,
         include_local_density_index: bool = True,
     ) -> "GridData":
-        """Build one empty regular periodic grid from explicit metadata.
+        """Build one regular periodic grid from explicit metadata and fields.
 
         ``values`` requires ``grid_size``, ``grid_spacing``, ``n_types``, and
         either ``temperature`` or ``T``. Matching model metadata may instead
         be supplied through ``grid_info``. Density and external-potential
         fields can be assigned to the returned dictionary afterward. Optional
+        ``rho`` and ``rho_std`` have shape ``[n_grid, n_types]``.
         ``dipole_density`` may be supplied with shape ``[n_grid, n_types, 3]``;
+        its optional ``dipole_density_std`` has the same shape. Polarization
         tensor inputs retain their differentiation graph. Set
         ``include_local_density_index=False`` only for models whose local
         operators all use non-gather backends.
@@ -271,7 +283,10 @@ class GridData(dict):
             "T",
             "n_types",
             "excluded_mask",
+            "rho",
+            "rho_std",
             "dipole_density",
+            "dipole_density_std",
         }
         unknown_keys = set(values) - allowed_keys
         if unknown_keys:
@@ -310,7 +325,10 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
+                rho=values.get("rho"),
+                rho_std=values.get("rho_std"),
                 dipole_density=values.get("dipole_density"),
+                dipole_density_std=values.get("dipole_density_std"),
                 include_local_density_index=include_local_density_index,
             )
         )

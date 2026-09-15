@@ -29,6 +29,7 @@ from ._argument_checks import (
     optional_positive_integer,
     positive_integer,
 )
+from ._density_noise import add_field_noise
 from ._trainer_io import (
     append_log_message,
     atomic_torch_save,
@@ -39,6 +40,28 @@ from .loss import Loss
 
 
 _MAX_CACHED_GRID_GEOMETRIES = 2
+
+
+def _noise_dipole_magnitude(value: Any) -> Optional[Union[float, List[float]]]:
+    """Normalize an optional fixed moment; species count is checked per batch."""
+
+    if value is None:
+        return None
+    magnitude = torch.as_tensor(value)
+    if magnitude.dtype == torch.bool or magnitude.is_complex():
+        raise ValueError("noise_dipole_magnitude must contain real numeric values")
+    # Preserve Python/NumPy double precision independently of torch's default.
+    magnitude = torch.as_tensor(value, dtype=torch.float64)
+    if (
+        magnitude.ndim > 1
+        or magnitude.numel() == 0
+        or not torch.all(torch.isfinite(magnitude)).item()
+        or torch.any(magnitude <= 0).item()
+    ):
+        raise ValueError(
+            "noise_dipole_magnitude must be a finite positive scalar or vector"
+        )
+    return magnitude.detach().cpu().tolist()
 
 
 @dataclass
@@ -61,6 +84,10 @@ class TrainingStream:
     batches_per_step: int = 1
     model_kwargs: Optional[Dict[str, Any]] = None
     cycle: bool = False
+    density_noise: bool = False
+    density_noise_floor: float = 0.0
+    polarization_noise: bool = False
+    noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None
 
     def __post_init__(self) -> None:
         self.name = nonempty_string(self.name, "stream name")
@@ -80,6 +107,16 @@ class TrainingStream:
         )
         self.model_kwargs = dict(self.model_kwargs or {})
         self.cycle = boolean(self.cycle, "cycle")
+        self.density_noise = boolean(self.density_noise, "density_noise")
+        self.density_noise_floor = nonnegative_scalar(
+            self.density_noise_floor, "density_noise_floor"
+        )
+        self.polarization_noise = boolean(
+            self.polarization_noise, "polarization_noise"
+        )
+        self.noise_dipole_magnitude = _noise_dipole_magnitude(
+            self.noise_dipole_magnitude
+        )
 
 
 class Trainer(nn.Module):
@@ -124,6 +161,21 @@ class Trainer(nn.Module):
         Optional directory for ``history.csv`` and ``training.log``.
         ``history.csv`` is atomically reconstructed from the complete trainer
         history after every epoch and after loading a checkpoint.
+    density_noise, polarization_noise
+        Add independent Gaussian draws scaled by batch ``rho_std`` and/or
+        ``dipole_density_std`` before each training forward. Validation and
+        explicit evaluation remain clean. Joint training uses the per-stream
+        settings on :class:`TrainingStream` instead.
+    density_noise_floor
+        Nonnegative lower density bound, default zero. Excluded cells remain
+        zero; particle numbers are not renormalized. This is separate from
+        the model's loss-mask threshold ``rho_min``.
+    noise_dipole_magnitude
+        Positive fixed single-particle dipole magnitude (scalar or per-species
+        values), required when augmenting a polarized batch, including
+        density-only augmentation of that batch. Used to preserve the local
+        physical bound and refresh coupled ideal targets. This is a physical
+        moment in the units of P/rho, not a statistical loss weight.
     """
 
     def __init__(
@@ -141,6 +193,10 @@ class Trainer(nn.Module):
         save_best: bool = True,
         early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
+        density_noise: bool = False,
+        density_noise_floor: float = 0.0,
+        polarization_noise: bool = False,
+        noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
     ) -> None:
         super().__init__()
 
@@ -182,6 +238,12 @@ class Trainer(nn.Module):
         self.checkpoint_interval = checkpoint_interval
         self.save_best = save_best
         self.early_stopping_patience = early_stopping_patience
+        self.density_noise = boolean(density_noise, "density_noise")
+        self.density_noise_floor = nonnegative_scalar(
+            density_noise_floor, "density_noise_floor"
+        )
+        self.polarization_noise = boolean(polarization_noise, "polarization_noise")
+        self.noise_dipole_magnitude = _noise_dipole_magnitude(noise_dipole_magnitude)
 
         self.checkpoint_dir = None
         if checkpoint_dir is not None:
@@ -233,6 +295,10 @@ class Trainer(nn.Module):
             valid_loader,
             self.loss,
             metrics=tuple(self.metrics),
+            density_noise=self.density_noise,
+            density_noise_floor=self.density_noise_floor,
+            polarization_noise=self.polarization_noise,
+            noise_dipole_magnitude=self.noise_dipole_magnitude,
         )
 
         if self._stop_before_training(verbose):
@@ -436,6 +502,24 @@ class Trainer(nn.Module):
             "history": self.history,
             "best_valid_loss": self.best_valid_loss,
             "epochs_without_improvement": self.epochs_without_improvement,
+            "density_noise": self.density_noise,
+            "density_noise_floor": self.density_noise_floor,
+            "polarization_noise": self.polarization_noise,
+            "noise_dipole_magnitude": self.noise_dipole_magnitude,
+            "stream_density_noise": {
+                stream.name: {
+                    "enabled": stream.density_noise,
+                    "floor": stream.density_noise_floor,
+                }
+                for stream in self._streams
+            },
+            "stream_polarization_noise": {
+                stream.name: {
+                    "enabled": stream.polarization_noise,
+                    "dipole_magnitude": stream.noise_dipole_magnitude,
+                }
+                for stream in self._streams
+            },
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state_all": (
                 torch.cuda.get_rng_state_all()
@@ -503,6 +587,37 @@ class Trainer(nn.Module):
             )
 
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.density_noise = boolean(
+            checkpoint.get("density_noise", False), "density_noise"
+        )
+        self.density_noise_floor = nonnegative_scalar(
+            checkpoint.get("density_noise_floor", 0.0), "density_noise_floor"
+        )
+        self.polarization_noise = boolean(
+            checkpoint.get("polarization_noise", False), "polarization_noise"
+        )
+        self.noise_dipole_magnitude = _noise_dipole_magnitude(
+            checkpoint.get("noise_dipole_magnitude")
+        )
+        for stream in self._streams:
+            density_setting = checkpoint.get("stream_density_noise", {}).get(
+                stream.name, {}
+            )
+            polarization_setting = checkpoint.get(
+                "stream_polarization_noise", {}
+            ).get(stream.name, {})
+            stream.density_noise = boolean(
+                density_setting.get("enabled", False), "density_noise"
+            )
+            stream.density_noise_floor = nonnegative_scalar(
+                density_setting.get("floor", 0.0), "density_noise_floor"
+            )
+            stream.polarization_noise = boolean(
+                polarization_setting.get("enabled", False), "polarization_noise"
+            )
+            stream.noise_dipole_magnitude = _noise_dipole_magnitude(
+                polarization_setting.get("dipole_magnitude")
+            )
         self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:
@@ -831,6 +946,10 @@ class Trainer(nn.Module):
                         batch,
                         stream.loss,
                         stream.model_kwargs,
+                        density_noise=stream.density_noise,
+                        density_noise_floor=stream.density_noise_floor,
+                        polarization_noise=stream.polarization_noise,
+                        noise_dipole_magnitude=stream.noise_dipole_magnitude,
                     )
                     self._update_metrics(
                         stream.metrics,
@@ -953,6 +1072,10 @@ class Trainer(nn.Module):
         batch: Dict[str, torch.Tensor],
         loss: Loss,
         model_kwargs: Optional[Dict[str, Any]] = None,
+        density_noise: bool = False,
+        density_noise_floor: float = 0.0,
+        polarization_noise: bool = False,
+        noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
     ) -> Tuple[
         Dict[str, torch.Tensor],
         Dict[str, torch.Tensor],
@@ -962,6 +1085,14 @@ class Trainer(nn.Module):
         """Move one batch, run the model, and evaluate one loss module."""
 
         batch = self._move_batch(batch)
+        if density_noise or polarization_noise:
+            batch = add_field_noise(
+                batch,
+                density_noise=density_noise,
+                density_noise_floor=density_noise_floor,
+                polarization_noise=polarization_noise,
+                dipole_magnitude=noise_dipole_magnitude,
+            )
         outputs = self.model(batch, **(model_kwargs or {}))
         losses, details = loss.evaluate(outputs, batch, model=self.model)
         return batch, outputs, losses, details
