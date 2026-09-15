@@ -13,9 +13,7 @@ from ._argument_checks import (
     nonnegative_scalar,
 )
 from ._fourier import (
-    _energy_only_model,
     _validated_grid,
-    _validated_validity_mask,
     canonical_mode_triplets,
     feasible_modes as _feasible_modes,
     mode_triplets,
@@ -150,15 +148,6 @@ class FourierStabilityLoss(nn.Module):
         Whether to add the uniform polarization mode. It defaults to true for
         polarization and false for density. Density cannot include the zero
         mode because its perturbations preserve particle number.
-    validity_mask_key
-        Optional batch key for a Boolean ``[field, grid]`` mask whose true
-        entries contain physically valid polarization data. When supplied,
-        polarization is replaced by zero at false entries in a private copy
-        used by this stability term, and the matching base excess energy is
-        recomputed. The ordinary model outputs and input batch are unchanged.
-        Fourier waves are constructed on the complete periodic grid and then
-        restricted by this mask for polarization probes; this is not a Fourier
-        transform of an irregular subset.
     """
 
     requires_model = True
@@ -180,7 +169,6 @@ class FourierStabilityLoss(nn.Module):
         variable: str = "rho",
         dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
         include_zero_mode: Optional[bool] = None,
-        validity_mask_key: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -189,11 +177,6 @@ class FourierStabilityLoss(nn.Module):
         if variable not in ("rho", "dipole_density"):
             raise ValueError("variable must be 'rho' or 'dipole_density'")
         self.variable = variable
-        self.validity_mask_key = (
-            None
-            if validity_mask_key is None
-            else nonempty_string(validity_mask_key, "validity_mask_key")
-        )
         if include_zero_mode is None:
             include_zero_mode = variable == "dipole_density"
         self.include_zero_mode = boolean(include_zero_mode, "include_zero_mode")
@@ -405,21 +388,10 @@ class FourierStabilityLoss(nn.Module):
         if outputs["beta_F_exc"].shape != rho.shape[:-2]:
             raise ValueError("beta_F_exc must contain one value per field")
 
-        validity_mask = self._validity_mask(batch, rho)
-        if validity_mask is not None:
-            batch = self._physicalized_batch(batch, rho, validity_mask)
-            outputs = _energy_only_model(model, batch)
-            if "beta_F_exc" not in outputs:
-                raise KeyError("model outputs are missing 'beta_F_exc'")
-            if outputs["beta_F_exc"].shape != rho.shape[:-2]:
-                raise ValueError("beta_F_exc must contain one value per field")
-
         modes = self._select_modes(batch, rho)
         variable = getattr(self, "variable", "rho")
         if variable == "dipole_density":
-            return self._polarization_loss(
-                model, outputs, batch, rho, modes, validity_mask,
-            )
+            return self._polarization_loss(model, outputs, batch, rho, modes)
 
         mode_phases = None
         amplitude_shape = modes.shape[:2]
@@ -454,9 +426,7 @@ class FourierStabilityLoss(nn.Module):
             "batch contains no valid mixture-mode direction",
         )
 
-    def _polarization_loss(
-        self, model, outputs, batch, rho, modes, validity_mask,
-    ):
+    def _polarization_loss(self, model, outputs, batch, rho, modes):
         """Return the fixed-density polarization stability penalty."""
 
         if getattr(self, "include_zero_mode", True):
@@ -476,7 +446,6 @@ class FourierStabilityLoss(nn.Module):
             dipole_magnitude=self.dipole_magnitude,
             relative_amplitude=self._sample_amplitude(modes.shape[:2], rho),
             polarization_directions=directions,
-            validity_mask=validity_mask,
             perturbations_per_forward=self.response.perturbations_per_forward,
         )
         return self._directional_loss(
@@ -484,35 +453,6 @@ class FourierStabilityLoss(nn.Module):
             valid,
             "batch contains no valid polarization direction",
         )
-
-    def _validity_mask(self, batch, rho):
-        """Return the optional true-is-valid voxel mask on rho's device."""
-
-        key = getattr(self, "validity_mask_key", None)
-        if key is None:
-            return None
-        if key not in batch:
-            raise KeyError("batch is missing validity mask '{}'".format(key))
-        return _validated_validity_mask(batch[key], rho)
-
-    @staticmethod
-    def _physicalized_batch(batch, rho, validity_mask):
-        """Copy a batch and zero invalid polarization reference values."""
-
-        physicalized = dict(batch)
-        if "dipole_density" not in batch:
-            return physicalized
-        polarization = batch["dipole_density"]
-        if not torch.is_tensor(polarization):
-            raise TypeError("dipole_density must be a tensor")
-        if polarization.shape != rho.shape + (3,):
-            raise ValueError("dipole_density must have shape rho.shape + (3,)")
-        if polarization.dtype != rho.dtype or polarization.device != rho.device:
-            raise ValueError("rho and dipole_density must share dtype and device")
-        physicalized["dipole_density"] = polarization.masked_fill(
-            ~validity_mask[..., None, None], 0.0,
-        )
-        return physicalized
 
     def _sample_amplitude(self, shape, reference):
         """Draw per-pattern amplitudes only for an interval configuration."""

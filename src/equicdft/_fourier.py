@@ -75,20 +75,6 @@ def _validated_mode_amplitudes(amplitude, reference, modes):
     return amplitude.detach().to(reference)
 
 
-def _validated_validity_mask(mask, reference):
-    """Return a true-is-valid [field, grid] mask on reference's device."""
-
-    if mask is None:
-        return None
-    if not torch.is_tensor(mask) or mask.dtype != torch.bool:
-        raise TypeError("validity mask must be a Boolean tensor")
-    if mask.shape != reference.shape[:2]:
-        raise ValueError("validity mask must have shape rho.shape[:-1]")
-    if torch.any(~torch.any(mask, dim=-1)).item():
-        raise ValueError("validity mask must retain a voxel in every field")
-    return mask.to(device=reference.device)
-
-
 def real_mode_shape(modes, mode_phases):
     """A supplied phase per wave selects one summed spatial pattern."""
     return (modes.shape[1], 2) if mode_phases is None else (1, 1)
@@ -305,7 +291,6 @@ def polarization_fourier_curvature(
     relative_amplitude: Union[float, torch.Tensor],
     polarization_directions: torch.Tensor,
     perturbations_per_forward: int = None,
-    validity_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return one ideal-normalized polarization curvature per field.
 
@@ -322,11 +307,6 @@ def polarization_fourier_curvature(
         raise ValueError("dipole_density must have shape rho.shape + (3,)")
     if polarization.dtype != rho.dtype or polarization.device != rho.device:
         raise ValueError("rho and dipole_density must share dtype and device")
-    validity_mask = _validated_validity_mask(validity_mask, rho)
-    if validity_mask is not None:
-        polarization = polarization.masked_fill(
-            ~validity_mask[..., None, None], 0.0,
-        )
     if not torch.all(torch.isfinite(polarization)).item():
         raise ValueError("dipole_density must be finite")
     zero_density = rho == 0.0
@@ -339,10 +319,7 @@ def polarization_fourier_curvature(
         raise ValueError("dipole_magnitude must contain one value per density type")
 
     waves, valid_wave = _real_fourier_waves(batch, rho, modes)
-    if validity_mask is not None:
-        waves = waves * validity_mask[:, None, :]
     wave_norm = torch.amax(torch.abs(waves), dim=-1)
-    valid_wave = wave_norm > 1.0e-5
     waves = waves / torch.clamp(wave_norm[..., None], min=1.0e-12)
     selected_direction = _unit_polarization_directions(
         polarization_directions, rho,
