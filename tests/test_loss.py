@@ -77,24 +77,34 @@ class _CoupledQuadraticExcessModel(nn.Module):
 class _PolarizationQuadraticExcessModel(nn.Module):
     """Analytic local polarization functional with a Cartesian Hessian."""
 
-    def __init__(self, matrix):
+    def __init__(self, matrix, density_coefficient=0.0):
         super().__init__()
         self.matrix = nn.Parameter(torch.as_tensor(matrix, dtype=torch.float64))
+        self.density_coefficient = nn.Parameter(
+            torch.tensor(float(density_coefficient), dtype=torch.float64)
+        )
         self.last_polarization = None
+        self.polarization_history = []
 
     def forward(self, data, compute_c1=None):
+        rho = data["rho"]
         polarization = data["dipole_density"]
         volume_element = voxel_volume(data["grid_spacing"].to(polarization))
         self.last_polarization = polarization.detach()
+        self.polarization_history.append(polarization.detach().clone())
         return {
             "beta_F_exc": (
                 0.5
                 * volume_element
-                * torch.einsum(
-                    "...gai,ij,...gaj->...",
-                    polarization,
-                    self.matrix.to(polarization),
-                    polarization,
+                * (
+                    self.density_coefficient.to(rho)
+                    * torch.sum(rho.square(), dim=(-2, -1))
+                    + torch.einsum(
+                        "...gai,ij,...gaj->...",
+                        polarization,
+                        self.matrix.to(polarization),
+                        polarization,
+                    )
                 )
             )
         }
@@ -315,6 +325,113 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(modes=((1, 0, 0),))
         del term.variable
         del term.include_zero_mode
+
+        value = term(model(batch), batch, model=model)
+
+        self.assertEqual(value.item(), 0.0)
+
+    def test_default_polarization_behavior_does_not_sanitize_invalid_voxels(self):
+        batch = self._add_polarization(self._batch())
+        batch["dipole_density"][0, 0, 0, 0] = batch["rho"][0, 0, 0]
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            include_zero_mode=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, r"fixed dipoles require \|P\|"):
+            term(model(batch), batch, model=model)
+
+    def test_validity_mask_physicalizes_density_and_polarization_probes(self):
+        for variable in ("rho", "dipole_density"):
+            with self.subTest(variable=variable):
+                batch = self._add_polarization(self._batch())
+                batch["dipole_density"][..., 0] = 0.1 * batch["rho"]
+                batch["dipole_density"][0, 0, 0, 0] = 2.0 * batch["rho"][0, 0, 0]
+                batch["valid"] = torch.ones(
+                    batch["rho"].shape[:-1], dtype=torch.bool,
+                )
+                batch["valid"][0, 0] = False
+                original_polarization = batch["dipole_density"].clone()
+                model = _PolarizationQuadraticExcessModel(
+                    -12.0 * torch.eye(3), density_coefficient=-4.0,
+                )
+                options = {}
+                if variable == "dipole_density":
+                    options.update(
+                        dipole_magnitude=1.0,
+                        include_zero_mode=False,
+                    )
+                term = FourierStabilityLoss(
+                    modes=((1, 0, 0),),
+                    variable=variable,
+                    validity_mask_key="valid",
+                    **options,
+                )
+                raw_outputs = model(batch)
+                model.polarization_history.clear()
+
+                value = term(raw_outputs, batch, model=model)
+                value.backward()
+
+                # One stability-only base call plus one batched perturbed call
+                # proves that raw_outputs was not reused for the new reference.
+                self.assertEqual(len(model.polarization_history), 2)
+                stability_base = model.polarization_history[0]
+                self.assertTrue(torch.all(stability_base[:, 0] == 0.0))
+                torch.testing.assert_close(
+                    stability_base[:, 1:], original_polarization[:, 1:]
+                )
+                for observed in model.polarization_history:
+                    self.assertTrue(
+                        torch.all(observed.select(dim=-3, index=0) == 0.0)
+                    )
+                torch.testing.assert_close(
+                    batch["dipole_density"], original_polarization,
+                )
+                self.assertGreater(value.item(), 0.0)
+                for parameter in model.parameters():
+                    self.assertIsNotNone(parameter.grad)
+                    self.assertTrue(torch.all(torch.isfinite(parameter.grad)))
+
+    def test_validity_mask_configuration_and_batch_are_validated(self):
+        with self.assertRaisesRegex(TypeError, "validity_mask_key"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),), validity_mask_key=1,
+            )
+        with self.assertRaisesRegex(ValueError, "validity_mask_key"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),), validity_mask_key="",
+            )
+
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),), validity_mask_key="valid",
+        )
+        for mask, error, message in (
+            (None, KeyError, "missing validity mask"),
+            ([[True] * 8], TypeError, "Boolean tensor"),
+            (torch.ones(1, 8), TypeError, "Boolean tensor"),
+            (torch.ones(1, 8, 1, dtype=torch.bool), ValueError, "shape"),
+            (torch.zeros(1, 8, dtype=torch.bool), ValueError, "retain a voxel"),
+        ):
+            with self.subTest(mask=mask):
+                batch = self._batch()
+                if mask is not None:
+                    batch["valid"] = mask
+                with self.assertRaisesRegex(error, message):
+                    term(model(batch), batch, model=model)
+
+    def test_training_only_skips_missing_validity_mask_during_evaluation(self):
+        batch = self._batch()
+        model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            validity_mask_key="not_present",
+            training_only=True,
+        ).eval()
 
         value = term(model(batch), batch, model=model)
 

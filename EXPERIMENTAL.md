@@ -559,6 +559,35 @@ loss = Loss([
 ])
 ```
 
+If a dataset marks voxels where its molecular polarization estimate is not
+physical, pass the same true-is-valid Boolean `[field, grid]` mask to both
+terms. For example, when the batch stores it as `valid_voxel`:
+
+```python
+rho_stability = FourierStabilityLoss(
+    variable="rho",
+    random_modes_per_field=1,
+    relative_amplitude=0.02,
+    validity_mask_key="valid_voxel",
+)
+polarization_stability = FourierStabilityLoss(
+    variable="dipole_density",
+    dipole_magnitude=m,
+    random_modes_per_field=1,
+    relative_amplitude=0.02,
+    validity_mask_key="valid_voxel",
+)
+```
+
+The stability terms make a private batch copy, set polarization to zero at
+excluded voxels, and recompute the matching unperturbed excess energy. The
+ordinary forward prediction, supervised field loss, and original batch are
+unchanged. Density probes still span the complete periodic grid. Polarization
+waves are also constructed on the complete periodic grid, but their
+displacement is zeroed at excluded voxels; the energy is always evaluated as a
+complete periodic field, not as a Fourier transform over an irregular subset.
+Omitting `validity_mask_key` preserves the original behavior exactly.
+
 The two positive directional tests implement the working approximation that
 density and polarization modes can be regularized independently. They do not
 test the mixed density--polarization Hessian block. One random polarization
