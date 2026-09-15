@@ -64,6 +64,12 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                     radial_exponents=(.15,), kernel="coulomb",
                 ),
             ),
+            LongRangeReadout(
+                n_kernels=2, hidden_sizes=(5,), zero_init=False,
+                features=ReciprocalFeatures(
+                    radial_exponents=(.1, .4), variable="dipole_density",
+                ),
+            ),
         ]
         return GridCACEModel(
             a, b, readouts, grid_spacing=.7, mean_temperature=1.5,
@@ -81,7 +87,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         inputs = {key: value.detach().clone() for key, value in data.items()}
         return {key: value.detach() for key, value in model(inputs).items()}
 
-    def test_all_48_actions_with_lda_and_coulomb_on_even_grid(self):
+    def test_all_48_actions_with_lda_coulomb_and_gaussian_on_even_grid(self):
         data = self.data()
         positions = data["grid_positions"].numpy()
         # Guard against accidentally replacing this by a smooth/constant
@@ -106,7 +112,8 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             with self.subTest(backend=backend, charge=charge, messages=messages):
                 full = self.model(backend, charge, messages)
                 models = {"complete": full}
-                for index, name in enumerate(("short_range", "LDA", "Coulomb_LR")):
+                branches = ("short_range", "LDA", "Coulomb_LR", "Gaussian_P")
+                for index, name in enumerate(branches):
                     branch = copy.deepcopy(full)
                     branch.readout = torch.nn.ModuleList([branch.readout[index]])
                     models[name] = branch
@@ -117,7 +124,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                              for name, model in models.items()}
                 # Nonzero energies AND vector responses ensure no branch is
                 # silently disabled (in particular, the LDA final layer).
-                for name in ("short_range", "LDA", "Coulomb_LR"):
+                for name in branches:
                     self.assertGreater(reference[name]["beta_F_exc"].abs().item(), 1e-8)
                     self.assertGreater(reference[name]["polarization_derivative"].abs().max().item(), 1e-8)
                 for key in reference["complete"]:

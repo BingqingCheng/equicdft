@@ -315,3 +315,74 @@ The default `BChiMessage(include_polarization=False)` remains the original
 scalar gate-only message, without multiplication by rho. Its parameter layout
 and operation are unchanged. Joint field gating is an opt-in extension, not
 an identical reproduction of the historical scalar-only polarization message.
+
+## 7. Gaussian polarization response
+
+The existing reciprocal features and long-range readout also support direct
+polarization coupling:
+
+```python
+from equicdft import LongRangeReadout, ReciprocalFeatures
+
+# Supply Gaussian widths in the same length units as grid_spacing.
+polarization_features = ReciprocalFeatures(
+    radial_exponents=[0.5 * sigma**2 for sigma in gaussian_widths],
+    kernel="gaussian",
+    variable="dipole_density",
+    n_types=1,
+)
+polarization_lr = LongRangeReadout(
+    n_kernels=polarization_features.n_kernels,
+    n_types=1,
+    features=polarization_features,
+    hidden_sizes=(16, 16),
+)
+# Include polarization_lr in GridCACEModel's readout list, alongside the
+# desired local and Coulomb branches. The A features above provide rho_ref
+# for the existing state normalization. No neighbor list is needed by LR.
+```
+
+`variable="rho"` remains the default and preserves the density-only behavior.
+For `variable="dipole_density"`, the input is the physical
+`data["dipole_density"]`, not a descriptor-normalized field. No extra charge,
+molecular moment or reference-scale factor is applied. `LongRangeReadout`
+automatically requires polarization from its features; do not supply
+`charges`, `coulomb_amplitude` or the Coulomb-only `include_polarization` flag.
+
+For one species in beta-free-energy mode, this contribution is
+
+$$
+\beta F_{G,P}=\frac{1}{2V}\sum_{\mathbf k}\sum_n
+c_n(T,\bar\rho)e^{-\alpha_n k^2}
+\widehat{\mathbf P}(\mathbf k)^*\cdot\widehat{\mathbf P}(\mathbf k),
+\qquad \alpha_n=\frac{\sigma_n^2}{2},
+$$
+
+where $\widehat{\mathbf P}=\Delta V\sum_g\mathbf P_g
+e^{-i\mathbf k\cdot\mathbf r_g}$. For mixtures, the features use the real
+part of $\widehat{\mathbf P}_a^*\cdot\widehat{\mathbf P}_b$, with a factor
+of two for off-diagonal species pairs. All three vector components share each
+coefficient. With P in charge/length squared, the features have units
+charge squared/length and $c_n$ has units length/charge squared.
+
+Unlike density-fluctuation and Coulomb features, this branch retains the
+uniform mode: no polarization mean is subtracted and the Gaussian kernel
+equals one at $k=0$. It therefore responds to uniform, longitudinal and
+transverse polarization. The coefficients are predicted from normalized
+temperature and mean species densities by the existing state MLP; derivatives
+through the mean density are retained. The default zero initialization leaves
+an existing model unchanged until this branch is trained.
+
+The physical Coulomb branch still uses the source
+$q_a\widehat\rho_a-i\mathbf k_D\cdot\widehat{\mathbf P}_a$ through
+`include_polarization=True` with Coulomb features and explicit charges.
+It remains separate and its zero-mode convention is unchanged. The Gaussian
+branch also acts longitudinally: it is a learned residual response fitted
+jointly with the fixed Coulomb contribution, not another fixed electrostatic
+term. Density and polarization Gaussian readouts have independent coefficients.
+
+The exact ideal orientational term remains necessary. Gaussian coefficients
+are signed, like the existing density LR coefficients; neither this branch nor
+its presence alongside the ideal term guarantees positive total curvature.
+Broad Gaussians weaken at high wavevectors. Widths, regularization and any
+stability constraints remain application choices, not implicit API defaults.
