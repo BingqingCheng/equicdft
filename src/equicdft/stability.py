@@ -9,14 +9,14 @@ from ._argument_checks import (
     boolean,
     finite_scalar,
     nonempty_string,
-    nonnegative_integer,
     nonnegative_scalar,
+    positive_integer,
 )
 from ._fourier import (
     _validated_grid,
-    canonical_mode_triplets,
-    feasible_modes as _feasible_modes,
-    mode_triplets,
+    canonical_wavevector_indices,
+    feasible_wavevector_indices as _feasible_wavevector_indices,
+    wavevector_index_triplets,
     polarization_fourier_curvature,
     wavevector_magnitude as _wavevector_magnitude,
 )
@@ -26,38 +26,39 @@ from .response import FourierResponse
 class FourierStabilityLoss(nn.Module):
     r"""Penalize negative density or fixed-dipole Fourier curvature.
 
-    In density mode, a single mode uses separate cosine and sine waves;
-    multiple randomly sampled modes are summed with random phases into one
-    spatial pattern. A fixed-number base direction is built for each density
-    component from
+    Selected wavevectors can be evaluated as independent cosine/sine probes
+    or superposed with random phases into one spatial pattern. A fixed-number
+    base direction is built for each density component from
 
     ``delta_rho_a = epsilon * rho_a * (wave - <wave>_rho_a)``,
 
     so the particle number of every component is unchanged. The selected
-    mixture mode either keeps these component directions separate or combines
-    them. Symmetric evaluations at ``rho +/- delta_rho`` estimate the projected
-    curvature of the total intrinsic dimensionless free energy
-    ``beta * (F_id + F_exc)``. External-potential and reservoir terms are
-    linear in density and therefore cancel from the second difference.
+    component treatment either keeps these component directions independent
+    or combines them. Symmetric evaluations at ``rho +/- delta_rho`` estimate
+    the projected curvature of the total intrinsic dimensionless free energy
+    ``beta * (F_id + F_exc)``. External-potential and reservoir terms are linear
+    in density and therefore cancel from the second difference.
 
-    For a single mode in a homogeneous one-component fluid, curvature tends to
+    For a single wavevector in a homogeneous one-component fluid, curvature
+    tends to
 
     ``rho * delta^2(beta*F) / (DeltaV * sum(delta_rho**2)) = 1 / S(k)``.
 
-    For mixtures, ``mixture_mode`` selects the component-space treatment.
+    For mixtures, ``component_treatment`` selects the component-space treatment.
     ``"independent"`` averages independently perturbed physical components,
     ``"total_density"`` perturbs every component in phase, and ``"charge"``
     weights the component perturbations by explicit charges. The latter two
-    modes probe coupled directions of the component-space Hessian. For a
+    choices probe coupled directions of the component-space Hessian. For a
     symmetric binary mixture with equal component densities and charges
     ``(+1, -1)``, they are the number-number and charge-charge directions.
     ``"full_matrix"`` reconstructs the complete physical-component Hessian
     in the ideal-gas metric and penalizes every eigenvalue below the requested
-    minimum. At a single mode in a homogeneous field this is the inverse OZ
-    response matrix. A summed pattern instead probes a projected Hessian with
-    cross-wavevector contributions in inhomogeneous fields, not S(k) at one k
-    or the complete spatial Hessian. Matrix polarization makes small finite-
-    difference amplitudes susceptible to floating-point cancellation.
+    minimum. At a single wavevector in a homogeneous field this is the inverse
+    OZ response matrix. A superposed pattern instead probes a projected
+    Hessian with cross-wavevector contributions in inhomogeneous fields, not
+    S(k) at one k or the complete spatial Hessian. Matrix polarization makes
+    small finite-difference amplitudes susceptible to floating-point
+    cancellation.
 
     ``variable="dipole_density"`` instead holds density fixed and probes the
     one randomly selected polarization direction ``u`` per field, drawn
@@ -66,8 +67,6 @@ class FourierStabilityLoss(nn.Module):
     ``delta_P_a = epsilon * m_a * rho_a * wave * u``,
 
     so ``epsilon`` is a dimensionless change in local alignment fraction.
-    Every selected polarization wavevector keeps its cosine and sine probes
-    separate; random wavevectors are not superposed in polarization mode.
     The same ``u`` is used for all wavevectors and phases of one field.
     The selected direction is normalized by the isotropic small-alignment
     fixed-dipole ideal curvature, so the ideal reference has unit curvature.
@@ -78,37 +77,39 @@ class FourierStabilityLoss(nn.Module):
 
     Parameters
     ----------
-    modes
-        Optional fixed nonzero integer triplets ``(nx, ny, nz)``. When omitted,
-        ``random_modes_per_field`` triplets are sampled independently for every
-        field and batch.
-    random_modes_per_field
+    wavevector_indices
+        Fixed nonzero integer triplets ``(nx, ny, nz)``. Supply either this or
+        ``random_wavevectors_per_field``, but not both.
+    random_wavevectors_per_field
         Number of distinct reciprocal triplets sampled per field from
-        ``mode_domain``. In density mode they are SUMMED into one pattern; in
-        polarization mode each remains a separate cosine/sine probe. An integer pair
-        ``(lower, upper)`` draws an inclusive uniform count once per batch.
-        In density mode every field uses independent wavevectors and uniform
-        phases in [0, 2*pi). The sum is projected to fixed component counts
-        and then normalized; one amplitude per field controls the combined perturbation.
+        ``wavevector_domain``. An integer pair ``(lower, upper)`` draws an
+        inclusive uniform count once per batch.
         Both endpoints must be positive; the upper endpoint must fit every
-        field's feasible set. Equal endpoints fix the number of summed waves
+        field's feasible set. Equal endpoints fix the number of selected waves
         without a count draw, identical to the corresponding integer argument.
-        A selected count of one retains the original separate cosine/sine
-        evaluation; counts of two or more use one summed spatial pattern.
-        Must be zero when explicit ``modes`` are supplied.
-    mode_domain
+        Supply either this or ``wavevector_indices``, but not both.
+    wavevector_treatment
+        ``"independent"`` evaluates the cosine and sine wave for every selected
+        triplet as independent curvature probes. ``"superposition"`` assigns
+        every selected triplet an independent uniform phase in ``[0, 2*pi)``
+        and sums them into one spatial pattern before projection and
+        normalization. For polarization, the optional zero wavevector
+        remains an independent probe. The default is ``"independent"``.
+    wavevector_domain
         ``"sphere"`` keeps the physical isotropic Nyquist sphere (default).
-        ``"cube"`` includes every grid-representable mode, bounded separately
-        by each axis's Nyquist limit. This includes high-wavevector corners
-        omitted by the sphere. Both domains remove the zero mode, global-sign
-        duplicates, and equivalent signs of even-grid Nyquist components.
+        ``"cube"`` includes every grid-representable wavevector, bounded
+        separately by each axis's Nyquist limit. This includes high-wavevector
+        corners omitted by the sphere. Both domains remove the zero
+        wavevector, global-sign duplicates, and equivalent signs of even-grid
+        Nyquist components.
     wavevector_range
         Optional inclusive ``(minimum, maximum)`` magnitude used to restrict
-        random mode sampling. Values use the reciprocal units implied by
-        ``grid_spacing``. It cannot be combined with explicit ``modes``.
+        random wavevector sampling. Values use the reciprocal units implied by
+        ``grid_spacing``. It cannot be combined with explicit
+        ``wavevector_indices``.
     relative_amplitude
-        In density mode, the maximum pointwise fractional change after the
-        fixed-number projection. In polarization mode, the requested maximum
+        For density, the maximum pointwise fractional change after the
+        fixed-number projection. For polarization, the requested maximum
         change in ``P/(m*rho)``. The stability probe does not constrain this
         local alignment fraction. A scalar preserves fixed-amplitude
         evaluation. A pair ``(lower, upper)`` samples uniformly per field and
@@ -120,22 +121,22 @@ class FourierStabilityLoss(nn.Module):
         unstable directions.
     weight
         Nonnegative multiplier applied after averaging the squared hinge over
-        fields, modes, real phases, and selected mixture directions.
+        fields, wavevectors, real phases, and selected component directions.
     training_only
         Return an exact zero during evaluation. This keeps validation model
         selection tied to the data objective rather than a random regularizer.
     name
         Unique name used by :class:`equicdft.loss.Loss`.
-    mixture_mode
+    component_treatment
         Component-space treatment. It must be ``"independent"``,
         ``"total_density"``, ``"charge"``, or ``"full_matrix"``. The default
         preserves the original independent-component density behavior.
-        Polarization mode currently accepts only ``"independent"`` because it
+        Polarization currently accepts only ``"independent"`` because it
         samples one shared three-dimensional polarization direction.
     charges
         Explicit finite charge weight for every density component. Required
-        only by ``mixture_mode="charge"``. A common scale is immaterial because
-        the weights are normalized by their largest absolute value.
+        only by ``component_treatment="charge"``. A common scale is immaterial
+        because the weights are normalized by their largest absolute value.
     perturbations_per_forward
         Optional maximum number of perturbed fields evaluated together. This
         can limit memory use for the quadratic number of full-matrix probes.
@@ -147,31 +148,35 @@ class FourierStabilityLoss(nn.Module):
         Positive scalar or one value per species. Required only for
         ``variable="dipole_density"``. This is the physical fixed molecular
         dipole magnitude, not a statistical loss weight.
-    include_zero_mode
-        Whether to add the uniform polarization mode. It defaults to true for
-        polarization and false for density. Density cannot include the zero
-        mode because its perturbations preserve particle number.
+    include_zero_wavevector
+        Whether to add the uniform polarization wavevector. It defaults to
+        true for polarization and false for density. Density cannot include
+        the zero wavevector because its perturbations preserve particle number.
     """
 
     requires_model = True
 
     def __init__(
         self,
-        modes: Optional[Sequence[Sequence[int]]] = None,
-        random_modes_per_field: Union[int, Sequence[int]] = 0,
+        *,
+        wavevector_indices: Optional[Sequence[Sequence[int]]] = None,
+        random_wavevectors_per_field: Optional[
+            Union[int, Sequence[int]]
+        ] = None,
+        wavevector_treatment: str = "independent",
         relative_amplitude: Union[float, Sequence[float]] = 0.05,
         minimum_curvature: float = 0.0,
         weight: float = 1.0,
         training_only: bool = True,
         name: str = "fourier_stability",
-        mixture_mode: str = "independent",
+        component_treatment: str = "independent",
         charges: Optional[Sequence[float]] = None,
         wavevector_range: Optional[Sequence[float]] = None,
         perturbations_per_forward: Optional[int] = None,
-        mode_domain: str = "sphere",
+        wavevector_domain: str = "sphere",
         variable: str = "rho",
         dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
-        include_zero_mode: Optional[bool] = None,
+        include_zero_wavevector: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -180,46 +185,75 @@ class FourierStabilityLoss(nn.Module):
         if variable not in ("rho", "dipole_density"):
             raise ValueError("variable must be 'rho' or 'dipole_density'")
         self.variable = variable
-        if include_zero_mode is None:
-            include_zero_mode = variable == "dipole_density"
-        self.include_zero_mode = boolean(include_zero_mode, "include_zero_mode")
-        if variable == "rho" and self.include_zero_mode:
-            raise ValueError("density stability cannot include the zero mode")
+        if include_zero_wavevector is None:
+            include_zero_wavevector = variable == "dipole_density"
+        self.include_zero_wavevector = boolean(
+            include_zero_wavevector,
+            "include_zero_wavevector",
+        )
+        if variable == "rho" and self.include_zero_wavevector:
+            raise ValueError(
+                "density stability cannot include the zero wavevector"
+            )
+        wavevector_treatment = nonempty_string(
+            wavevector_treatment,
+            "wavevector_treatment",
+        )
+        if wavevector_treatment not in ("independent", "superposition"):
+            raise ValueError(
+                "wavevector_treatment must be 'independent' or "
+                "'superposition'"
+            )
+        self.wavevector_treatment = wavevector_treatment
 
-        if modes is None:
-            integer_modes = torch.empty((0, 3), dtype=torch.long)
+        if (wavevector_indices is None) == (
+            random_wavevectors_per_field is None
+        ):
+            raise ValueError(
+                "supply exactly one of wavevector_indices or "
+                "random_wavevectors_per_field"
+            )
+        if wavevector_indices is None:
+            selected_indices = torch.empty((0, 3), dtype=torch.long)
         else:
-            integer_modes = mode_triplets(modes)
+            selected_indices = wavevector_index_triplets(
+                wavevector_indices,
+                name="wavevector_indices",
+            )
 
-        if isinstance(random_modes_per_field, (tuple, list)):
-            if len(random_modes_per_field) != 2:
-                raise ValueError("random_modes_per_field interval must have two endpoints")
+        if isinstance(random_wavevectors_per_field, (tuple, list)):
+            if len(random_wavevectors_per_field) != 2:
+                raise ValueError(
+                    "random_wavevectors_per_field interval must have two "
+                    "endpoints"
+                )
             lower, upper = (
-                nonnegative_integer(value, "random_modes_per_field endpoint")
-                for value in random_modes_per_field
+                positive_integer(
+                    value,
+                    "random_wavevectors_per_field endpoint",
+                )
+                for value in random_wavevectors_per_field
             )
             if not 1 <= lower <= upper:
-                raise ValueError("random_modes_per_field requires 1 <= lower <= upper")
-            random_modes_per_field = lower if lower == upper else (lower, upper)
-        else:
-            random_modes_per_field = nonnegative_integer(
-                random_modes_per_field,
-                "random_modes_per_field",
+                raise ValueError(
+                    "random_wavevectors_per_field requires "
+                    "1 <= lower <= upper"
+                )
+            random_wavevectors_per_field = (
+                lower if lower == upper else (lower, upper)
             )
-        if modes is None and random_modes_per_field == 0:
-            raise ValueError(
-                "supply modes or a positive random_modes_per_field"
-            )
-        if modes is not None and random_modes_per_field != 0:
-            raise ValueError(
-                "random_modes_per_field must be zero when modes are supplied"
+        elif random_wavevectors_per_field is not None:
+            random_wavevectors_per_field = positive_integer(
+                random_wavevectors_per_field,
+                "random_wavevectors_per_field",
             )
         if wavevector_range is None:
             selected_wavevector_range = None
         else:
-            if modes is not None:
+            if wavevector_indices is not None:
                 raise ValueError(
-                    "wavevector_range cannot be combined with explicit modes"
+                    "wavevector_range cannot be combined with explicit "
+                    "wavevector_indices"
                 )
             try:
                 wavevector_limits = tuple(wavevector_range)
@@ -251,25 +285,33 @@ class FourierStabilityLoss(nn.Module):
                 maximum_wavevector,
             )
         training_only = boolean(training_only, "training_only")
-        mixture_mode = nonempty_string(mixture_mode, "mixture_mode")
-        if mixture_mode not in (
+        component_treatment = nonempty_string(
+            component_treatment,
+            "component_treatment",
+        )
+        if component_treatment not in (
             "independent",
             "total_density",
             "charge",
             "full_matrix",
         ):
             raise ValueError(
-                "mixture_mode must be 'independent', 'total_density', "
+                "component_treatment must be 'independent', 'total_density', "
                 "'charge', or 'full_matrix'"
             )
-        if variable == "dipole_density" and mixture_mode != "independent":
+        if (
+            variable == "dipole_density"
+            and component_treatment != "independent"
+        ):
             raise ValueError(
                 "dipole-density stability currently requires "
-                "mixture_mode='independent'"
+                "component_treatment='independent'"
             )
-        if mixture_mode == "charge":
+        if component_treatment == "charge":
             if charges is None:
-                raise ValueError("charges are required for charge mixture_mode")
+                raise ValueError(
+                    "charges are required for charge component_treatment"
+                )
             charge_tensor = torch.as_tensor(
                 charges,
                 dtype=torch.get_default_dtype(),
@@ -282,7 +324,7 @@ class FourierStabilityLoss(nn.Module):
                 raise ValueError("charges must contain a nonzero value")
         else:
             if charges is not None:
-                raise ValueError("charges require charge mixture_mode")
+                raise ValueError("charges require charge component_treatment")
             charge_tensor = None
 
         if variable == "rho":
@@ -319,16 +361,23 @@ class FourierStabilityLoss(nn.Module):
 
         if isinstance(relative_amplitude, (tuple, list)):
             if len(relative_amplitude) != 2:
-                raise ValueError("relative_amplitude interval must have two endpoints")
+                raise ValueError(
+                    "relative_amplitude interval must have two endpoints"
+                )
             lower, upper = (
                 finite_scalar(value, "relative_amplitude endpoint")
                 for value in relative_amplitude
             )
             if not 0.0 < lower <= upper < 1.0:
-                raise ValueError("relative_amplitude requires 0 < lower <= upper < 1")
+                raise ValueError(
+                    "relative_amplitude requires 0 < lower <= upper < 1"
+                )
             relative_amplitude = lower if lower == upper else (lower, upper)
         else:
-            relative_amplitude = finite_scalar(relative_amplitude, "relative_amplitude")
+            relative_amplitude = finite_scalar(
+                relative_amplitude,
+                "relative_amplitude",
+            )
             if not 0.0 < relative_amplitude < 1.0:
                 raise ValueError("relative_amplitude must lie in (0, 1)")
 
@@ -339,19 +388,19 @@ class FourierStabilityLoss(nn.Module):
                 if isinstance(relative_amplitude, tuple) else relative_amplitude
             ),
             perturbations_per_forward=perturbations_per_forward,
-            mode_domain=mode_domain,
+            wavevector_domain=wavevector_domain,
         )
-        self.mode_domain = self.response.mode_domain
-        self.random_modes_per_field = random_modes_per_field
+        self.wavevector_domain = self.response.wavevector_domain
+        self.random_wavevectors_per_field = random_wavevectors_per_field
         self.wavevector_range = selected_wavevector_range
         self.training_only = training_only
-        self.mixture_mode = mixture_mode
+        self.component_treatment = component_treatment
         self.minimum_curvature = nonnegative_scalar(
             minimum_curvature,
             "minimum_curvature",
         )
         self.weight = nonnegative_scalar(weight, "weight")
-        self.register_buffer("modes", integer_modes)
+        self.register_buffer("wavevector_indices", selected_indices)
         self.register_buffer("charges", charge_tensor)
         self.register_buffer("dipole_magnitude", dipole_tensor)
 
@@ -391,71 +440,134 @@ class FourierStabilityLoss(nn.Module):
         if outputs["beta_F_exc"].shape != rho.shape[:-2]:
             raise ValueError("beta_F_exc must contain one value per field")
 
-        modes = self._select_modes(batch, rho)
-        variable = getattr(self, "variable", "rho")
-        if variable == "dipole_density":
-            return self._polarization_loss(model, outputs, batch, rho, modes)
+        wavevector_indices = self._select_wavevector_indices(batch, rho)
+        if self.variable == "dipole_density":
+            return self._polarization_loss(
+                model,
+                outputs,
+                batch,
+                rho,
+                wavevector_indices,
+            )
 
-        mode_phases = None
-        amplitude_shape = modes.shape[:2]
-        if self.modes.shape[0] == 0 and modes.shape[1] > 1:
-            mode_phases = rho.new_empty(modes.shape[:2]).uniform_(0.0, 2.0 * torch.pi)
-            amplitude_shape = (rho.shape[0], 1)
-        amplitude = self._sample_amplitude(amplitude_shape, rho)
-        if self.mixture_mode == "full_matrix":
+        wavevector_phases, amplitude = self._sample_wavevector_probe(
+            wavevector_indices,
+            rho,
+        )
+        if self.component_treatment == "full_matrix":
             matrix, active = self.response.matrix(
                 model=model,
                 batch=batch,
-                modes=modes,
+                wavevector_indices=wavevector_indices,
                 outputs=outputs,
                 relative_amplitude=amplitude,
-                mode_phases=mode_phases,
+                wavevector_phases=wavevector_phases,
             )
             return self._matrix_loss(matrix, active)
 
-        mixture_weights = self._mixture_weights(rho.shape[-1], rho)
+        component_weights = self._component_weights(rho.shape[-1], rho)
         normalized_curvature, valid = self.response(
             model=model,
             batch=batch,
-            modes=modes,
-            directions=mixture_weights,
+            wavevector_indices=wavevector_indices,
+            directions=component_weights,
             outputs=outputs,
             relative_amplitude=amplitude,
-            mode_phases=mode_phases,
+            wavevector_phases=wavevector_phases,
         )
         return self._directional_loss(
             normalized_curvature,
             valid,
-            "batch contains no valid mixture-mode direction",
+            "batch contains no valid component direction",
         )
 
-    def _polarization_loss(self, model, outputs, batch, rho, modes):
+    def _polarization_loss(self, model, outputs, batch, rho, wavevector_indices):
         """Return the fixed-density polarization stability penalty."""
 
-        if getattr(self, "include_zero_mode", True):
-            modes = torch.cat((torch.zeros_like(modes[:, :1]), modes), dim=1)
         directions = torch.randn(
             (rho.shape[0], 3), dtype=rho.dtype, device=rho.device,
         )
         directions /= torch.linalg.vector_norm(
             directions, dim=-1, keepdim=True,
         )
-        curvature, valid = polarization_fourier_curvature(
-            model=model,
-            outputs=outputs,
-            batch=batch,
-            rho=rho,
-            modes=modes,
-            dipole_magnitude=self.dipole_magnitude,
-            relative_amplitude=self._sample_amplitude(modes.shape[:2], rho),
-            polarization_directions=directions,
-            perturbations_per_forward=self.response.perturbations_per_forward,
-        )
+        common = {
+            "model": model,
+            "outputs": outputs,
+            "batch": batch,
+            "rho": rho,
+            "dipole_magnitude": self.dipole_magnitude,
+            "polarization_directions": directions,
+            "perturbations_per_forward": self.response.perturbations_per_forward,
+        }
+        if self.wavevector_treatment == "independent":
+            if self.include_zero_wavevector:
+                wavevector_indices = torch.cat(
+                    (
+                        torch.zeros_like(wavevector_indices[:, :1]),
+                        wavevector_indices,
+                    ),
+                    dim=1,
+                )
+            _, amplitude = self._sample_wavevector_probe(
+                wavevector_indices,
+                rho,
+            )
+            curvature, valid = polarization_fourier_curvature(
+                wavevector_indices=wavevector_indices,
+                relative_amplitude=amplitude,
+                **common,
+            )
+        else:
+            phases, amplitude = self._sample_wavevector_probe(
+                wavevector_indices,
+                rho,
+            )
+            curvature, valid = polarization_fourier_curvature(
+                wavevector_indices=wavevector_indices,
+                relative_amplitude=amplitude,
+                wavevector_phases=phases,
+                **common,
+            )
+            if self.include_zero_wavevector:
+                zero_indices = torch.zeros_like(wavevector_indices[:, :1])
+                zero_curvature, zero_valid = polarization_fourier_curvature(
+                    wavevector_indices=zero_indices,
+                    relative_amplitude=self._sample_amplitude(
+                        zero_indices.shape[:2], rho
+                    ),
+                    **common,
+                )
+                curvature = torch.cat(
+                    (zero_curvature.flatten(1), curvature.flatten(1)), dim=1
+                )
+                valid = torch.cat(
+                    (zero_valid.flatten(1), valid.flatten(1)), dim=1
+                )
         return self._directional_loss(
             curvature,
             valid,
             "batch contains no valid polarization direction",
         )
+
+    def _sample_wavevector_probe(self, wavevector_indices, reference):
+        """Return phases and amplitudes for the selected probe treatment."""
+
+        if self.wavevector_treatment == "independent":
+            return (
+                None,
+                self._sample_amplitude(
+                    wavevector_indices.shape[:2],
+                    reference,
+                ),
+            )
+        phases = reference.new_empty(
+            wavevector_indices.shape[:2]
+        ).uniform_(0.0, 2.0 * torch.pi)
+        amplitude = self._sample_amplitude(
+            (reference.shape[0], 1),
+            reference,
+        )
+        return phases, amplitude
 
     def _sample_amplitude(self, shape, reference):
         """Draw per-pattern amplitudes only for an interval configuration."""
@@ -503,38 +615,38 @@ class FourierStabilityLoss(nn.Module):
             raise ValueError("batch contains no valid full-matrix direction")
         return self.weight * torch.cat(penalties).mean()
 
-    def _mixture_weights(
+    def _component_weights(
         self,
         n_types: int,
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        """Return one component-weight row per mixture direction."""
+        """Return one component-weight row per selected treatment."""
 
-        if self.mixture_mode == "independent":
+        if self.component_treatment == "independent":
             return torch.eye(
                 n_types,
                 device=reference.device,
                 dtype=reference.dtype,
             )
-        if self.mixture_mode == "total_density":
+        if self.component_treatment == "total_density":
             return torch.ones(
                 (1, n_types),
                 device=reference.device,
                 dtype=reference.dtype,
             )
-        if self.mixture_mode == "full_matrix":
-            raise RuntimeError("full_matrix does not use mixture weights")
+        if self.component_treatment == "full_matrix":
+            raise RuntimeError("full_matrix does not use component weights")
         if self.charges.shape != (n_types,):
             raise ValueError("charges must contain one value per density type")
         charges = self.charges.to(reference)
         return (charges / torch.amax(torch.abs(charges)))[None, :]
 
-    def _select_modes(
+    def _select_wavevector_indices(
         self,
         batch: Dict[str, torch.Tensor],
         rho: torch.Tensor,
     ) -> torch.Tensor:
-        """Return fixed or randomly sampled physical modes for every field."""
+        """Return fixed or randomly sampled indices for every field."""
 
         n_fields = rho.shape[0]
         grid_size, grid_spacing = _validated_grid(
@@ -543,11 +655,11 @@ class FourierStabilityLoss(nn.Module):
             n_grid=rho.shape[1],
         )
 
-        count = maximum_count = self.random_modes_per_field
+        count = maximum_count = self.random_wavevectors_per_field
         if isinstance(count, tuple):
             lower, maximum_count = count
-            # One common count keeps the response tensor rectangular. Mode
-            # identities are still sampled independently for each field.
+            # One common count keeps the response tensor rectangular.
+            # Wavevector identities remain independent between fields.
             count = (
                 lower if lower == maximum_count else
                 int(torch.randint(lower, maximum_count + 1, ()).item())
@@ -557,16 +669,18 @@ class FourierStabilityLoss(nn.Module):
         for field in range(n_fields):
             size = tuple(grid_size[field].tolist())
             spacing = tuple(grid_spacing[field].tolist())
-            if self.modes.shape[0] > 0:
-                selected = canonical_mode_triplets(
-                    self.modes,
+            if self.wavevector_indices.shape[0] > 0:
+                selected = canonical_wavevector_indices(
+                    self.wavevector_indices,
                     size,
                     spacing,
-                    mode_domain=self.mode_domain,
+                    wavevector_domain=self.wavevector_domain,
                 ).detach().cpu().tolist()
             else:
-                candidates = _feasible_modes(
-                    size, spacing, mode_domain=self.mode_domain,
+                candidates = _feasible_wavevector_indices(
+                    size,
+                    spacing,
+                    wavevector_domain=self.wavevector_domain,
                 )
                 if self.wavevector_range is not None:
                     box_lengths = tuple(
@@ -577,10 +691,10 @@ class FourierStabilityLoss(nn.Module):
                         self.wavevector_range
                     )
                     candidates = [
-                        mode
-                        for mode in candidates
+                        index_triplet
+                        for index_triplet in candidates
                         if minimum_wavevector
-                        <= _wavevector_magnitude(mode, box_lengths)
+                        <= _wavevector_magnitude(index_triplet, box_lengths)
                         <= maximum_wavevector
                     ]
                 if maximum_count > len(candidates):
@@ -590,7 +704,8 @@ class FourierStabilityLoss(nn.Module):
                         else ""
                     )
                     raise ValueError(
-                        "random_modes_per_field exceeds the feasible modes"
+                        "random_wavevectors_per_field exceeds the feasible "
+                        "wavevector indices"
                         + selection_scope
                     )
                 indices = torch.randperm(len(candidates))[:count].tolist()

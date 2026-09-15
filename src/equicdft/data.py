@@ -26,7 +26,7 @@ from ._data_helpers import (
     process_atoms,
     validate_frame_grid_info,
 )
-from ._fourier import canonical_mode_triplets, integer_mode_tensor
+from ._fourier import canonical_wavevector_indices, integer_wavevector_indices
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -320,27 +320,29 @@ class FourierResponseData(Dataset):
     """Homogeneous grid fields paired with projected Fourier curvatures.
 
     ``template`` supplies one periodic grid geometry. ``density`` contains
-    the component densities for each response item, while ``modes`` and
-    ``curvature`` contain its integer reciprocal modes and projected response
-    targets.  The dataset is deliberately agnostic to component names,
-    directions, thermodynamic units, and how response targets were obtained.
+    the component densities for each response item. ``wavevector_indices``
+    and ``curvature`` contain its integer reciprocal-lattice indices and
+    projected response targets. The dataset is deliberately agnostic to
+    component names, directions, thermodynamic units, and how response targets
+    were obtained.
 
-    A single mode per item may be supplied as ``[n_items, 3]``; otherwise
-    modes have shape ``[n_items, n_modes, 3]``. Curvature, scale, and weight
-    have shape ``[n_items, n_modes, n_directions]``. Optional ``indices``
-    selects an existing, externally defined split without regenerating it.
+    A single wavevector per item may be supplied as ``[n_items, 3]``;
+    otherwise indices have shape ``[n_items, n_wavevectors, 3]``. Curvature,
+    scale, and weight have shape
+    ``[n_items, n_wavevectors, n_directions]``. Optional ``indices`` selects
+    an existing, externally defined split without regenerating it.
     """
 
     def __init__(
         self,
         template: Mapping[str, Any],
         density: Any,
-        modes: Any,
+        wavevector_indices: Any,
         curvature: Any,
         scale: Optional[Any] = None,
         weight: Optional[Any] = None,
         indices: Optional[Sequence[int]] = None,
-        modes_key: str = "fourier_modes",
+        wavevector_indices_key: str = "fourier_wavevector_indices",
         target_key: str = "fourier_curvature",
         scale_key: str = "fourier_scale",
         weights_key: str = "fourier_weight",
@@ -364,7 +366,10 @@ class FourierResponseData(Dataset):
                     sorted(missing_template_keys)
                 )
             )
-        self.modes_key = nonempty_string(modes_key, "modes_key")
+        self.wavevector_indices_key = nonempty_string(
+            wavevector_indices_key,
+            "wavevector_indices_key",
+        )
         self.target_key = nonempty_string(target_key, "target_key")
         self.scale_key = nonempty_string(scale_key, "scale_key")
         self.weights_key = nonempty_string(weights_key, "weights_key")
@@ -374,10 +379,10 @@ class FourierResponseData(Dataset):
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError("dtype must be a floating-point torch dtype")
         self.density = torch.as_tensor(density, dtype=dtype)
-        self.modes = integer_mode_tensor(modes)
+        self.wavevector_indices = integer_wavevector_indices(wavevector_indices)
         self.curvature = torch.as_tensor(curvature, dtype=dtype)
-        if self.modes.ndim == 2:
-            self.modes = self.modes.unsqueeze(1)
+        if self.wavevector_indices.ndim == 2:
+            self.wavevector_indices = self.wavevector_indices.unsqueeze(1)
         if self.curvature.ndim == 2:
             self.curvature = self.curvature.unsqueeze(1)
 
@@ -386,24 +391,33 @@ class FourierResponseData(Dataset):
         n_items, n_types = self.density.shape
         if int(torch.as_tensor(self.template["n_types"]).item()) != n_types:
             raise ValueError("density n_types does not match template")
-        if self.modes.shape[:1] != (n_items,) or self.modes.ndim != 3:
-            raise ValueError("modes must have shape [n_items, n_modes, 3]")
-        if self.modes.shape[-1] != 3:
-            raise ValueError("modes must contain three integer components")
-        self.modes = torch.stack(
+        if (
+            self.wavevector_indices.shape[:1] != (n_items,)
+            or self.wavevector_indices.ndim != 3
+        ):
+            raise ValueError(
+                "wavevector_indices must have shape "
+                "[n_items, n_wavevectors, 3]"
+            )
+        if self.wavevector_indices.shape[-1] != 3:
+            raise ValueError(
+                "wavevector_indices must contain three integer components"
+            )
+        self.wavevector_indices = torch.stack(
             [
-                canonical_mode_triplets(
-                    item_modes,
+                canonical_wavevector_indices(
+                    item_indices,
                     self.template["grid_size"],
                     self.template["grid_spacing"],
                 )
-                for item_modes in self.modes
+                for item_indices in self.wavevector_indices
             ]
         )
-        expected = (n_items, self.modes.shape[1])
+        expected = (n_items, self.wavevector_indices.shape[1])
         if self.curvature.ndim != 3 or self.curvature.shape[:2] != expected:
             raise ValueError(
-                "curvature must have shape [n_items, n_modes, n_directions]"
+                "curvature must have shape "
+                "[n_items, n_wavevectors, n_directions]"
             )
 
         self.scale = self._optional_response_tensor(
@@ -445,7 +459,7 @@ class FourierResponseData(Dataset):
         frame = dict(self.template)
         n_grid = int(torch.as_tensor(frame["index"]).numel())
         frame["rho"] = self.density[index].expand(n_grid, -1).clone()
-        frame[self.modes_key] = self.modes[index]
+        frame[self.wavevector_indices_key] = self.wavevector_indices[index]
         frame[self.target_key] = self.curvature[index]
         if self.scale is not None:
             frame[self.scale_key] = self.scale[index]

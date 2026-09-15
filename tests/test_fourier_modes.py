@@ -9,9 +9,9 @@ from torch import nn
 
 from equicdft import FourierResponse, FourierStabilityLoss
 from equicdft._fourier import (
-    canonical_grid_mode,
-    canonical_mode_triplets,
-    feasible_modes,
+    canonical_grid_wavevector_index,
+    canonical_wavevector_indices,
+    feasible_wavevector_indices,
 )
 
 
@@ -50,14 +50,14 @@ class TestFourierModeDomains(unittest.TestCase):
         mode = ((6, 6, -5),)
         geometry = ((16, 16, 16), (0.5, 0.5, 0.5))
         with self.assertRaisesRegex(ValueError, "Nyquist sphere"):
-            canonical_mode_triplets(mode, *geometry)
-        selected = canonical_mode_triplets(mode, *geometry, mode_domain="cube")
+            canonical_wavevector_indices(mode, *geometry)
+        selected = canonical_wavevector_indices(mode, *geometry, wavevector_domain="cube")
         self.assertEqual(selected.tolist(), list(map(list, mode)))
 
     def test_cube_contains_each_nonzero_discrete_real_mode_once(self):
         for size in ((16, 16, 16), (5, 7, 3), (4, 5, 6)):
             with self.subTest(size=size):
-                modes = feasible_modes(size, (0.5, 1.0, 2.0), mode_domain="cube")
+                modes = feasible_wavevector_indices(size, (0.5, 1.0, 2.0), wavevector_domain="cube")
                 # A real wave is identified by the unordered pair of FFT
                 # residues {n, -n}; this checks completeness independently
                 # of the canonical representative chosen by the library.
@@ -78,17 +78,17 @@ class TestFourierModeDomains(unittest.TestCase):
         size = (16, 16, 16)
         for mode in ((8, -1, -8), (-1, 8, 0), (-8, -8, 0), (6, 6, -5)):
             with self.subTest(mode=mode):
-                canonical = canonical_grid_mode(mode, size)
-                opposite = canonical_grid_mode(tuple(-n for n in mode), size)
+                canonical = canonical_grid_wavevector_index(mode, size)
+                opposite = canonical_grid_wavevector_index(tuple(-n for n in mode), size)
                 self.assertEqual(canonical, opposite)
-                self.assertEqual(canonical_grid_mode(canonical, size), canonical)
-        self.assertEqual(canonical_grid_mode((8, -1, -8), size), (8, 1, 8))
+                self.assertEqual(canonical_grid_wavevector_index(canonical, size), canonical)
+        self.assertEqual(canonical_grid_wavevector_index((8, -1, -8), size), (8, 1, 8))
         with self.assertRaisesRegex(ValueError, "equivalent"):
-            canonical_mode_triplets(
+            canonical_wavevector_indices(
                 ((8, -1, -8), (-8, 1, 8)),
                 size,
                 (0.5, 0.5, 0.5),
-                mode_domain="cube",
+                wavevector_domain="cube",
             )
 
     def test_cube_still_rejects_zero_and_out_of_band_aliases(self):
@@ -100,39 +100,39 @@ class TestFourierModeDomains(unittest.TestCase):
         ):
             with self.subTest(size=size, mode=mode):
                 with self.assertRaisesRegex(ValueError, "Nyquist cube"):
-                    canonical_mode_triplets(
-                        (mode,), size, (1.0, 1.0, 1.0), mode_domain="cube",
+                    canonical_wavevector_indices(
+                        (mode,), size, (1.0, 1.0, 1.0), wavevector_domain="cube",
                     )
-        with self.assertRaisesRegex(ValueError, "zero mode"):
-            canonical_mode_triplets(
-                ((0, 0, 0),), (16, 16, 16), (1.0, 1.0, 1.0), mode_domain="cube",
+        with self.assertRaisesRegex(ValueError, "zero wavevector"):
+            canonical_wavevector_indices(
+                ((0, 0, 0),), (16, 16, 16), (1.0, 1.0, 1.0), wavevector_domain="cube",
             )
 
     def test_anisotropic_cube_uses_componentwise_not_isotropic_limit(self):
         size, spacing = (8, 6, 5), (0.5, 1.0, 2.0)
-        cube = feasible_modes(size, spacing, mode_domain="cube")
-        sphere = feasible_modes(size, spacing)
+        cube = feasible_wavevector_indices(size, spacing, wavevector_domain="cube")
+        sphere = feasible_wavevector_indices(size, spacing)
         self.assertIn((4, 3, 2), cube)
         self.assertNotIn((4, 3, 2), sphere)
         self.assertTrue(set(sphere) < set(cube))
-        self.assertEqual(cube, feasible_modes(size, (1.0, 1.0, 1.0), "cube"))
-        self.assertEqual(sphere, feasible_modes(size, spacing, "sphere"))
+        self.assertEqual(cube, feasible_wavevector_indices(size, (1.0, 1.0, 1.0), "cube"))
+        self.assertEqual(sphere, feasible_wavevector_indices(size, spacing, "sphere"))
 
     def test_random_cube_sampling_and_physical_wavevector_filter(self):
         batch = _batch(size=(8, 8, 8), spacing=(1.0, 1.0, 1.0))
-        candidates = feasible_modes((8, 8, 8), (1.0, 1.0, 1.0), "cube")
+        candidates = feasible_wavevector_indices((8, 8, 8), (1.0, 1.0, 1.0), "cube")
         term = FourierStabilityLoss(
-            random_modes_per_field=len(candidates), mode_domain="cube",
+            random_wavevectors_per_field=len(candidates), wavevector_domain="cube",
         )
-        selected = term._select_modes(batch, batch["rho"])[0]
+        selected = term._select_wavevector_indices(batch, batch["rho"])[0]
         self.assertEqual(sorted(map(tuple, selected.tolist())), candidates)
         # This entire band is outside the isotropic sphere |k| <= pi.
         term = FourierStabilityLoss(
-            random_modes_per_field=4,
-            mode_domain="cube",
+            random_wavevectors_per_field=4,
+            wavevector_domain="cube",
             wavevector_range=(4.0, 4.5),
         )
-        selected = term._select_modes(batch, batch["rho"])
+        selected = term._select_wavevector_indices(batch, batch["rho"])
         magnitudes = (2.0 * torch.pi * selected.to(torch.float64) / 8).norm(dim=-1)
         self.assertTrue(torch.all((magnitudes >= 4.0) & (magnitudes <= 4.5)))
 
@@ -140,7 +140,7 @@ class TestFourierModeDomains(unittest.TestCase):
         batch = _batch()
         model = _QuadraticModel()
         modes = torch.tensor([[[6, 6, -5]]])
-        response = FourierResponse(relative_amplitude=2.0**-8, mode_domain="cube")
+        response = FourierResponse(relative_amplitude=2.0**-8, wavevector_domain="cube")
         curvature, valid = response(
             model, batch, modes, directions=torch.ones(1, 1, dtype=torch.float64),
         )
@@ -158,7 +158,7 @@ class TestFourierModeDomains(unittest.TestCase):
         batch = _batch()
         batch["rho"][:, ::2] *= 0.8
         model = _QuadraticModel()
-        term = FourierStabilityLoss(modes=((6, 6, -5),), mode_domain="cube")
+        term = FourierStabilityLoss(wavevector_indices=((6, 6, -5),), wavevector_domain="cube")
         value = term(model(batch), batch, model=model)
         value.backward()
         self.assertGreater(value.item(), 0.0)
@@ -178,21 +178,21 @@ class TestFourierModeDomains(unittest.TestCase):
                     for key, value in _batch().items()
                 }
                 model = _QuadraticModel().to(dtype)
-                curvature, valid = FourierResponse(mode_domain="cube")(
+                curvature, valid = FourierResponse(wavevector_domain="cube")(
                     model, batch, torch.tensor([[[8, 8, 8]]]),
                     directions=torch.ones(1, 1, dtype=dtype),
                 )
                 self.assertEqual(valid.flatten().tolist(), [True, False])
                 self.assertTrue(torch.all(torch.isfinite(curvature)))
 
-    def test_mode_domain_is_validated(self):
-        for mode_domain in (None, "full", "Cube"):
-            with self.subTest(mode_domain=mode_domain):
-                with self.assertRaisesRegex(ValueError, "mode_domain"):
-                    FourierResponse(mode_domain=mode_domain)
-                with self.assertRaisesRegex(ValueError, "mode_domain"):
+    def test_wavevector_domain_is_validated(self):
+        for wavevector_domain in (None, "full", "Cube"):
+            with self.subTest(wavevector_domain=wavevector_domain):
+                with self.assertRaisesRegex(ValueError, "wavevector_domain"):
+                    FourierResponse(wavevector_domain=wavevector_domain)
+                with self.assertRaisesRegex(ValueError, "wavevector_domain"):
                     FourierStabilityLoss(
-                        random_modes_per_field=1, mode_domain=mode_domain,
+                        random_wavevectors_per_field=1, wavevector_domain=wavevector_domain,
                     )
 
 

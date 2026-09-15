@@ -108,12 +108,13 @@ class TensorLoss(nn.Module):
 class FourierResponseLoss(nn.Module):
     r"""Fit projected homogeneous Fourier curvatures to response data.
 
-    Each batch item is one homogeneous, periodic, unmasked state. Integer mode
-    triplets are read from ``modes_key``. Symmetric fixed-number perturbations
-    evaluate ``beta * (F_id + F_exc)`` along each component-space direction;
-    valid cosine and sine estimates are averaged before comparison with the
-    target. A one-component target is ``1/S(k)``. Mixture targets must project
-    the full inverse response matrix using the same direction convention.
+    Each batch item is one homogeneous, periodic, unmasked state. Integer
+    reciprocal-lattice triplets are read from ``wavevector_indices_key``.
+    Symmetric fixed-number perturbations evaluate
+    ``beta * (F_id + F_exc)`` along each component-space direction; valid
+    cosine and sine estimates are averaged before comparison with the target.
+    A one-component target is ``1/S(k)``. Mixture targets must project the full
+    inverse response matrix using the same direction convention.
     """
 
     requires_model = True
@@ -122,7 +123,7 @@ class FourierResponseLoss(nn.Module):
     def __init__(
         self,
         directions: Sequence[Sequence[float]],
-        modes_key: str = "fourier_modes",
+        wavevector_indices_key: str = "fourier_wavevector_indices",
         target_key: str = "fourier_curvature",
         scale_key: Optional[str] = None,
         weights_key: Optional[str] = None,
@@ -140,7 +141,10 @@ class FourierResponseLoss(nn.Module):
             raise TypeError("loss_fn must be a torch.nn.Module")
 
         self.name = nonempty_string(name, "name")
-        self.modes_key = nonempty_string(modes_key, "modes_key")
+        self.wavevector_indices_key = nonempty_string(
+            wavevector_indices_key,
+            "wavevector_indices_key",
+        )
         self.target_key = nonempty_string(target_key, "target_key")
         self.scale_key = _optional_key(scale_key, "scale_key")
         self.weights_key = _optional_key(weights_key, "weights_key")
@@ -179,11 +183,14 @@ class FourierResponseLoss(nn.Module):
 
         if model is None:
             raise ValueError("FourierResponseLoss requires the model")
-        modes = _required_batch_value(batch, self.modes_key)
+        wavevector_indices = _required_batch_value(
+            batch,
+            self.wavevector_indices_key,
+        )
         curvature, valid = self.response(
             model=model,
             batch=batch,
-            modes=modes,
+            wavevector_indices=wavevector_indices,
             directions=self.directions,
             outputs=outputs,
         )
@@ -251,7 +258,8 @@ def _response_tensor(
     )
     if value.shape != reference.shape:
         raise ValueError(
-            "{} must have shape [n_fields, n_modes, n_directions]".format(key)
+            "{} must have shape "
+            "[n_fields, n_wavevectors, n_directions]".format(key)
         )
     if not torch.all(torch.isfinite(value)).item():
         raise ValueError("{} must be finite".format(key))

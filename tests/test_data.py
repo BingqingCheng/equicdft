@@ -896,7 +896,7 @@ class TestFourierResponseData(unittest.TestCase):
         data = FourierResponseData(
             template=self._template(),
             density=[[0.1, 0.2], [0.3, 0.4]],
-            modes=[[1, 0, 0], [1, 0, 0]],
+            wavevector_indices=[[1, 0, 0], [1, 0, 0]],
             curvature=[[2.0, 3.0], [4.0, 5.0]],
             scale=[[1.0, 2.0], [2.0, 4.0]],
             weight=[[1.0, 1.0], [0.5, 2.0]],
@@ -909,7 +909,7 @@ class TestFourierResponseData(unittest.TestCase):
         self.assertTrue(
             torch.allclose(frame["rho"], torch.tensor([[0.3, 0.4]] * 4))
         )
-        self.assertEqual(frame["fourier_modes"].shape, (1, 3))
+        self.assertEqual(frame["fourier_wavevector_indices"].shape, (1, 3))
         self.assertEqual(frame["fourier_curvature"].shape, (1, 2))
         self.assertEqual(frame["fourier_scale"].shape, (1, 2))
         self.assertEqual(frame["fourier_weight"].shape, (1, 2))
@@ -958,8 +958,8 @@ class TestFourierResponseData(unittest.TestCase):
             ([[True, False, False]], TypeError),
             ([[1.0 + 0.0j, 0.0j, 0.0j]], TypeError),
         ):
-            with self.subTest(modes=modes):
-                with self.assertRaisesRegex(error, "modes"):
+            with self.subTest(wavevector_indices=modes):
+                with self.assertRaisesRegex(error, "wavevector_indices"):
                     FourierResponseData(
                         template,
                         [[0.2, 0.2]],
@@ -973,15 +973,15 @@ class TestFourierResponseData(unittest.TestCase):
             [[-1.0, 0.0, 0.0]],
             [[1.0]],
         )
-        self.assertEqual(data.modes.dtype, torch.long)
+        self.assertEqual(data.wavevector_indices.dtype, torch.long)
         self.assertTrue(
-            torch.equal(data.modes, torch.tensor([[[1, 0, 0]]]))
+            torch.equal(data.wavevector_indices, torch.tensor([[[1, 0, 0]]]))
         )
 
-    def test_modes_are_physically_validated_against_the_template(self):
+    def test_wavevectors_are_physically_validated_against_template(self):
         template = self._template()
         cases = (
-            ([[0, 0, 0]], [[1.0]], "zero mode"),
+            ([[0, 0, 0]], [[1.0]], "zero wavevector"),
             (
                 [[[1, 0, 0], [-1, 0, 0]]],
                 [[[1.0], [1.0]]],

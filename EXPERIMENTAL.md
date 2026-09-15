@@ -347,20 +347,20 @@ fixed_lr = LongRangeReadout(
 
 The coefficients are `C_ij = amplitude * charge_i * charge_j`. Omitting
 `coulomb_amplitude` learns one shared state-dependent amplitude. Omitting
-`charges` retains freely learned pair coefficients. Charge-factorized mode
+`charges` retains freely learned pair coefficients. Charge factorization
 currently requires one reciprocal kernel.
 
 For `kernel="coulomb"`, the implemented kernel is
-`4 pi exp(-alpha k^2)/k^2` at nonzero modes. It is a Gaussian-damped Coulomb
-kernel, so choosing `alpha` also defines an LR/SR partition and is not merely
-a numerical setting.
+`4 pi exp(-alpha k^2)/k^2` at nonzero wavevectors. It is a Gaussian-damped
+Coulomb kernel, so choosing `alpha` also defines an LR/SR partition and is not
+merely a numerical setting.
 
 ## Shared Fourier-response evaluator
 
 `FourierResponse` evaluates projected curvature of the total intrinsic
 dimensionless free energy `beta(F_id+F_exc)` using symmetric finite
-differences around a supplied density field. Integer reciprocal-grid modes and
-component-space directions are supplied at evaluation time.
+differences around a supplied density field. Integer reciprocal-lattice
+indices and component-space directions are supplied at evaluation time.
 
 For every physical component, the perturbation is projected to preserve that
 component's particle number. Cosine and sine phases are evaluated separately.
@@ -376,14 +376,14 @@ response = FourierResponse(
 curvature_by_phase, valid = response(
     model,
     batch,
-    modes=integer_modes,
+    wavevector_indices=integer_wavevector_indices,
     directions=component_directions,
 )
 ```
 
-The result has shape `[field, mode, phase, direction]`. This evaluator is the
-shared numerical core used by both stability regularization and supervised
-response fitting.
+The result has shape `[field, wavevector, phase, direction]`. This evaluator
+is the shared numerical core used by both stability regularization and
+supervised response fitting.
 
 For multicomponent stability, the same evaluator can reconstruct the complete
 physical-component curvature matrix:
@@ -392,12 +392,12 @@ physical-component curvature matrix:
 curvature_matrix, active_components = response.matrix(
     model,
     batch,
-    modes=integer_modes,
+    wavevector_indices=integer_wavevector_indices,
 )
 ```
 
-The matrix has shape `[field, mode, phase, type, type]`. It is normalized in
-the ideal-gas metric, so the ideal contribution is the identity. For a
+The matrix has shape `[field, wavevector, phase, type, type]`. It is normalized
+in the ideal-gas metric, so the ideal contribution is the identity. For a
 homogeneous mixture it is the dimensionless inverse OZ matrix
 `I-sqrt(R)c(k)sqrt(R)`. Around an inhomogeneous field it is a projected
 component Hessian; it is not the complete position-dependent OZ operator.
@@ -409,11 +409,12 @@ below `minimum_curvature`:
 
 ```python
 stability = FourierStabilityLoss(
-    random_modes_per_field=1,
+    random_wavevectors_per_field=1,
+    wavevector_treatment="independent",
     wavevector_range=(k_min, k_max),
     relative_amplitude=0.01,
     minimum_curvature=0.0,
-    mixture_mode="charge",
+    component_treatment="charge",
     charges=(1.0, -1.0),
     weight=1.0,
     training_only=True,
@@ -424,22 +425,37 @@ The complete multicomponent stability test is selected explicitly with:
 
 ```python
 matrix_stability = FourierStabilityLoss(
-    random_modes_per_field=1,
+    random_wavevectors_per_field=1,
+    wavevector_treatment="independent",
     wavevector_range=(k_min, k_max),
     relative_amplitude=0.05,
     minimum_curvature=0.0,
-    mixture_mode="full_matrix",
+    component_treatment="full_matrix",
     perturbations_per_forward=4,
     weight=1.0,
     training_only=True,
 )
 ```
 
-Explicit `modes=((nx,ny,nz),...)` and random sampling are mutually exclusive.
-Random candidates lie in the physical isotropic Nyquist sphere. The optional
-inclusive `wavevector_range=(k_min,k_max)` is expressed in reciprocal units
-implied by `grid_spacing`: if positions are measured in `sigma`, its units are
-`1/sigma`. It is not measured in grid-index units.
+Explicit `wavevector_indices=((nx,ny,nz),...)` and random sampling are mutually
+exclusive. Random candidates lie in the physical isotropic Nyquist sphere.
+The optional inclusive `wavevector_range=(k_min,k_max)` is expressed in
+reciprocal units implied by `grid_spacing`: if positions are measured in
+`sigma`, its units are `1/sigma`. It is not measured in grid-index units.
+
+`random_wavevectors_per_field` controls how many reciprocal triplets are
+selected; `wavevector_treatment` controls how those triplets become probes:
+
+- `"independent"` evaluates the cosine and sine of every triplet independently.
+  Thus `random_wavevectors_per_field=12` gives up to 24 nonzero curvature
+  probes per field.
+- `"superposition"` draws one phase for every triplet, sums the waves, and
+  evaluates one composite spatial direction per field. Thus
+  `random_wavevectors_per_field=12` still gives one curvature probe containing
+  12 wavevectors.
+
+The default is `wavevector_treatment="independent"`. Use `"superposition"`
+explicitly when a random-phase superposition is intended.
 
 Mixture directions are:
 
@@ -453,8 +469,8 @@ For an equal-density symmetric binary mixture, `(1,1)` and `(1,-1)` are the
 number and charge directions. That special interpretation must not be assumed
 for a general mixture. Positive curvature along selected directions does not
 guarantee that the coupled matrix is positive definite, so `"full_matrix"` is
-the recommended general mixture stability check. Existing modes remain useful
-as cheaper targeted regularizers.
+the recommended general mixture stability check. The directional treatments
+remain useful as cheaper targeted regularizers.
 
 The matrix is a finite-difference estimate with truncation error of order
 `relative_amplitude**2`. Taking an extremely small amplitude can instead
@@ -462,8 +478,8 @@ amplify energy roundoff, especially in float32, and the off-diagonal
 polarization adds another subtraction. Check amplitude convergence for the
 actual model and grid; a smaller amplitude is not automatically more accurate.
 For inhomogeneous fields this check covers the physical-component subspace of
-each selected cosine or sine perturbation, but not cosine-sine or inter-mode
-Hessian blocks.
+each selected cosine or sine perturbation, but not cosine-sine or
+cross-wavevector Hessian blocks.
 
 For `n` components the exact matrix reconstruction uses `n(n+1)/2` component
 directions. Cosine and sine phases and symmetric positive/negative differences
@@ -495,10 +511,12 @@ $$
 
 Here $m_a$ is the fixed molecular dipole magnitude of species $a$, not a loss
 weight. One direction $\mathbf u_f$ is shared by every selected wavevector and
-its cosine and sine phases in field $f$. Random wavevectors remain separate in
-polarization mode; unlike the density random-mode option, they are not summed
-into a composite pattern. Repeated training calls sample the full sphere
-without evaluating three coordinate-axis probes on every call.
+phase in field $f$. With `wavevector_treatment="independent"`, each cosine and
+sine is an independent curvature direction. With
+`wavevector_treatment="superposition"`, the selected nonzero wavevectors form
+one random-phase composite direction. Repeated training calls sample the full
+polarization sphere without evaluating three coordinate-axis probes on every
+call.
 
 For each valid phase, the normalized curvature is
 
@@ -544,16 +562,18 @@ sampling bound locally. The exact ideal functional and equilibrium solver
 retain their physical-domain checks; only this stochastic regularizer omits
 the constraint.
 
-The uniform polarization mode is meaningful because total polarization is not
-conserved. It is included by default; its cosine is the constant wave and its
-identically zero sine partner is discarded. Density stability continues to
-exclude the zero mode because each species particle number is fixed.
+The zero-wavevector polarization probe is meaningful because total
+polarization is not conserved. It is included by default; its cosine is the
+constant wave and its identically zero sine partner is discarded. It remains
+a separate probe when nonzero waves are superposed. Density stability excludes
+the zero wavevector because each species particle number is fixed.
 
 ```python
 loss = Loss([
     FourierStabilityLoss(
         variable="rho",
-        random_modes_per_field=1,
+        random_wavevectors_per_field=1,
+        wavevector_treatment="independent",
         relative_amplitude=0.02,
         minimum_curvature=0.0,
         weight=w_rho_stability,
@@ -562,8 +582,9 @@ loss = Loss([
     FourierStabilityLoss(
         variable="dipole_density",
         dipole_magnitude=m,
-        random_modes_per_field=1,
-        include_zero_mode=True,
+        random_wavevectors_per_field=1,
+        wavevector_treatment="independent",
+        include_zero_wavevector=True,
         relative_amplitude=0.02,
         minimum_curvature=0.0,
         weight=w_P_stability,
@@ -573,8 +594,8 @@ loss = Loss([
 ```
 
 The two positive directional tests implement the working approximation that
-density and polarization modes can be regularized independently. They do not
-test the mixed density--polarization Hessian block. One random polarization
+density and polarization fluctuations can be regularized independently. They
+do not test the mixed density--polarization Hessian block. One random polarization
 direction per field also does not prove that every Cartesian direction is
 positive on a particular call; it is a stochastic stability regularizer whose
 spherical coverage accumulates during training.
@@ -595,7 +616,7 @@ data-preparation workflow.
 ```python
 response_loss = FourierResponseLoss(
     directions=((1.0, 1.0), (1.0, -1.0)),
-    modes_key="fourier_modes",
+    wavevector_indices_key="fourier_wavevector_indices",
     target_key="fourier_curvature",
     scale_key="fourier_scale",
     weights_key="fourier_weight",
@@ -612,17 +633,19 @@ explicit tensors:
 response_data = FourierResponseData(
     template=grid_template,
     density=density_by_item,       # [item, component]
-    modes=modes_by_item,           # [item, mode, 3]
-    curvature=target_by_item,      # [item, mode, direction]
+    wavevector_indices=wavevector_indices_by_item,
+                                    # [item, wavevector, 3]
+    curvature=target_by_item,       # [item, wavevector, direction]
     scale=scale_by_item,           # optional, same target shape
     weight=weight_by_item,         # optional, same target shape
     indices=frozen_train_indices,
 )
 ```
 
-Every response item must be uniform, periodic, positive, and unmasked. Mode
-triplets are integer reciprocal-grid indices inside the isotropic Nyquist
-sphere. Valid sine and cosine estimates are averaged before applying the loss.
+Every response item must be uniform, periodic, positive, and unmasked.
+Wavevector triplets are integer reciprocal-lattice indices inside the
+isotropic Nyquist sphere. Valid sine and cosine estimates are averaged before
+applying the loss.
 
 `FourierResponseMetrics` reuses the tensors already computed by the loss and
 reports curvature RMSE, scaled curvature RMSE, nonpositive counts, and
@@ -706,7 +729,7 @@ functional or convergence criterion.
 - `features.py`: Cartesian feature ownership, density transforms, and radial
   dispatch
 - `interaction.py`: invariant-to-equivariant message layers
-- `_fourier.py`, `response.py`: shared mode validation, perturbations, and
+- `_fourier.py`, `response.py`: shared wavevector validation, perturbations, and
   projected curvature
 - `stability.py`: curvature-positivity regularization
 - `loss.py`, `metrics.py`, `data.py`: supervised response loss, diagnostics,
