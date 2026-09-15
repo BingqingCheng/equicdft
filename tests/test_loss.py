@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
 from equicdft import (
+    FixedDipoleIdeal,
     FourierResponse,
     FourierResponseLoss,
     FourierStabilityLoss,
@@ -13,6 +15,7 @@ from equicdft import (
     TensorLoss,
 )
 from equicdft._grid import voxel_volume
+from equicdft._fourier import polarization_fourier_curvature
 from equicdft.stability import _feasible_modes
 
 
@@ -66,6 +69,32 @@ class _CoupledQuadraticExcessModel(nn.Module):
                     rho,
                     self.matrix.to(rho),
                     rho,
+                )
+            )
+        }
+
+
+class _PolarizationQuadraticExcessModel(nn.Module):
+    """Analytic local polarization functional with a Cartesian Hessian."""
+
+    def __init__(self, matrix):
+        super().__init__()
+        self.matrix = nn.Parameter(torch.as_tensor(matrix, dtype=torch.float64))
+        self.last_polarization = None
+
+    def forward(self, data, compute_c1=None):
+        polarization = data["dipole_density"]
+        volume_element = voxel_volume(data["grid_spacing"].to(polarization))
+        self.last_polarization = polarization.detach()
+        return {
+            "beta_F_exc": (
+                0.5
+                * volume_element
+                * torch.einsum(
+                    "...gai,ij,...gaj->...",
+                    polarization,
+                    self.matrix.to(polarization),
+                    polarization,
                 )
             )
         }
@@ -260,6 +289,13 @@ class TestFourierStabilityLoss(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def _add_polarization(batch):
+        batch["dipole_density"] = batch["rho"].new_zeros(
+            (*batch["rho"].shape, 3)
+        )
+        return batch
+
     def test_stable_ideal_curvature_has_zero_penalty(self):
         batch = self._batch()
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
@@ -272,6 +308,209 @@ class TestFourierStabilityLoss(unittest.TestCase):
         value = term(outputs, batch, model=model)
 
         self.assertEqual(value.item(), 0.0)
+
+    def test_legacy_density_term_without_new_attributes_is_unchanged(self):
+        batch = self._batch()
+        model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
+        term = FourierStabilityLoss(modes=((1, 0, 0),))
+        del term.variable
+        del term.include_zero_mode
+
+        value = term(model(batch), batch, model=model)
+
+        self.assertEqual(value.item(), 0.0)
+
+    def test_polarization_ideal_has_zero_penalty_and_unstable_block_backpropagates(self):
+        batch = self._add_polarization(self._batch())
+        stable = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        common = {
+            "modes": ((1, 0, 0),),
+            "variable": "dipole_density",
+            "dipole_magnitude": 1.0,
+            "relative_amplitude": 2.0**-10,
+            "include_zero_mode": False,
+        }
+
+        self.assertEqual(
+            FourierStabilityLoss(**common)(stable(batch), batch, model=stable).item(),
+            0.0,
+        )
+
+        # At rho=1/2 and P=0 the ideal Cartesian Hessian is 3/rho=6.
+        # Adding -12 I therefore gives the ideal-metric matrix -I.
+        unstable = _PolarizationQuadraticExcessModel(-12.0 * torch.eye(3))
+        value = FourierStabilityLoss(**common)(
+            unstable(batch), batch, model=unstable
+        )
+        value.backward()
+
+        rho = batch["rho"]
+        polarization = batch["dipole_density"]
+        ideal = FixedDipoleIdeal(1.0)
+        reference = ideal(rho, polarization, torch.ones(1))["beta_F_id"]
+        phase = (
+            2.0
+            * torch.pi
+            * batch["grid_positions"][0, :, 0].to(rho)
+            / 8.0
+        )
+        expected = []
+        for wave in (torch.cos(phase), torch.sin(phase)):
+            delta = torch.zeros_like(polarization)
+            delta[..., 0] = common["relative_amplitude"] * rho * wave[None, :, None]
+            ideal_second = (
+                ideal(rho, delta, torch.ones(1))["beta_F_id"]
+                + ideal(rho, -delta, torch.ones(1))["beta_F_id"]
+                - 2.0 * reference
+            )
+            excess_second = -12.0 * delta.square().sum()
+            expected.append((1.0 + excess_second / ideal_second).square())
+        expected = torch.stack(expected).mean()
+        torch.testing.assert_close(value, expected, atol=2.0e-11, rtol=2.0e-11)
+        self.assertTrue(torch.all(torch.isfinite(unstable.matrix.grad)))
+        self.assertGreater(torch.linalg.vector_norm(unstable.matrix.grad).item(), 0.0)
+
+    def test_polarization_result_is_independent_of_species_count(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], 0.6 * batch["rho"]), dim=-1)
+        self._add_polarization(batch)
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        modes = torch.tensor([[[1, 0, 0]]])
+
+        curvature, active = polarization_fourier_curvature(
+            model=model,
+            outputs=model(batch),
+            batch=batch,
+            rho=batch["rho"],
+            modes=modes,
+            dipole_magnitude=torch.tensor([0.7, 1.3]),
+            relative_amplitude=0.05,
+            polarization_directions=torch.tensor([[0.0, 0.0, 1.0]]),
+        )
+
+        self.assertEqual(curvature.shape, (1, 1, 2))
+        self.assertEqual(active.shape, (1, 1, 2))
+        torch.testing.assert_close(
+            curvature[active],
+            torch.ones_like(curvature[active]),
+            atol=2.0e-11,
+            rtol=2.0e-11,
+        )
+
+    def test_polarization_draws_one_spherical_direction_per_field(self):
+        batch = self._add_polarization(self._batch(n_fields=2))
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        draws = torch.tensor(
+            [[2.0, 0.0, 0.0], [1.0, 2.0, 2.0]],
+            dtype=batch["rho"].dtype,
+        )
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            relative_amplitude=0.05,
+            include_zero_mode=False,
+        )
+
+        with patch("equicdft.stability.torch.randn", return_value=draws):
+            term(model(batch), batch, model=model)
+
+        first_cosine_plus = model.last_polarization[:, 0, 0, 0]
+        observed = first_cosine_plus / torch.linalg.vector_norm(
+            first_cosine_plus, dim=-1, keepdim=True
+        )
+        expected = draws / torch.linalg.vector_norm(draws, dim=-1, keepdim=True)
+        torch.testing.assert_close(observed, expected)
+
+    def test_polarization_zero_mode_keeps_cosine_and_discards_sine(self):
+        batch = self._add_polarization(self._batch())
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+        )
+
+        selected = torch.zeros((1, 1, 3), dtype=torch.long)
+        curvature, active = polarization_fourier_curvature(
+            model=model,
+            outputs=model(batch),
+            batch=batch,
+            rho=batch["rho"],
+            modes=selected,
+            dipole_magnitude=term.dipole_magnitude,
+            relative_amplitude=0.05,
+            polarization_directions=torch.tensor([[0.0, 1.0, 0.0]]),
+        )
+
+        self.assertTrue(active[:, :, 0].all())
+        self.assertFalse(active[:, :, 1].any())
+        torch.testing.assert_close(curvature[0, 0, 0], curvature.new_tensor(1.0))
+
+        with patch(
+            "equicdft.stability.polarization_fourier_curvature",
+            wraps=polarization_fourier_curvature,
+        ) as response:
+            term(model(batch), batch, model=model)
+        supplied_modes = response.call_args.kwargs["modes"]
+        self.assertTrue(torch.equal(supplied_modes[:, 0], selected[:, 0]))
+
+    def test_polarization_amplitude_shrinks_before_fixed_dipole_boundary(self):
+        batch = self._add_polarization(self._batch())
+        batch["dipole_density"][..., 0] = 0.95 * batch["rho"]
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            relative_amplitude=0.1,
+            include_zero_mode=False,
+        )
+
+        direction = torch.tensor([[1.0, 0.0, 0.0]], dtype=batch["rho"].dtype)
+        with patch("equicdft.stability.torch.randn", return_value=direction):
+            term(model(batch), batch, model=model)
+
+        perturbed_q = model.last_polarization / batch["rho"][:, None, :, :, None]
+        self.assertLess(torch.linalg.vector_norm(perturbed_q, dim=-1).max().item(), 1.0)
+        self.assertGreater(
+            torch.linalg.vector_norm(perturbed_q, dim=-1).max().item(),
+            0.99,
+        )
+
+    def test_polarization_stability_integrates_with_grid_model(self):
+        batch = self._add_polarization(self._batch())
+        readout = LDAReadout(
+            mean_density=0.5,
+            dipole_density_scale=0.5,
+            hidden_sizes=(),
+        ).to(dtype=torch.float64)
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(
+                torch.tensor([[0.0, -100.0, 0.0]], dtype=torch.float64)
+            )
+            readout.mlp[0].bias.zero_()
+        model = GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=[readout],
+            grid_spacing=1.0,
+            mean_temperature=1.0,
+            compute_c1=False,
+        ).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            modes=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            include_zero_mode=False,
+        )
+
+        value = term(model(batch, compute_c1=False), batch, model=model)
+        value.backward()
+
+        self.assertGreater(value.item(), 1.0)
+        self.assertTrue(torch.all(torch.isfinite(readout.mlp[0].weight.grad)))
+        self.assertNotEqual(readout.mlp[0].weight.grad[0, 1].item(), 0.0)
 
     def test_unstable_curvature_is_penalized_and_differentiable(self):
         batch = self._batch()
@@ -697,6 +936,30 @@ class TestFourierStabilityLoss(unittest.TestCase):
         self.assertEqual(value.item(), 0.0)
 
     def test_configuration_and_scope_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "variable"):
+            FourierStabilityLoss(modes=((1, 0, 0),), variable="unknown")
+        with self.assertRaisesRegex(ValueError, "dipole_magnitude is required"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                variable="dipole_density",
+            )
+        with self.assertRaisesRegex(ValueError, "requires variable"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                dipole_magnitude=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot include the zero mode"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                include_zero_mode=True,
+            )
+        with self.assertRaisesRegex(ValueError, "requires mixture_mode='independent'"):
+            FourierStabilityLoss(
+                modes=((1, 0, 0),),
+                variable="dipole_density",
+                dipole_magnitude=1.0,
+                mixture_mode="full_matrix",
+            )
         for modes in ((), ((0, 0, 0),), ((1.5, 0, 0),)):
             with self.subTest(modes=modes):
                 with self.assertRaises(ValueError):

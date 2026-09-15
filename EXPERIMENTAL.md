@@ -475,6 +475,97 @@ directions.
 Stability loss prevents selected negative curvatures; it does not determine
 the correct positive response and is not direct structure-factor training.
 
+### Fixed-dipole polarization stability
+
+Density and polarization stability are separate loss terms. The density term
+keeps the existing fixed-particle-number construction. The polarization term
+holds density fixed and perturbs the dimensionless local alignment fraction
+along one random direction per field:
+
+$$
+\mathbf u_f=\frac{\mathbf z_f}{|\mathbf z_f|},
+\qquad \mathbf z_f\sim\mathcal N(\mathbf 0,I_3),
+$$
+
+$$
+\delta\mathbf P_{fa}(\mathbf r)
+=\epsilon_P m_a\rho_{fa}(\mathbf r)
+\phi_{\mathbf k}(\mathbf r)\mathbf u_f.
+$$
+
+Here $m_a$ is the fixed molecular dipole magnitude of species $a$, not a loss
+weight. One direction $\mathbf u_f$ is shared by every selected wavevector and
+its cosine and sine phases in field $f$. Random wavevectors remain separate in
+polarization mode; unlike the density random-mode option, they are not summed
+into a composite pattern. Repeated training calls sample the full sphere
+without evaluating three coordinate-axis probes on every call.
+
+For each valid phase, the normalized curvature is
+
+$$
+\kappa_P=
+\frac{
+A[\rho,\mathbf P+\delta\mathbf P]
++A[\rho,\mathbf P-\delta\mathbf P]
+-2A[\rho,\mathbf P]
+}{
+F_{\rm id}[\rho,\mathbf P+\delta\mathbf P]
++F_{\rm id}[\rho,\mathbf P-\delta\mathbf P]
+-2F_{\rm id}[\rho,\mathbf P]
+},
+$$
+
+where $A=F_{\rm id}+F_{\rm exc}$ and $F_{\rm id}$ is the exact freely
+rotating fixed-dipole ideal functional. An ideal-only model therefore has
+$\kappa_P=1$. The polarization loss is
+
+$$
+L_{P,\mathrm{stab}}
+=\frac{w_P}{N_{\rm valid}}
+\sum_{f,\mathbf k,s}
+\max(0,\kappa_{\min}-\kappa_{P,f\mathbf k s})^2,
+$$
+
+where $s$ labels cosine or sine, $w_P$ is the statistical loss weight, and
+`minimum_curvature` supplies $\kappa_{\min}$. The implementation reduces
+$\epsilon_P$ when necessary rather than clipping a perturbed field at the
+strict fixed-dipole boundary $|\mathbf P_a|<m_a\rho_a$.
+
+The uniform polarization mode is meaningful because total polarization is not
+conserved. It is included by default; its cosine is the constant wave and its
+identically zero sine partner is discarded. Density stability continues to
+exclude the zero mode because each species particle number is fixed.
+
+```python
+loss = Loss([
+    FourierStabilityLoss(
+        variable="rho",
+        random_modes_per_field=1,
+        relative_amplitude=0.02,
+        minimum_curvature=0.0,
+        weight=w_rho_stability,
+        name="rho_fourier_stability",
+    ),
+    FourierStabilityLoss(
+        variable="dipole_density",
+        dipole_magnitude=m,
+        random_modes_per_field=1,
+        include_zero_mode=True,
+        relative_amplitude=0.02,
+        minimum_curvature=0.0,
+        weight=w_P_stability,
+        name="polarization_fourier_stability",
+    ),
+])
+```
+
+The two positive directional tests implement the working approximation that
+density and polarization modes can be regularized independently. They do not
+test the mixed density--polarization Hessian block. One random polarization
+direction per field also does not prove that every Cartesian direction is
+positive on a particular call; it is a stochastic stability regularizer whose
+spherical coverage accumulates during training.
+
 ## Supervised homogeneous Fourier response
 
 `FourierResponseLoss` compares projected homogeneous curvature with explicit
