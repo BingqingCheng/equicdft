@@ -177,9 +177,13 @@ class LongRangeReadout(EnergyReadout):
     Parameters
     ----------
     n_kernels
-        Number of fixed radial kernels in the reciprocal representation.
+        Number of kernel channels. Inferred from ``features`` when omitted;
+        required for standalone use without a feature module. Direct Gaussian
+        polarization with divergence has two channels per radial exponent.
     n_types
-        Number of physical density components. The state vector contains
+        Number of physical density components. Inferred from ``features`` when
+        omitted, or defaults to one without a feature module. Explicit counts
+        must match the feature module. The state vector contains
         normalized temperature followed by one mean density per component.
     hidden_sizes
         Width of each state-network hidden layer. An empty sequence gives a
@@ -207,6 +211,9 @@ class LongRangeReadout(EnergyReadout):
         flag and disallows charges / Coulomb amplitudes. Its coefficients are
         independent of any separate density or Coulomb readout. The existing
         ideal orientational free energy is not replaced.
+        With ``features.include_divergence=True``, the coefficient order is
+        all vector kernels followed by all divergence kernels. These have
+        different physical units; no width or reference scaling is implicit.
     include_polarization
         If true, require ``dipole_density`` and use the same Coulomb kernel
         on ``q_a rho_hat_a - i k.P_hat_a``. Requires explicit ``charges``
@@ -235,8 +242,8 @@ class LongRangeReadout(EnergyReadout):
 
     def __init__(
         self,
-        n_kernels: int,
-        n_types: int = 1,
+        n_kernels: Optional[int] = None,
+        n_types: Optional[int] = None,
         hidden_sizes: Sequence[int] = (16, 16),
         zero_init: bool = True,
         charges: Optional[Sequence[float]] = None,
@@ -245,6 +252,15 @@ class LongRangeReadout(EnergyReadout):
         include_polarization: bool = False,
     ) -> None:
         super().__init__()
+
+        if features is not None and not isinstance(features, ReciprocalFeatures):
+            raise TypeError("features must be ReciprocalFeatures or None")
+        if n_kernels is None:
+            if features is None:
+                raise ValueError("n_kernels is required without features")
+            n_kernels = features.n_kernels
+        if n_types is None:
+            n_types = features.n_types if features is not None else 1
 
         self.include_polarization = boolean(
             include_polarization, "include_polarization",
@@ -305,8 +321,6 @@ class LongRangeReadout(EnergyReadout):
         self.register_buffer("pair_charge_products", pair_charge_products)
         self.register_buffer("coulomb_amplitude", amplitude_tensor)
         if features is not None:
-            if not isinstance(features, ReciprocalFeatures):
-                raise TypeError("features must be ReciprocalFeatures or None")
             if features.n_types != self.n_types:
                 raise ValueError("features and readout n_types differ")
             if features.n_kernels != self.n_kernels:

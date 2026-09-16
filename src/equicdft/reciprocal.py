@@ -6,7 +6,7 @@ from typing import Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import positive_integer
+from ._argument_checks import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
 from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
 
@@ -37,6 +37,13 @@ class ReciprocalFeatures(nn.Module):
     retained, so both uniform and transverse polarization contribute. This
     is a direct orientational-response term, not a Coulomb interaction.
 
+    ``include_divergence=True`` appends a second block of Gaussian features
+    formed from ``-i k_D.P_hat``. Independent coefficients for the two blocks
+    give the tensor kernel ``A(k) I + B(k) k_D k_D``: away from Nyquist,
+    ``G_T=A`` and ``G_L=A+k^2 B``. The residual splitting vanishes at k=0,
+    preserving the long-wavelength dipolar interaction in a separate Coulomb
+    branch.
+
     Parameters
     ----------
     radial_exponents
@@ -62,6 +69,15 @@ class ReciprocalFeatures(nn.Module):
         fields, without an extra charge, dipole-magnitude or reference-scale
         factor. For P in charge/length^2, these features have units
         charge^2/length; beta-free-energy coefficients have length/charge^2.
+    include_divergence
+        Append divergence-pair features after all vector-dot-product kernels.
+        Only supported for direct Gaussian polarization. The output has twice
+        as many kernel channels as radial exponents. Divergence features have
+        units charge^2/length^3, so their beta-free-energy coefficients have
+        length^3/charge^2. No Gaussian-width or other scale factor is applied.
+        The same real spectral derivative as Coulomb is used, including its
+        zero even-axis Nyquist components. Uniform and pure Nyquist modes
+        therefore receive only the vector-dot-product contribution.
     """
 
     _KERNELS = (
@@ -78,6 +94,7 @@ class ReciprocalFeatures(nn.Module):
         n_types: int = 1,
         *,
         variable: str = "rho",
+        include_divergence: bool = False,
     ) -> None:
         super().__init__()
 
@@ -102,6 +119,9 @@ class ReciprocalFeatures(nn.Module):
             raise ValueError(
                 "direct dipole_density features require a Gaussian kernel"
             )
+        include_divergence = boolean(include_divergence, "include_divergence")
+        if include_divergence and variable != "dipole_density":
+            raise ValueError("include_divergence requires direct polarization features")
 
         if screening is None:
             screening_values = torch.zeros_like(exponents)
@@ -124,8 +144,9 @@ class ReciprocalFeatures(nn.Module):
 
         self.kernel = kernel
         self.variable = variable
+        self.include_divergence = include_divergence
         self.n_types = n_types
-        self.n_kernels = int(exponents.numel())
+        self.n_kernels = int(exponents.numel()) * (2 if include_divergence else 1)
         self.n_type_pairs = len(symmetric_component_pairs(n_types))
         self.register_buffer("radial_exponents", exponents)
         self.register_buffer("screening", screening_values)
@@ -149,6 +170,8 @@ class ReciprocalFeatures(nn.Module):
         In direct ``variable="dipole_density"`` mode, only the polarization
         pair features are returned; ``rho`` supplies grid/species shape and
         charges are not allowed. Use a separate density readout if needed.
+        With ``include_divergence=True``, the kernel axis contains all vector
+        kernels followed by all divergence kernels, in radial-exponent order.
 
         Otherwise, optional ``charges`` weights each density component before
         the pair contraction. With ``dipole_density`` (``rho.shape + (3,)``),
@@ -236,14 +259,23 @@ class ReciprocalFeatures(nn.Module):
             grid_spacing=spacing,
             device=rho.device,
             dtype=rho.dtype,
-        ).reshape(self.n_kernels, -1)
-        fourier_source = fourier_source.reshape(
-            *leading_shape,
-            nx * ny * nz,
-            self.n_types,
-            3 if direct_polarization else 1,
-        )
+        ).flatten(start_dim=1)
+        features = self._pair_features(fourier_source, kernels, volume)
+        # Previously serialized reciprocal modules have no divergence flag.
+        if getattr(self, "include_divergence", False):
+            divergence_hat = self._bound_charge_hat(
+                polarization_hat, (nx, ny, nz), spacing,
+            ).unsqueeze(-1)
+            divergence_features = self._pair_features(
+                divergence_hat, kernels, volume,
+            )
+            features = torch.cat((features, divergence_features), dim=-2)
+        return features
 
+    def _pair_features(self, fourier_source, kernels, volume):
+        """Contract ``[..., nx, ny, nz, n_types, n_vector]`` pair spectra."""
+
+        fourier_source = fourier_source.flatten(start_dim=-5, end_dim=-3)
         pair_features = []
         for first, second in symmetric_component_pairs(self.n_types):
             cross_power = torch.real(
@@ -286,7 +318,7 @@ class ReciprocalFeatures(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Return ``[n_kernels, nx, ny, nz]`` radial kernel values."""
+        """Return one ``[nx, ny, nz]`` kernel per radial exponent."""
 
         k_axes = self._wavevector_axes(grid_size, grid_spacing, device, dtype)
         kx, ky, kz = torch.meshgrid(*k_axes, indexing="ij")

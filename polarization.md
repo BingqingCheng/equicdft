@@ -332,8 +332,6 @@ polarization_features = ReciprocalFeatures(
     n_types=1,
 )
 polarization_lr = LongRangeReadout(
-    n_kernels=polarization_features.n_kernels,
-    n_types=1,
     features=polarization_features,
     hidden_sizes=(16, 16),
 )
@@ -343,6 +341,10 @@ polarization_lr = LongRangeReadout(
 ```
 
 `variable="rho"` remains the default and preserves the density-only behavior.
+Kernel and species counts are inferred from `features` at construction, not
+lazily on the first batch. Explicit counts remain supported and must match.
+Standalone coefficient contraction without `features` requires `n_kernels`
+and defaults to one species unless `n_types` is supplied.
 For `variable="dipole_density"`, the input is the physical
 `data["dipole_density"]`, not a descriptor-normalized field. No extra charge,
 molecular moment or reference-scale factor is applied. `LongRangeReadout`
@@ -386,6 +388,101 @@ are signed, like the existing density LR coefficients; neither this branch nor
 its presence alongside the ideal term guarantees positive total curvature.
 Broad Gaussians weaken at high wavevectors. Widths, regularization and any
 stability constraints remain application choices, not implicit API defaults.
+
+### Distinct longitudinal and transverse response
+
+To add a separate finite-wavelength longitudinal correction, construct the
+same features with `include_divergence=True`:
+
+```python
+polarization_features = ReciprocalFeatures(
+    radial_exponents=[0.5 * sigma**2 for sigma in gaussian_widths],
+    variable="dipole_density",
+    kernel="gaussian",
+    include_divergence=True,
+)
+polarization_lr = LongRangeReadout(
+    features=polarization_features,
+)
+```
+
+For N radial exponents, the output has 2N kernel channels: all N vector
+dot-product features first, followed by N divergence-pair features in the same
+radial order. The state network supplies independent signed coefficients for
+both blocks. For one species,
+
+$$
+\beta F_{G,P}=\frac{1}{2V}\sum_{\mathbf k}
+\left[A(k)|\widehat{\mathbf P}|^2
++B(k)|\mathbf k_D\cdot\widehat{\mathbf P}|^2\right],
+$$
+
+$$
+A(k)=\sum_n a_n e^{-\alpha_n k^2},\qquad
+B(k)=\sum_n b_n e^{-\alpha_n k^2}.
+$$
+
+For resolved modes away from Nyquist, $\mathbf k_D=\mathbf k$ and the added
+transverse and longitudinal stiffnesses are $G_T=A$ and $G_L=A+k^2B$.
+Their difference vanishes at $k=0$, preserving a common isotropic uniform
+response and leaving the asymptotic dipolar interaction in the fixed Coulomb
+branch. Setting the B coefficients to zero recovers the unsplit Gaussian
+functional. This is a residual-response parameterization, not a positivity
+constraint or a replacement for the ideal term.
+
+The divergence uses the same real spectral derivative as Coulomb: each
+even-axis Nyquist derivative component is zero. The radial Gaussian still
+uses the ordinary FFT wavevectors. B therefore vanishes on uniform and pure
+Nyquist patterns; A retains them. On mixed Nyquist modes the tensor is
+$A I+B\mathbf k_D\mathbf k_D$, not the continuum projector constructed from
+ordinary $\mathbf k$.
+
+No width, molecular-moment, beta or descriptor-reference factor is inserted
+into these features. The B features have units charge squared/length cubed,
+so $b_n$ has units length cubed/charge squared in beta-free-energy mode.
+The A units remain those stated above. Mixture B features use the same
+unique species pairs and off-diagonal factor of two as A. The default
+`include_divergence=False` preserves existing Gaussian-P, density and Coulomb
+models; this option is only available for direct Gaussian polarization.
+
+### Density-only use of the same API
+
+```python
+density_features = ReciprocalFeatures(
+    radial_exponents=[0.5 * sigma**2 for sigma in gaussian_widths],
+    variable="rho",  # Default; no polarization input is required.
+    kernel="gaussian",
+    n_types=1,
+)
+density_lr = LongRangeReadout(features=density_features, hidden_sizes=(16, 16))
+```
+
+For one species, write the physical density fluctuation as
+$\delta\rho=\rho-\bar\rho$ and its continuum-normalized discrete Fourier
+transform as $\widehat{\delta\rho}=\Delta V\,\mathrm{FFT}(\delta\rho)$.
+The Gaussian features and their energy contribution are
+
+$$
+X_n=\frac{1}{2V}\sum_{\mathbf k\ne0}
+e^{-\alpha_n k^2}|\widehat{\delta\rho}(\mathbf k)|^2,
+\qquad
+\beta F_{G,\rho}=\sum_n c_n X_n.
+$$
+
+Here $V$ is the cell volume, $\alpha_n=\sigma_n^2/2$ is fixed, and the
+readout learns signed coefficients $c_n$ from normalized temperature and
+mean density. The Fourier input is not divided by a reference density.
+For number density in inverse volume, $X_n$ has inverse-volume units and
+$c_n$ has volume units in beta-free-energy mode. Uniform density contributes
+zero to this branch; retain the appropriate local/bulk and ideal terms.
+This differs from direct polarization mode, which retains the uniform mode.
+
+For mixtures, set `n_types` on the feature module. The readout infers it and
+learns coefficients for every radial channel and unique species pair, with
+off-diagonal pairs counted twice. `include_divergence` is not applicable to
+scalar density. Fixed-charge Coulomb remains a separate option using
+`kernel="coulomb"`, charges and the desired Coulomb amplitude; the Gaussian
+density example above is not itself an electrostatic kernel.
 
 ## Training-only SEM noise augmentation
 

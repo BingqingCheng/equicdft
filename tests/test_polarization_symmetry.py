@@ -51,6 +51,10 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             max_power=1, max_product_order=2,
             include_polarization=True, separate_center=True,
         )
+        gaussian_features = ReciprocalFeatures(
+            radial_exponents=(.1, .4), variable="dipole_density",
+            include_divergence=True,
+        )
         readouts = [
             LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
@@ -65,10 +69,8 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 ),
             ),
             LongRangeReadout(
-                n_kernels=2, hidden_sizes=(5,), zero_init=False,
-                features=ReciprocalFeatures(
-                    radial_exponents=(.1, .4), variable="dipole_density",
-                ),
+                hidden_sizes=(5,), zero_init=False,
+                features=gaussian_features,
             ),
         ]
         return GridCACEModel(
