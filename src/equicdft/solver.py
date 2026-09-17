@@ -216,6 +216,7 @@ class GridSolver:
         ] = None,
         beta_multiplier: float = 0.0,
         initial_polarization: Optional[torch.Tensor] = None,
+        fixed_field: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic functional to obtain equilibrium.
 
@@ -283,6 +284,13 @@ class GridSolver:
         the fixed-dipole entropy mirror map and an Armijo line search, preserving
         ``rho > 0`` and ``|P| < m*rho``. When ``method`` is omitted, scalar
         solving defaults to Euler and fixed-dipole solving to minimization.
+
+        For fixed-dipole minimization, ``fixed_field="dipole_density"`` holds
+        the supplied initial polarization fixed and minimizes only over
+        density. ``fixed_field="rho"`` holds the supplied initial density
+        fixed and minimizes only over polarization. Convergence then uses only
+        the residual of the relaxed field; the full coupled residual remains
+        available as ``full_maximum_residual`` and ``full_rms_residual``.
         """
 
         if method is None:
@@ -319,7 +327,10 @@ class GridSolver:
                 maximum_density=maximum_density,
                 maximum_polarization_fraction=maximum_polarization_fraction,
                 beta_multiplier=beta_multiplier,
+                fixed_field=fixed_field,
             )
+        if fixed_field is not None:
+            raise ValueError("fixed_field requires an explicit dipole_magnitude")
         if initial_polarization is not None:
             raise ValueError(
                 "initial_polarization requires an explicit dipole_magnitude"
@@ -1372,10 +1383,44 @@ class GridSolver:
         maximum_polarization_fraction,
         moment,
         accessible,
+        fixed_field=None,
+        minimum_density=None,
     ):
         """Apply canonical density and polarization-bound KKT residuals."""
 
-        if maximum_density is None and maximum_polarization_fraction is None:
+        if (
+            maximum_density is None
+            and maximum_polarization_fraction is None
+            and fixed_field is None
+        ):
+            return result
+        if fixed_field == "dipole_density":
+            residual, chemical_potential, maximum, rms = (
+                _canonical_density_residual(
+                    result["rho"],
+                    result["local_chemical_potential"],
+                    0.0,
+                    maximum_density,
+                    accessible,
+                    minimum_density=minimum_density,
+                )
+            )
+            result["equilibrium_chemical_potential"] = chemical_potential
+            result["beta_mu"] = chemical_potential
+            result["euler_lagrange_residual"] = residual
+            result["density_residual"] = residual
+            result["max_euler_lagrange_residual"] = maximum
+            result["rms_euler_lagrange_residual"] = rms
+            result["full_maximum_residual"] = torch.maximum(
+                result["max_polarization_residual"],
+                result["max_polarization_residual"].new_tensor(maximum),
+            )
+            result["full_rms_residual"] = torch.maximum(
+                result["rms_polarization_residual"],
+                result["rms_polarization_residual"].new_tensor(rms),
+            )
+            result["maximum_residual"] = result["rho"].new_tensor(maximum)
+            result["rms_residual"] = result["rho"].new_tensor(rms)
             return result
         unconstrained_polarization = result[
             "scaled_polarization_residual"
@@ -1421,14 +1466,22 @@ class GridSolver:
         result["polarization_bound_multiplier"] = multiplier
         result["max_polarization_residual"] = max_polarization
         result["rms_polarization_residual"] = rms_polarization
-        result["maximum_residual"] = torch.maximum(
+        full_maximum = torch.maximum(
             max_polarization.new_tensor(maximum),
             max_polarization,
         )
-        result["rms_residual"] = torch.maximum(
+        full_rms = torch.maximum(
             rms_polarization.new_tensor(rms),
             rms_polarization,
         )
+        result["full_maximum_residual"] = full_maximum
+        result["full_rms_residual"] = full_rms
+        if fixed_field == "rho":
+            result["maximum_residual"] = max_polarization
+            result["rms_residual"] = rms_polarization
+        else:
+            result["maximum_residual"] = full_maximum
+            result["rms_residual"] = full_rms
         return result
 
     @torch.enable_grad()
@@ -1458,8 +1511,9 @@ class GridSolver:
         maximum_density,
         maximum_polarization_fraction,
         beta_multiplier,
+        fixed_field,
     ):
-        """Solve the coupled fixed-dipole Euler equations at fixed N."""
+        """Solve fixed-dipole Euler equations at fixed particle numbers."""
 
         if particle_numbers is None:
             raise ValueError(
@@ -1473,6 +1527,12 @@ class GridSolver:
             raise ValueError(
                 "residual_density_threshold is not supported with fixed dipoles"
             )
+        if fixed_field not in (None, "rho", "dipole_density"):
+            raise ValueError(
+                "fixed_field must be None, 'rho', or 'dipole_density'"
+            )
+        if fixed_field is not None and method != "minimize":
+            raise ValueError("fixed_field is supported only with method='minimize'")
         max_iter = positive_integer(max_iter, "max_iter")
         tolerance_residual = positive_scalar(
             tolerance_residual, "tolerance_residual"
@@ -1577,6 +1637,12 @@ class GridSolver:
             if initial_polarization is not None
             else data.get("dipole_density")
         )
+        if fixed_field == "rho" and rho0 is None:
+            raise ValueError("fixed_field='rho' requires an initial density")
+        if fixed_field == "dipole_density" and p0 is None:
+            raise ValueError(
+                "fixed_field='dipole_density' requires an initial polarization"
+            )
         if rho0 is None:
             initial_alignment = (
                 beta_multiplier
@@ -1642,18 +1708,49 @@ class GridSolver:
             raise ValueError(
                 "initial_rho must have the requested particle_numbers"
             )
-        projected_rho = _project_density_constraints(
-            rho,
-            numbers,
-            volume,
-            density_cap,
-            accessible,
-        )
-        polarization[accessible] *= (
-            projected_rho[accessible] / rho[accessible]
-        )[..., None]
-        rho = projected_rho
-        if polarization_fraction_cap is not None:
+        minimum_density = None
+        if fixed_field == "dipole_density":
+            interior_fraction = (
+                polarization_fraction_cap
+                if polarization_fraction_cap is not None
+                else 1.0 - 16.0 * torch.finfo(rho.dtype).eps
+            )
+            minimum_density = torch.zeros_like(rho)
+            minimum_density[accessible] = (
+                polarization[accessible].norm(dim=-1)
+                / (moment * interior_fraction)
+            )
+            rho = _project_density_constraints(
+                rho,
+                numbers,
+                volume,
+                density_cap,
+                accessible,
+                minimum_density=minimum_density,
+            )
+        elif fixed_field == "rho":
+            if density_cap is not None and torch.any(
+                rho[accessible] > density_cap
+            ).item():
+                raise ValueError(
+                    "fixed initial density exceeds maximum_density"
+                )
+        else:
+            projected_rho = _project_density_constraints(
+                rho,
+                numbers,
+                volume,
+                density_cap,
+                accessible,
+            )
+            polarization[accessible] *= (
+                projected_rho[accessible] / rho[accessible]
+            )[..., None]
+            rho = projected_rho
+        if (
+            polarization_fraction_cap is not None
+            and fixed_field != "dipole_density"
+        ):
             allowed_norm = (
                 rho[accessible]
                 * moment
@@ -1685,6 +1782,8 @@ class GridSolver:
                 polarization_fraction_cap,
                 moment,
                 accessible,
+                fixed_field=fixed_field,
+                minimum_density=minimum_density,
             )
             if method == "minimize":
                 state = self._minimize_fixed_dipoles(
@@ -1704,6 +1803,8 @@ class GridSolver:
                     minimum_step_size,
                     line_search_factor,
                     armijo_factor,
+                    fixed_field,
+                    minimum_density,
                 )
             else:
                 state = self._solve_fixed_dipole_euler(
@@ -1741,6 +1842,7 @@ class GridSolver:
                 if polarization_fraction_cap is None
                 else polarization_fraction_cap.detach()
             ),
+            solver_fixed_field=fixed_field,
             n_iter=state["n_iter"],
             iterations=state["n_iter"],
             n_evaluations=state["n_evaluations"],
@@ -1778,6 +1880,8 @@ class GridSolver:
         minimum_step_size,
         line_search_factor,
         armijo_factor,
+        fixed_field,
+        minimum_density,
     ):
         history = []
         n_evaluations = 1
@@ -1810,35 +1914,58 @@ class GridSolver:
             trial_step = step_size
             accepted = False
             while trial_step >= minimum_step_size:
-                trial_alignment = (
-                    alignment
-                    - trial_step
-                    * result["scaled_polarization_residual"][accessible]
-                )
-                trial_alignment = _project_vector_norm(
-                    trial_alignment, maximum_alignment
-                )
-                log_weights = (
-                    rho[accessible].log()
-                    - trial_step * result["density_residual"][accessible]
-                    + log_sinhc(trial_alignment.norm(dim=-1))
-                    - log_z
-                )
-                trial_rho = torch.zeros_like(rho)
-                trial_p = torch.zeros_like(polarization)
-                trial_rho[accessible] = (
-                    torch.softmax(log_weights, dim=0) * numbers / volume
-                )
-                trial_rho = _project_density_constraints(
-                    trial_rho,
-                    numbers,
-                    volume,
-                    maximum_density,
-                    accessible,
-                )
-                trial_p[accessible] = (
-                    trial_rho[accessible] * moment
-                )[..., None] * dipole_alignment(trial_alignment)
+                if fixed_field == "dipole_density":
+                    trial_alignment = alignment
+                    log_weights = (
+                        rho[accessible].log()
+                        - trial_step * result["density_residual"][accessible]
+                    )
+                    trial_rho = torch.zeros_like(rho)
+                    trial_rho[accessible] = (
+                        torch.softmax(log_weights, dim=0) * numbers / volume
+                    )
+                    trial_rho = _project_density_constraints(
+                        trial_rho,
+                        numbers,
+                        volume,
+                        maximum_density,
+                        accessible,
+                        minimum_density=minimum_density,
+                    )
+                    trial_p = polarization.clone()
+                else:
+                    trial_alignment = (
+                        alignment
+                        - trial_step
+                        * result["scaled_polarization_residual"][accessible]
+                    )
+                    trial_alignment = _project_vector_norm(
+                        trial_alignment, maximum_alignment
+                    )
+                    if fixed_field == "rho":
+                        trial_rho = rho.clone()
+                    else:
+                        log_weights = (
+                            rho[accessible].log()
+                            - trial_step * result["density_residual"][accessible]
+                            + log_sinhc(trial_alignment.norm(dim=-1))
+                            - log_z
+                        )
+                        trial_rho = torch.zeros_like(rho)
+                        trial_rho[accessible] = (
+                            torch.softmax(log_weights, dim=0) * numbers / volume
+                        )
+                        trial_rho = _project_density_constraints(
+                            trial_rho,
+                            numbers,
+                            volume,
+                            maximum_density,
+                            accessible,
+                        )
+                    trial_p = torch.zeros_like(polarization)
+                    trial_p[accessible] = (
+                        trial_rho[accessible] * moment
+                    )[..., None] * dipole_alignment(trial_alignment)
                 interior = (
                     torch.isfinite(trial_rho).all()
                     and torch.all(trial_rho[accessible] > 0)
@@ -1858,13 +1985,27 @@ class GridSolver:
                         maximum_polarization_fraction,
                         moment,
                         accessible,
+                        fixed_field=fixed_field,
+                        minimum_density=minimum_density,
                     )
                     n_evaluations += 1
                     rho_delta = trial_rho - rho
                     p_delta = trial_p - polarization
                     linear_change = volume * (
-                        (result["local_chemical_potential"] * rho_delta).sum()
-                        + (result["polarization_residual"] * p_delta).sum()
+                        (
+                            0.0
+                            if fixed_field == "rho"
+                            else (
+                                result["local_chemical_potential"] * rho_delta
+                            ).sum()
+                        )
+                        + (
+                            0.0
+                            if fixed_field == "dipole_density"
+                            else (
+                                result["polarization_residual"] * p_delta
+                            ).sum()
+                        )
                     )
                     epsilon = torch.finfo(rho.dtype).eps
                     roundoff = 32 * epsilon * max(

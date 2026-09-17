@@ -431,6 +431,133 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertFalse(failure["converged"])
         self.assertEqual(failure["status"], "line_search_failed")
 
+    def test_fixed_field_minimization_is_conditional(self):
+        data = self.case()
+        moments = torch.tensor([0.7, 1.9])
+        target_rho = 0.35 + 0.12 * torch.rand_like(data["V_ext"])
+        target_p = 0.06 * torch.randn(*target_rho.shape, 3)
+        target_p *= (
+            0.5 * target_rho * moments
+            / target_p.norm(dim=-1).clamp_min(1.0e-12)
+        )[..., None]
+        ideal = FixedDipoleIdeal(moments)(
+            target_rho,
+            target_p,
+            data["grid_spacing"].prod(),
+        )
+        numbers = target_rho.sum(0) * data["grid_spacing"].prod()
+        solver = GridSolver(None, dipole_magnitude=moments)
+
+        fixed_p_data = dict(
+            data,
+            V_ext=-ideal["density_derivative"] / data["beta"],
+            E_ext=torch.full_like(data["E_ext"], 30.0),
+        )
+        initial_rho = target_rho.roll(1, dims=0)
+        fixed_p = solver.solve(
+            fixed_p_data,
+            initial_rho=initial_rho,
+            initial_polarization=target_p,
+            particle_numbers=numbers,
+            method="minimize",
+            fixed_field="dipole_density",
+            max_iter=500,
+            tolerance_residual=1.0e-8,
+        )
+        self.assertTrue(fixed_p["converged"], str(fixed_p["maximum_residual"]))
+        torch.testing.assert_close(fixed_p["rho"], target_rho, atol=2.0e-8, rtol=0)
+        torch.testing.assert_close(fixed_p["dipole_density"], target_p)
+        self.assertLess(float(fixed_p["maximum_residual"]), 1.0e-8)
+        self.assertGreater(float(fixed_p["full_maximum_residual"]), 1.0)
+        self.assertEqual(fixed_p["solver_fixed_field"], "dipole_density")
+        self.assertEqual(fixed_p["final_relative_polarization_change"], 0.0)
+
+        fixed_rho_data = dict(
+            data,
+            V_ext=30.0 * data["V_ext"],
+            E_ext=ideal["polarization_derivative"] / data["beta"],
+        )
+        fixed_rho = solver.solve(
+            fixed_rho_data,
+            initial_rho=target_rho,
+            initial_polarization=torch.zeros_like(target_p),
+            particle_numbers=numbers,
+            method="minimize",
+            fixed_field="rho",
+            max_iter=500,
+            tolerance_residual=1.0e-8,
+        )
+        self.assertTrue(
+            fixed_rho["converged"], str(fixed_rho["maximum_residual"])
+        )
+        torch.testing.assert_close(fixed_rho["rho"], target_rho)
+        torch.testing.assert_close(
+            fixed_rho["dipole_density"], target_p, atol=2.0e-8, rtol=0
+        )
+        self.assertLess(float(fixed_rho["maximum_residual"]), 1.0e-8)
+        self.assertGreater(float(fixed_rho["full_maximum_residual"]), 1.0)
+        self.assertEqual(fixed_rho["solver_fixed_field"], "rho")
+        self.assertEqual(fixed_rho["final_relative_density_change"], 0.0)
+
+    def test_fixed_polarization_enforces_density_floor(self):
+        data = {
+            "V_ext": torch.tensor([[10.0], [0.0], [0.0], [0.0]]),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        rho = torch.full((4, 1), 0.5)
+        polarization = torch.zeros(4, 1, 3)
+        polarization[0, 0, 0] = 0.3
+        result = GridSolver(None, dipole_magnitude=1.0).solve(
+            data,
+            initial_rho=rho,
+            initial_polarization=polarization,
+            particle_numbers=[2.0],
+            method="minimize",
+            fixed_field="dipole_density",
+            maximum_polarization_fraction=0.75,
+            max_iter=500,
+            tolerance_residual=1.0e-9,
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertAlmostEqual(float(result["rho"][0]), 0.4, places=9)
+        torch.testing.assert_close(result["dipole_density"], polarization)
+        self.assertLess(float(result["maximum_residual"]), 1.0e-9)
+
+    def test_fixed_field_validation(self):
+        solver = GridSolver(None, dipole_magnitude=0.8)
+        data = self.case()
+        rho = torch.ones_like(data["V_ext"])
+        rho *= torch.tensor([3.0, 4.0]) / (
+            data["grid_spacing"].prod() * rho.sum(0)
+        )
+        polarization = torch.zeros(*rho.shape, 3)
+        with self.assertRaisesRegex(ValueError, "fixed_field must"):
+            solver.solve(
+                data,
+                initial_rho=rho,
+                initial_polarization=polarization,
+                particle_numbers=[3.0, 4.0],
+                fixed_field="temperature",
+            )
+        with self.assertRaisesRegex(ValueError, "only with method='minimize'"):
+            solver.solve(
+                data,
+                initial_rho=rho,
+                initial_polarization=polarization,
+                particle_numbers=[3.0, 4.0],
+                method="euler",
+                fixed_field="rho",
+            )
+        with self.assertRaisesRegex(ValueError, "requires an initial polarization"):
+            solver.solve(
+                data,
+                initial_rho=rho,
+                particle_numbers=[3.0, 4.0],
+                fixed_field="dipole_density",
+            )
+
     def test_coupled_euler_expression(self):
         data = self.case()
         moments = [0.7, 1.9]
