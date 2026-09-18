@@ -62,13 +62,14 @@ def _example_model(**overrides):
     """Build the compact LDA + invariant model used by the LJ example."""
 
     n_types = overrides.pop("n_types", 1)
+    separate_center = overrides.pop("separate_center", True)
     a_features = CartesianAFeatures(
         mean_density=0.4,
         cutoff_grid=1,
         max_power=2,
         radial_basis="none",
         n_radial_channels=1,
-        separate_center=True,
+        separate_center=separate_center,
         n_types=n_types,
     )
     b_features = CartesianBFeatures(max_power=2, max_product_order=2)
@@ -92,7 +93,11 @@ def _example_model(**overrides):
     return GridCACEModel(**arguments)
 
 
-def _gaussian_message_model(radial_basis="gaussian", backend="gather"):
+def _gaussian_message_model(
+    radial_basis="gaussian",
+    backend="gather",
+    radial_transform=True,
+):
     a_features = CartesianAFeatures(
         mean_density=0.7,
         cutoff_grid=1,
@@ -101,7 +106,7 @@ def _gaussian_message_model(radial_basis="gaussian", backend="gather"):
         radial_exponents=(0.125, 0.5),
         radial_centers=(0.0, 1.0),
         trainable_radial_exponents=True,
-        n_radial_channels=2,
+        n_radial_channels=2 if radial_transform else None,
         n_types=2,
         n_channels=2,
         density_transform=((0.5, 0.5), (-0.5, 0.5)),
