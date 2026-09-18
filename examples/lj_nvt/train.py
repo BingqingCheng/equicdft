@@ -26,6 +26,7 @@ from equicdft import (
     TensorLoss,
     Trainer,
     make_dataloaders,
+    save_model,
 )
 
 # Optional message passing used in the commented example below:
@@ -259,15 +260,16 @@ def main():
     elif not (checkpoint_directory / "best.pt").is_file():
         raise RuntimeError("no epochs requested and no best checkpoint exists")
 
-    # Restore the best validation checkpoint before saving the self-contained
-    # model. torch.load(model.pt) is sufficient for later inference.
+    # Restore the best validation checkpoint before saving the model in the
+    # versioned configuration-plus-state format. equicdft.load_model(model.pt)
+    # rebuilds it for inference without repeating this construction code.
     best = torch.load(
         str(checkpoint_directory / "best.pt"),
         map_location=device,
     )
     model.load_state_dict(best["model_state_dict"])
     model.eval()
-    torch.save(model, str(output / "model.pt"))
+    save_model(model, output / "model.pt")
 
     run_config = {
         "data": str(args.data.expanduser().resolve()),

@@ -203,15 +203,14 @@ representation and are rejected.
 
 ## Inference and equilibrium solution
 
-A saved full model can be loaded without reconstructing the architecture:
+A saved model can be loaded without reconstructing the architecture:
 
 ```python
 import torch
-from equicdft import GridData
+from equicdft import GridData, load_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = torch.load("examples/lj_nvt/fit/model.pt", map_location=device)
-model = model.to(device).eval()
+model = load_model("examples/lj_nvt/fit/model.pt", map_location=device)
 
 field = GridData.from_xyz(
     "examples/lj_nvt/mini_lj_nvt.extxyz",
@@ -225,6 +224,20 @@ field = {
 outputs = model(field)
 print(outputs["beta_F_exc"], outputs["c1"])
 ```
+
+`save_model` and `load_model` use a versioned file that stores the model's
+structure (`model.to_config()`, a plain JSON-compatible dictionary) next to
+its fitted `state_dict`. The file contains no Python object references, so
+it loads under PyTorch's default `weights_only` unpickler, and
+`read_model_config` inspects the architecture without building it. Model
+files written before this format by `torch.save(model)` are converted once:
+
+```bash
+python -m equicdft.convert old_model.pt converted_model.pt
+```
+
+The converter rebuilds the model from its configuration, transfers the
+fitted state, and verifies that old and new models evaluate identically.
 
 `GridSolver` provides two complementary operations:
 
@@ -252,6 +265,8 @@ reciprocal kernels with nonperiodic boundary conditions.
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support
+- `serialization.py`, `legacy.py`: versioned model files and conversion of
+  whole-object pickles
 
 Run the test suite with:
 

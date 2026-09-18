@@ -1,8 +1,15 @@
 # LJ-paper-v1 production regression
 
 This self-contained regression freezes one representative held-out NVT field
-and the published LJ model. It checks compatibility of the complete saved
-model with the `equicdft` forward derivative and fixed-particle-number solver.
+and the published LJ model. It checks compatibility of the saved model with
+the `equicdft` forward derivative and fixed-particle-number solver.
+
+`model.pt` is the published model in the versioned `equicdft-model` format
+written by `equicdft.save_model`. It was produced by converting the original
+`torch.save(model)` object with `python -m equicdft.convert`; that original
+whole-object pickle is retained as
+`tests/fixtures/lj_paper_v1_whole_object_model.pt`, and
+`tests/test_legacy.py` checks that the two stay in sync.
 
 The field is zero-based frame 120 from the `T=1.5` general-3D held-out file in
 `equicdft-lj-data/reference_data/heldout_nvt_general.zip`. It has `N=208`, mean
@@ -32,6 +39,6 @@ python -m unittest discover -s tests -p "test_lj_paper_v1_regression.py"
 ```
 
 `provenance.json` records the production tag/commit, source archive member,
-frame index, and SHA-256 hashes. The tolerances are scientific compatibility
+frame index, both model files, and SHA-256 hashes. The tolerances are scientific compatibility
 gates rather than bitwise-output requirements, allowing harmless floating-point
 variation across supported PyTorch versions.

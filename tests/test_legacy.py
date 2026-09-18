@@ -38,7 +38,10 @@ from tests.test_config import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-FROZEN_LEGACY_MODEL = (
+FROZEN_WHOLE_OBJECT_MODEL = (
+    REPOSITORY / "tests" / "fixtures" / "lj_paper_v1_whole_object_model.pt"
+)
+FROZEN_CONVERTED_MODEL = (
     REPOSITORY / "examples" / "lj_paper_v1_regression" / "model.pt"
 )
 
@@ -341,28 +344,41 @@ class TestLegacyConversion(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    FROZEN_LEGACY_MODEL.is_file(),
-    "frozen LJ-paper-v1 whole-object model is not present",
+    FROZEN_WHOLE_OBJECT_MODEL.is_file() and FROZEN_CONVERTED_MODEL.is_file(),
+    "frozen LJ-paper-v1 model fixtures are not present",
 )
 class TestFrozenProductionModel(unittest.TestCase):
     def test_published_whole_object_model_converts_and_verifies(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "lj_paper_v1.pt"
-            try:
-                convert_legacy_model(FROZEN_LEGACY_MODEL, destination)
-            except ValueError as error:
-                if "not an equicdft-model" in str(error) or "pickled" in str(error):
-                    self.skipTest("fixture is no longer a whole-object file")
-                raise
-            model = load_model(destination)
-        config = model.to_config()
+            convert_legacy_model(FROZEN_WHOLE_OBJECT_MODEL, destination)
+            converted = load_model(destination)
+        config = converted.to_config()
         self.assertEqual(config["a_features"]["radial_basis"], "none")
+        self.assertEqual(config["a_features"]["cutoff_grid"], 3)
         self.assertEqual(
             [item["type"] for item in config["readout"]],
             ["LDAReadout", "LocalReadout"],
         )
         self.assertEqual(config["free_energy_mode"], "beta")
-        self.assertFalse(model.training)
+        self.assertFalse(converted.training)
+
+    def test_committed_regression_model_is_the_converted_pickle(self):
+        """The example fixture must stay in sync with the whole-object file.
+
+        Byte-level equality is not required (archive metadata may differ);
+        the configuration and every state tensor must agree.
+        """
+
+        committed = load_model(FROZEN_CONVERTED_MODEL)
+        legacy = load_legacy_model(FROZEN_WHOLE_OBJECT_MODEL)
+        rebuilt = legacy_model_to_current(legacy)
+        self.assertEqual(committed.to_config(), rebuilt.to_config())
+        committed_state = committed.state_dict()
+        rebuilt_state = rebuilt.state_dict()
+        self.assertEqual(set(committed_state), set(rebuilt_state))
+        for key, value in committed_state.items():
+            self.assertTrue(torch.equal(value, rebuilt_state[key]), key)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from equicdft import GridData, GridSolver
+from equicdft import GridData, GridSolver, load_model
 
 
 DIRECTORY = Path(__file__).resolve().parent
@@ -49,18 +49,10 @@ def load_case():
     verify_fixtures()
     torch.set_num_threads(2)
     device = torch.device("cpu")
-    try:
-        # PyTorch 2.6 defaults to weights-only loading, but this fixture is a
-        # complete serialized model and intentionally checks that contract.
-        model = torch.load(
-            MODEL_PATH,
-            map_location=device,
-            weights_only=False,
-        ).eval()
-    except TypeError:
-        # The weights_only keyword is unavailable in older supported PyTorch
-        # releases.
-        model = torch.load(MODEL_PATH, map_location=device).eval()
+    # model.pt is the published LJ-paper-v1 model in the versioned
+    # configuration-plus-state format; the original whole-object pickle it
+    # was converted from is kept under tests/fixtures.
+    model = load_model(MODEL_PATH, map_location=device)
     frames = GridData.from_xyz(FIELD_PATH, grid_info=model.grid_info)
     if len(frames) != 1:
         raise RuntimeError("expected exactly one regression field")

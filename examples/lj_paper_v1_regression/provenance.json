@@ -17,12 +17,21 @@
   },
   "artifacts": {
     "model": {
-      "source": "model/model.pt",
-      "sha256": "d725f38b5151407984aa3a5b20e0ab4aac9e6b4ea66bb03d37bca72fd5cd67a8"
+      "source": "model/model.pt from the production tag, converted with python -m equicdft.convert",
+      "format": "equicdft-model",
+      "format_version": 1,
+      "sha256": "95464f2e9af3df38c2177828b930ee230092d0d531c5a8ec29ebbd1af678b96f",
+      "converted_from": "tests/fixtures/lj_paper_v1_whole_object_model.pt"
     },
     "field": {
       "source": "the selected archive member and frame above",
       "sha256": "e3bcf4e390db14e9a6606f89c8be291f583a74c1beecb43fb1809f8faa095b9a"
+    },
+    "whole_object_model": {
+      "source": "model/model.pt",
+      "format": "torch.save(model) whole-object pickle",
+      "path": "tests/fixtures/lj_paper_v1_whole_object_model.pt",
+      "sha256": "d725f38b5151407984aa3a5b20e0ab4aac9e6b4ea66bb03d37bca72fd5cd67a8"
     }
   }
 }

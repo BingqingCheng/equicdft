@@ -248,9 +248,9 @@ message = BChiMessage(
 ```
 
 This execution option changes neither learned parameters nor `state_dict`
-keys. A reconstructed model must select it explicitly; whole-object saves
-retain it, while legacy whole objects use the class default `"gather"`.
-`"conv3d"` scatters the spherical stencil into its enclosing dense Cartesian
+keys. It is part of the model configuration, so `save_model` records it and
+`load_model` restores it; converted legacy whole-object files that predate
+the option report `"gather"`. `"conv3d"` scatters the spherical stencil into its enclosing dense Cartesian
 kernel and applies grouped cross-correlation. `"fft"` scatters onto the
 periodic grid and applies the same cross-correlation in reciprocal space;
 duplicate or periodically aliased offsets are summed. Both avoid the explicit
@@ -301,20 +301,21 @@ frames = GridData.from_xyz(
 )
 ```
 
-For a trusted whole-object model that was saved with the legacy gather
-backend, the execution method can be changed without modifying its learned
-state:
+For a model saved with the gather backend, the execution method can be
+changed without modifying its learned state, either on the loaded object or
+in its configuration before rebuilding:
 
 ```python
+model = load_model(path)
 model.a_features.convolution_backend = "fft"
-for message in getattr(model, "message_layers", ()):
+for message in model.message_layers:
     message.convolution_backend = "fft"
 ```
 
 Do this only when inputs provide a complete regular periodic grid. A model
 reconstructed from a `state_dict` should instead set the backend explicitly in
-the constructors, because `convolution_backend` is deliberately not a learned
-or serialized state tensor.
+the constructors, because `convolution_backend` is a configuration entry and
+deliberately not a learned or serialized state tensor.
 
 Gather and FFT evaluate the same periodic cross-correlation. Their outputs are
 mathematically equivalent, but need not be bitwise identical because the FFT

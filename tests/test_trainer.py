@@ -693,6 +693,10 @@ class TestTrainer(unittest.TestCase):
             checkpoint = torch.load(directory / "last.pt")
 
         self.assertEqual(checkpoint["epoch"], 2)
+        self.assertEqual(checkpoint["checkpoint_version"], 2)
+        # Toy models carry no configuration; real models record theirs.
+        self.assertIn("model_config", checkpoint)
+        self.assertIsNone(checkpoint["model_config"])
         self.assertIn("model_state_dict", checkpoint)
         self.assertIn("loss_state_dict", checkpoint)
         self.assertIn("optimizer_state_dict", checkpoint)
@@ -702,6 +706,75 @@ class TestTrainer(unittest.TestCase):
         self.assertIn("torch_rng_state", checkpoint)
         self.assertIn("train_loader_generator_state", checkpoint)
         self.assertEqual(len(checkpoint["history"]), 2)
+
+    def test_checkpoints_record_configurable_model_structure(self):
+        from equicdft import (
+            CartesianAFeatures,
+            CartesianBFeatures,
+            GridCACEModel,
+            LDAReadout,
+            Loss,
+            TensorLoss,
+        )
+        from equicdft.stencil import get_neighbor_indices
+        import numpy as np
+
+        shape = (4, 4, 4)
+        positions = np.indices(shape, dtype=int).reshape(3, -1).T
+        neighbor_indices, _ = get_neighbor_indices(positions, cutoff_grid=1)
+        n_grid = int(np.prod(shape))
+
+        def frame(seed):
+            generator = torch.Generator().manual_seed(seed)
+            rho = torch.rand(n_grid, 1, generator=generator) + 0.2
+            return {
+                "rho": rho,
+                "V_ext": torch.zeros(n_grid, 1),
+                "grid_positions": torch.tensor(positions, dtype=torch.long),
+                "local_density_index": torch.tensor(
+                    neighbor_indices,
+                    dtype=torch.long,
+                ),
+                "grid_spacing": torch.ones(3),
+                "grid_size": torch.tensor(shape),
+                "temperature": torch.tensor(1.0),
+                "beta": torch.tensor(1.0),
+                "beta_F_exc": torch.tensor(0.5),
+            }
+
+        model = GridCACEModel(
+            a_features=CartesianAFeatures(
+                mean_density=0.5,
+                cutoff_grid=1,
+                max_power=1,
+                n_types=1,
+            ),
+            b_features=CartesianBFeatures(max_power=1, max_product_order=1),
+            readout=[LDAReadout(mean_density=0.5, n_types=1, hidden_sizes=(2,))],
+            grid_spacing=1.0,
+            compute_c1=False,
+        )
+        loss = Loss([TensorLoss("energy", "beta_F_exc", "beta_F_exc")])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trainer = Trainer(
+                model=model,
+                loss=loss,
+                optimizer_args={"lr": 1.0e-3},
+                checkpoint_dir=temporary_directory,
+            )
+            trainer.fit(
+                DataLoader([frame(1), frame(2)], batch_size=2),
+                DataLoader([frame(3)], batch_size=1),
+                epochs=1,
+                verbose=False,
+            )
+            checkpoint = torch.load(
+                Path(temporary_directory) / "last.pt",
+                weights_only=True,
+            )
+        self.assertEqual(checkpoint["model_config"], model.to_config())
+        rebuilt = GridCACEModel.from_config(checkpoint["model_config"])
+        rebuilt.load_state_dict(checkpoint["model_state_dict"], strict=True)
 
     def test_checkpoint_resume_restores_complete_training_state(self):
         train_values = [1, 2, 3, 4]
