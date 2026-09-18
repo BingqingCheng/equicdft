@@ -1,21 +1,33 @@
 """Local readout for invariant grid features."""
 
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
 
 from ._argument_checks import (
+    boolean,
     finite_scalar,
     optional_positive_integer,
     positive_integer,
 )
 from ._component_pairs import symmetric_component_pairs
-from ._nn import build_mlp
+from ._config import (
+    Configurable,
+    build_optional,
+    constructor_arguments,
+    make_config,
+    mlp_input_size,
+    optional_buffer_value,
+    optional_config,
+    register,
+)
+from ._nn import build_mlp, validate_hidden_sizes
 from .energy import EnergyReadout, density_weighted_integral
 from .reciprocal import ReciprocalFeatures
 
 
-class LocalReadout(EnergyReadout):
+@register
+class LocalReadout(EnergyReadout, Configurable):
     """Map local invariant features to one output per physical component.
 
     A shared MLP maps a local feature vector at each grid point to one output
@@ -60,10 +72,29 @@ class LocalReadout(EnergyReadout):
 
         self.n_features = optional_positive_integer(n_features, "n_features")
         self.n_types = positive_integer(n_types, "n_types")
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.mlp = build_mlp(
             self.n_features,
-            hidden_sizes,
+            self.hidden_sizes,
             self.n_types,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout.
+
+        A lazily built input layer reports its width once it has been
+        materialized, so a reconstructed readout is never lazy.
+        """
+
+        return make_config(
+            self,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            n_features=(
+                self.n_features
+                if self.n_features is not None
+                else mlp_input_size(self.mlp)
+            ),
         )
 
     def forward(
@@ -93,7 +124,8 @@ class LocalReadout(EnergyReadout):
         )
 
 
-class BulkReadout(EnergyReadout):
+@register
+class BulkReadout(EnergyReadout, Configurable):
     """Map temperature and mean densities to a bulk free energy per particle.
 
     The state vector contains normalized temperature followed by one
@@ -129,11 +161,23 @@ class BulkReadout(EnergyReadout):
 
         self.n_types = positive_integer(n_types, "n_types")
         self.n_state_features = 1 + self.n_types
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = boolean(zero_init, "zero_init")
         self.mlp = build_mlp(
             self.n_state_features,
-            hidden_sizes,
+            self.hidden_sizes,
             self.n_types,
-            zero_init=zero_init,
+            zero_init=self.zero_init,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
         )
 
     def forward(self, state_features: torch.Tensor) -> torch.Tensor:
@@ -165,7 +209,8 @@ class BulkReadout(EnergyReadout):
         )
 
 
-class LongRangeReadout(EnergyReadout):
+@register
+class LongRangeReadout(EnergyReadout, Configurable):
     """Map thermodynamic state to a reciprocal quadratic kernel.
 
     The readout predicts one coefficient for every fixed reciprocal kernel and
@@ -221,6 +266,8 @@ class LongRangeReadout(EnergyReadout):
         type_pairs = symmetric_component_pairs(self.n_types)
         self.n_type_pairs = len(type_pairs)
         self.n_state_features = 1 + self.n_types
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = boolean(zero_init, "zero_init")
 
         if charges is None:
             if coulomb_amplitude is not None:
@@ -282,10 +329,32 @@ class LongRangeReadout(EnergyReadout):
             )
             self.mlp = build_mlp(
                 self.n_state_features,
-                hidden_sizes,
+                self.hidden_sizes,
                 output_width,
-                zero_init=zero_init,
+                zero_init=self.zero_init,
             )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            n_kernels=self.n_kernels,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
+            charges=optional_buffer_value(self.charges),
+            coulomb_amplitude=optional_buffer_value(self.coulomb_amplitude),
+            features=optional_config(self.features),
+        )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "LongRangeReadout":
+        """Rebuild the readout together with its reciprocal features."""
+
+        arguments = constructor_arguments(cls, config)
+        arguments["features"] = build_optional(arguments.get("features"))
+        return cls(**arguments)
 
     def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""

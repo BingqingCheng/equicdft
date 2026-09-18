@@ -6,12 +6,13 @@ integer spherical stencil constructed by :func:`equicdft.stencil.make_stencil`.
 """
 
 from itertools import combinations_with_replacement, permutations, product
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
+from ._config import Configurable, make_config, register
 from .features import _make_powers
 
 
@@ -130,7 +131,8 @@ def _make_product_recipes(
     return recipes
 
 
-class CartesianBFeatures(nn.Module):
+@register
+class CartesianBFeatures(nn.Module, Configurable):
     """Symmetrize Cartesian ``A`` features under cubic-grid point symmetry.
 
     Parameters
@@ -209,6 +211,15 @@ class CartesianBFeatures(nn.Module):
         self.register_buffer(
             "correlation_orders",
             torch.tensor(correlation_orders, dtype=torch.long),
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this module."""
+
+        return make_config(
+            self,
+            max_power=self.max_power,
+            max_product_order=self.max_product_order,
         )
 
     def forward(self, A: torch.Tensor) -> torch.Tensor:

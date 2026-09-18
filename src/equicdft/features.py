@@ -1,6 +1,6 @@
 """Cartesian moment features for density fields on fixed integer grids."""
 
-from typing import Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -11,6 +11,7 @@ from ._argument_checks import (
     optional_positive_integer,
     positive_integer,
 )
+from ._config import Configurable, make_config, register, scalar_value
 from ._grid import gather_neighbors, periodic_density_convolution
 # These imports also retain the historical package-internal access points in
 # this module while their implementations live with the radial helpers.
@@ -44,7 +45,8 @@ def _make_powers(max_power: int) -> torch.Tensor:
     return torch.tensor(powers, dtype=torch.long)
 
 
-class CartesianAFeatures(nn.Module):
+@register
+class CartesianAFeatures(nn.Module, Configurable):
     """Compute normalized Cartesian ``A`` features on a fixed stencil.
 
     For central grid point ``g``, radial channel ``n``, monomial
@@ -457,6 +459,54 @@ class CartesianAFeatures(nn.Module):
         # This deterministic constructor product is not fitted state. Keeping
         # it out of state_dict lets older checkpoints load strictly.
         self.register_buffer("neighbor_mask", neighbor_mask, persistent=False)
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this module.
+
+        Learned values live in the ``state_dict`` and are not repeated here,
+        with two deliberate exceptions. Gaussian exponents are recorded
+        because their count fixes the number of primitive channels, and the
+        current values always satisfy the constructor's positivity check.
+        Fixed Gaussian centers are recorded because they are not persistent
+        state; trainable centers may have left the nonnegative initial
+        domain, so they are described as ``None`` and restored from state.
+        """
+
+        gaussian = self.radial_basis == "gaussian"
+        bessel = self.radial_basis == "bessel"
+        density_transform = self.density_transform
+        return make_config(
+            self,
+            max_power=self.max_power,
+            mean_density=scalar_value(self.mean_density),
+            cutoff_grid=self.cutoff_grid,
+            radial_basis=self.radial_basis,
+            radial_exponents=self.radial_exponents if gaussian else None,
+            n_radial_channels=(
+                None
+                if self.radial_transform is None
+                else self.n_radial_channels
+            ),
+            trainable_radial_exponents=self.trainable_radial_exponents,
+            coordinate_scaling=self.coordinate_scaling,
+            separate_center=self.separate_center,
+            n_types=self.n_types,
+            n_channels=self.n_channels,
+            radial_centers=(
+                self.radial_centers
+                if gaussian and not self.trainable_radial_centers
+                else None
+            ),
+            trainable_radial_centers=self.trainable_radial_centers,
+            density_transform=(
+                None
+                if density_transform is None
+                else density_transform.weight
+            ),
+            trainable_density_transform=self.trainable_density_transform,
+            n_radial_functions=self.n_radial_functions if bessel else None,
+            convolution_backend=self.convolution_backend,
+        )
 
     @property
     def radial_exponents(self) -> torch.Tensor:

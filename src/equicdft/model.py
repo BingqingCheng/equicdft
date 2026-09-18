@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from numbers import Integral
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -12,6 +12,16 @@ from ._argument_checks import (
     nonnegative_scalar,
     optional_boolean,
     positive_scalar,
+)
+from ._config import (
+    Configurable,
+    build,
+    build_optional,
+    constructor_arguments,
+    make_config,
+    optional_config,
+    register,
+    scalar_value,
 )
 from ._grid import (
     grid_spacing_tensor,
@@ -25,7 +35,8 @@ from .interaction import BChiMessage
 from .symmetrize import CartesianBFeatures
 
 
-class GridCACEModel(nn.Module):
+@register
+class GridCACEModel(nn.Module, Configurable):
     """Combine free-energy readouts and differentiate their scalar sum.
 
     Every configured :class:`EnergyReadout` receives a shared context and
@@ -226,6 +237,54 @@ class GridCACEModel(nn.Module):
             "thermal_wavelength",
             thermal_wavelength_tensor,
         )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the nested constructor arguments describing this model.
+
+        The configuration records structure only: feature, message, and
+        readout configurations plus the fixed thermodynamic metadata. Fitted
+        parameters and buffers are restored separately from the
+        ``state_dict``. See :mod:`equicdft.serialization` for the file format
+        that stores both together.
+        """
+
+        return make_config(
+            self,
+            a_features=optional_config(self.a_features),
+            b_features=optional_config(self.b_features),
+            readout=[optional_config(item) for item in self.readout],
+            grid_spacing=self.grid_spacing,
+            mean_temperature=scalar_value(self.mean_temperature),
+            boltzmann_constant=scalar_value(self.boltzmann_constant),
+            thermal_wavelength=self.thermal_wavelength,
+            compute_c1=self.compute_c1,
+            compute_c2=self.compute_c2,
+            compute_local_mu=self.compute_local_mu,
+            rho_min=self.rho_min,
+            free_energy_mode=self.free_energy_mode,
+            message_layers=[
+                optional_config(item) for item in self.message_layers
+            ],
+        )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "GridCACEModel":
+        """Rebuild the model and every configured submodule."""
+
+        arguments = constructor_arguments(cls, config)
+        arguments["a_features"] = build_optional(arguments.get("a_features"))
+        arguments["b_features"] = build_optional(arguments.get("b_features"))
+        readouts = arguments.get("readout")
+        if not isinstance(readouts, (list, tuple)):
+            raise TypeError("model configuration 'readout' must be a list")
+        arguments["readout"] = [build(item) for item in readouts]
+        messages = arguments.get("message_layers") or []
+        if not isinstance(messages, (list, tuple)):
+            raise TypeError(
+                "model configuration 'message_layers' must be a list"
+            )
+        arguments["message_layers"] = [build(item) for item in messages]
+        return cls(**arguments)
 
     @property
     def cutoff_grid(self) -> int:

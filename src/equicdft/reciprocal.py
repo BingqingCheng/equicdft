@@ -1,17 +1,19 @@
 """Differentiable reciprocal-space features of periodic density fields."""
 
 import math
-from typing import Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import positive_integer
 from ._component_pairs import symmetric_component_pairs
+from ._config import Configurable, make_config, register
 from ._grid import common_grid_size, grid_spacing_tensor, voxel_volume
 
 
-class ReciprocalFeatures(nn.Module):
+@register
+class ReciprocalFeatures(nn.Module, Configurable):
     r"""Contract Fourier density fluctuations against fixed radial kernels.
 
     For density component ``i``, the continuum-normalized discrete Fourier
@@ -107,6 +109,17 @@ class ReciprocalFeatures(nn.Module):
         self.n_type_pairs = len(symmetric_component_pairs(n_types))
         self.register_buffer("radial_exponents", exponents)
         self.register_buffer("screening", screening_values)
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this module."""
+
+        return make_config(
+            self,
+            radial_exponents=self.radial_exponents,
+            screening=self.screening,
+            kernel=self.kernel,
+            n_types=self.n_types,
+        )
 
     def forward(
         self,

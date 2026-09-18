@@ -1,13 +1,14 @@
 """Finite-range message passing between invariant grid environments."""
 
-from typing import Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import boolean, positive_integer
+from ._config import Configurable, make_config, register
 from ._grid import gather_neighbors, periodic_stencil_convolution
-from ._nn import build_mlp
+from ._nn import build_mlp, validate_hidden_sizes
 from ._radial import (
     _RadialTransform,
     prepare_radial_centers,
@@ -15,7 +16,8 @@ from ._radial import (
 )
 
 
-class BChiMessage(nn.Module):
+@register
+class BChiMessage(nn.Module, Configurable):
     r"""Convert invariant ``B`` features into the next equivariant ``A``.
 
     At layer ``t``, a shared neural map first constructs scalar gates at every
@@ -244,6 +246,7 @@ class BChiMessage(nn.Module):
         self.convolution_backend = convolution_backend
         self.trainable_radial_exponents = trainable_radial_exponents
         self.trainable_radial_centers = trainable_radial_centers
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.n_input_features = (
             self.n_radial_channels
             * self.n_invariant_features
@@ -252,8 +255,39 @@ class BChiMessage(nn.Module):
         self.n_output_features = self.n_radial_channels * self.n_channels
         self.mlp = build_mlp(
             input_size=self.n_input_features,
-            hidden_sizes=hidden_sizes,
+            hidden_sizes=self.hidden_sizes,
             output_size=self.n_output_features,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this layer.
+
+        The radial basis is recorded explicitly. Gaussian exponents are
+        recorded because their count is structural; fixed Gaussian centers
+        are recorded because they are not persistent state, while trainable
+        centers are restored from the ``state_dict``. A Bessel basis bound by
+        the containing model is rebuilt when the model is reconstructed.
+        """
+
+        gaussian = self.radial_basis == "gaussian"
+        bessel = self.radial_basis == "bessel"
+        return make_config(
+            self,
+            n_invariant_features=self.n_invariant_features,
+            n_radial_channels=self.n_radial_channels,
+            n_channels=self.n_channels,
+            hidden_sizes=self.hidden_sizes,
+            radial_exponents=self.radial_exponents if gaussian else None,
+            trainable_radial_exponents=self.trainable_radial_exponents,
+            radial_centers=(
+                self.radial_centers
+                if gaussian and not self.trainable_radial_centers
+                else None
+            ),
+            trainable_radial_centers=self.trainable_radial_centers,
+            radial_basis=self.radial_basis,
+            n_radial_functions=self.n_radial_functions if bessel else None,
+            convolution_backend=self.convolution_backend,
         )
 
     @property
