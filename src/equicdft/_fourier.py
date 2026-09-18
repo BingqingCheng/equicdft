@@ -1,7 +1,7 @@
 """Shared numerical helpers for projected periodic Fourier curvatures."""
 
 import math
-from typing import Dict, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -11,63 +11,100 @@ from ._grid import voxel_volume
 from .energy import ideal_free_energy
 
 
-def integer_mode_tensor(
-    supplied_modes: object,
-    name: str = "modes",
+def integer_wavevector_indices(
+    supplied_indices: object,
+    name: str = "wavevector_indices",
 ) -> torch.Tensor:
-    """Return exact integer reciprocal modes without rounding or truncation."""
+    """Return reciprocal-lattice indices without rounding or truncation."""
 
-    modes = torch.as_tensor(supplied_modes)
-    if modes.dtype == torch.bool or torch.is_complex(modes):
+    wavevector_indices = torch.as_tensor(supplied_indices)
+    if (
+        wavevector_indices.dtype == torch.bool
+        or torch.is_complex(wavevector_indices)
+    ):
         raise TypeError("{} must contain real integer values".format(name))
-    if not torch.all(torch.isfinite(modes)).item():
+    if not torch.all(torch.isfinite(wavevector_indices)).item():
         raise ValueError("{} must be finite".format(name))
-    integer_modes = modes.to(torch.long)
-    if not torch.equal(modes, integer_modes.to(modes.dtype)):
+    integer_indices = wavevector_indices.to(torch.long)
+    if not torch.equal(
+        wavevector_indices,
+        integer_indices.to(wavevector_indices.dtype),
+    ):
         raise ValueError("{} must contain integers".format(name))
-    return integer_modes
+    return integer_indices
 
 
-def mode_triplets(
-    supplied_modes: object,
-    name: str = "modes",
+def wavevector_index_triplets(
+    supplied_indices: object,
+    name: str = "wavevector_indices",
 ) -> torch.Tensor:
     """Return a nonempty collection of distinct, nonzero integer triplets."""
 
-    modes = integer_mode_tensor(supplied_modes, name)
-    if modes.ndim != 2 or modes.shape[0] == 0 or modes.shape[1] != 3:
-        raise ValueError("{} must have shape [n_modes, 3]".format(name))
-    if torch.any(torch.all(modes == 0, dim=-1)).item():
-        raise ValueError("{} must not contain the zero mode".format(name))
-    if torch.unique(modes, dim=0).shape[0] != modes.shape[0]:
+    wavevector_indices = integer_wavevector_indices(supplied_indices, name)
+    if (
+        wavevector_indices.ndim != 2
+        or wavevector_indices.shape[0] == 0
+        or wavevector_indices.shape[1] != 3
+    ):
+        raise ValueError(
+            "{} must have shape [n_wavevectors, 3]".format(name)
+        )
+    if torch.any(torch.all(wavevector_indices == 0, dim=-1)).item():
+        raise ValueError(
+            "{} must not contain the zero wavevector".format(name)
+        )
+    if (
+        torch.unique(wavevector_indices, dim=0).shape[0]
+        != wavevector_indices.shape[0]
+    ):
         raise ValueError("{} must not contain duplicates".format(name))
-    return modes
+    return wavevector_indices
 
 
-def expand_mode_amplitudes(amplitude, rho, modes, n_directions, n_phases=2):
-    """Broadcast one amplitude per field/mode to its phases and probes.
+def expand_probe_amplitudes(
+    amplitude,
+    rho,
+    wavevector_indices,
+    n_directions,
+    n_phases=2,
+):
+    """Broadcast one amplitude per field/wavevector to phases and probes.
 
     Keep the scalar path scalar to preserve existing numerical behavior.
-    Explicit tensors must have shape [field, mode]; amplitudes are not learned.
+    Explicit tensors have shape [field, wavevector]; amplitudes are not learned.
     """
+    amplitude = _validated_probe_amplitudes(amplitude, rho, wavevector_indices)
     if not torch.is_tensor(amplitude):
-        amplitude = finite_scalar(amplitude, "relative_amplitude")
-        if not 0.0 < amplitude < 1.0:
-            raise ValueError("relative_amplitude must lie in (0, 1)")
         return amplitude
-    if amplitude.shape != modes.shape[:2]:
-        raise ValueError("relative_amplitude tensor must have shape [field, mode]")
+    return amplitude.repeat_interleave(n_phases * n_directions, dim=1)
+
+
+def _validated_probe_amplitudes(amplitude, reference, wavevector_indices):
+    """Return a scalar or detached [field, wavevector] amplitude."""
+
+    if not torch.is_tensor(amplitude):
+        value = finite_scalar(amplitude, "relative_amplitude")
+        if not 0.0 < value < 1.0:
+            raise ValueError("relative_amplitude must lie in (0, 1)")
+        return value
+    if amplitude.shape != wavevector_indices.shape[:2]:
+        raise ValueError(
+            "relative_amplitude tensor must have shape [field, wavevector]"
+        )
     if (
         amplitude.dtype == torch.bool or torch.is_complex(amplitude)
         or not torch.all(torch.isfinite(amplitude) & (amplitude > 0) & (amplitude < 1))
     ):
         raise ValueError("relative_amplitude tensor values must lie in (0, 1)")
-    return amplitude.detach().to(rho).repeat_interleave(n_phases * n_directions, dim=1)
+    return amplitude.detach().to(reference)
 
 
-def real_mode_shape(modes, mode_phases):
-    """A supplied phase per wave selects one summed spatial pattern."""
-    return (modes.shape[1], 2) if mode_phases is None else (1, 1)
+def probe_shape(wavevector_indices, wavevector_phases):
+    """Return pattern and phase counts for one probe treatment."""
+
+    if wavevector_phases is None:
+        return wavevector_indices.shape[1], 2
+    return 1, 1
 
 
 def projected_fourier_curvature(
@@ -79,7 +116,7 @@ def projected_fourier_curvature(
     valid_directions: torch.Tensor,
     mean_densities: torch.Tensor,
     relative_amplitude: Union[float, torch.Tensor],
-    perturbations_per_forward: int = None,
+    perturbations_per_forward: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Evaluate normalized total intrinsic curvature along fixed directions."""
 
@@ -108,7 +145,7 @@ def _symmetric_energy_difference(
     rho: torch.Tensor,
     directions: torch.Tensor,
     relative_amplitude: Union[float, torch.Tensor],
-    perturbations_per_forward: int = None,
+    perturbations_per_forward: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return central energy differences and squared perturbation norms."""
 
@@ -127,7 +164,7 @@ def _symmetric_energy_difference(
     n_directions = directions.shape[1]
     perturbed_rho = torch.stack((rho_plus, rho_minus), dim=2).flatten(1, 2)
     volume_element = voxel_volume(batch["grid_spacing"].to(rho))
-    # These modes conserve each component's particle number, so the
+    # These probes conserve each component's particle number, so the
     # thermal-wavelength term is linear and has zero projected curvature.
     thermal_wavelength = rho.new_ones(rho.shape[-1])
     reference_energy = (
@@ -138,9 +175,9 @@ def _symmetric_energy_difference(
     energy_chunks = []
     for start in range(0, perturbed_rho.shape[1], chunk_size):
         chunk = perturbed_rho[:, start:start + chunk_size]
-        perturbed_outputs = model(
+        perturbed_outputs = _energy_only_model(
+            model,
             _expand_batch(batch, chunk),
-            compute_c1=False,
         )
         if "beta_F_exc" not in perturbed_outputs:
             raise KeyError("model outputs are missing 'beta_F_exc'")
@@ -172,18 +209,19 @@ def fourier_curvature_matrix(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
-    modes: torch.Tensor,
+    wavevector_indices: torch.Tensor,
     relative_amplitude: Union[float, torch.Tensor],
-    perturbations_per_forward: int = None,
-    mode_phases: torch.Tensor = None,
+    perturbations_per_forward: Optional[int] = None,
+    wavevector_phases: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Return the ideal-metric component Hessian for every real mode.
+    r"""Return the ideal-metric component Hessian for every real probe.
 
-    The returned matrix has shape ``[field, mode, phase, type, type]``.
+    The returned matrix has shape
+    ``[field, wavevector, phase, type, type]``.
     For a homogeneous mixture it is the dimensionless inverse OZ response
     ``I - sqrt(R) c(k) sqrt(R)``. Around an inhomogeneous density it is the
     component Hessian projected onto the selected real Fourier perturbations.
-    With ``mode_phases`` supplied, waves are summed before projection and the
+    With ``wavevector_phases`` supplied, waves are summed before projection and the
     output has shape [field, 1, 1, type, type]; it includes cross-wavevector
     contributions but does not reconstruct the complete spatial Hessian. Pair
     polarization adds numerical cancellation, so matrix applications should
@@ -193,10 +231,10 @@ def fourier_curvature_matrix(
     component_directions, active = component_fourier_directions(
         batch,
         rho,
-        modes,
-        mode_phases=mode_phases,
+        wavevector_indices,
+        wavevector_phases=wavevector_phases,
     )
-    n_fields, n_real_modes, _, n_types = component_directions.shape
+    n_fields, n_real_probes, _, n_types = component_directions.shape
     identity = torch.eye(n_types, device=rho.device, dtype=rho.dtype)
     pair_indices = torch.triu_indices(
         n_types,
@@ -208,9 +246,13 @@ def fourier_curvature_matrix(
         identity[pair_indices[0]] + identity[pair_indices[1]]
     )
     weights = torch.cat((identity, pair_weights), dim=0)
-    n_patterns, n_phases = real_mode_shape(modes, mode_phases)
-    amplitude = expand_mode_amplitudes(
-        relative_amplitude, rho, modes[:, :n_patterns], weights.shape[0], n_phases,
+    n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
+    amplitude = expand_probe_amplitudes(
+        relative_amplitude,
+        rho,
+        wavevector_indices[:, :n_patterns],
+        weights.shape[0],
+        n_phases,
     )
     directions = (
         component_directions[:, :, None, :, :]
@@ -227,12 +269,12 @@ def fourier_curvature_matrix(
         perturbations_per_forward=perturbations_per_forward,
     )
     scale_squared = (
-        amplitude.reshape(n_fields, n_real_modes, weights.shape[0]).square()
+        amplitude.reshape(n_fields, n_real_probes, weights.shape[0]).square()
         if torch.is_tensor(amplitude) else amplitude**2
     )
     quadratic_forms = second_difference.reshape(
         n_fields,
-        n_real_modes,
+        n_real_probes,
         weights.shape[0],
     ) / scale_squared
     diagonal = quadratic_forms[..., :n_types]
@@ -271,12 +313,191 @@ def fourier_curvature_matrix(
     )
 
 
+def polarization_fourier_curvature(
+    model: nn.Module,
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    rho: torch.Tensor,
+    wavevector_indices: torch.Tensor,
+    dipole_magnitude: torch.Tensor,
+    relative_amplitude: Union[float, torch.Tensor],
+    polarization_directions: torch.Tensor,
+    perturbations_per_forward: Optional[int] = None,
+    wavevector_phases: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Return one ideal-normalized polarization curvature per field.
+
+    The selected basis displacement applies one shared Cartesian alignment
+    change to every species, scaled locally by ``m_a*rho_a``. The result has
+    shape ``[field, wavevector, phase]`` independent of species count. With
+    ``wavevector_phases`` supplied, all selected waves are summed into one
+    pattern and the result has shape ``[field, 1, 1]``. Density is held fixed,
+    including for the zero wavevector.
+    """
+
+    if "dipole_density" not in batch:
+        raise KeyError("batch is missing 'dipole_density'")
+    polarization = batch["dipole_density"]
+    if polarization.shape != rho.shape + (3,):
+        raise ValueError("dipole_density must have shape rho.shape + (3,)")
+    if polarization.dtype != rho.dtype or polarization.device != rho.device:
+        raise ValueError("rho and dipole_density must share dtype and device")
+    if not torch.all(torch.isfinite(polarization)).item():
+        raise ValueError("dipole_density must be finite")
+    zero_density = rho == 0.0
+    if torch.any(zero_density[..., None] & (polarization != 0.0)).item():
+        raise ValueError("dipole_density must be zero where rho is zero")
+
+    moment = dipole_magnitude.to(rho).reshape(-1)
+    if moment.numel() not in (1, rho.shape[-1]):
+        raise ValueError("dipole_magnitude must contain one value per density type")
+
+    waves, valid_wave = _real_fourier_waves(
+        batch,
+        rho,
+        wavevector_indices,
+        wavevector_phases=wavevector_phases,
+    )
+    wave_norm = torch.amax(torch.abs(waves), dim=-1)
+    waves = waves / torch.clamp(wave_norm[..., None], min=1.0e-12)
+    selected_direction = _unit_polarization_directions(
+        polarization_directions, rho,
+    )
+
+    alignment_scale = rho * moment
+    directions = (
+        waves[:, :, :, None, None]
+        * alignment_scale[:, None, :, :, None]
+        * selected_direction[:, None, None, None, :]
+    )
+
+    n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
+    amplitude_indices = (
+        wavevector_indices
+        if wavevector_phases is None
+        else wavevector_indices[:, :1]
+    )
+    used_amplitude = _validated_probe_amplitudes(
+        relative_amplitude,
+        rho,
+        amplitude_indices,
+    )
+    if not torch.is_tensor(used_amplitude):
+        used_amplitude = rho.new_full(
+            amplitude_indices.shape[:2], used_amplitude
+        )
+    used_amplitude = used_amplitude.repeat_interleave(n_phases, dim=1)
+    excess_second = _polarization_excess_energy_difference(
+        model=model,
+        outputs=outputs,
+        batch=batch,
+        rho=rho,
+        polarization=polarization,
+        directions=directions,
+        relative_amplitude=used_amplitude,
+        perturbations_per_forward=perturbations_per_forward,
+    )
+    volume = voxel_volume(batch["grid_spacing"].to(rho))
+    alignment_change = used_amplitude[..., None, None] * waves[..., None]
+    ideal_second = (
+        3.0
+        * volume[:, None]
+        * torch.sum(rho[:, None] * alignment_change.square(), dim=(-2, -1))
+    )
+    total_second = ideal_second + excess_second
+    ideal_denominator = ideal_second.detach()
+    ideal_scale = torch.clamp(
+        torch.amax(torch.abs(ideal_denominator), dim=1, keepdim=True),
+        min=1.0,
+    )
+    ideal_valid = ideal_denominator > (
+        100.0 * torch.finfo(rho.dtype).eps * ideal_scale
+    )
+    valid = valid_wave & ideal_valid
+    curvature = total_second / torch.clamp(
+        ideal_denominator, min=torch.finfo(rho.dtype).tiny
+    )
+    curvature = torch.where(valid, curvature, torch.zeros_like(curvature))
+    return (
+        curvature.reshape(rho.shape[0], n_patterns, n_phases),
+        valid.reshape(rho.shape[0], n_patterns, n_phases),
+    )
+
+
+def _unit_polarization_directions(directions, reference):
+    """Validate and normalize one Cartesian direction per field."""
+
+    directions = torch.as_tensor(directions, device=reference.device)
+    if (
+        directions.dtype == torch.bool
+        or torch.is_complex(directions)
+        or directions.shape != (reference.shape[0], 3)
+        or not torch.all(torch.isfinite(directions)).item()
+    ):
+        raise ValueError(
+            "polarization_directions must be finite with shape [field, 3]"
+        )
+    directions = directions.to(reference)
+    norm = torch.linalg.vector_norm(directions, dim=-1, keepdim=True)
+    if torch.any(norm == 0.0).item():
+        raise ValueError("polarization_directions must be nonzero")
+    return directions / norm
+
+
+def _polarization_excess_energy_difference(
+    model,
+    outputs,
+    batch,
+    rho,
+    polarization,
+    directions,
+    relative_amplitude,
+    perturbations_per_forward=None,
+):
+    """Return excess-energy central differences for polarization probes."""
+
+    delta = relative_amplitude[..., None, None, None] * directions
+    plus = polarization[:, None] + delta
+    minus = polarization[:, None] - delta
+    perturbed = torch.stack((plus, minus), dim=2).flatten(1, 2)
+    n_perturbations = perturbed.shape[1]
+    expanded_rho = rho[:, None].expand(-1, n_perturbations, -1, -1)
+
+    excess_chunks = []
+    chunk_size = perturbations_per_forward or n_perturbations
+    for start in range(0, n_perturbations, chunk_size):
+        chunk_p = perturbed[:, start:start + chunk_size]
+        chunk_rho = expanded_rho[:, start:start + chunk_size]
+        expanded_batch = _expand_batch(batch, chunk_rho)
+        expanded_batch["dipole_density"] = chunk_p
+        perturbed_outputs = _energy_only_model(model, expanded_batch)
+        if "beta_F_exc" not in perturbed_outputs:
+            raise KeyError("model outputs are missing 'beta_F_exc'")
+        excess_chunks.append(perturbed_outputs["beta_F_exc"])
+
+    perturbed_excess = torch.cat(excess_chunks, dim=1).reshape(
+        rho.shape[0], directions.shape[1], 2
+    )
+    return (
+        perturbed_excess.sum(dim=2) - 2.0 * outputs["beta_F_exc"][:, None]
+    )
+
+
+def _energy_only_model(model, batch):
+    """Evaluate energy without optional response derivatives."""
+
+    kwargs = {"compute_c1": False}
+    if hasattr(model, "compute_polarization_derivative"):
+        kwargs["compute_polarization_derivative"] = False
+    return model(batch, **kwargs)
+
+
 def fourier_directions(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
-    modes: torch.Tensor,
-    mixture_weights: torch.Tensor,
-    mode_phases: torch.Tensor = None,
+    wavevector_indices: torch.Tensor,
+    component_weights: torch.Tensor,
+    wavevector_phases: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return fixed-number Fourier directions, validity, and density scale."""
 
@@ -284,20 +505,20 @@ def fourier_directions(
     component_directions, valid_component = component_fourier_directions(
         batch,
         rho,
-        modes,
-        mode_phases=mode_phases,
+        wavevector_indices,
+        wavevector_phases=wavevector_phases,
     )
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12
 
-    mixture_weights = mixture_weights.to(rho)
-    if mixture_weights.ndim != 2 or mixture_weights.shape[1] != n_types:
+    component_weights = component_weights.to(rho)
+    if component_weights.ndim != 2 or component_weights.shape[1] != n_types:
         raise ValueError(
-            "mixture weights must have shape [n_directions, n_types]"
+            "component weights must have shape [n_directions, n_types]"
         )
-    active_components = torch.abs(mixture_weights) > 0.0
-    n_patterns, n_phases = real_mode_shape(modes, mode_phases)
-    valid_by_mode = valid_component.reshape(
+    active_components = torch.abs(component_weights) > 0.0
+    n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
+    valid_by_wavevector = valid_component.reshape(
         n_fields,
         n_patterns,
         n_phases,
@@ -306,14 +527,17 @@ def fourier_directions(
     required_components = (
         component_present & active_components.any(dim=0)[None, :]
     )
-    if torch.any(required_components[:, None, :] & ~valid_by_mode).item():
+    if torch.any(
+        required_components[:, None, :] & ~valid_by_wavevector
+    ).item():
         raise ValueError(
-            "a requested mode aliases to a constant for a present component"
+            "a requested wavevector aliases to a constant for a present "
+            "component"
         )
 
     directions = (
         component_directions[:, :, None, :, :]
-        * mixture_weights[None, None, :, None, :]
+        * component_weights[None, None, :, None, :]
     ).flatten(start_dim=1, end_dim=2)
     valid = (
         valid_component[:, :, None, :]
@@ -321,7 +545,7 @@ def fourier_directions(
     ).any(dim=-1).flatten(start_dim=1, end_dim=2)
 
     component_mean_densities = total_density / n_grid
-    squared_weights = mixture_weights.square()
+    squared_weights = component_weights.square()
     effective_density = torch.einsum(
         "mc,bc->bm",
         squared_weights,
@@ -345,55 +569,18 @@ def fourier_directions(
 def component_fourier_directions(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
-    modes: torch.Tensor,
-    mode_phases: torch.Tensor = None,
+    wavevector_indices: torch.Tensor,
+    wavevector_phases: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return one fixed-number real Fourier direction per component."""
 
     n_fields, n_grid, n_types = rho.shape
-    positions = batch["grid_positions"].to(rho)
-    grid_size = batch["grid_size"].to(rho)
-    if positions.shape != (n_fields, n_grid, 3):
-        raise ValueError(
-            "grid_positions must have shape [n_fields, n_grid, 3]"
-        )
-    if grid_size.shape != (n_fields, 3):
-        raise ValueError("grid_size must have shape [n_fields, 3]")
-    if modes.ndim != 3 or modes.shape[0] != n_fields or modes.shape[2] != 3:
-        raise ValueError("modes must have shape [n_fields, n_modes, 3]")
-
-    phase = 2.0 * torch.pi * torch.sum(
-        positions[:, None, :, :]
-        * modes.to(rho)[:, :, None, :]
-        / grid_size[:, None, None, :],
-        dim=-1,
+    waves, _ = _real_fourier_waves(
+        batch,
+        rho,
+        wavevector_indices,
+        wavevector_phases=wavevector_phases,
     )
-    # A self-conjugate grid mode has an identically zero sine phase. Enforce
-    # this algebraically: float32 sin(m*pi) roundoff at Nyquist corners can
-    # otherwise be normalized into a spurious finite perturbation.
-    self_conjugate = torch.all(
-        torch.remainder(2 * modes, batch["grid_size"].to(modes)[:, None, :]) == 0,
-        dim=-1,
-    )
-    sine = torch.sin(phase).masked_fill(self_conjugate[:, :, None], 0.0)
-    if mode_phases is None:
-        waves = torch.stack((torch.cos(phase), sine), dim=2)
-        waves = waves.flatten(start_dim=1, end_dim=2)
-    else:
-        if (
-            not torch.is_tensor(mode_phases)
-            or mode_phases.shape != modes.shape[:2]
-            or mode_phases.dtype == torch.bool
-            or torch.is_complex(mode_phases)
-            or not torch.all(torch.isfinite(mode_phases)).item()
-        ):
-            raise ValueError("mode_phases must be a finite real [field, mode] tensor")
-        offsets = mode_phases.detach().to(rho)[..., None]
-        # Sum BEFORE projecting/normalizing. Keep exact zero sine at Nyquist
-        # rather than amplifying sin(m*pi) roundoff into a spurious wave.
-        waves = (
-            torch.cos(phase) * torch.cos(offsets) - sine * torch.sin(offsets)
-        ).sum(dim=1, keepdim=True)
 
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12
@@ -414,6 +601,76 @@ def component_fourier_directions(
     return component_directions.detach(), valid_component
 
 
+def _real_fourier_waves(
+    batch: Dict[str, torch.Tensor],
+    reference: torch.Tensor,
+    wavevector_indices: torch.Tensor,
+    wavevector_phases: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return cosine/sine waves and a mask for nonzero real waves."""
+
+    n_fields, n_grid = reference.shape[:2]
+    positions = batch["grid_positions"].to(reference)
+    grid_size = batch["grid_size"].to(reference)
+    if positions.shape != (n_fields, n_grid, 3):
+        raise ValueError(
+            "grid_positions must have shape [n_fields, n_grid, 3]"
+        )
+    if grid_size.shape != (n_fields, 3):
+        raise ValueError("grid_size must have shape [n_fields, 3]")
+    if (
+        wavevector_indices.ndim != 3
+        or wavevector_indices.shape[0] != n_fields
+        or wavevector_indices.shape[2] != 3
+    ):
+        raise ValueError(
+            "wavevector_indices must have shape "
+            "[n_fields, n_wavevectors, 3]"
+        )
+
+    phase = 2.0 * torch.pi * torch.sum(
+        positions[:, None, :, :]
+        * wavevector_indices.to(reference)[:, :, None, :]
+        / grid_size[:, None, None, :],
+        dim=-1,
+    )
+    # A self-conjugate grid wavevector has an identically zero sine. Enforce
+    # this algebraically: float32 sin(m*pi) roundoff at Nyquist corners can
+    # otherwise be normalized into a spurious finite perturbation.
+    self_conjugate = torch.all(
+        torch.remainder(
+            2 * wavevector_indices,
+            batch["grid_size"].to(wavevector_indices)[:, None, :],
+        ) == 0,
+        dim=-1,
+    )
+    sine = torch.sin(phase).masked_fill(self_conjugate[:, :, None], 0.0)
+    if wavevector_phases is None:
+        waves = torch.stack((torch.cos(phase), sine), dim=2)
+        waves = waves.flatten(start_dim=1, end_dim=2)
+    else:
+        if (
+            not torch.is_tensor(wavevector_phases)
+            or wavevector_phases.shape != wavevector_indices.shape[:2]
+            or wavevector_phases.dtype == torch.bool
+            or torch.is_complex(wavevector_phases)
+            or not torch.all(torch.isfinite(wavevector_phases)).item()
+        ):
+            raise ValueError(
+                "wavevector_phases must be a finite real "
+                "[field, wavevector] tensor"
+            )
+        offsets = wavevector_phases.detach().to(reference)[..., None]
+        # Sum BEFORE projecting/normalizing. Keep exact zero sine at Nyquist
+        # rather than amplifying sin(m*pi) roundoff into a spurious wave.
+        waves = (
+            torch.cos(phase) * torch.cos(offsets) - sine * torch.sin(offsets)
+        ).sum(dim=1, keepdim=True)
+
+    valid = torch.amax(torch.abs(waves), dim=-1) > 1.0e-5
+    return waves, valid
+
+
 def average_fourier_phases(
     curvature: torch.Tensor,
     valid: torch.Tensor,
@@ -422,7 +679,8 @@ def average_fourier_phases(
 
     if curvature.ndim != 4 or curvature.shape[2] != 2:
         raise ValueError(
-            "curvature must have shape [field, mode, phase, direction]"
+            "curvature must have shape "
+            "[field, wavevector, phase, direction]"
         )
     if valid.shape != curvature.shape:
         raise ValueError("valid and curvature must have the same shape")
@@ -508,24 +766,25 @@ def validate_uniform_response(
     )
 
 
-def validate_explicit_modes(
+def validate_wavevector_indices(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
-    supplied_modes: torch.Tensor,
-    mode_domain: str = "sphere",
+    supplied_indices: torch.Tensor,
+    wavevector_domain: str = "sphere",
 ) -> torch.Tensor:
-    """Validate and canonicalize per-field integer response modes."""
+    """Validate and canonicalize per-field reciprocal-lattice indices."""
 
-    modes = torch.as_tensor(supplied_modes)
+    wavevector_indices = torch.as_tensor(supplied_indices)
     n_fields = rho.shape[0]
     if (
-        modes.ndim != 3
-        or modes.shape[0] != n_fields
-        or modes.shape[1] == 0
-        or modes.shape[2] != 3
+        wavevector_indices.ndim != 3
+        or wavevector_indices.shape[0] != n_fields
+        or wavevector_indices.shape[1] == 0
+        or wavevector_indices.shape[2] != 3
     ):
         raise ValueError(
-            "response modes must have shape [n_fields, n_modes, 3]"
+            "response wavevector_indices must have shape "
+            "[n_fields, n_wavevectors, 3]"
         )
     grid_size, grid_spacing = _validated_grid(
         batch,
@@ -537,25 +796,25 @@ def validate_explicit_modes(
         size = tuple(grid_size[field].tolist())
         spacing = tuple(grid_spacing[field].tolist())
         canonical_by_field.append(
-            canonical_mode_triplets(
-                modes[field],
+            canonical_wavevector_indices(
+                wavevector_indices[field],
                 size,
                 spacing,
-                name="response modes",
-                mode_domain=mode_domain,
+                name="response wavevector_indices",
+                wavevector_domain=wavevector_domain,
             )
         )
     return torch.stack(canonical_by_field).to(device=rho.device)
 
 
-def feasible_modes(
+def feasible_wavevector_indices(
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
-    mode_domain: str = "sphere",
+    wavevector_domain: str = "sphere",
 ) -> Sequence[Tuple[int, int, int]]:
-    """Return unique real modes in the selected grid-representable domain."""
+    """Return unique real wavevector indices in the selected grid domain."""
 
-    mode_domain = validated_mode_domain(mode_domain)
+    wavevector_domain = validated_wavevector_domain(wavevector_domain)
     size_tensor, spacing_tensor = _validated_grid_geometry(
         grid_size,
         grid_spacing,
@@ -568,39 +827,48 @@ def feasible_modes(
     for nx in range(-half_sizes[0], half_sizes[0] + 1):
         for ny in range(-half_sizes[1], half_sizes[1] + 1):
             for nz in range(-half_sizes[2], half_sizes[2] + 1):
-                mode = (nx, ny, nz)
-                if mode != (0, 0, 0) and _mode_is_feasible(
-                    mode,
+                index_triplet = (nx, ny, nz)
+                if index_triplet != (
+                    0,
+                    0,
+                    0,
+                ) and _wavevector_index_is_feasible(
+                    index_triplet,
                     grid_size,
                     grid_spacing,
-                    mode_domain,
+                    wavevector_domain,
                 ):
-                    feasible.add(canonical_grid_mode(mode, grid_size))
+                    feasible.add(
+                        canonical_grid_wavevector_index(
+                            index_triplet,
+                            grid_size,
+                        )
+                    )
     return sorted(feasible)
 
 
 def wavevector_magnitude(
-    mode: Sequence[int],
+    wavevector_index: Sequence[int],
     box_lengths: Sequence[float],
 ) -> float:
-    """Return the physical reciprocal-space magnitude of an integer mode."""
+    """Return the physical magnitude represented by an integer index."""
 
     return math.sqrt(
         sum(
             (2.0 * math.pi * component / length) ** 2
-            for component, length in zip(mode, box_lengths)
+            for component, length in zip(wavevector_index, box_lengths)
         )
     )
 
 
-def canonical_grid_mode(
-    mode: Sequence[int],
+def canonical_grid_wavevector_index(
+    wavevector_index: Sequence[int],
     grid_size: Sequence[int],
 ) -> Tuple[int, int, int]:
-    """Remove Nyquist-sign and global-sign duplicates of a real Fourier mode."""
+    """Remove sign-equivalent representations of a real grid wavevector."""
 
     canonical = []
-    for component, size in zip(mode, grid_size):
+    for component, size in zip(wavevector_index, grid_size):
         if size % 2 == 0 and abs(component) == size // 2:
             component = abs(component)
         canonical.append(component)
@@ -616,12 +884,12 @@ def canonical_grid_mode(
     return max(tuple(canonical), tuple(opposite))
 
 
-def validated_mode_domain(mode_domain: str) -> str:
+def validated_wavevector_domain(wavevector_domain: str) -> str:
     """Return the requested Nyquist-domain convention."""
 
-    if mode_domain not in ("sphere", "cube"):
-        raise ValueError("mode_domain must be 'sphere' or 'cube'")
-    return mode_domain
+    if wavevector_domain not in ("sphere", "cube"):
+        raise ValueError("wavevector_domain must be 'sphere' or 'cube'")
+    return wavevector_domain
 
 
 def _validated_grid(
@@ -682,62 +950,73 @@ def _validated_grid_geometry(
     return integer_size, spacing
 
 
-def _mode_is_feasible(
-    mode: Sequence[int],
+def _wavevector_index_is_feasible(
+    wavevector_index: Sequence[int],
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
-    mode_domain: str = "sphere",
+    wavevector_domain: str = "sphere",
 ) -> bool:
-    """Return whether a mode is on-grid and inside the requested domain."""
+    """Return whether an index is on-grid and in the requested domain."""
 
     if any(
         abs(component) > size // 2
-        for component, size in zip(mode, grid_size)
+        for component, size in zip(wavevector_index, grid_size)
     ):
         return False
-    if mode_domain == "cube":
+    if wavevector_domain == "cube":
         return True
     box_lengths = tuple(
         size * spacing for size, spacing in zip(grid_size, grid_spacing)
     )
     isotropic_nyquist = min(math.pi / spacing for spacing in grid_spacing)
     return (
-        wavevector_magnitude(mode, box_lengths) ** 2
+        wavevector_magnitude(wavevector_index, box_lengths) ** 2
         <= isotropic_nyquist**2 * (1.0 + 1.0e-12)
     )
 
 
-def canonical_mode_triplets(
-    supplied_modes: object,
+def canonical_wavevector_indices(
+    supplied_indices: object,
     grid_size: Sequence[int],
     grid_spacing: Sequence[float],
-    name: str = "modes",
-    mode_domain: str = "sphere",
+    name: str = "wavevector_indices",
+    wavevector_domain: str = "sphere",
 ) -> torch.Tensor:
-    """Validate and canonicalize explicit modes for one periodic grid."""
+    """Validate explicit indices and canonicalize their signs on one grid."""
 
-    mode_domain = validated_mode_domain(mode_domain)
-    modes = mode_triplets(supplied_modes, name)
+    wavevector_domain = validated_wavevector_domain(wavevector_domain)
+    wavevector_indices = wavevector_index_triplets(supplied_indices, name)
     size, spacing = _validated_grid_geometry(grid_size, grid_spacing)
     grid_size = tuple(size.tolist())
     grid_spacing = tuple(spacing.tolist())
     selected = [
-        canonical_grid_mode(mode, grid_size)
-        for mode in modes.detach().cpu().tolist()
+        canonical_grid_wavevector_index(index_triplet, grid_size)
+        for index_triplet in wavevector_indices.detach().cpu().tolist()
     ]
     if len(set(selected)) != len(selected):
         raise ValueError("{} contain equivalent Fourier directions".format(name))
     if any(
-        not _mode_is_feasible(mode, grid_size, grid_spacing, mode_domain)
-        for mode in selected
+        not _wavevector_index_is_feasible(
+            index_triplet,
+            grid_size,
+            grid_spacing,
+            wavevector_domain,
+        )
+        for index_triplet in selected
     ):
         domain_name = (
             "isotropic Nyquist sphere"
-            if mode_domain == "sphere"
+            if wavevector_domain == "sphere"
             else "componentwise Nyquist cube"
         )
-        raise ValueError("a requested mode lies outside the " + domain_name)
-    return torch.tensor(selected, dtype=torch.long, device=modes.device)
+        raise ValueError(
+            "a requested wavevector lies outside the " + domain_name
+        )
+    return torch.tensor(
+        selected,
+        dtype=torch.long,
+        device=wavevector_indices.device,
+    )
 
 
 def _expand_batch(

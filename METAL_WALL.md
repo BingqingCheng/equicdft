@@ -182,7 +182,9 @@ result = GridSolver(model).solve(
 
 For a neutral fixed-dipole fluid, the liquid coupling is instead
 `data["E_ext"]` with shape `[grid, species, 3]`, in energy per dipole units;
-set its z component to the same `E_z`. Use `PolarizationSolver(m, model)` to
+set its z component to the same `E_z`. Use `GridSolver(model, dipole_magnitude=m)` to
 minimize density and polarization together, with `m` the molecular dipole
 magnitude. It supports `excluded_mask` and keeps both fields zero there.
 No charge-based scalar voltage term is needed for neutral molecules.
+Pass particle counts with `solve(data, particle_numbers=...)`. Coupled dipole
+solves do not currently support `homogeneous_axes`.

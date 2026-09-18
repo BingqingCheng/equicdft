@@ -245,7 +245,7 @@ class TestTrainer(unittest.TestCase):
             loss=Loss(
                 [
                     FourierStabilityLoss(
-                        ((1, 0, 0),),
+                        wavevector_indices=((1, 0, 0),),
                         training_only=False,
                     )
                 ]
@@ -275,7 +275,7 @@ class TestTrainer(unittest.TestCase):
     def test_fourier_response_loss_runs_through_trainer(self):
         dataset = _functional_dataset()
         for frame in dataset:
-            frame["fourier_modes"] = torch.tensor([[1, 0, 0]])
+            frame["fourier_wavevector_indices"] = torch.tensor([[1, 0, 0]])
             frame["fourier_curvature"] = torch.ones((1, 1))
         model = _QuadraticDictionaryFunctional()
         trainer = Trainer(
@@ -540,7 +540,7 @@ class TestTrainer(unittest.TestCase):
     def test_response_stream_reuses_loss_details_for_metrics(self):
         dataset = _functional_dataset()
         for frame in dataset:
-            frame["fourier_modes"] = torch.tensor([[1, 0, 0]])
+            frame["fourier_wavevector_indices"] = torch.tensor([[1, 0, 0]])
             frame["fourier_curvature"] = torch.ones((1, 1))
             frame["fourier_scale"] = torch.ones((1, 1))
         term = FourierResponseLoss(

@@ -21,13 +21,13 @@ class TestFourierAmplitudes(unittest.TestCase):
         for interval in ((), (.1,), (.1, .2, .3), (0, .1), (.1, 1), (.2, .1),
                          (float('nan'), .2), (.1, float('inf')), (True, .2)):
             with self.subTest(interval=interval), self.assertRaises((ValueError, TypeError)):
-                FourierStabilityLoss(modes=((1, 0, 0),), relative_amplitude=interval)
+                FourierStabilityLoss(wavevector_indices=((1, 0, 0),), relative_amplitude=interval)
 
-    def test_sampling_per_field_mode_and_eval_does_not_sample(self):
+    def test_sampling_per_field_wavevector_and_eval_does_not_sample(self):
         data = batch(64)
         model = fixtures._CoupledQuadraticExcessModel([[0., 3.], [3., 0.]])
-        term = FourierStabilityLoss(modes=((1, 0, 0), (2, 0, 0)),
-                                    mixture_mode='full_matrix', relative_amplitude=(.02, .1))
+        term = FourierStabilityLoss(wavevector_indices=((1, 0, 0), (2, 0, 0)),
+                                    component_treatment='full_matrix', relative_amplitude=(.02, .1))
         with patch.object(term.response, 'matrix', wraps=term.response.matrix) as response:
             torch.manual_seed(10)
             term(model(data), data, model=model)
@@ -55,7 +55,7 @@ class TestFourierAmplitudes(unittest.TestCase):
             values, gradients = [], []
             for amplitude in (.05, (.05, .05), [.05, .05]):
                 model = fixtures._CoupledQuadraticExcessModel([[-4., 3.], [3., -4.]])
-                term = FourierStabilityLoss(modes=((1, 0, 0),), mixture_mode=mode,
+                term = FourierStabilityLoss(wavevector_indices=((1, 0, 0),), component_treatment=mode,
                                             relative_amplitude=amplitude, **kwargs)
                 rng = torch.get_rng_state().clone()
                 value = term(model(data), data, model=model)
@@ -66,7 +66,7 @@ class TestFourierAmplitudes(unittest.TestCase):
                 self.assertTrue(torch.equal(value, values[0]))
                 self.assertTrue(torch.equal(grad, gradients[0]))
 
-    def test_per_mode_matrices_and_projections_match_scalar_calls(self):
+    def test_per_wavevector_matrices_and_projections_match_scalar_calls(self):
         data = batch()
         modes = torch.tensor([[[1, 0, 0], [2, 0, 0]]] * 2)
         amplitudes = torch.tensor([[.02, .04], [.07, .1]], dtype=torch.float64)
@@ -120,7 +120,7 @@ class TestFourierAmplitudes(unittest.TestCase):
             seen.append(fields['rho'].detach().clone())
             return forward(fields, **kwargs)
         with patch.object(model, 'forward', side_effect=record):
-            term = FourierStabilityLoss(modes=((1, 0, 0), (2, 0, 0)), mixture_mode='full_matrix',
+            term = FourierStabilityLoss(wavevector_indices=((1, 0, 0), (2, 0, 0)), component_treatment='full_matrix',
                                         relative_amplitude=(.1, .3), perturbations_per_forward=2)
             term(model(data), data, model=model)
         for rho in seen:
@@ -141,13 +141,13 @@ class TestFourierAmplitudes(unittest.TestCase):
             with self.subTest(amplitude=amplitude), self.assertRaises((ValueError, TypeError)):
                 FourierResponse().matrix(model, data, modes, relative_amplitude=amplitude)
 
-    def test_trainer_checkpoint_replays_random_modes_and_amplitudes(self):
+    def test_trainer_replays_random_wavevectors_and_amplitudes(self):
         data = batch(2)
         dataset = [{k: v[i] for k, v in data.items()} for i in range(2)]
         def setup(path=None):
             model = fixtures._CoupledQuadraticExcessModel([[-4., 3.], [3., -4.]])
-            term = FourierStabilityLoss(random_modes_per_field=2, mode_domain='cube',
-                                        mixture_mode='full_matrix', relative_amplitude=(.02, .1))
+            term = FourierStabilityLoss(random_wavevectors_per_field=2, wavevector_domain='cube',
+                                        component_treatment='full_matrix', relative_amplitude=(.02, .1))
             trainer = Trainer(model, Loss([term]), optimizer_args={'lr': .001},
                               device='cpu', checkpoint_dir=path)
             loader = DataLoader(dataset, batch_size=1, shuffle=True,

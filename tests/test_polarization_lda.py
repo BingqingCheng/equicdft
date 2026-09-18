@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from equicdft import GridCACEModel, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout, PolarizationSolver
+from equicdft import GridCACEModel, GridSolver, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout
 from equicdft.stencil import get_neighbor_indices
 import numpy as np
 
@@ -177,8 +177,12 @@ class TestPolarizationLDA(unittest.TestCase):
                 "temperature": torch.tensor(1.2),
                 "beta": 1. / (model.boltzmann_constant * 1.2),
                 "grid_spacing": torch.full((3,), .5)}
-        ideal = PolarizationSolver(.7).solve(data, [.5], tolerance_residual=1e-10)
-        with_lda = PolarizationSolver(.7, model).solve(data, [.5], tolerance_residual=1e-10)
+        ideal = GridSolver(None, dipole_magnitude=.7).solve(
+            data, particle_numbers=[.5], tolerance_residual=1e-10
+        )
+        with_lda = GridSolver(model, dipole_magnitude=.7).solve(
+            data, particle_numbers=[.5], tolerance_residual=1e-10
+        )
         self.assertEqual(ideal["status"], "converged")
         self.assertEqual(with_lda["status"], "converged")
         for key in ("rho", "dipole_density", "beta_A"):

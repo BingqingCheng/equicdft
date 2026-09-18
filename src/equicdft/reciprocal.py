@@ -6,7 +6,7 @@ from typing import NamedTuple, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import positive_integer
+from ._argument_checks import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
 from ._fourier_sites import FourierSites
 from ._grid import (
@@ -142,7 +142,7 @@ class _CoulombEvaluation(NamedTuple):
 
 
 class ReciprocalFeatures(nn.Module):
-    r"""Contract Fourier density fluctuations against fixed radial kernels.
+    r"""Contract scalar or vector Fourier fields against fixed radial kernels.
 
     For density component ``i``, the continuum-normalized discrete Fourier
     mode is
@@ -160,6 +160,19 @@ class ReciprocalFeatures(nn.Module):
     symmetric quadratic form is reduced to unique pairs ``i <= j``. The
     resulting features are translation invariant, extensive, and exactly zero
     for a homogeneous density field.
+
+    With ``variable="dipole_density"``, Gaussian kernels instead contract
+    ``Re[P_hat_i(k)^* dot P_hat_j(k)]``, summing all three vector components
+    with the same weight. The full polarization FFT and the zero mode are
+    retained, so both uniform and transverse polarization contribute. This
+    is a direct orientational-response term, not a Coulomb interaction.
+
+    ``include_divergence=True`` appends a second block of Gaussian features
+    formed from ``-i k_D.P_hat``. Independent coefficients for the two blocks
+    give the tensor kernel ``A(k) I + B(k) k_D k_D``: away from Nyquist,
+    ``G_T=A`` and ``G_L=A+k^2 B``. The residual splitting vanishes at k=0,
+    preserving the long-wavelength dipolar interaction in a separate Coulomb
+    branch.
 
     Parameters
     ----------
@@ -181,6 +194,22 @@ class ReciprocalFeatures(nn.Module):
         the Gaussian-damped Coulomb convention used in Ewald-type methods.
     n_types
         Number of density components.
+    variable
+        ``"rho"`` (default) keeps the density-fluctuation / Coulomb-source
+        behavior. ``"dipole_density"`` selects direct polarization pair
+        features and requires ``kernel="gaussian"``. Inputs are physical
+        fields, without an extra charge, dipole-magnitude or reference-scale
+        factor. For P in charge/length^2, these features have units
+        charge^2/length; beta-free-energy coefficients have length/charge^2.
+    include_divergence
+        Append divergence-pair features after all vector-dot-product kernels.
+        Only supported for direct Gaussian polarization. The output has twice
+        as many kernel channels as radial exponents. Divergence features have
+        units charge^2/length^3, so their beta-free-energy coefficients have
+        length^3/charge^2. No Gaussian-width or other scale factor is applied.
+        The same real spectral derivative as Coulomb is used, including its
+        zero even-axis Nyquist components. Uniform and pure Nyquist modes
+        therefore receive only the vector-dot-product contribution.
     """
 
     _KERNELS = (
@@ -195,6 +224,9 @@ class ReciprocalFeatures(nn.Module):
         screening: Optional[Union[float, Sequence[float]]] = None,
         kernel: str = "gaussian",
         n_types: int = 1,
+        *,
+        variable: str = "rho",
+        include_divergence: bool = False,
     ) -> None:
         super().__init__()
 
@@ -214,6 +246,15 @@ class ReciprocalFeatures(nn.Module):
 
         if kernel not in self._KERNELS:
             raise ValueError("kernel must be one of {}".format(self._KERNELS))
+        if variable not in ("rho", "dipole_density"):
+            raise ValueError("variable must be 'rho' or 'dipole_density'")
+        if variable == "dipole_density" and kernel != "gaussian":
+            raise ValueError(
+                "direct dipole_density features require a Gaussian kernel"
+            )
+        include_divergence = boolean(include_divergence, "include_divergence")
+        if include_divergence and variable != "dipole_density":
+            raise ValueError("include_divergence requires direct polarization features")
 
         if screening is None:
             screening_values = torch.zeros_like(exponents)
@@ -235,11 +276,19 @@ class ReciprocalFeatures(nn.Module):
                 raise ValueError("screening values must be nonnegative")
 
         self.kernel = kernel
+        self.variable = variable
+        self.include_divergence = include_divergence
         self.n_types = n_types
-        self.n_kernels = int(exponents.numel())
+        self.n_kernels = int(exponents.numel()) * (2 if include_divergence else 1)
         self.n_type_pairs = len(symmetric_component_pairs(n_types))
         self.register_buffer("radial_exponents", exponents)
         self.register_buffer("screening", screening_values)
+
+    @property
+    def requires_dipole_density(self) -> bool:
+        # Density/Coulomb checkpoints predating the direct-vector mode have
+        # no variable attribute.
+        return getattr(self, "variable", "rho") == "dipole_density"
 
     def forward(
         self,
@@ -251,8 +300,14 @@ class ReciprocalFeatures(nn.Module):
     ) -> torch.Tensor:
         """Return features with shape ``[..., n_kernels, n_type_pairs]``.
 
-        Optional ``charges`` weights each density component before the pair
-        contraction. With ``dipole_density`` (shape ``rho.shape + (3,)``),
+        In direct ``variable="dipole_density"`` mode, only the polarization
+        pair features are returned; ``rho`` supplies grid/species shape and
+        charges are not allowed. Use a separate density readout if needed.
+        With ``include_divergence=True``, the kernel axis contains all vector
+        kernels followed by all divergence kernels, in radial-exponent order.
+
+        Otherwise, optional ``charges`` weights each density component before
+        the pair contraction. With ``dipole_density`` (``rho.shape + (3,)``),
         the Coulomb source for component a is instead
         ``q_a * rho_hat_a - i k.P_hat_a``. Charges are then required, including
         explicit zeros for neutral polar molecules. P already includes the
@@ -270,6 +325,7 @@ class ReciprocalFeatures(nn.Module):
                 "rho must have shape [..., n_grid, n_types] with the "
                 "configured n_types"
             )
+        direct_polarization = self.requires_dipole_density
         self._validate_polarization(rho, dipole_density, charges)
         if charges is not None:
             charges = torch.as_tensor(
@@ -284,44 +340,61 @@ class ReciprocalFeatures(nn.Module):
         spacing = self._spacing(grid_spacing, rho)
 
         leading_shape = rho.shape[:-2]
-        rho_grid = rho.reshape(
-            *leading_shape,
-            nx,
-            ny,
-            nz,
-            self.n_types,
-        )
-        spatial_dims = (-4, -3, -2)
         volume_element = voxel_volume(spacing)
         volume = volume_element * float(nx * ny * nz)
-        fourier_source = self._fluctuation_fft(
-            rho_grid, spatial_dims, volume_element,
-        )
-        if charges is not None:
-            fourier_source = fourier_source * charges
+        polarization_hat = None
         if dipole_density is not None:
-            fourier_source = fourier_source + self._bound_charge_hat(
-                dipole_density, (nx, ny, nz), spacing, volume_element,
+            p_grid = dipole_density.reshape(
+                *leading_shape, nx, ny, nz, self.n_types, 3,
             )
+            polarization_hat = self._field_fft(
+                p_grid, (-5, -4, -3), volume_element,
+                remove_mean=not direct_polarization,
+            )
+
+        if direct_polarization:
+            fourier_source = polarization_hat
+        else:
+            rho_grid = rho.reshape(*leading_shape, nx, ny, nz, self.n_types)
+            fourier_source = self._field_fft(
+                rho_grid, (-4, -3, -2), volume_element,
+            )
+            if charges is not None:
+                fourier_source = fourier_source * charges
+            if polarization_hat is not None:
+                fourier_source = fourier_source + self._bound_charge_hat(
+                    polarization_hat, (nx, ny, nz), spacing,
+                )
+            fourier_source = fourier_source.unsqueeze(-1)
 
         kernels = self._kernel_values(
             grid_size=(nx, ny, nz),
             grid_spacing=spacing,
             device=rho.device,
             dtype=rho.dtype,
-        ).reshape(self.n_kernels, -1)
-        fourier_source = fourier_source.reshape(
-            *leading_shape,
-            nx * ny * nz,
-            self.n_types,
-        )
+        ).flatten(start_dim=1)
+        features = self._pair_features(fourier_source, kernels, volume)
+        # Previously serialized reciprocal modules have no divergence flag.
+        if getattr(self, "include_divergence", False):
+            divergence_hat = self._bound_charge_hat(
+                polarization_hat, (nx, ny, nz), spacing,
+            ).unsqueeze(-1)
+            divergence_features = self._pair_features(
+                divergence_hat, kernels, volume,
+            )
+            features = torch.cat((features, divergence_features), dim=-2)
+        return features
 
+    def _pair_features(self, fourier_source, kernels, volume):
+        """Contract ``[..., nx, ny, nz, n_types, n_vector]`` pair spectra."""
+
+        fourier_source = fourier_source.flatten(start_dim=-5, end_dim=-3)
         pair_features = []
         for first, second in symmetric_component_pairs(self.n_types):
             cross_power = torch.real(
-                torch.conj(fourier_source[..., first])
-                * fourier_source[..., second]
-            )
+                torch.conj(fourier_source[..., first, :])
+                * fourier_source[..., second, :]
+            ).sum(dim=-1)
             multiplicity = 1.0 if first == second else 2.0
             contracted = torch.einsum(
                 "nk,...k->...n",
@@ -371,8 +444,14 @@ class ReciprocalFeatures(nn.Module):
             dim=(-3, -2, -1),
         )
         if dipole_density is not None:
+            p_grid = dipole_density.reshape(
+                *rho.shape[:-2], *shape, self.n_types, 3,
+            )
+            polarization_hat = self._field_fft(
+                p_grid, (-5, -4, -3), volume_element,
+            )
             charge_spectrum = charge_spectrum + self._bound_charge_hat(
-                dipole_density, shape, spacing, volume_element,
+                polarization_hat, shape, spacing,
             ).sum(dim=-1)
         kernel = self._kernel_values(
             grid_size=shape,
@@ -399,10 +478,15 @@ class ReciprocalFeatures(nn.Module):
         )
 
     def _validate_polarization(self, rho, polarization, charges):
+        if self.requires_dipole_density:
+            if polarization is None:
+                raise ValueError("dipole_density is required for direct polarization features")
+            if charges is not None:
+                raise ValueError("direct polarization features do not use charges")
+        elif polarization is not None and (self.kernel != "coulomb" or charges is None):
+            raise ValueError("dipole_density requires a Coulomb kernel and charges")
         if polarization is None:
             return
-        if self.kernel != "coulomb" or charges is None:
-            raise ValueError("dipole_density requires a Coulomb kernel and charges")
         if polarization.shape != rho.shape + (3,):
             raise ValueError("dipole_density must have shape rho.shape + (3,)")
         if polarization.dtype != rho.dtype or polarization.device != rho.device:
@@ -411,27 +495,22 @@ class ReciprocalFeatures(nn.Module):
             raise ValueError("dipole_density must be finite")
 
     @staticmethod
-    def _fluctuation_fft(field, spatial_dims, volume_element):
-        """Continuum-normalized FFT with the homogeneous mode removed."""
+    def _field_fft(field, spatial_dims, volume_element, *, remove_mean=True):
+        """Continuum-normalized FFT with an explicit homogeneous-mode policy."""
 
-        fluctuation = field - field.mean(dim=spatial_dims, keepdim=True)
-        return volume_element * torch.fft.fftn(fluctuation, dim=spatial_dims)
+        if remove_mean:
+            field = field - field.mean(dim=spatial_dims, keepdim=True)
+        return volume_element * torch.fft.fftn(field, dim=spatial_dims)
 
-    def _bound_charge_hat(self, polarization, grid_size, spacing, volume_element):
-        """Fourier bound charge -i k_D.P_hat, retaining component indices."""
+    def _bound_charge_hat(self, polarization_hat, grid_size, spacing):
+        """Contract a polarization FFT with -i k_D, retaining species indices."""
 
-        p_grid = polarization.reshape(
-            *polarization.shape[:-3], *grid_size, self.n_types, 3,
-        )
-        fourier_p = self._fluctuation_fft(
-            p_grid, (-5, -4, -3), volume_element,
-        )
         axes = _wavevector_axes(
-            grid_size, spacing, polarization.device, polarization.dtype,
+            grid_size, spacing, polarization_hat.device, polarization_hat.real.dtype,
             derivative=True,
         )
         wavevector = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
-        return -1j * (fourier_p * wavevector[..., None, :]).sum(dim=-1)
+        return -1j * (polarization_hat * wavevector[..., None, :]).sum(dim=-1)
 
     def _kernel_values(
         self,
@@ -440,7 +519,7 @@ class ReciprocalFeatures(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Return ``[n_kernels, nx, ny, nz]`` radial kernel values."""
+        """Return one ``[nx, ny, nz]`` kernel per radial exponent."""
 
         squared_wavevector = _squared_wavevectors(
             grid_size, grid_spacing, device, dtype,
@@ -454,6 +533,8 @@ class ReciprocalFeatures(nn.Module):
         )
 
         if self.kernel == "gaussian":
+            if self.requires_dipole_density:
+                return gaussian
             values = gaussian
         elif self.kernel == "screened_inverse_laplacian":
             screening = self.screening.to(device=device, dtype=dtype)

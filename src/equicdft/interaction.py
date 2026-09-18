@@ -38,6 +38,13 @@ class BChiMessage(nn.Module):
     ``A^(t+1) = M^t``. Earlier invariant ``B`` levels are retained separately
     by :class:`equicdft.model.GridCACEModel` for the final readout.
 
+    With ``include_polarization=True``, the neural map instead produces two
+    scalar gates per radial/channel pair. They multiply the original normalized
+    rho and P channels before convolution; one P gate is shared across x/y/z.
+    The result has the same joint A layout as polarized CartesianAFeatures,
+    so every layer uses the same joint B symmetrizer. Physical fields are not
+    updated, and no additional density normalization or voxel volume is used.
+
     Parameters
     ----------
     n_invariant_features
@@ -80,11 +87,15 @@ class BChiMessage(nn.Module):
         grouped dense convolution, and ``"fft"`` evaluates it as a circular
         Fourier cross-correlation. Neither alternative materializes
         ``[G, J, N, C]``.
+    include_polarization
+        Enable joint field-gated messages. The default retains the original
+        scalar gate-only operation, parameter shapes and checkpoint keys.
     """
 
     # A class default keeps whole-object models saved before this execution
     # option loadable without a migration hook or an extra state-dict key.
     convolution_backend: str = "gather"
+    include_polarization: bool = False  # Legacy whole-object checkpoints.
 
     def __init__(
         self,
@@ -103,9 +114,11 @@ class BChiMessage(nn.Module):
         radial_basis: Optional[str] = None,
         n_radial_functions: Optional[int] = None,
         convolution_backend: str = "gather",
+        include_polarization: bool = False,
     ) -> None:
         super().__init__()
 
+        self.include_polarization = boolean(include_polarization, "include_polarization")
         self.n_invariant_features = positive_integer(
             n_invariant_features,
             "n_invariant_features",
@@ -250,6 +263,8 @@ class BChiMessage(nn.Module):
             * self.n_channels
         )
         self.n_output_features = self.n_radial_channels * self.n_channels
+        if self.include_polarization:
+            self.n_output_features *= 2
         self.mlp = build_mlp(
             input_size=self.n_input_features,
             hidden_sizes=hidden_sizes,
@@ -412,6 +427,8 @@ class BChiMessage(nn.Module):
         grid_positions: Optional[torch.Tensor] = None,
         grid_size: Optional[torch.Tensor] = None,
         stencil_positions: Optional[torch.Tensor] = None,
+        normalized_fields: Optional[torch.Tensor] = None,
+        separate_center: bool = False,
     ) -> torch.Tensor:
         """Return ``A^(t+1)`` with shape ``[..., G, N, K, C]``.
 
@@ -420,6 +437,12 @@ class BChiMessage(nn.Module):
         ``[..., G, J]``. The ``"conv3d"`` and ``"fft"`` backends require the
         complete grid coordinates, grid size, and matching stencil offsets;
         for those backends ``local_density_index`` may be ``None``.
+
+        Joint messages require ``normalized_fields: [..., G, 4*C]``, packed
+        [rho, Px, Py, Pz] after the initial feature module's species mixing and
+        reference scaling. ``separate_center`` appends each gated center within
+        its field block; the returned moment axis is then ``4*(K+1)`` instead
+        of ``4*K``. Scalar gate-only messages do not take field carriers.
         """
 
         if B.ndim < 4:
@@ -449,12 +472,26 @@ class BChiMessage(nn.Module):
         flat_B = B.flatten(start_dim=-3)
         zero_B = flat_B.new_zeros(self.n_input_features)
         gates = self.mlp(flat_B) - self.mlp(zero_B)
-        gates = gates.reshape(
-            *B.shape[:-3],
-            self.n_radial_channels,
-            self.n_channels,
-        )
-        return self._apply_stencil(
+        separate_center = boolean(separate_center, "separate_center")
+        if self.include_polarization:
+            shape = (*B.shape[:-3], 4 * self.n_channels)
+            if normalized_fields is None or normalized_fields.shape != shape:
+                raise ValueError(
+                    "joint messages require normalized_fields with shape {}".format(shape)
+                )
+            if normalized_fields.dtype != B.dtype or normalized_fields.device != B.device:
+                raise ValueError("normalized_fields and B must share dtype and device")
+            gates = gates.reshape(*B.shape[:-3], self.n_radial_channels, 2, self.n_channels)
+            rho_gate, p_gate = gates.unbind(dim=-2)
+            gates = torch.cat((rho_gate, p_gate, p_gate, p_gate), dim=-1)
+            gates = gates * normalized_fields.unsqueeze(-2)
+        else:
+            if normalized_fields is not None or separate_center:
+                raise ValueError(
+                    "field carriers and center slots require include_polarization=True"
+                )
+            gates = gates.reshape(*B.shape[:-3], self.n_radial_channels, self.n_channels)
+        moments = self._apply_stencil(
             gates,
             local_density_index,
             stencil_basis,
@@ -462,3 +499,10 @@ class BChiMessage(nn.Module):
             grid_size=grid_size,
             stencil_positions=stencil_positions,
         )
+        if not self.include_polarization:
+            return moments
+        if separate_center:
+            moments = torch.cat((moments, gates.unsqueeze(-2)), dim=-2)
+        # Match CartesianAFeatures: [rho moments, Px moments, Py moments, Pz moments].
+        moments = moments.unflatten(-1, (4, self.n_channels))
+        return moments.transpose(-3, -2).flatten(-3, -2)

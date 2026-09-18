@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from equicdft import GridCACEModel, MetalWall, PolarizationSolver, ReciprocalFeatures
+from equicdft import GridCACEModel, GridSolver, LDAReadout, LongRangeReadout, MetalWall, ReciprocalFeatures
 from test_metalwall_polarization import _case, _liquid, _oracle
 import test_polarization_ideal as ideal_reference
 
@@ -19,13 +19,13 @@ class TestPolarizationConfinement(unittest.TestCase):
         torch.set_default_dtype(self.old_dtype)
 
     def test_confined_ideal_matches_angular_integral_both_starts(self):
-        data = ideal_reference.TestPolarizationSolver.case()
+        data = ideal_reference.TestGridSolverPolarization.case()
         mask = torch.arange(24) % 3 == 0
         data["excluded_mask"] = mask
         active_data = dict(data, V_ext=data["V_ext"][~mask], E_ext=data["E_ext"][~mask])
         numbers, moments = torch.tensor([3., 4.]), torch.tensor([.7, 1.9])
         expected_rho, expected_p = ideal_reference.exact_solution(active_data, numbers, moments)
-        solver = PolarizationSolver(moments)
+        solver = GridSolver(None, dipole_magnitude=moments)
         for perturbed in (False, True):
             initial = {}
             if perturbed:
@@ -34,7 +34,7 @@ class TestPolarizationConfinement(unittest.TestCase):
                 rho *= numbers / (data["grid_spacing"].prod() * rho.sum(0))
                 p = .02 * (rho * moments)[..., None] * torch.randn(24, 2, 3)
                 initial = dict(initial_rho=rho, initial_polarization=p)
-            result = solver.solve(data, numbers, tolerance_residual=1e-9, **initial)
+            result = solver.solve(data, particle_numbers=numbers, tolerance_residual=1e-9, **initial)
             self.assertTrue(result["converged"])
             self.assertLess(result["maximum_residual"].item(), 1e-9)
             torch.testing.assert_close(result["rho"][~mask], expected_rho, atol=1e-9, rtol=0)
@@ -48,19 +48,23 @@ class TestPolarizationConfinement(unittest.TestCase):
         changed["V_ext"][mask] = 1000.
         changed["E_ext"][mask] = -3000.
         changed["V_ext"][~mask] += torch.tensor([2., -3.])
-        shifted = solver.solve(changed, numbers, tolerance_residual=1e-9)
+        shifted = solver.solve(changed, particle_numbers=numbers, tolerance_residual=1e-9)
         torch.testing.assert_close(shifted["rho"], result["rho"], atol=1e-9, rtol=0)
         torch.testing.assert_close(shifted["dipole_density"], result["dipole_density"], atol=1e-9, rtol=0)
         torch.testing.assert_close(shifted["beta_mu"] - result["beta_mu"], data["beta"] * torch.tensor([2., -3.]), atol=1e-9, rtol=0)
 
     def test_invalid_masks_and_excluded_initial_fields(self):
-        data = ideal_reference.TestPolarizationSolver.case()
-        solver = PolarizationSolver([.7, 1.9])
-        for mask in (torch.ones(24, dtype=torch.bool), torch.zeros(24), torch.zeros(24, 2, dtype=torch.bool)):
-            with self.assertRaises(ValueError):
-                solver.solve(dict(data, excluded_mask=mask), [3., 4.])
+        data = ideal_reference.TestGridSolverPolarization.case()
+        solver = GridSolver(None, dipole_magnitude=[.7, 1.9])
+        for mask, error in (
+            (torch.ones(24, dtype=torch.bool), ValueError),
+            (torch.zeros(24), TypeError),
+            (torch.zeros(24, 2, dtype=torch.bool), ValueError),
+        ):
+            with self.assertRaises(error):
+                solver.solve(dict(data, excluded_mask=mask), particle_numbers=[3., 4.])
         data["excluded_mask"] = torch.arange(24) == 0
-        result = solver.solve(data, [3., 4.])
+        result = solver.solve(data, particle_numbers=[3., 4.])
         for name in ("rho", "dipole_density"):
             bad = result[name].clone()
             bad[0] = .01
@@ -83,6 +87,12 @@ class TestPolarizationConfinement(unittest.TestCase):
             ReciprocalFeatures((-.1,), kernel="coulomb")
 
     def test_manufactured_confined_metal_equilibrium(self):
+        self._check_manufactured_equilibrium(gaussian=False)
+
+    def test_gaussian_p_and_metal_equilibrium(self):
+        self._check_manufactured_equilibrium(gaussian=True)
+
+    def _check_manufactured_equilibrium(self, gaussian):
         shape = (3, 3, 8)
         data, sites, charges = _case(shape, neutral_species=True, spacing=(.8, .8, .8))
         mask = (torch.arange(72) % 8 == 0) | (torch.arange(72) % 8 == 7)
@@ -96,14 +106,39 @@ class TestPolarizationConfinement(unittest.TestCase):
         sites["metal_group_ids"] = torch.tensor([0])
         sites["metal_total_charge"] = torch.zeros(1)
         wall = MetalWall(_liquid(charges, alpha=0., amplitude=.3), sites, .35, external_field=(0., 0., -.03))
-        model = GridCACEModel(None, None, [wall], grid_spacing=.8).eval()
-        solver = PolarizationSolver(.7, model)
+        readouts = [wall]
+        if gaussian:
+            readouts.append(LDAReadout(mean_density=.4, zero_init=True))
+            response = LongRangeReadout(
+                features=ReciprocalFeatures(
+                    (.1, .8), variable="dipole_density", include_divergence=True,
+                ),
+                hidden_sizes=(),
+            )
+            with torch.no_grad():
+                response.mlp[-1].weight.zero_()
+                response.mlp[-1].bias.copy_(torch.tensor([.2, .1, .03, .02]))
+            readouts.append(response)
+        model = GridCACEModel(None, None, readouts, grid_spacing=.8).eval()
+        solver = GridSolver(model, dipole_magnitude=.7)
         data["V_ext"] = torch.zeros_like(data["rho"])
         data["E_ext"] = torch.zeros_like(data["dipole_density"])
         target = solver.evaluate(data)
+        if gaussian:
+            # Both derivatives include Gaussian response and relaxed electrodes.
+            for key, gradient_key in (("rho", "local_chemical_potential"),
+                                      ("dipole_density", "polarization_residual")):
+                delta = torch.zeros_like(data[key])
+                delta[9] = .001
+                step = 1.e-4
+                plus = solver.evaluate(dict(data, **{key: data[key] + step * delta}))
+                minus = solver.evaluate(dict(data, **{key: data[key] - step * delta}))
+                numeric = (plus["beta_A"] - minus["beta_A"]) / (2 * step)
+                analytic = .8**3 * (target[gradient_key] * delta).sum()
+                torch.testing.assert_close(numeric, analytic, rtol=1.e-6, atol=1.e-9)
         data["V_ext"] = -target["density_residual"] / data["beta"]
         data["E_ext"] = target["polarization_residual"] / data["beta"]
-        result = solver.solve(data, target["particle_numbers"],
+        result = solver.solve(data, particle_numbers=target["particle_numbers"],
                               initial_rho=torch.where(mask[:, None], 0., target["particle_numbers"] / ((~mask).sum() * .8**3)),
                               initial_polarization=torch.zeros_like(data["dipole_density"]), tolerance_residual=1e-8)
         self.assertTrue(result["converged"], result["status"])
@@ -112,6 +147,12 @@ class TestPolarizationConfinement(unittest.TestCase):
         endpoint = model(dict(data, rho=result["rho"], dipole_density=result["dipole_density"]), compute_c1=False)
         self.assertLess(endpoint["charge_residual"].item(), 1e-10)
         self.assertLess(endpoint["potential_residual"].item(), 1e-10)
+
+    def test_homogeneous_axes_cannot_be_silently_ignored_for_dipoles(self):
+        solver = GridSolver(None, dipole_magnitude=[.7, 1.9])
+        with self.assertRaisesRegex(ValueError, "not supported with fixed dipoles"):
+            solver.solve(ideal_reference.TestGridSolverPolarization.case(),
+                         particle_numbers=[3., 4.], homogeneous_axes=["x", "y"])
 
 
 if __name__ == "__main__":

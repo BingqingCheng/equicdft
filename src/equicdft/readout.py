@@ -179,16 +179,20 @@ class LongRangeReadout(EnergyReadout):
     """Map thermodynamic state to a reciprocal quadratic kernel.
 
     The readout predicts one coefficient for every fixed reciprocal kernel and
-    unique density-component pair. Its output energy is a linear contraction
-    with the reciprocal features, preserving their quadratic density
-    dependence and extensive scaling.
+    unique species pair. Its output energy is a linear contraction with the
+    reciprocal features, preserving their quadratic field dependence and
+    extensive scaling. Coefficients are signed, not positivity constrained.
 
     Parameters
     ----------
     n_kernels
-        Number of fixed radial kernels in the reciprocal representation.
+        Number of kernel channels. Inferred from ``features`` when omitted;
+        required for standalone use without a feature module. Direct Gaussian
+        polarization with divergence has two channels per radial exponent.
     n_types
-        Number of physical density components. The state vector contains
+        Number of physical density components. Inferred from ``features`` when
+        omitted, or defaults to one without a feature module. Explicit counts
+        must match the feature module. The state vector contains
         normalized temperature followed by one mean density per component.
     hidden_sizes
         Width of each state-network hidden layer. An empty sequence gives a
@@ -210,6 +214,15 @@ class LongRangeReadout(EnergyReadout):
     features
         Reciprocal feature module used by :meth:`energy`. It may be omitted
         when the readout is used only as a standalone coefficient contraction.
+        ``ReciprocalFeatures(variable="dipole_density", kernel="gaussian")``
+        selects direct vector-dot-product features, including uniform and
+        transverse polarization. This mode requires no ``include_polarization``
+        flag and disallows charges / Coulomb amplitudes. Its coefficients are
+        independent of any separate density or Coulomb readout. The existing
+        ideal orientational free energy is not replaced.
+        With ``features.include_divergence=True``, the coefficient order is
+        all vector kernels followed by all divergence kernels. These have
+        different physical units; no width or reference scaling is implicit.
     include_polarization
         If true, require ``dipole_density`` and use the same Coulomb kernel
         on ``q_a rho_hat_a - i k.P_hat_a``. Requires explicit ``charges``
@@ -230,12 +243,16 @@ class LongRangeReadout(EnergyReadout):
     @property
     def requires_dipole_density(self) -> bool:
         # Old serialized charge-only readouts have no include_polarization.
-        return getattr(self, "include_polarization", False)
+        features = getattr(self, "features", None)
+        return (
+            getattr(self, "include_polarization", False)
+            or (features is not None and features.requires_dipole_density)
+        )
 
     def __init__(
         self,
-        n_kernels: int,
-        n_types: int = 1,
+        n_kernels: Optional[int] = None,
+        n_types: Optional[int] = None,
         hidden_sizes: Sequence[int] = (16, 16),
         zero_init: bool = True,
         charges: Optional[Sequence[float]] = None,
@@ -244,6 +261,15 @@ class LongRangeReadout(EnergyReadout):
         include_polarization: bool = False,
     ) -> None:
         super().__init__()
+
+        if features is not None and not isinstance(features, ReciprocalFeatures):
+            raise TypeError("features must be ReciprocalFeatures or None")
+        if n_kernels is None:
+            if features is None:
+                raise ValueError("n_kernels is required without features")
+            n_kernels = features.n_kernels
+        if n_types is None:
+            n_types = features.n_types if features is not None else 1
 
         self.include_polarization = boolean(
             include_polarization, "include_polarization",
@@ -304,12 +330,12 @@ class LongRangeReadout(EnergyReadout):
         self.register_buffer("pair_charge_products", pair_charge_products)
         self.register_buffer("coulomb_amplitude", amplitude_tensor)
         if features is not None:
-            if not isinstance(features, ReciprocalFeatures):
-                raise TypeError("features must be ReciprocalFeatures or None")
             if features.n_types != self.n_types:
                 raise ValueError("features and readout n_types differ")
             if features.n_kernels != self.n_kernels:
                 raise ValueError("features and readout kernel counts differ")
+            if features.requires_dipole_density and charges is not None:
+                raise ValueError("direct polarization features do not use charges")
         self.features = features
 
         if coulomb_amplitude is not None:
@@ -345,7 +371,7 @@ class LongRangeReadout(EnergyReadout):
 
         amplitude = self.amplitude(state_features)[..., None, None]
         pair_weights = self.pair_charge_products.to(state_features)
-        if self.requires_dipole_density:
+        if getattr(self, "include_polarization", False):
             # q is already in each source; applying q_i*q_j here would both
             # double-count charge factors and erase neutral-molecule dipoles.
             pair_weights = torch.ones_like(pair_weights)
@@ -477,9 +503,6 @@ class LongRangeReadout(EnergyReadout):
     ) -> torch.Tensor:
         """Return the reciprocal-space contribution for a complete field."""
 
-        if self.provides_coulomb_potential:
-            state, amplitude = self._coulomb_state(context)
-            return amplitude * state.base_energy
         if self.features is None:
             raise ValueError(
                 "LongRangeReadout requires ReciprocalFeatures for model use"
@@ -488,10 +511,16 @@ class LongRangeReadout(EnergyReadout):
             raise KeyError(
                 "long-range evaluation requires data['grid_size']"
             )
+        source_options = {}
+        if self.requires_dipole_density:
+            source_options["dipole_density"] = context["dipole_density"]
+        if getattr(self, "include_polarization", False):
+            source_options["charges"] = self.charges
         reciprocal_features = self.features(
             rho=context["rho"],
             grid_size=context["grid_size"],
             grid_spacing=context["grid_spacing"],
+            **source_options,
         )
         energy = self(reciprocal_features, self._state_features(context))
         if energy.shape != context["rho"].shape[:-2]:

@@ -143,6 +143,96 @@ class TestReciprocalFeatures(unittest.TestCase):
 
 
 class TestLongRangeReadout(unittest.TestCase):
+    def test_inferred_dimensions_match_explicit_readout(self):
+        for n_types in (1, 2, 3):
+            for variable, divergence in (
+                ("rho", False),
+                ("dipole_density", False),
+                ("dipole_density", True),
+            ):
+                with self.subTest(n_types=n_types, variable=variable,
+                                  divergence=divergence):
+                    features = ReciprocalFeatures(
+                        (.2, .7), n_types=n_types, variable=variable,
+                        include_divergence=divergence,
+                    )
+                    rng = torch.random.get_rng_state()
+                    explicit = LongRangeReadout(
+                        features.n_kernels, n_types,
+                        hidden_sizes=(4,), zero_init=False, features=features,
+                    )
+                    torch.random.set_rng_state(rng)
+                    inferred = LongRangeReadout(
+                        features=features, hidden_sizes=(4,), zero_init=False,
+                    )
+                    self.assertEqual(inferred.n_kernels, features.n_kernels)
+                    self.assertEqual(inferred.n_types, n_types)
+                    self.assertEqual(inferred.n_state_features, 1 + n_types)
+                    for key, value in explicit.state_dict().items():
+                        torch.testing.assert_close(
+                            inferred.state_dict()[key], value, rtol=0, atol=0,
+                        )
+                    # Old state dictionaries load without migration.
+                    inferred.load_state_dict(explicit.state_dict(), strict=True)
+                    reciprocal = torch.randn(
+                        2, features.n_kernels, features.n_type_pairs,
+                        requires_grad=True,
+                    )
+                    state = torch.randn(2, 1 + n_types, requires_grad=True)
+                    expected = explicit(reciprocal, state)
+                    actual = inferred(reciprocal, state)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    for readout in (explicit, inferred):
+                        readout(reciprocal, state).sum().backward()
+                    for old, new in zip(explicit.mlp.parameters(),
+                                        inferred.mlp.parameters()):
+                        torch.testing.assert_close(new.grad, old.grad,
+                                                   rtol=0, atol=0)
+
+    def test_inferred_coulomb_dimensions(self):
+        features = ReciprocalFeatures((.2,), n_types=2, kernel="coulomb")
+        for polarized in (False, True):
+            for amplitude in (None, 3.):
+                with self.subTest(polarized=polarized, amplitude=amplitude):
+                    readout = LongRangeReadout(
+                        features=features, charges=(1., -1.),
+                        coulomb_amplitude=amplitude,
+                        include_polarization=polarized,
+                    )
+                    self.assertEqual(readout.n_kernels, 1)
+                    self.assertEqual(readout.n_types, 2)
+                    coefficients = readout.coefficients(torch.ones(2, 3))
+                    pair_weights = torch.tensor(
+                        [1., 1., 1.] if polarized else [1., -1., 1.],
+                    )
+                    expected = (0. if amplitude is None else amplitude) * pair_weights
+                    torch.testing.assert_close(coefficients, expected.expand(2, 1, 3))
+
+    def test_inference_rejects_missing_or_inconsistent_counts(self):
+        with self.assertRaisesRegex(ValueError, "required without features"):
+            LongRangeReadout()
+        with self.assertRaisesRegex(TypeError, "features must be"):
+            LongRangeReadout(features=object())
+        features = ReciprocalFeatures((.2, .7), n_types=2)
+        with self.assertRaisesRegex(ValueError, "kernel counts differ"):
+            LongRangeReadout(1, features=features)
+        with self.assertRaisesRegex(ValueError, "n_types differ"):
+            LongRangeReadout(n_types=1, features=features)
+        for name in ("n_kernels", "n_types"):
+            for value, error in ((0, ValueError), (True, TypeError), (1.5, TypeError)):
+                with self.subTest(name=name, value=value), self.assertRaises(error):
+                    LongRangeReadout(features=features, **{name: value})
+
+    def test_standalone_and_partial_dimension_inference(self):
+        standalone = LongRangeReadout(2)
+        self.assertEqual(standalone.n_types, 1)
+        features = ReciprocalFeatures((.2, .7), n_types=3)
+        for kwargs in ({"n_kernels": 2}, {"n_types": 3}):
+            with self.subTest(kwargs=kwargs):
+                readout = LongRangeReadout(features=features, **kwargs)
+                self.assertEqual(readout.n_kernels, 2)
+                self.assertEqual(readout.n_types, 3)
+
     def test_zero_initialization_gives_zero_energy(self):
         readout = LongRangeReadout(n_kernels=3, hidden_sizes=(4,))
         reciprocal = torch.randn(2, 3, 1)

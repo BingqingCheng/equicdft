@@ -8,7 +8,7 @@ import torch
 
 from equicdft import (
     FixedDipoleIdeal, GridCACEModel, LDAReadout, LongRangeReadout,
-    PolarizationSolver, ReciprocalFeatures,
+    GridSolver, ReciprocalFeatures,
 )
 
 
@@ -270,11 +270,17 @@ class TestPolarizationCoulomb(unittest.TestCase):
         external.update(beta=torch.tensor(1.), V_ext=(response["c1"]-ideal["density_derivative"]).detach(),
                         E_ext=(response["polarization_derivative"]+ideal["polarization_derivative"]).detach())
         numbers = data["rho"].sum(0)
-        solver = PolarizationSolver(.7, model)
+        solver = GridSolver(model, dipole_magnitude=.7)
         perturbed = data["rho"] * (1 + .03 * torch.randn_like(data["rho"]))
         perturbed *= numbers / perturbed.sum(0)
         for start in ({}, dict(initial_rho=perturbed, initial_polarization=.002*torch.randn_like(data["dipole_density"]))):
-            result = solver.solve(external, numbers, tolerance_residual=1e-9, max_iter=300, **start)
+            result = solver.solve(
+                external,
+                particle_numbers=numbers,
+                tolerance_residual=1e-9,
+                max_iter=300,
+                **start,
+            )
             self.assertEqual(result["status"], "converged")
             torch.testing.assert_close(result["rho"], data["rho"], atol=2e-9, rtol=2e-9)
             torch.testing.assert_close(result["dipole_density"], data["dipole_density"], atol=2e-9, rtol=2e-9)

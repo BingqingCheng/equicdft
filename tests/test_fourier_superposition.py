@@ -22,7 +22,7 @@ class SpatialQuadratic(nn.Module):
 
 
 class TestFourierSuperposition(unittest.TestCase):
-    def test_sum_before_projection_counts_masks_and_bound(self):
+    def test_superposition_precedes_projection_and_preserves_bounds(self):
         data = batch()
         rho = data['rho']
         rho[:, 0] = 0
@@ -47,12 +47,13 @@ class TestFourierSuperposition(unittest.TestCase):
             torch.testing.assert_close(perturbed.sum(-2), rho.sum(-2)[:, None])
         self.assertTrue((directions.abs() <= rho[:, None] + 1e-14).all())
 
-    def test_sampling_one_amplitude_and_shared_pattern_for_full_matrix(self):
+    def test_superposition_samples_one_amplitude_and_shared_pattern(self):
         data = batch(8)
         model = fixtures._CoupledQuadraticExcessModel([[-4., 3.], [3., -4.]])
         for count in (1, 2, 3, (1, 3)):
-            term = FourierStabilityLoss(random_modes_per_field=count, mode_domain='cube',
-                                        mixture_mode='full_matrix', relative_amplitude=(.01, .1))
+            term = FourierStabilityLoss(random_wavevectors_per_field=count, wavevector_domain='cube',
+                                        wavevector_treatment='superposition', component_treatment='full_matrix',
+                                        relative_amplitude=(.01, .1))
             with patch.object(term.response, 'matrix', wraps=term.response.matrix) as call:
                 torch.manual_seed(7)
                 loss = term(model(data), data, model=model)
@@ -61,14 +62,66 @@ class TestFourierSuperposition(unittest.TestCase):
                 amplitude = args['relative_amplitude']
                 self.assertEqual(amplitude.shape, (8, 1))
                 self.assertTrue(((amplitude >= .01) & (amplitude < .1)).all())
-                if args['modes'].shape[1] == 1:
-                    self.assertIsNone(args['mode_phases'])
+                self.assertEqual(args['wavevector_phases'].shape, args['wavevector_indices'].shape[:2])
+                value, active = term.response.matrix(**args)
+                self.assertEqual(value.shape, (8, 1, 1, 2, 2))
+                self.assertTrue(active.all())
+                self.assertTrue(torch.isfinite(model.matrix.grad).all())
+
+    def test_explicit_wavevector_treatment_controls_density_patterns(self):
+        data = batch()
+        model = fixtures._CoupledQuadraticExcessModel(
+            [[-4.0, 3.0], [3.0, -4.0]]
+        )
+        for treatment, expected_shape in (
+            ("independent", (2, 2)),
+            ("superposition", (1, 1)),
+        ):
+            with self.subTest(wavevector_treatment=treatment):
+                term = FourierStabilityLoss(
+                    wavevector_indices=((1, 0, 0), (2, 0, 0)),
+                    wavevector_treatment=treatment,
+                    component_treatment="full_matrix",
+                )
+                with patch.object(
+                    term.response,
+                    "matrix",
+                    wraps=term.response.matrix,
+                ) as response:
+                    term(model(data), data, model=model)
+                kwargs = response.call_args.kwargs
+                phases = kwargs["wavevector_phases"]
+                if treatment == "independent":
+                    self.assertIsNone(phases)
                 else:
-                    self.assertEqual(args['mode_phases'].shape, args['modes'].shape[:2])
-                    value, active = term.response.matrix(**args)
-                    self.assertEqual(value.shape, (8, 1, 1, 2, 2))
-                    self.assertTrue(active.all())
-                    self.assertTrue(torch.isfinite(model.matrix.grad).all())
+                    self.assertEqual(phases.shape, (2, 2))
+                matrix, _ = term.response.matrix(**kwargs)
+                self.assertEqual(matrix.shape[1:3], expected_shape)
+
+    def test_default_tests_random_density_wavevectors_independently(self):
+        data = batch()
+        model = fixtures._CoupledQuadraticExcessModel(
+            [[-4.0, 3.0], [3.0, -4.0]]
+        )
+        term = FourierStabilityLoss(
+            random_wavevectors_per_field=2,
+            wavevector_domain="cube",
+            component_treatment="full_matrix",
+            relative_amplitude=(0.01, 0.1),
+        )
+
+        with patch.object(
+            term.response,
+            "matrix",
+            wraps=term.response.matrix,
+        ) as response:
+            term(model(data), data, model=model)
+
+        kwargs = response.call_args.kwargs
+        self.assertIsNone(kwargs["wavevector_phases"])
+        self.assertEqual(kwargs["relative_amplitude"].shape, (2, 2))
+        matrix, _ = term.response.matrix(**kwargs)
+        self.assertEqual(matrix.shape, (2, 2, 2, 2, 2))
 
     def test_composite_detects_cross_wavevector_curvature(self):
         data = batch(1)
@@ -85,8 +138,8 @@ class TestFourierSuperposition(unittest.TestCase):
         base, _ = response.matrix(ideal, data, modes)
         torch.testing.assert_close(single - base, torch.zeros_like(single), atol=1e-9, rtol=0)
         phases = torch.zeros((1, 2), dtype=torch.float64)
-        composite, _ = response.matrix(model, data, modes, mode_phases=phases)
-        base, _ = response.matrix(ideal, data, modes, mode_phases=phases)
+        composite, _ = response.matrix(model, data, modes, wavevector_phases=phases)
+        base, _ = response.matrix(ideal, data, modes, wavevector_phases=phases)
         d, _ = component_fourier_directions(data, data['rho'], modes, phases)
         d = d[0, 0, :, 0]
         expected = (d @ hessian @ d) / (d.square() / data['rho'][0, :, 0]).sum()
@@ -104,11 +157,11 @@ class TestFourierSuperposition(unittest.TestCase):
         results, gradients = [], []
         for chunk in (None, 2):
             response = FourierResponse(perturbations_per_forward=chunk)
-            value, _ = response.matrix(model, data, modes, mode_phases=phases, relative_amplitude=amplitudes)
-            base, _ = response.matrix(ideal, data, modes, mode_phases=phases, relative_amplitude=amplitudes)
+            value, _ = response.matrix(model, data, modes, wavevector_phases=phases, relative_amplitude=amplitudes)
+            base, _ = response.matrix(ideal, data, modes, wavevector_phases=phases, relative_amplitude=amplitudes)
             torch.testing.assert_close(value - base, (.5 * model.matrix).expand_as(value), atol=1e-9, rtol=0)
             projected, _ = response(model, data, modes, torch.eye(2),
-                                    mode_phases=phases, relative_amplitude=amplitudes)
+                                    wavevector_phases=phases, relative_amplitude=amplitudes)
             torch.testing.assert_close(projected, torch.diagonal(value, dim1=-2, dim2=-1), atol=1e-9, rtol=0)
             results.append(value.detach())
             gradients.append(torch.autograd.grad(value.square().sum(), model.matrix)[0])
@@ -118,9 +171,9 @@ class TestFourierSuperposition(unittest.TestCase):
     def test_single_mode_keeps_cosine_sine_and_rng(self):
         data = batch()
         model = fixtures._CoupledQuadraticExcessModel([[-4., 3.], [3., -4.]])
-        term = FourierStabilityLoss(random_modes_per_field=1, mode_domain='cube', mixture_mode='full_matrix')
+        term = FourierStabilityLoss(random_wavevectors_per_field=1, wavevector_domain='cube', component_treatment='full_matrix')
         torch.manual_seed(19)
-        modes = term._select_modes(data, data['rho'])
+        modes = term._select_wavevector_indices(data, data['rho'])
         rng = torch.get_rng_state().clone()
         matrix, active = term.response.matrix(model, data, modes)
         expected = term._matrix_loss(matrix, active)
@@ -135,7 +188,7 @@ class TestFourierSuperposition(unittest.TestCase):
         modes = torch.tensor([[[4, 0, 0]]])
         for invalid in (torch.zeros(2), torch.ones(1, 1, dtype=torch.bool),
                         torch.full((1, 1), float('nan')), torch.ones(1, 1, dtype=torch.complex64)):
-            with self.assertRaisesRegex(ValueError, 'mode_phases'):
+            with self.assertRaisesRegex(ValueError, 'wavevector_phases'):
                 component_fourier_directions(data, data['rho'], modes, invalid)
         d, valid = component_fourier_directions(data, data['rho'], modes,
                                                 torch.tensor([[.3]], dtype=torch.float64))

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -13,7 +14,8 @@ from equicdft import (
     TensorLoss,
 )
 from equicdft._grid import voxel_volume
-from equicdft.stability import _feasible_modes
+from equicdft._fourier import polarization_fourier_curvature
+from equicdft.stability import _feasible_wavevector_indices
 
 
 class _PredictionPenalty(nn.Module):
@@ -66,6 +68,32 @@ class _CoupledQuadraticExcessModel(nn.Module):
                     rho,
                     self.matrix.to(rho),
                     rho,
+                )
+            )
+        }
+
+
+class _PolarizationQuadraticExcessModel(nn.Module):
+    """Analytic local polarization functional with a Cartesian Hessian."""
+
+    def __init__(self, matrix):
+        super().__init__()
+        self.matrix = nn.Parameter(torch.as_tensor(matrix, dtype=torch.float64))
+        self.last_polarization = None
+
+    def forward(self, data, compute_c1=None):
+        polarization = data["dipole_density"]
+        volume_element = voxel_volume(data["grid_spacing"].to(polarization))
+        self.last_polarization = polarization.detach()
+        return {
+            "beta_F_exc": (
+                0.5
+                * volume_element
+                * torch.einsum(
+                    "...gai,ij,...gaj->...",
+                    polarization,
+                    self.matrix.to(polarization),
+                    polarization,
                 )
             )
         }
@@ -260,12 +288,19 @@ class TestFourierStabilityLoss(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def _add_polarization(batch):
+        batch["dipole_density"] = batch["rho"].new_zeros(
+            (*batch["rho"].shape, 3)
+        )
+        return batch
+
     def test_stable_ideal_curvature_has_zero_penalty(self):
         batch = self._batch()
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
         )
 
@@ -273,12 +308,261 @@ class TestFourierStabilityLoss(unittest.TestCase):
 
         self.assertEqual(value.item(), 0.0)
 
+    def test_polarization_wavevector_treatment_is_explicit(self):
+        batch = self._add_polarization(self._batch())
+        model = _PolarizationQuadraticExcessModel(-12.0 * torch.eye(3))
+        common = {
+            "wavevector_indices": ((1, 0, 0), (2, 0, 0)),
+            "variable": "dipole_density",
+            "dipole_magnitude": 1.0,
+            "include_zero_wavevector": False,
+        }
+
+        for treatment, expected_shape in (
+            ("independent", (1, 2, 2)),
+            ("superposition", (1, 1, 1)),
+        ):
+            with self.subTest(wavevector_treatment=treatment):
+                term = FourierStabilityLoss(
+                    wavevector_treatment=treatment,
+                    **common,
+                )
+                with patch(
+                    "equicdft.stability.polarization_fourier_curvature",
+                    wraps=polarization_fourier_curvature,
+                ) as response:
+                    value = term(model(batch), batch, model=model)
+                kwargs = response.call_args.kwargs
+                if treatment == "independent":
+                    self.assertNotIn("wavevector_phases", kwargs)
+                else:
+                    self.assertEqual(
+                        kwargs["wavevector_phases"].shape,
+                        (1, 2),
+                    )
+                curvature, valid = polarization_fourier_curvature(**kwargs)
+                self.assertEqual(curvature.shape, expected_shape)
+                self.assertEqual(valid.shape, expected_shape)
+                self.assertGreater(value.item(), 0.0)
+                value.backward()
+                self.assertTrue(torch.all(torch.isfinite(model.matrix.grad)))
+                model.matrix.grad.zero_()
+
+    def test_superposed_polarization_keeps_zero_wavevector_independent(self):
+        batch = self._add_polarization(self._batch())
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            wavevector_indices=((1, 0, 0), (2, 0, 0)),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            wavevector_treatment="superposition",
+            include_zero_wavevector=True,
+        )
+
+        with patch(
+            "equicdft.stability.polarization_fourier_curvature",
+            wraps=polarization_fourier_curvature,
+        ) as response:
+            term(model(batch), batch, model=model)
+
+        self.assertEqual(response.call_count, 2)
+        superposed, zero = (call.kwargs for call in response.call_args_list)
+        self.assertEqual(superposed["wavevector_phases"].shape, (1, 2))
+        self.assertNotIn("wavevector_phases", zero)
+        self.assertTrue(torch.all(zero["wavevector_indices"] == 0).item())
+
+    def test_polarization_ideal_has_zero_penalty_and_unstable_block_backpropagates(self):
+        batch = self._add_polarization(self._batch())
+        stable = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        common = {
+            "wavevector_indices": ((1, 0, 0),),
+            "variable": "dipole_density",
+            "dipole_magnitude": 1.0,
+            "relative_amplitude": 2.0**-10,
+            "include_zero_wavevector": False,
+        }
+
+        self.assertEqual(
+            FourierStabilityLoss(**common)(stable(batch), batch, model=stable).item(),
+            0.0,
+        )
+
+        # At rho=1/2 and P=0 the ideal Cartesian Hessian is 3/rho=6.
+        # Adding -12 I therefore gives the ideal-metric matrix -I.
+        unstable = _PolarizationQuadraticExcessModel(-12.0 * torch.eye(3))
+        value = FourierStabilityLoss(**common)(
+            unstable(batch), batch, model=unstable
+        )
+        value.backward()
+
+        rho = batch["rho"]
+        polarization = batch["dipole_density"]
+        phase = (
+            2.0
+            * torch.pi
+            * batch["grid_positions"][0, :, 0].to(rho)
+            / 8.0
+        )
+        expected = []
+        for wave in (torch.cos(phase), torch.sin(phase)):
+            delta = torch.zeros_like(polarization)
+            delta[..., 0] = common["relative_amplitude"] * rho * wave[None, :, None]
+            ideal_second = 3.0 * (delta.square() / rho[..., None]).sum()
+            excess_second = -12.0 * delta.square().sum()
+            expected.append((1.0 + excess_second / ideal_second).square())
+        expected = torch.stack(expected).mean()
+        torch.testing.assert_close(value, expected)
+        self.assertTrue(torch.all(torch.isfinite(unstable.matrix.grad)))
+        self.assertGreater(torch.linalg.vector_norm(unstable.matrix.grad).item(), 0.0)
+
+    def test_polarization_result_is_independent_of_species_count(self):
+        batch = self._batch()
+        batch["rho"] = torch.cat((batch["rho"], 0.6 * batch["rho"]), dim=-1)
+        self._add_polarization(batch)
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        modes = torch.tensor([[[1, 0, 0]]])
+
+        curvature, active = polarization_fourier_curvature(
+            model=model,
+            outputs=model(batch),
+            batch=batch,
+            rho=batch["rho"],
+            wavevector_indices=modes,
+            dipole_magnitude=torch.tensor([0.7, 1.3]),
+            relative_amplitude=0.05,
+            polarization_directions=torch.tensor([[0.0, 0.0, 1.0]]),
+        )
+
+        self.assertEqual(curvature.shape, (1, 1, 2))
+        self.assertEqual(active.shape, (1, 1, 2))
+        torch.testing.assert_close(
+            curvature[active],
+            torch.ones_like(curvature[active]),
+            atol=2.0e-11,
+            rtol=2.0e-11,
+        )
+
+    def test_polarization_draws_one_spherical_direction_per_field(self):
+        batch = self._add_polarization(self._batch(n_fields=2))
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        draws = torch.tensor(
+            [[2.0, 0.0, 0.0], [1.0, 2.0, 2.0]],
+            dtype=batch["rho"].dtype,
+        )
+        term = FourierStabilityLoss(
+            wavevector_indices=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            relative_amplitude=0.05,
+            include_zero_wavevector=False,
+        )
+
+        with patch("equicdft.stability.torch.randn", return_value=draws):
+            term(model(batch), batch, model=model)
+
+        first_cosine_plus = model.last_polarization[:, 0, 0, 0]
+        observed = first_cosine_plus / torch.linalg.vector_norm(
+            first_cosine_plus, dim=-1, keepdim=True
+        )
+        expected = draws / torch.linalg.vector_norm(draws, dim=-1, keepdim=True)
+        torch.testing.assert_close(observed, expected)
+
+    def test_polarization_zero_mode_keeps_cosine_and_discards_sine(self):
+        batch = self._add_polarization(self._batch())
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            wavevector_indices=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+        )
+
+        selected = torch.zeros((1, 1, 3), dtype=torch.long)
+        curvature, active = polarization_fourier_curvature(
+            model=model,
+            outputs=model(batch),
+            batch=batch,
+            rho=batch["rho"],
+            wavevector_indices=selected,
+            dipole_magnitude=term.dipole_magnitude,
+            relative_amplitude=0.05,
+            polarization_directions=torch.tensor([[0.0, 1.0, 0.0]]),
+        )
+
+        self.assertTrue(active[:, :, 0].all())
+        self.assertFalse(active[:, :, 1].any())
+        torch.testing.assert_close(curvature[0, 0, 0], curvature.new_tensor(1.0))
+
+        with patch(
+            "equicdft.stability.polarization_fourier_curvature",
+            wraps=polarization_fourier_curvature,
+        ) as response:
+            term(model(batch), batch, model=model)
+        supplied_modes = response.call_args.kwargs["wavevector_indices"]
+        self.assertTrue(torch.equal(supplied_modes[:, 0], selected[:, 0]))
+
+    def test_polarization_stability_does_not_impose_fixed_dipole_boundary(self):
+        batch = self._add_polarization(self._batch())
+        batch["dipole_density"][..., 0] = 1.05 * batch["rho"]
+        model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        term = FourierStabilityLoss(
+            wavevector_indices=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            relative_amplitude=0.1,
+            include_zero_wavevector=False,
+        )
+
+        direction = torch.tensor([[1.0, 0.0, 0.0]], dtype=batch["rho"].dtype)
+        with patch("equicdft.stability.torch.randn", return_value=direction):
+            value = term(model(batch), batch, model=model)
+
+        perturbed_q = model.last_polarization / batch["rho"][:, None, :, :, None]
+        self.assertGreater(
+            torch.linalg.vector_norm(perturbed_q, dim=-1).max().item(),
+            1.0,
+        )
+        self.assertTrue(torch.isfinite(value).item())
+
+    def test_polarization_stability_integrates_with_grid_model(self):
+        batch = self._add_polarization(self._batch())
+        readout = LDAReadout(
+            mean_density=0.5,
+            dipole_density_scale=0.5,
+            hidden_sizes=(),
+        ).to(dtype=torch.float64)
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(
+                torch.tensor([[0.0, -100.0, 0.0]], dtype=torch.float64)
+            )
+            readout.mlp[0].bias.zero_()
+        model = GridCACEModel(
+            a_features=None,
+            b_features=None,
+            readout=[readout],
+            grid_spacing=1.0,
+            mean_temperature=1.0,
+            compute_c1=False,
+        ).to(dtype=torch.float64)
+        term = FourierStabilityLoss(
+            wavevector_indices=((1, 0, 0),),
+            variable="dipole_density",
+            dipole_magnitude=1.0,
+            include_zero_wavevector=False,
+        )
+
+        value = term(model(batch, compute_c1=False), batch, model=model)
+        value.backward()
+
+        self.assertGreater(value.item(), 1.0)
+        self.assertTrue(torch.all(torch.isfinite(readout.mlp[0].weight.grad)))
+        self.assertNotEqual(readout.mlp[0].weight.grad[0, 1].item(), 0.0)
+
     def test_unstable_curvature_is_penalized_and_differentiable(self):
         batch = self._batch()
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
         )
 
@@ -299,7 +583,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         )
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
-        term = FourierStabilityLoss(modes=((1, 0, 0), (2, 0, 0)))
+        term = FourierStabilityLoss(wavevector_indices=((1, 0, 0), (2, 0, 0)))
 
         term(outputs, batch, model=model)
 
@@ -323,7 +607,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(-8.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
         )
 
@@ -341,14 +625,14 @@ class TestFourierStabilityLoss(unittest.TestCase):
         batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
 
         total = FourierStabilityLoss(
-            modes=((1, 0, 0),),
-            mixture_mode="total_density",
-        )._mixture_weights(2, batch["rho"])
+            wavevector_indices=((1, 0, 0),),
+            component_treatment="total_density",
+        )._component_weights(2, batch["rho"])
         charge = FourierStabilityLoss(
-            modes=((1, 0, 0),),
-            mixture_mode="charge",
+            wavevector_indices=((1, 0, 0),),
+            component_treatment="charge",
             charges=(1.0, -1.0),
-        )._mixture_weights(2, batch["rho"])
+        )._component_weights(2, batch["rho"])
 
         self.assertTrue(torch.equal(total, torch.tensor([[1.0, 1.0]])))
         self.assertTrue(torch.equal(charge, torch.tensor([[1.0, -1.0]])))
@@ -360,19 +644,19 @@ class TestFourierStabilityLoss(unittest.TestCase):
         outputs = model(batch)
 
         independent = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
-            mixture_mode="independent",
+            component_treatment="independent",
         )(outputs, batch, model=model)
         total_density = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
-            mixture_mode="total_density",
+            component_treatment="total_density",
         )(outputs, batch, model=model)
         charge = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
-            mixture_mode="charge",
+            component_treatment="charge",
             charges=(1.0, -1.0),
         )(outputs, batch, model=model)
 
@@ -389,26 +673,26 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _CoupledQuadraticExcessModel([[7.2, 3.0], [3.0, -1.2]])
         outputs = model(batch)
         common = {
-            "modes": ((1, 0, 0),),
+            "wavevector_indices": ((1, 0, 0),),
             "relative_amplitude": 2.0**-10,
         }
 
         independent = FourierStabilityLoss(
             **common,
-            mixture_mode="independent",
+            component_treatment="independent",
         )(outputs, batch, model=model)
         total_density = FourierStabilityLoss(
             **common,
-            mixture_mode="total_density",
+            component_treatment="total_density",
         )(outputs, batch, model=model)
         charge = FourierStabilityLoss(
             **common,
-            mixture_mode="charge",
+            component_treatment="charge",
             charges=(1.0, -1.0),
         )(outputs, batch, model=model)
         full_matrix = FourierStabilityLoss(
             **common,
-            mixture_mode="full_matrix",
+            component_treatment="full_matrix",
         )(outputs, batch, model=model)
         full_matrix.backward()
 
@@ -427,8 +711,8 @@ class TestFourierStabilityLoss(unittest.TestCase):
         )
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
-            mixture_mode="full_matrix",
+            wavevector_indices=((1, 0, 0),),
+            component_treatment="full_matrix",
         )
 
         term(model(batch), batch, model=model)
@@ -449,15 +733,15 @@ class TestFourierStabilityLoss(unittest.TestCase):
         batch["rho"] = torch.cat((batch["rho"], 0.5 * batch["rho"]), dim=-1)
         reference_sum = batch["rho"].sum(dim=-2)
 
-        for mixture_mode, charges in (
+        for component_treatment, charges in (
             ("total_density", None),
             ("charge", (2.0, -1.0)),
         ):
-            with self.subTest(mixture_mode=mixture_mode):
+            with self.subTest(component_treatment=component_treatment):
                 model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
                 term = FourierStabilityLoss(
-                    modes=((1, 0, 0),),
-                    mixture_mode=mixture_mode,
+                    wavevector_indices=((1, 0, 0),),
+                    component_treatment=component_treatment,
                     charges=charges,
                 )
                 term(model(batch), batch, model=model)
@@ -497,7 +781,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         ).to(dtype=torch.float64)
         outputs = model(batch, compute_c1=False)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
         )
 
@@ -532,9 +816,9 @@ class TestFourierStabilityLoss(unittest.TestCase):
             free_energy_mode="beta",
         ).to(dtype=torch.float64)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
-            mixture_mode="full_matrix",
+            component_treatment="full_matrix",
         )
 
         value = term(model(batch, compute_c1=False), batch, model=model)
@@ -555,7 +839,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             relative_amplitude=0.01,
         )
 
@@ -568,7 +852,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
         loss = Loss(
-            [FourierStabilityLoss(modes=((1, 0, 0),), weight=2.0)]
+            [FourierStabilityLoss(wavevector_indices=((1, 0, 0),), weight=2.0)]
         )
 
         values = loss(outputs, batch, model=model)
@@ -584,14 +868,14 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(0.0)
         outputs = model(batch)
 
-        value = FourierStabilityLoss(((4, 0, 0),))(
+        value = FourierStabilityLoss(wavevector_indices=((4, 0, 0),))(
             outputs,
             batch,
             model=model,
         )
         self.assertEqual(value.item(), 0.0)
         with self.assertRaisesRegex(ValueError, "Nyquist sphere"):
-            FourierStabilityLoss(((8, 0, 0),))(
+            FourierStabilityLoss(wavevector_indices=((8, 0, 0),))(
                 outputs,
                 batch,
                 model=model,
@@ -614,10 +898,10 @@ class TestFourierStabilityLoss(unittest.TestCase):
             "grid_size": torch.tensor([[n_grid] * 3] * 2),
             "grid_positions": positions[None].expand(2, -1, -1),
         }
-        term = FourierStabilityLoss(random_modes_per_field=3)
+        term = FourierStabilityLoss(random_wavevectors_per_field=3)
         torch.manual_seed(11)
 
-        modes = term._select_modes(batch, batch["rho"])
+        modes = term._select_wavevector_indices(batch, batch["rho"])
 
         self.assertEqual(modes.shape, (2, 3, 3))
         scaled_squared_norm = torch.sum(
@@ -647,12 +931,12 @@ class TestFourierStabilityLoss(unittest.TestCase):
             "grid_positions": positions[None].expand(2, -1, -1),
         }
         term = FourierStabilityLoss(
-            random_modes_per_field=3,
+            random_wavevectors_per_field=3,
             wavevector_range=(1.5, 1.6),
         )
         torch.manual_seed(11)
 
-        modes = term._select_modes(batch, batch["rho"])
+        modes = term._select_wavevector_indices(batch, batch["rho"])
         wavevectors = 2.0 * torch.pi * modes.to(torch.float32) / n_grid
         magnitudes = torch.linalg.vector_norm(wavevectors, dim=-1)
 
@@ -661,7 +945,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         self.assertTrue(torch.all(magnitudes <= 1.6).item())
 
     def test_anisotropic_spacing_uses_physical_nyquist_sphere(self):
-        modes = set(_feasible_modes((8, 8, 8), (0.5, 1.0, 1.0)))
+        modes = set(_feasible_wavevector_indices((8, 8, 8), (0.5, 1.0, 1.0)))
 
         # The x direction has a larger axis-specific Nyquist limit, but the
         # isotropically complete sphere is limited by y and z to k <= pi.
@@ -688,7 +972,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(-4.0).to(dtype=torch.float64)
         outputs = model(batch)
         term = FourierStabilityLoss(
-            modes=((1, 0, 0),),
+            wavevector_indices=((1, 0, 0),),
             training_only=True,
         ).eval()
 
@@ -697,18 +981,60 @@ class TestFourierStabilityLoss(unittest.TestCase):
         self.assertEqual(value.item(), 0.0)
 
     def test_configuration_and_scope_are_validated(self):
-        for modes in ((), ((0, 0, 0),), ((1.5, 0, 0),)):
-            with self.subTest(modes=modes):
-                with self.assertRaises(ValueError):
-                    FourierStabilityLoss(modes=modes)
-        with self.assertRaisesRegex(ValueError, "relative_amplitude"):
-            FourierStabilityLoss(((1, 0, 0),), relative_amplitude=1.0)
-        with self.assertRaisesRegex(ValueError, "random_modes_per_field"):
-            FourierStabilityLoss(random_modes_per_field=0)
-        with self.assertRaisesRegex(ValueError, "must be zero"):
+        with self.assertRaisesRegex(TypeError, "positional"):
+            FourierStabilityLoss(((1, 0, 0),))
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            FourierStabilityLoss()
+        with self.assertRaisesRegex(ValueError, "variable"):
+            FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="unknown")
+        with self.assertRaisesRegex(ValueError, "dipole_magnitude is required"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                random_modes_per_field=1,
+                wavevector_indices=((1, 0, 0),),
+                variable="dipole_density",
+            )
+        with self.assertRaisesRegex(ValueError, "requires variable"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                dipole_magnitude=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "zero wavevector"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                include_zero_wavevector=True,
+            )
+        for invalid_treatment in ("", "unknown"):
+            with self.assertRaisesRegex(ValueError, "wavevector_treatment"):
+                FourierStabilityLoss(
+                    wavevector_indices=((1, 0, 0),),
+                    wavevector_treatment=invalid_treatment,
+                )
+        with self.assertRaisesRegex(TypeError, "wavevector_treatment"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                wavevector_treatment=1,
+            )
+        with self.assertRaisesRegex(ValueError, "requires component_treatment='independent'"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                variable="dipole_density",
+                dipole_magnitude=1.0,
+                component_treatment="full_matrix",
+            )
+        for modes in ((), ((0, 0, 0),), ((1.5, 0, 0),)):
+            with self.subTest(wavevector_indices=modes):
+                with self.assertRaises(ValueError):
+                    FourierStabilityLoss(wavevector_indices=modes)
+        with self.assertRaisesRegex(ValueError, "relative_amplitude"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                relative_amplitude=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "random_wavevectors_per_field"):
+            FourierStabilityLoss(random_wavevectors_per_field=0)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            FourierStabilityLoss(
+                wavevector_indices=((1, 0, 0),),
+                random_wavevectors_per_field=1,
             )
         for wavevector_range in (
             1.0,
@@ -723,54 +1049,54 @@ class TestFourierStabilityLoss(unittest.TestCase):
             with self.subTest(wavevector_range=wavevector_range):
                 with self.assertRaisesRegex(ValueError, "wavevector_range"):
                     FourierStabilityLoss(
-                        random_modes_per_field=1,
+                        random_wavevectors_per_field=1,
                         wavevector_range=wavevector_range,
                     )
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
+                wavevector_indices=((1, 0, 0),),
                 wavevector_range=(0.5, 1.5),
             )
         with self.assertRaisesRegex(ValueError, "wavevector_range"):
             term = FourierStabilityLoss(
-                random_modes_per_field=1,
+                random_wavevectors_per_field=1,
                 wavevector_range=(0.1, 0.2),
             )
             batch = self._batch()
-            term._select_modes(batch, batch["rho"])
+            term._select_wavevector_indices(batch, batch["rho"])
 
-        with self.assertRaisesRegex(ValueError, "mixture_mode"):
+        with self.assertRaisesRegex(ValueError, "component_treatment"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="unknown",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="unknown",
             )
         with self.assertRaisesRegex(ValueError, "required"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="charge",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="charge",
             )
         with self.assertRaisesRegex(ValueError, "require charge"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="total_density",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="total_density",
                 charges=(1.0,),
             )
         with self.assertRaisesRegex(ValueError, "require charge"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="full_matrix",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="full_matrix",
                 charges=(1.0,),
             )
         with self.assertRaisesRegex(ValueError, "perturbations_per_forward"):
             FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="full_matrix",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="full_matrix",
                 perturbations_per_forward=0,
             )
         with self.assertRaisesRegex(ValueError, "one value per density type"):
             term = FourierStabilityLoss(
-                modes=((1, 0, 0),),
-                mixture_mode="charge",
+                wavevector_indices=((1, 0, 0),),
+                component_treatment="charge",
                 charges=(1.0, -1.0),
             )
             batch = self._batch()
@@ -780,29 +1106,29 @@ class TestFourierStabilityLoss(unittest.TestCase):
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
         del batch["grid_size"]
         with self.assertRaisesRegex(KeyError, "grid_size"):
-            FourierStabilityLoss(((1, 0, 0),))(
+            FourierStabilityLoss(wavevector_indices=((1, 0, 0),))(
                 model(batch),
                 batch,
                 model=model,
             )
 
-    def test_explicit_modes_share_canonical_grid_validation(self):
+    def test_explicit_wavevectors_share_canonical_grid_validation(self):
         batch = self._batch()
-        term = FourierStabilityLoss(modes=((-1, 0, 0),))
+        term = FourierStabilityLoss(wavevector_indices=((-1, 0, 0),))
 
-        selected = term._select_modes(batch, batch["rho"])
+        selected = term._select_wavevector_indices(batch, batch["rho"])
 
         self.assertTrue(
             torch.equal(selected, torch.tensor([[[1, 0, 0]]]))
         )
         duplicate = FourierStabilityLoss(
-            modes=((1, 0, 0), (-1, 0, 0))
+            wavevector_indices=((1, 0, 0), (-1, 0, 0))
         )
         with self.assertRaisesRegex(ValueError, "equivalent"):
-            duplicate._select_modes(batch, batch["rho"])
+            duplicate._select_wavevector_indices(batch, batch["rho"])
 
-    def test_mode_selection_validates_complete_grid_geometry(self):
-        term = FourierStabilityLoss(modes=((1, 0, 0),))
+    def test_wavevector_selection_validates_complete_grid_geometry(self):
+        term = FourierStabilityLoss(wavevector_indices=((1, 0, 0),))
         cases = (
             ("grid_size", [[0, 1, 1]], "positive integers"),
             ("grid_size", [[4, 1, 1]], "number of grid points"),
@@ -818,7 +1144,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             batch[key] = torch.tensor(value, dtype=batch[key].dtype)
             with self.subTest(key=key, value=value):
                 with self.assertRaisesRegex(ValueError, message):
-                    term._select_modes(batch, batch["rho"])
+                    term._select_wavevector_indices(batch, batch["rho"])
 
 
 class TestFourierResponseLoss(unittest.TestCase):
@@ -828,7 +1154,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         if n_types == 2:
             batch["rho"] = torch.cat((batch["rho"], batch["rho"]), dim=-1)
         modes = ((1, 0, 0), (2, 0, 0))[:n_modes]
-        batch["fourier_modes"] = torch.tensor([modes])
+        batch["fourier_wavevector_indices"] = torch.tensor([modes])
         return batch
 
     def test_ideal_gas_matches_unit_inverse_response(self):
@@ -917,7 +1243,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         curvature, valid = response(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             directions=torch.tensor(
                 ((1.0, 1.0), (1.0, -1.0)),
                 dtype=torch.float64,
@@ -940,7 +1266,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         matrix, active = response.matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -978,7 +1304,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         ).matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1007,14 +1333,14 @@ class TestFourierResponseLoss(unittest.TestCase):
         curvature, valid = response(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             directions=weights,
             outputs=model(batch),
         )
         matrix, active = response.matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1049,7 +1375,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         matrix, active = response.matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1074,7 +1400,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         ).matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1093,7 +1419,7 @@ class TestFourierResponseLoss(unittest.TestCase):
 
     def test_full_matrix_nyquist_excludes_only_the_aliased_phase(self):
         batch = self._batch(n_types=2, n_modes=1)
-        batch["fourier_modes"] = torch.tensor([[[4, 0, 0]]])
+        batch["fourier_wavevector_indices"] = torch.tensor([[[4, 0, 0]]])
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
 
         matrix, active = FourierResponse(
@@ -1101,7 +1427,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         ).matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1116,7 +1442,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         unchunked = FourierResponse(relative_amplitude=2.0**-10).matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
         chunked = FourierResponse(
@@ -1125,7 +1451,7 @@ class TestFourierResponseLoss(unittest.TestCase):
         ).matrix(
             model=model,
             batch=batch,
-            modes=batch["fourier_modes"],
+            wavevector_indices=batch["fourier_wavevector_indices"],
             outputs=model(batch),
         )
 
@@ -1235,7 +1561,7 @@ class TestFourierResponseLoss(unittest.TestCase):
 
     def test_nyquist_uses_the_single_nonaliased_real_phase(self):
         batch = self._batch(dtype=torch.float64, n_modes=1)
-        batch["fourier_modes"] = torch.tensor([[[4, 0, 0]]])
+        batch["fourier_wavevector_indices"] = torch.tensor([[[4, 0, 0]]])
         batch["fourier_curvature"] = torch.ones((1, 1, 1), dtype=torch.float64)
         model = _QuadraticExcessModel(0.0).to(dtype=torch.float64)
 
@@ -1293,8 +1619,8 @@ class TestFourierResponseLoss(unittest.TestCase):
             term(model(nonuniform), nonuniform, model=model)
 
         zero_mode = {key: value.clone() for key, value in batch.items()}
-        zero_mode["fourier_modes"].zero_()
-        with self.assertRaisesRegex(ValueError, "zero mode"):
+        zero_mode["fourier_wavevector_indices"].zero_()
+        with self.assertRaisesRegex(ValueError, "zero wavevector"):
             term(model(zero_mode), zero_mode, model=model)
 
         for value, message in (
@@ -1304,7 +1630,7 @@ class TestFourierResponseLoss(unittest.TestCase):
             invalid_mode = {
                 key: value.clone() for key, value in batch.items()
             }
-            invalid_mode["fourier_modes"] = torch.tensor(
+            invalid_mode["fourier_wavevector_indices"] = torch.tensor(
                 [[[value, 0.0, 0.0]]], dtype=torch.float64
             )
             with self.subTest(mode=value):

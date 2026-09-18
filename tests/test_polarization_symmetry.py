@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from equicdft import (
-    CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
+    BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
     LocalReadout, LongRangeReadout, ReciprocalFeatures,
 )
 from equicdft.stencil import get_neighbor_indices
@@ -40,7 +40,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         }
 
     @staticmethod
-    def model(backend, charge):
+    def model(backend, charge, message_count=0):
         a = CartesianAFeatures(
             max_power=1, mean_density=.5, dipole_density_scale=.3,
             include_polarization=True, separate_center=True, cutoff_grid=1,
@@ -51,8 +51,12 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             max_power=1, max_product_order=2,
             include_polarization=True, separate_center=True,
         )
+        gaussian_features = ReciprocalFeatures(
+            radial_exponents=(.1, .4), variable="dipole_density",
+            include_divergence=True,
+        )
         readouts = [
-            LocalReadout(n_features=a.n_radial_channels * b.n_features + 1,
+            LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
             LDAReadout(mean_density=.5, dipole_density_scale=.3,
                        hidden_sizes=(5,), zero_init=False),
@@ -64,10 +68,20 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                     radial_exponents=(.15,), kernel="coulomb",
                 ),
             ),
+            LongRangeReadout(
+                hidden_sizes=(5,), zero_init=False,
+                features=gaussian_features,
+            ),
         ]
         return GridCACEModel(
             a, b, readouts, grid_spacing=.7, mean_temperature=1.5,
             compute_c1=True, compute_polarization_derivative=True,
+            message_layers=[BChiMessage(
+                b.n_features, a.n_radial_channels, a.n_output_channels,
+                hidden_sizes=(5,), include_polarization=True,
+                radial_exponents=(.2, .6), trainable_radial_exponents=True,
+                convolution_backend=backend,
+            ) for _ in range(message_count)],
         ).eval()
 
     @staticmethod
@@ -75,7 +89,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         inputs = {key: value.detach().clone() for key, value in data.items()}
         return {key: value.detach() for key, value in model(inputs).items()}
 
-    def test_all_48_actions_with_lda_and_coulomb_on_even_grid(self):
+    def test_all_48_actions_with_lda_coulomb_and_gaussian_on_even_grid(self):
         data = self.data()
         positions = data["grid_positions"].numpy()
         # Guard against accidentally replacing this by a smooth/constant
@@ -96,11 +110,12 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         self.assertEqual(sum(round(np.linalg.det(r)) == 1 for r in actions), 24)
 
         # Neutral dipoles and a mixed charge/dipole source; both SR backends.
-        for backend, charge in itertools.product(("gather", "fft"), (0., .7)):
-            with self.subTest(backend=backend, charge=charge):
-                full = self.model(backend, charge)
+        for backend, charge, messages in itertools.product(("gather", "fft"), (0., .7), (0, 1)):
+            with self.subTest(backend=backend, charge=charge, messages=messages):
+                full = self.model(backend, charge, messages)
                 models = {"complete": full}
-                for index, name in enumerate(("short_range", "LDA", "Coulomb_LR")):
+                branches = ("short_range", "LDA", "Coulomb_LR", "Gaussian_P")
+                for index, name in enumerate(branches):
                     branch = copy.deepcopy(full)
                     branch.readout = torch.nn.ModuleList([branch.readout[index]])
                     models[name] = branch
@@ -111,7 +126,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                              for name, model in models.items()}
                 # Nonzero energies AND vector responses ensure no branch is
                 # silently disabled (in particular, the LDA final layer).
-                for name in ("short_range", "LDA", "Coulomb_LR"):
+                for name in branches:
                     self.assertGreater(reference[name]["beta_F_exc"].abs().item(), 1e-8)
                     self.assertGreater(reference[name]["polarization_derivative"].abs().max().item(), 1e-8)
                 for key in reference["complete"]:

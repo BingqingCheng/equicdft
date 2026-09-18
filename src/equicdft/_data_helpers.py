@@ -150,6 +150,9 @@ def process_atoms(
         grid_center = grid_center[order]
 
     rho = _ordered_optional_field(atoms, data_key["rho"], order, "rho")
+    rho_std = _ordered_optional_field(
+        atoms, data_key["rho_std"], order, "rho_std"
+    )
     excluded_mask = _ordered_optional_excluded_mask(
         atoms,
         data_key["excluded_mask"],
@@ -173,12 +176,21 @@ def process_atoms(
     dipole_density = _ordered_optional_field(
         atoms, data_key["dipole_density"], order, "dipole_density"
     )
-    if dipole_density is not None:
-        if dipole_density.shape != (n_grid, 3 * n_types):
+    dipole_density_std = _ordered_optional_field(
+        atoms, data_key["dipole_density_std"], order, "dipole_density_std"
+    )
+    for name, field in (
+        ("dipole_density", dipole_density),
+        ("dipole_density_std", dipole_density_std),
+    ):
+        if field is not None and field.shape != (n_grid, 3 * n_types):
             raise ValueError(
-                "EXTXYZ dipole_density must have shape [n_grid, 3*n_types]"
+                "EXTXYZ {} must have shape [n_grid, 3*n_types]".format(name)
             )
+    if dipole_density is not None:
         dipole_density = dipole_density.reshape(n_grid, n_types, 3)
+    if dipole_density_std is not None:
+        dipole_density_std = dipole_density_std.reshape(n_grid, n_types, 3)
 
     grid_spacing = _metadata_grid_spacing(
         _required_source_value(
@@ -190,6 +202,21 @@ def process_atoms(
     if grid_center is not None:
         _grid_center_origin(grid_center, grid_positions, grid_spacing)
     if target_grid_spacing is not None:
+        if not np.allclose(
+            _metadata_grid_spacing(target_grid_spacing),
+            grid_spacing,
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        ):
+            for name, field in (
+                ("rho_std", rho_std),
+                ("dipole_density_std", dipole_density_std),
+            ):
+                if field is not None:
+                    raise ValueError(
+                        "{} cannot be coarsened without covariance information; "
+                        "supply fields and uncertainties on the final grid".format(name)
+                    )
         fields_to_coarsen = [
             field for field in (rho, V_ext) if field is not None
         ]
@@ -266,8 +293,10 @@ def process_atoms(
         boltzmann_constant=boltzmann_constant,
         thermal_wavelength=thermal_wavelength,
         rho=rho,
+        rho_std=rho_std,
         V_ext=V_ext,
         dipole_density=dipole_density,
+        dipole_density_std=dipole_density_std,
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
         geometry_cache=geometry_cache,
@@ -294,6 +323,8 @@ def build_grid_data(
     include_local_density_index: bool = True,
     grid_center: Optional[Any] = None,
     dipole_density: Optional[Any] = None,
+    rho_std: Optional[Any] = None,
+    dipole_density_std: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -330,6 +361,11 @@ def build_grid_data(
         n_type_values,
         "V_ext",
     )
+    rho_std_values = _normalize_grid_field(
+        rho_std, n_grid, n_type_values, "rho_std", nonnegative=True
+    )
+    if rho_std_values is not None and rho_values is None:
+        raise ValueError("rho_std requires rho")
     mu_values = _normalize_optional_mu(mu, n_type_values)
     excluded_mask_values = _normalize_excluded_mask(excluded_mask, n_grid)
     if np.all(excluded_mask_values):
@@ -340,6 +376,20 @@ def build_grid_data(
         n_type_values,
         excluded_mask_values,
     )
+    dipole_density_std_values = _normalize_dipole_density(
+        dipole_density_std,
+        n_grid,
+        n_type_values,
+        excluded_mask_values,
+        name="dipole_density_std",
+        nonnegative=True,
+    )
+    if dipole_density_std_values is not None and dipole_density_values is None:
+        raise ValueError("dipole_density_std requires dipole_density")
+    if rho_std_values is not None and np.any(
+        rho_std_values[excluded_mask_values] != 0.0
+    ):
+        raise ValueError("rho_std must be zero at excluded grid points")
     if rho_values is not None and np.any(
         np.abs(rho_values[excluded_mask_values]) > 1.0e-12
     ):
@@ -388,11 +438,15 @@ def build_grid_data(
         data["local_density_index"] = local_density_index
     if rho_values is not None:
         data["rho"] = torch.tensor(rho_values, dtype=dtype)
+    if rho_std_values is not None:
+        data["rho_std"] = torch.tensor(rho_std_values, dtype=dtype)
     if V_ext_values is not None:
         data["V_ext"] = torch.tensor(V_ext_values, dtype=dtype)
     if dipole_density_values is not None:
         # Unlike torch.tensor(...), .to(...) retains a supplied live graph.
         data["dipole_density"] = dipole_density_values.to(dtype=dtype)
+    if dipole_density_std_values is not None:
+        data["dipole_density_std"] = dipole_density_std_values.to(dtype=dtype)
     if wavelength_values is not None:
         data["thermal_wavelength"] = torch.tensor(
             wavelength_values,
@@ -420,6 +474,11 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
         for frame in data:
             if "grid_center" not in frame:
                 frame["grid_center"] = frame["grid_positions"].double() * frame["grid_spacing"].double()
+
+    for name in ("rho_std", "dipole_density_std"):
+        available = [name in frame for frame in data]
+        if any(available) and not all(available):
+            raise ValueError("{} must be present in every frame or none".format(name))
 
     if any("c1_plus_beta_mu" not in frame for frame in data):
         for frame in data:
@@ -672,6 +731,8 @@ def _normalize_dipole_density(
     n_grid: int,
     n_types: int,
     excluded_mask: np.ndarray,
+    name: str = "dipole_density",
+    nonnegative: bool = False,
 ) -> Optional[torch.Tensor]:
     """Validate a signed polar-vector field without detaching tensor inputs."""
 
@@ -680,13 +741,15 @@ def _normalize_dipole_density(
     field = torch.as_tensor(value)
     if field.shape != (n_grid, n_types, 3):
         raise ValueError(
-            "dipole_density must have shape [n_grid, n_types, 3]"
+            "{} must have shape [n_grid, n_types, 3]".format(name)
         )
     if field.is_complex() or not torch.all(torch.isfinite(field)).item():
-        raise ValueError("dipole_density must contain only finite real values")
+        raise ValueError("{} must contain only finite real values".format(name))
+    if nonnegative and torch.any(field < 0.0).item():
+        raise ValueError("{} must contain only nonnegative values".format(name))
     mask = torch.as_tensor(excluded_mask, device=field.device)
     if torch.any(field[mask] != 0.0).item():
-        raise ValueError("dipole_density must be zero at excluded grid points")
+        raise ValueError("{} must be zero at excluded grid points".format(name))
     return field
 
 

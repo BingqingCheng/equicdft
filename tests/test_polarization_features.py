@@ -245,7 +245,7 @@ class TestPolarizationFeatures(unittest.TestCase):
                       CartesianBFeatures(1, 3, include_polarization=True, separate_center=False)):
             with self.assertRaisesRegex(ValueError, "A/B"):
                 GridCACEModel(a, wrong, [LocalReadout()], grid_spacing=.5)
-        with self.assertRaisesRegex(ValueError, "polarized Cartesian moments"):
+        with self.assertRaisesRegex(ValueError, "include_polarization must match"):
             GridCACEModel(a, b, [LocalReadout()], grid_spacing=.5,
                           message_layers=[BChiMessage(b.n_features, 2, 1)])
         data, _ = periodic_field()

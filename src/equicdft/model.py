@@ -111,11 +111,9 @@ class GridCACEModel(nn.Module):
             raise ValueError(
                 "a_features and b_features are required by message_layers"
             )
-        if messages and not getattr(a_features, "supports_message_layers", True):
-            raise ValueError(
-                "message_layers do not yet support polarized Cartesian moments"
-            )
         for module in messages:
+            if module.include_polarization != getattr(a_features, "include_polarization", False):
+                raise ValueError("message layers and A/B include_polarization must match")
             expected = (
                 a_features.n_radial_channels,
                 b_features.n_features,
@@ -472,6 +470,13 @@ class GridCACEModel(nn.Module):
         messages = getattr(self, "message_layers", ())
         if messages:
             shared_basis = self.a_features.stencil_basis()
+            message_fields = {}
+            if getattr(self.a_features, "include_polarization", False):
+                fields, scales = self.a_features._polarization_fields(data)
+                message_fields = {
+                    "normalized_fields": fields / scales,
+                    "separate_center": self.a_features.separate_center,
+                }
             for message in messages:
                 stencil_basis = message._stencil_basis(
                     self.a_features,
@@ -484,6 +489,7 @@ class GridCACEModel(nn.Module):
                     grid_positions=data.get("grid_positions"),
                     grid_size=data.get("grid_size"),
                     stencil_positions=self.a_features.local_density_positions,
+                    **message_fields,
                 )
                 B = self.b_features(A)
                 levels.append(B.flatten(start_dim=-feature_axes))
