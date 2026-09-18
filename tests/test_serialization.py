@@ -26,18 +26,18 @@ from equicdft.serialization import (
     validate_model_payload,
 )
 
-from tests.test_config import (
-    _bessel_message_model,
-    _example_model,
-    _gaussian_message_model,
-    _grid_data,
+from tests.model_fixtures import (
+    bessel_message_model,
+    example_model,
+    gaussian_message_model,
+    grid_data,
 )
 
 
 def _materialized_example():
     torch.manual_seed(11)
-    model = _example_model()
-    data = _grid_data(cutoff_grid=1)
+    model = example_model()
+    data = grid_data(cutoff_grid=1)
     model(copy.deepcopy(data))
     model.eval()
     return model, data
@@ -77,10 +77,10 @@ class TestModelPayload(unittest.TestCase):
 
     def test_model_dtype_is_read_from_state_not_global_default(self):
         with default_dtype(torch.float64):
-            model = _example_model()
+            model = example_model()
             data = {
                 key: value.double() if value.is_floating_point() else value
-                for key, value in _grid_data(cutoff_grid=1).items()
+                for key, value in grid_data(cutoff_grid=1).items()
             }
             model(data)
         self.assertEqual(model_dtype(model), torch.float64)
@@ -90,7 +90,7 @@ class TestModelPayload(unittest.TestCase):
             model_dtype(model)
 
     def test_lazy_models_must_see_a_batch_before_saving(self):
-        model = _example_model()
+        model = example_model()
         with self.assertRaisesRegex(ValueError, "uninitialized lazy"):
             model_payload(model)
 
@@ -146,8 +146,8 @@ class TestSaveLoadModel(unittest.TestCase):
     def test_float64_models_are_rebuilt_under_their_dtype(self):
         with default_dtype(torch.float64):
             torch.manual_seed(12)
-            model = _bessel_message_model()
-            data = _grid_data(shape=(7, 7, 7), cutoff_grid=2)
+            model = bessel_message_model()
+            data = grid_data(shape=(7, 7, 7), cutoff_grid=2)
             model(copy.deepcopy(data))
             model.eval()
             expected = model(copy.deepcopy(data))
@@ -163,8 +163,8 @@ class TestSaveLoadModel(unittest.TestCase):
 
     def test_message_model_round_trip(self):
         torch.manual_seed(13)
-        model = _gaussian_message_model("gaussian", backend="fft")
-        data = _grid_data(cutoff_grid=1, n_types=2, grid_spacing=0.5)
+        model = gaussian_message_model("gaussian", backend="fft")
+        data = grid_data(cutoff_grid=1, n_types=2, grid_spacing=0.5)
         model(copy.deepcopy(data))
         model.eval()
         expected = model(copy.deepcopy(data))

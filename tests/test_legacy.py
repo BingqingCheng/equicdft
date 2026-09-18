@@ -28,12 +28,12 @@ from equicdft.legacy import (
     verify_equivalent,
 )
 
-from tests.test_config import (
-    _bessel_message_model,
-    _example_model,
-    _gaussian_message_model,
-    _grid_data,
-    _long_range_model,
+from tests.model_fixtures import (
+    bessel_message_model,
+    example_model,
+    gaussian_message_model,
+    grid_data,
+    long_range_model,
 )
 
 
@@ -181,8 +181,8 @@ class TestLegacyConversion(unittest.TestCase):
 
     def test_current_whole_object_file_is_converted(self):
         torch.manual_seed(21)
-        model = _example_model()
-        data = _grid_data(cutoff_grid=1)
+        model = example_model()
+        data = grid_data(cutoff_grid=1)
         model(copy.deepcopy(data))
         model.eval()
         with tempfile.TemporaryDirectory() as directory:
@@ -193,8 +193,8 @@ class TestLegacyConversion(unittest.TestCase):
         for separate_center in (True, False):
             with self.subTest(separate_center=separate_center):
                 torch.manual_seed(22)
-                model = _example_model(separate_center=separate_center)
-                data = _grid_data(cutoff_grid=1)
+                model = example_model(separate_center=separate_center)
+                data = grid_data(cutoff_grid=1)
                 model(copy.deepcopy(data))
                 model.eval()
                 reference = copy.deepcopy(model)
@@ -221,8 +221,8 @@ class TestLegacyConversion(unittest.TestCase):
 
     def test_gaussian_layout_with_channel_mixing_module_is_upgraded(self):
         torch.manual_seed(23)
-        model = _gaussian_message_model("gaussian", radial_transform=False)
-        data = _grid_data(cutoff_grid=1, n_types=2, grid_spacing=0.5)
+        model = gaussian_message_model("gaussian", radial_transform=False)
+        data = grid_data(cutoff_grid=1, n_types=2, grid_spacing=0.5)
         model(copy.deepcopy(data))
         model.eval()
         reference = copy.deepcopy(model)
@@ -246,10 +246,10 @@ class TestLegacyConversion(unittest.TestCase):
     def test_bessel_and_long_range_models_convert(self):
         torch.manual_seed(24)
         cases = (
-            (_bessel_message_model(), _grid_data(shape=(7, 7, 7), cutoff_grid=2)),
+            (bessel_message_model(), grid_data(shape=(7, 7, 7), cutoff_grid=2)),
             (
-                _long_range_model((1.0, -1.0), None),
-                _grid_data(shape=(6, 6, 6), n_types=2, grid_spacing=0.5),
+                long_range_model((1.0, -1.0), None),
+                grid_data(shape=(6, 6, 6), n_types=2, grid_spacing=0.5),
             ),
         )
         for model, data in cases:
@@ -261,8 +261,8 @@ class TestLegacyConversion(unittest.TestCase):
                     self.assert_converted_matches(model, data, legacy_file)
 
     def test_upgrade_is_idempotent_on_current_objects(self):
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         before = {key: value.clone() for key, value in model.state_dict().items()}
         upgrade_legacy_model(model)
         after = model.state_dict()
@@ -271,8 +271,8 @@ class TestLegacyConversion(unittest.TestCase):
             self.assertTrue(torch.equal(before[key], after[key]))
 
     def test_conversion_rejects_changed_state(self):
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         model.eval()
         broken = copy.deepcopy(model)
         # Corrupt a deterministic buffer so it no longer matches the value
@@ -284,8 +284,8 @@ class TestLegacyConversion(unittest.TestCase):
 
     def test_verify_equivalent_detects_differences(self):
         torch.manual_seed(25)
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         model.eval()
         other = copy.deepcopy(model)
         with torch.no_grad():
@@ -304,8 +304,8 @@ class TestLegacyConversion(unittest.TestCase):
                 load_legacy_model(Path(directory) / "absent.pt")
 
     def test_destination_is_protected_unless_overwrite(self):
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         with tempfile.TemporaryDirectory() as directory:
             legacy_file = _whole_object_file(model, directory)
             destination = Path(directory) / "taken.pt"
@@ -316,16 +316,16 @@ class TestLegacyConversion(unittest.TestCase):
             load_model(destination)
 
     def test_in_place_conversion_replaces_the_legacy_file(self):
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         with tempfile.TemporaryDirectory() as directory:
             legacy_file = _whole_object_file(model, directory)
             convert_legacy_model(legacy_file)
             self.assertEqual(read_model_config(legacy_file)["type"], "GridCACEModel")
 
     def test_command_line_conversion(self):
-        model = _example_model()
-        model(copy.deepcopy(_grid_data()))
+        model = example_model()
+        model(copy.deepcopy(grid_data()))
         with tempfile.TemporaryDirectory() as directory:
             legacy_file = _whole_object_file(model, directory)
             destination = Path(directory) / "cli.pt"
