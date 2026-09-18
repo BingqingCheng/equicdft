@@ -13,8 +13,10 @@ target.
 ## Compatibility principles
 
 - Omitting every option described here retains the existing model paths.
-- Existing models without message passing, density transformation, radial
-  transforms, or Fourier losses load without an external migration helper.
+- Models saved with `save_model` record every option in their configuration
+  and load unchanged; whole-object `torch.save(model)` files from before that
+  format are converted once with `python -m equicdft.convert`, which fills
+  in the defaults such files implied and verifies the result.
 - Optional energies are summed before functional differentiation.
 - Radial transforms act before invariant products; density transforms act
   before neighborhood gathering and Cartesian moments.
