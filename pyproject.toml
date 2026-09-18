@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "equicdft"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Equivariant learning of classical density functionals"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -16,3 +16,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "equicdft._version.__version__"}
