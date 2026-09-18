@@ -1148,5 +1148,3 @@ class Trainer(nn.Module):
         """Return the next positive training epoch after optional epoch 0."""
 
         return self.history[-1]["epoch"] + 1 if self.history else 1
-
-    _format_record = staticmethod(format_record)

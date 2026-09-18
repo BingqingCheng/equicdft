@@ -20,6 +20,8 @@ class _DensityFeatures(nn.Module):
         super().__init__()
         self.cutoff_grid = 0
         self.n_types = 1
+        self.separate_center = False
+        self.convolution_backend = "gather"
         self.register_buffer("mean_density", torch.tensor(1.0))
 
     def forward(self, data):

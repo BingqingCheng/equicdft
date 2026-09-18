@@ -318,7 +318,7 @@ class GridCACEModel(nn.Module, Configurable):
     def has_local_features(self) -> bool:
         """Whether local invariant environment features are configured."""
 
-        return getattr(self, "a_features", None) is not None
+        return self.a_features is not None
 
     @property
     def requires_local_density_index(self) -> bool:
@@ -326,14 +326,11 @@ class GridCACEModel(nn.Module, Configurable):
 
         if not self.has_local_features:
             return False
-        if (
-            getattr(self.a_features, "convolution_backend", "gather")
-            == "gather"
-        ):
+        if self.a_features.convolution_backend == "gather":
             return True
         return any(
-            getattr(message, "convolution_backend", "gather") == "gather"
-            for message in getattr(self, "message_layers", ())
+            message.convolution_backend == "gather"
+            for message in self.message_layers
         )
 
     @property
@@ -454,12 +451,9 @@ class GridCACEModel(nn.Module, Configurable):
         B = self.b_features(A)
         levels = [B.flatten(start_dim=-3)]
 
-        # getattr keeps full-model checkpoints saved before message passing
-        # loadable as ordinary zero-message models.
-        messages = getattr(self, "message_layers", ())
-        if messages:
+        if len(self.message_layers) > 0:
             shared_basis = self.a_features.stencil_basis()
-            for message in messages:
+            for message in self.message_layers:
                 stencil_basis = message._stencil_basis(
                     self.a_features,
                     shared_basis,
@@ -532,7 +526,7 @@ class GridCACEModel(nn.Module, Configurable):
                     ..., None, None
                 ].expand(*B_flat.shape[:-1], 1)
                 feature_blocks = []
-                if getattr(self.a_features, "separate_center", False):
+                if self.a_features.separate_center:
                     feature_blocks.append(
                         self.a_features.transform_density(rho)
                         / self.mean_density.to(
@@ -599,9 +593,7 @@ class GridCACEModel(nn.Module, Configurable):
             for energy in readout_energies[1:]:
                 readout_energy = readout_energy + energy
 
-            # getattr preserves full-model checkpoints saved before the mode
-            # flag existed; their readouts used the beta-F convention.
-            if getattr(self, "free_energy_mode", "beta") == "physical":
+            if self.free_energy_mode == "physical":
                 # The network represents F_exc / (k_B*T_ref). Therefore
                 # beta*F_exc = readout_energy * T_ref/T. This explicit known
                 # factor leaves the model to learn the physical free energy's

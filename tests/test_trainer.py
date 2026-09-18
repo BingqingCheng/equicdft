@@ -21,6 +21,7 @@ from equicdft import (
     make_dataloaders,
 )
 from equicdft._grid import voxel_volume
+from equicdft._trainer_io import format_record
 
 
 class _LinearDictionaryModel(nn.Module):
@@ -1003,7 +1004,7 @@ class TestTrainer(unittest.TestCase):
             },
         }
 
-        summary = Trainer._format_record(record)
+        summary = format_record(record)
 
         self.assertIn("Epoch   10 | learning rate 1.000e-04", summary)
         self.assertIn("Losses", summary)

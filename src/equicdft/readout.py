@@ -364,15 +364,14 @@ class LongRangeReadout(EnergyReadout, Configurable):
                 "state_features must end with normalized temperature and "
                 "one mean density per type"
             )
-        charges = getattr(self, "charges", None)
-        if charges is None:
+        if self.charges is None:
             return self.mlp(state_features).reshape(
                 *state_features.shape[:-1],
                 self.n_kernels,
                 self.n_type_pairs,
             )
 
-        amplitude = getattr(self, "coulomb_amplitude", None)
+        amplitude = self.coulomb_amplitude
         if amplitude is None:
             amplitude = self.mlp(state_features).reshape(
                 *state_features.shape[:-1],

@@ -14,6 +14,7 @@ from equicdft import (
     GridCACEModel,
     LocalReadout,
 )
+from equicdft.legacy import upgrade_legacy_model
 from equicdft.stencil import get_neighbor_indices
 
 
@@ -74,7 +75,11 @@ class TestCartesianAFeatures(unittest.TestCase):
             "local_density_index": torch.arange(7).repeat(7, 1),
         }
         expected = gather(data)
+        # Objects saved before the option existed are restored by the legacy
+        # upgrade to the explicit-neighborhood backend they used.
         del gather.convolution_backend
+        upgrade_legacy_model(gather)
+        self.assertEqual(gather.convolution_backend, "gather")
         self.assertTrue(torch.equal(gather(data), expected))
 
     def test_gather_backend_requires_explicit_neighborhood_index(self):
@@ -785,7 +790,10 @@ class TestCartesianAFeatures(unittest.TestCase):
         )
         expected = module.stencil_basis()
 
+        # Zero-centered Gaussian objects predate the centers buffer.
         del module._buffers["fixed_radial_centers"]
+        module._non_persistent_buffers_set.discard("fixed_radial_centers")
+        upgrade_legacy_model(module)
 
         self.assertTrue(torch.equal(module.radial_centers, torch.zeros(1)))
         self.assertTrue(torch.equal(module.stencil_basis(), expected))
@@ -855,9 +863,13 @@ class TestCartesianAFeatures(unittest.TestCase):
         expected = module(data)
 
         # Mimic an older torch.save(model) object, which has neither the flag
-        # nor its deterministic center mask.
+        # nor its deterministic center mask; the legacy upgrade restores both
+        # with the values such objects implied.
         del module.separate_center
         del module._buffers["neighbor_mask"]
+        module._non_persistent_buffers_set.discard("neighbor_mask")
+        upgrade_legacy_model(module)
+        self.assertFalse(module.separate_center)
         actual = module(data)
         self.assertTrue(torch.allclose(actual, expected))
 
@@ -1376,7 +1388,10 @@ class TestCartesianAFeatureBesselBasis(unittest.TestCase):
 
         del module.n_radial_functions
         del module.radial_transform
+        upgrade_legacy_model(module)
 
+        self.assertIsNone(module.radial_transform)
+        self.assertEqual(module.n_radial_functions, 1)
         self.assertTrue(torch.equal(module.stencil_basis(), expected))
 
     def test_bessel_arguments_are_validated(self):

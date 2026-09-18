@@ -12,6 +12,7 @@ from equicdft import (
     GridCACEModel,
     LocalReadout,
 )
+from equicdft.legacy import upgrade_legacy_model
 from equicdft.stencil import get_neighbor_indices
 
 
@@ -557,15 +558,22 @@ class TestBChiMessage(unittest.TestCase):
                 )
                 expected = model(data)["beta_F_exc"].detach().clone()
 
+                # Early message objects recorded only whether they owned a
+                # Gaussian basis and predate the execution-backend option.
                 del message.radial_basis
                 del message.convolution_backend
+                message.independent_radial_basis = exponents is not None
                 serialized = io.BytesIO()
                 torch.save(model, serialized)
                 serialized.seek(0)
-                restored = _load_whole_model(serialized)
+                restored = upgrade_legacy_model(_load_whole_model(serialized))
                 self.assertEqual(
                     restored.message_layers[0].convolution_backend,
                     "gather",
+                )
+                self.assertEqual(
+                    restored.message_layers[0].radial_basis,
+                    "shared" if exponents is None else "gaussian",
                 )
                 actual = restored(data)["beta_F_exc"]
 
@@ -1096,14 +1104,18 @@ class TestMessagePassingModel(unittest.TestCase):
                 message_layers=messages,
             )
 
+        # Objects saved before the backend option existed used gathering;
+        # the legacy upgrade makes that explicit again.
         legacy_features = make_fft_model(with_message=False)
         self.assertFalse(legacy_features.requires_local_density_index)
         del legacy_features.a_features.convolution_backend
+        upgrade_legacy_model(legacy_features)
         self.assertTrue(legacy_features.requires_local_density_index)
 
         legacy_message = make_fft_model(with_message=True)
         self.assertFalse(legacy_message.requires_local_density_index)
         del legacy_message.message_layers[0].convolution_backend
+        upgrade_legacy_model(legacy_message)
         self.assertTrue(legacy_message.requires_local_density_index)
 
     def test_convolution_matches_gather_energy_c1_c2_and_gradients(self):

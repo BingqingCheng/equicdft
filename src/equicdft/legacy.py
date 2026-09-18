@@ -193,10 +193,11 @@ def _upgrade_cartesian_a_features(module: CartesianAFeatures) -> None:
             module.squared_distances.new_zeros(1),
         )
     if (
-        module.radial_basis == "gaussian"
+        module.radial_basis != "bessel"
         and not module.trainable_radial_centers
         and not _has_buffer(module, "fixed_radial_centers")
     ):
+        # Zero-centered Gaussians (and the undamped basis) predate centers.
         module.register_buffer(
             "fixed_radial_centers",
             torch.zeros_like(module.radial_exponents),
@@ -258,8 +259,12 @@ def _upgrade_message(module: BChiMessage) -> None:
     _set_default(module, "trainable_radial_exponents", False)
     _set_default(module, "trainable_radial_centers", False)
     if "radial_basis" not in module.__dict__:
-        independent = module.__dict__.get("independent_radial_basis", False)
+        # Early message layers recorded only whether they owned a Gaussian
+        # basis; Bessel layers always carried radial_basis explicitly.
+        independent = module.__dict__.pop("independent_radial_basis", False)
         module.radial_basis = "gaussian" if independent else "shared"
+    else:
+        module.__dict__.pop("independent_radial_basis", None)
     if (
         module.radial_basis == "gaussian"
         and not module.trainable_radial_centers
@@ -270,6 +275,12 @@ def _upgrade_message(module: BChiMessage) -> None:
             torch.zeros_like(module.radial_exponents),
             persistent=False,
         )
+    # Bessel binding slots exist on every current layer; unbound is None.
+    _set_default(module, "radial_transform", None)
+    for name in ("fixed_bessel_stencil_basis", "bessel_gram_eigenvalues"):
+        if not _defines(module, name):
+            module.register_buffer(name, None)
+    _set_default(module, "_bessel_geometry_signature", None)
     _set_default(module, "hidden_sizes", tuple(mlp_hidden_sizes(module.mlp)))
 
 

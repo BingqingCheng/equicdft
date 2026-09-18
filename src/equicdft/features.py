@@ -13,10 +13,7 @@ from ._argument_checks import (
 )
 from ._config import Configurable, make_config, register, scalar_value
 from ._grid import gather_neighbors, periodic_density_convolution
-# These imports also retain the historical package-internal access points in
-# this module while their implementations live with the radial helpers.
 from ._radial import (
-    DEFAULT_RADIAL_EXPONENTS,  # noqa: F401
     _RadialTransform,
     _cartesian_stencil_basis,
     _conditioned_bessel_stencil_basis,
@@ -173,10 +170,6 @@ class CartesianAFeatures(nn.Module, Configurable):
     once using the same canonical ordering as ``GridData`` and registered as
     buffers, so they follow the module across devices without being optimized.
     """
-
-    # Older whole-model objects have no execution-backend attribute. A class
-    # default preserves their original explicit-neighborhood behavior.
-    convolution_backend: str = "gather"
 
     def __init__(
         self,
@@ -398,7 +391,9 @@ class CartesianAFeatures(nn.Module, Configurable):
                 self.learned_radial_centers = nn.Parameter(
                     initial_radial_centers
                 )
-            elif radial_basis == "gaussian":
+            else:
+                # Fixed centers are deterministic constructor input, not
+                # fitted state, so they stay out of the state_dict.
                 self.register_buffer(
                     "fixed_radial_centers",
                     initial_radial_centers,
@@ -456,8 +451,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         self.register_buffer("powers", powers)
         self.register_buffer("monomial_values", monomial_values)
         self.register_buffer("mean_density", mean_density_tensor)
-        # This deterministic constructor product is not fitted state. Keeping
-        # it out of state_dict lets older checkpoints load strictly.
+        # This deterministic constructor product is not fitted state.
         self.register_buffer("neighbor_mask", neighbor_mask, persistent=False)
 
     def to_config(self) -> Dict[str, Any]:
@@ -512,37 +506,28 @@ class CartesianAFeatures(nn.Module, Configurable):
     def radial_exponents(self) -> torch.Tensor:
         """Gaussian damping coefficients for all primitive channels.
 
-        The zero fallback keeps the retained undamped regression example
-        loadable; its checkpoint predates explicit radial-basis attributes.
+        The ``"none"`` basis reports its single fixed zero exponent.
         """
 
-        if getattr(self, "radial_basis", "none") == "bessel":
+        if self.radial_basis == "bessel":
             raise RuntimeError(
                 "radial_exponents are unavailable for the Bessel basis"
             )
-        if getattr(self, "trainable_radial_exponents", False):
+        if self.trainable_radial_exponents:
             return torch.exp(self.log_radial_exponents)
-        stored = self._buffers.get("fixed_radial_exponents")
-        if stored is not None:
-            return stored
-        if getattr(self, "radial_basis", "none") == "none":
-            return self.squared_distances.new_zeros(1)
-        raise RuntimeError("this Gaussian radial checkpoint is incompatible")
+        return self.fixed_radial_exponents
 
     @property
     def radial_centers(self) -> torch.Tensor:
-        """Gaussian centers, with a zero fallback for older checkpoints."""
+        """Gaussian centers in grid units; zero for the ``"none"`` basis."""
 
-        if getattr(self, "radial_basis", "none") == "bessel":
+        if self.radial_basis == "bessel":
             raise RuntimeError(
                 "radial_centers are unavailable for the Bessel basis"
             )
-        if getattr(self, "trainable_radial_centers", False):
+        if self.trainable_radial_centers:
             return self.learned_radial_centers
-        stored = self._buffers.get("fixed_radial_centers")
-        if stored is not None:
-            return stored
-        return torch.zeros_like(self.radial_exponents)
+        return self.fixed_radial_centers
 
     def stencil_basis(
         self,
@@ -560,7 +545,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         """
 
         if radial_centers is not None and radial_exponents is None:
-            if getattr(self, "radial_basis", "none") == "bessel":
+            if self.radial_basis == "bessel":
                 raise ValueError(
                     "radial_centers require explicit Gaussian "
                     "radial_exponents"
@@ -569,7 +554,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         independent_gaussian = radial_exponents is not None
         if independent_gaussian:
             if radial_centers is None:
-                if getattr(self, "radial_basis", "none") == "bessel":
+                if self.radial_basis == "bessel":
                     radial_centers = torch.zeros_like(radial_exponents)
                 else:
                     radial_centers = self.radial_centers
@@ -585,7 +570,7 @@ class CartesianAFeatures(nn.Module, Configurable):
                 self.stencil_neighbor_mask(),
             )
 
-        if getattr(self, "radial_basis", "none") == "bessel":
+        if self.radial_basis == "bessel":
             basis = self.fixed_bessel_stencil_basis
         else:
             basis = _cartesian_stencil_basis(
@@ -596,12 +581,8 @@ class CartesianAFeatures(nn.Module, Configurable):
                 self.stencil_neighbor_mask(),
             )
 
-        # Older whole-model objects have no radial_transform entry. The
-        # established Gaussian/none basis therefore remains directly loadable
-        # without a model migration or external fallback loader.
-        radial_transform = self._modules.get("radial_transform")
-        if radial_transform is not None:
-            basis = radial_transform(basis, self.powers)
+        if self.radial_transform is not None:
+            basis = self.radial_transform(basis, self.powers)
         return basis
 
     def _bessel_stencil_basis(
@@ -620,14 +601,9 @@ class CartesianAFeatures(nn.Module, Configurable):
         )
 
     def stencil_neighbor_mask(self) -> torch.Tensor:
-        """Return the center-inclusion mask, including legacy fallback."""
+        """Return the Boolean center-inclusion mask over stencil points."""
 
-        stored = self._buffers.get("neighbor_mask")
-        if stored is not None:
-            return stored
-        if getattr(self, "separate_center", False):
-            return self.squared_distances != 0
-        return torch.ones_like(self.squared_distances, dtype=torch.bool)
+        return self.neighbor_mask
 
     def transform_density(self, rho: torch.Tensor) -> torch.Tensor:
         """Return the physical or configured transformed density channels.
