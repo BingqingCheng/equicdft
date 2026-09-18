@@ -19,12 +19,19 @@ from equicdft.stencil import get_neighbor_indices
 
 
 class _DensityFeatures(nn.Module):
-    """Expose rho directly for an analytic model-integration test."""
+    """Expose rho directly for an analytic model-integration test.
+
+    The stand-in satisfies the feature interface the model relies on:
+    ``separate_center`` and ``convolution_backend`` alongside the geometry
+    and normalization attributes.
+    """
 
     def __init__(self):
         super().__init__()
         self.cutoff_grid = 0
         self.n_types = 1
+        self.separate_center = False
+        self.convolution_backend = "gather"
         self.register_buffer("mean_density", torch.tensor(1.0))
 
     def forward(self, data):
@@ -701,9 +708,17 @@ class TestGridCACEModel(unittest.TestCase):
             self._make_model(free_energy_mode="unknown")
 
     def test_pre_mode_checkpoint_defaults_to_beta_free_energy(self):
-        model = self._make_model()
-        del model.free_energy_mode
+        from equicdft.legacy import upgrade_legacy_model
 
+        model = self._make_model()
+        # Whole-object models saved before the mode flag existed lack the
+        # attribute; the legacy upgrade restores the beta-F convention.
+        del model.free_energy_mode
+        with self.assertRaises(AttributeError):
+            model(self._make_data())
+
+        upgrade_legacy_model(model)
+        self.assertEqual(model.free_energy_mode, "beta")
         outputs = model(self._make_data())
 
         self.assertEqual(list(outputs), ["beta_F_exc", "c1"])

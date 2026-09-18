@@ -256,7 +256,8 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
             buffer = io.BytesIO()
             torch.save(default, buffer)
             buffer.seek(0)
-            legacy = torch.load(buffer, weights_only=False)
+            from equicdft.legacy import upgrade_legacy_model
+            legacy = upgrade_legacy_model(torch.load(buffer, weights_only=False))
             torch.testing.assert_close(legacy(*args, **kwargs), expected, atol=0., rtol=0.)
 
     def test_invalid_divergence_contracts(self):

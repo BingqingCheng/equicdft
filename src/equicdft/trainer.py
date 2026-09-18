@@ -30,6 +30,7 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._density_noise import add_field_noise
+from ._config import Configurable
 from ._trainer_io import (
     append_log_message,
     atomic_torch_save,
@@ -483,11 +484,22 @@ class Trainer(nn.Module):
         path: Union[str, Path],
         record: Dict[str, Any],
     ) -> None:
-        """Write model, optimization, scheduler, and history state."""
+        """Write model, optimization, scheduler, and history state.
+
+        Version 2 checkpoints additionally record ``model_config``, the
+        model's ``to_config()`` structure, so a checkpoint describes the
+        architecture whose state it holds. Models without a configuration
+        store ``None`` there.
+        """
 
         checkpoint = {
-            "checkpoint_version": 1,
+            "checkpoint_version": 2,
             "epoch": record["epoch"],
+            "model_config": (
+                self.model.to_config()
+                if isinstance(self.model, Configurable)
+                else None
+            ),
             "model_state_dict": self.model.state_dict(),
             "loss_state_dict": self.loss.state_dict(),
             "stream_loss_state_dict": (
@@ -1267,5 +1279,3 @@ class Trainer(nn.Module):
         """Return the next positive training epoch after optional epoch 0."""
 
         return self.history[-1]["epoch"] + 1 if self.history else 1
-
-    _format_record = staticmethod(format_record)

@@ -1,16 +1,25 @@
 """Pointwise and gradient-expanded free-energy building blocks."""
 
 import math
-from typing import Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import (
+    boolean,
     nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
     positive_scalar,
+)
+from ._config import (
+    Configurable,
+    make_config,
+    mlp_input_size,
+    optional_buffer_value,
+    register,
+    scalar_value,
 )
 from ._grid import grid_spacing_tensor
 from ._nn import (
@@ -21,7 +30,8 @@ from ._nn import (
 from .energy import EnergyReadout, density_weighted_integral
 
 
-class LDAReadout(EnergyReadout):
+@register
+class LDAReadout(EnergyReadout, Configurable):
     """Predict a pointwise excess free energy per particle.
 
     The input at every grid point contains all locally normalized component
@@ -87,18 +97,34 @@ class LDAReadout(EnergyReadout):
                 positive_scalar_tensor(dipole_density_scale, "dipole_density_scale"),
             )
             self.n_state_features += self.n_types
+        else:
+            self.register_buffer("dipole_density_scale", None)
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = boolean(zero_init, "zero_init")
         self.mlp = build_mlp(
             self.n_state_features,
-            hidden_sizes,
+            self.hidden_sizes,
             1,
-            zero_init=zero_init,
+            zero_init=self.zero_init,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            mean_density=scalar_value(self.mean_density),
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
+            dipole_density_scale=optional_buffer_value(self.dipole_density_scale),
         )
 
     @property
     def requires_dipole_density(self) -> bool:
-        """Old density-only serialized readouts remain density-only."""
+        """Whether the LDA includes squared polarization magnitudes."""
 
-        return getattr(self, "dipole_density_scale", None) is not None
+        return self.dipole_density_scale is not None
 
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
         """Return ``a_exc_lda`` with shape ``[..., n_grid, 1]``."""
@@ -153,7 +179,8 @@ class LDAReadout(EnergyReadout):
         )
 
 
-class GGAReadout(EnergyReadout):
+@register
+class GGAReadout(EnergyReadout, Configurable):
     """Predict a positive scalar density-gradient coefficient.
 
     The input contains local invariant environment features followed by
@@ -225,6 +252,28 @@ class GGAReadout(EnergyReadout):
         nn.init.constant_(final_layer.bias, inverse_softplus)
         self.minimum_coefficient = minimum_coefficient
         self.initial_coefficient = initial_coefficient
+        self.hidden_sizes = validated_hidden_sizes
+        self.n_features = n_features
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout.
+
+        A lazily built input layer reports its width once it has been
+        materialized, so a reconstructed readout is never lazy.
+        """
+
+        return make_config(
+            self,
+            hidden_sizes=self.hidden_sizes,
+            n_features=(
+                self.n_features
+                if self.n_features is not None
+                else mlp_input_size(self.mlp)
+            ),
+            n_types=self.n_types,
+            minimum_coefficient=self.minimum_coefficient,
+            initial_coefficient=self.initial_coefficient,
+        )
 
     def forward(self, local_features: torch.Tensor) -> torch.Tensor:
         """Return ``kappa`` with shape ``[..., n_grid, 1]``."""

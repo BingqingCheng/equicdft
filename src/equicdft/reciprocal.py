@@ -1,13 +1,14 @@
 """Differentiable reciprocal-space features of periodic density fields."""
 
 import math
-from typing import NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 from ._argument_checks import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
+from ._config import Configurable, make_config, register
 from ._fourier_sites import FourierSites
 from ._grid import (
     _grid_center_origin,
@@ -141,7 +142,8 @@ class _CoulombEvaluation(NamedTuple):
         return potential[0]
 
 
-class ReciprocalFeatures(nn.Module):
+@register
+class ReciprocalFeatures(nn.Module, Configurable):
     r"""Contract scalar or vector Fourier fields against fixed radial kernels.
 
     For density component ``i``, the continuum-normalized discrete Fourier
@@ -286,9 +288,20 @@ class ReciprocalFeatures(nn.Module):
 
     @property
     def requires_dipole_density(self) -> bool:
-        # Density/Coulomb checkpoints predating the direct-vector mode have
-        # no variable attribute.
-        return getattr(self, "variable", "rho") == "dipole_density"
+        return self.variable == "dipole_density"
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this module."""
+
+        return make_config(
+            self,
+            radial_exponents=self.radial_exponents,
+            screening=self.screening,
+            kernel=self.kernel,
+            n_types=self.n_types,
+            variable=self.variable,
+            include_divergence=self.include_divergence,
+        )
 
     def forward(
         self,
@@ -375,7 +388,7 @@ class ReciprocalFeatures(nn.Module):
         ).flatten(start_dim=1)
         features = self._pair_features(fourier_source, kernels, volume)
         # Previously serialized reciprocal modules have no divergence flag.
-        if getattr(self, "include_divergence", False):
+        if self.include_divergence:
             divergence_hat = self._bound_charge_hat(
                 polarization_hat, (nx, ny, nz), spacing,
             ).unsqueeze(-1)

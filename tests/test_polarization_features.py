@@ -210,6 +210,9 @@ class TestPolarizationFeatures(unittest.TestCase):
             torch.save((explicit, off), stream)
             stream.seek(0)
             restored_a, restored_b = torch.load(stream, weights_only=False)
+            from equicdft.legacy import upgrade_legacy_model
+            upgrade_legacy_model(restored_a)
+            upgrade_legacy_model(restored_b)
             torch.testing.assert_close(restored_b(restored_a(data)), b(default(data)), atol=0, rtol=0)
 
     def test_fft_model_derivatives_without_neighbor_table(self):

@@ -6,6 +6,7 @@ from typing import Any, Dict, Mapping, NamedTuple
 import torch
 
 from ._argument_checks import positive_scalar
+from ._config import Configurable, build, constructor_arguments, make_config, register
 from ._fourier_sites import FourierSites
 from ._grid import common_grid_size, grid_spacing_tensor
 from ._metal_data import normalize_metal_site_mapping
@@ -71,7 +72,8 @@ class _MetalField(NamedTuple):
     external_field: torch.Tensor
 
 
-class MetalWall(EnergyReadout):
+@register
+class MetalWall(EnergyReadout, Configurable):
     r"""Extend a liquid Coulomb readout with Gaussian metal electrodes.
 
     MetalWall passes the electrode positions to the wrapped Coulomb readout,
@@ -124,6 +126,27 @@ class MetalWall(EnergyReadout):
         self.register_buffer("external_field", field)
         self._cache_key = None
         self._cache = None
+
+    def to_config(self) -> Dict[str, Any]:
+        """Describe the liquid kernel and fixed electrodes, never FFT/LU caches."""
+        sites = {
+            name: getattr(self, name) for name in (
+                "metal_positions", "metal_site_groups", "metal_group_ids",
+                "metal_total_charge",
+            )
+        }
+        sites["metal_charge_units"] = "e"
+        return make_config(
+            self, liquid_coulomb=self.liquid_coulomb.to_config(),
+            metal_sites=sites, metal_sigma=self.metal_sigma,
+            tolerance=self.tolerance, external_field=self.external_field,
+        )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "MetalWall":
+        arguments = constructor_arguments(cls, config)
+        arguments["liquid_coulomb"] = build(arguments["liquid_coulomb"])
+        return cls(**arguments)
 
     def _apply(self, fn):
         self._cache_key = self._cache = None

@@ -302,7 +302,8 @@ class TestPolarizationGaussian(unittest.TestCase):
         buffer = io.BytesIO()
         torch.save(default, buffer)
         buffer.seek(0)
-        legacy = torch.load(buffer, weights_only=False)
+        from equicdft.legacy import upgrade_legacy_model
+        legacy = upgrade_legacy_model(torch.load(buffer, weights_only=False))
         torch.testing.assert_close(legacy(*args), explicit(*args), atol=0., rtol=0.)
         homogeneous = torch.full_like(data["rho"], .4)
         torch.testing.assert_close(explicit(homogeneous, *args[1:]), torch.zeros(2, 1), atol=0., rtol=0.)

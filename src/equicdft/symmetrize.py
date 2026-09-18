@@ -6,12 +6,13 @@ integer spherical stencil constructed by :func:`equicdft.stencil.make_stencil`.
 """
 
 from itertools import combinations_with_replacement, permutations, product
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch import nn
 
 from ._argument_checks import boolean, positive_integer
+from ._config import Configurable, make_config, register
 from .features import _make_powers
 
 
@@ -147,7 +148,8 @@ def _make_product_recipes(
     return recipes
 
 
-class CartesianBFeatures(nn.Module):
+@register
+class CartesianBFeatures(nn.Module, Configurable):
     """Symmetrize Cartesian ``A`` features under cubic-grid point symmetry.
 
     Parameters
@@ -249,13 +251,24 @@ class CartesianBFeatures(nn.Module):
 
     def validate_a_features(self, a_features) -> None:
         """Keep field membership and moment layout fixed at construction."""
-        polarized = getattr(self, "include_polarization", False)
-        if polarized != getattr(a_features, "include_polarization", False):
+        polarized = self.include_polarization
+        if polarized != a_features.include_polarization:
             raise ValueError("A/B include_polarization must match")
         if a_features.max_power != self.max_power:
             raise ValueError("A/B max_power must match")
         if polarized and a_features.separate_center != self.separate_center:
             raise ValueError("A/B separate_center must match with polarization")
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this module."""
+
+        return make_config(
+            self,
+            max_power=self.max_power,
+            max_product_order=self.max_product_order,
+            include_polarization=self.include_polarization,
+            separate_center=self.separate_center,
+        )
 
     def forward(self, A: torch.Tensor) -> torch.Tensor:
         """Return signed-orbit averages through ``max_product_order``."""

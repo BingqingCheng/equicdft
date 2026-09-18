@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from numbers import Integral
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -12,6 +12,16 @@ from ._argument_checks import (
     nonnegative_scalar,
     optional_boolean,
     positive_scalar,
+)
+from ._config import (
+    Configurable,
+    build,
+    build_optional,
+    constructor_arguments,
+    make_config,
+    optional_config,
+    register,
+    scalar_value,
 )
 from ._grid import (
     grid_spacing_tensor,
@@ -24,7 +34,8 @@ from .interaction import BChiMessage
 from ._metal_data import METAL_DATA_KEYS
 
 
-class GridCACEModel(nn.Module):
+@register
+class GridCACEModel(nn.Module, Configurable):
     """Combine free-energy readouts and differentiate their scalar sum.
 
     Every configured :class:`EnergyReadout` receives a shared context and
@@ -278,6 +289,55 @@ class GridCACEModel(nn.Module):
             thermal_wavelength_tensor,
         )
 
+    def to_config(self) -> Dict[str, Any]:
+        """Return the nested constructor arguments describing this model.
+
+        The configuration records structure only: feature, message, and
+        readout configurations plus the fixed thermodynamic metadata. Fitted
+        parameters and buffers are restored separately from the
+        ``state_dict``. See :mod:`equicdft.serialization` for the file format
+        that stores both together.
+        """
+
+        return make_config(
+            self,
+            a_features=optional_config(self.a_features),
+            b_features=optional_config(self.b_features),
+            readout=[optional_config(item) for item in self.readout],
+            grid_spacing=self.grid_spacing,
+            mean_temperature=scalar_value(self.mean_temperature),
+            boltzmann_constant=scalar_value(self.boltzmann_constant),
+            thermal_wavelength=self.thermal_wavelength,
+            compute_c1=self.compute_c1,
+            compute_c2=self.compute_c2,
+            compute_local_mu=self.compute_local_mu,
+            compute_polarization_derivative=self.compute_polarization_derivative,
+            rho_min=self.rho_min,
+            free_energy_mode=self.free_energy_mode,
+            message_layers=[
+                optional_config(item) for item in self.message_layers
+            ],
+        )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "GridCACEModel":
+        """Rebuild the model and every configured submodule."""
+
+        arguments = constructor_arguments(cls, config)
+        arguments["a_features"] = build_optional(arguments.get("a_features"))
+        arguments["b_features"] = build_optional(arguments.get("b_features"))
+        readouts = arguments.get("readout")
+        if not isinstance(readouts, (list, tuple)):
+            raise TypeError("model configuration 'readout' must be a list")
+        arguments["readout"] = [build(item) for item in readouts]
+        messages = arguments.get("message_layers") or []
+        if not isinstance(messages, (list, tuple)):
+            raise TypeError(
+                "model configuration 'message_layers' must be a list"
+            )
+        arguments["message_layers"] = [build(item) for item in messages]
+        return cls(**arguments)
+
     @property
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
@@ -315,7 +375,7 @@ class GridCACEModel(nn.Module):
     def has_local_features(self) -> bool:
         """Whether local invariant environment features are configured."""
 
-        return getattr(self, "a_features", None) is not None
+        return self.a_features is not None
 
     @property
     def requires_local_density_index(self) -> bool:
@@ -325,14 +385,11 @@ class GridCACEModel(nn.Module):
             return True
         if not self.has_local_features:
             return False
-        if (
-            getattr(self.a_features, "convolution_backend", "gather")
-            == "gather"
-        ):
+        if self.a_features.convolution_backend == "gather":
             return True
         return any(
-            getattr(message, "convolution_backend", "gather") == "gather"
-            for message in getattr(self, "message_layers", ())
+            message.convolution_backend == "gather"
+            for message in self.message_layers
         )
 
     @property
@@ -460,15 +517,12 @@ class GridCACEModel(nn.Module):
 
         A = self.a_features(data)
         B = self.b_features(A)
-        # Cartesian B has radial/invariant/channel axes; joint B has already
-        # flattened its channel products. Older B checkpoints default to three.
+        # Custom symmetrizers may use the standard three-axis feature layout
+        # without declaring an override (this is not checkpoint migration).
         feature_axes = getattr(self.b_features, "n_feature_axes", 3)
         levels = [B.flatten(start_dim=-feature_axes)]
 
-        # getattr keeps full-model checkpoints saved before message passing
-        # loadable as ordinary zero-message models.
-        messages = getattr(self, "message_layers", ())
-        if messages:
+        if len(self.message_layers) > 0:
             shared_basis = self.a_features.stencil_basis()
             message_fields = {}
             if getattr(self.a_features, "include_polarization", False):
@@ -477,7 +531,7 @@ class GridCACEModel(nn.Module):
                     "normalized_fields": fields / scales,
                     "separate_center": self.a_features.separate_center,
                 }
-            for message in messages:
+            for message in self.message_layers:
                 stencil_basis = message._stencil_basis(
                     self.a_features,
                     shared_basis,
@@ -522,9 +576,7 @@ class GridCACEModel(nn.Module):
             "compute_polarization_derivative",
         )
         if compute_polarization_derivative is None:
-            compute_polarization_derivative = getattr(
-                self, "compute_polarization_derivative", False
-            )
+            compute_polarization_derivative = self.compute_polarization_derivative
         has_polarization = self.requires_dipole_density
         if compute_polarization_derivative and not has_polarization:
             raise ValueError(
@@ -584,7 +636,7 @@ class GridCACEModel(nn.Module):
                     ..., None, None
                 ].expand(*B_flat.shape[:-1], 1)
                 feature_blocks = []
-                if (getattr(self.a_features, "separate_center", False)
+                if (self.a_features.separate_center
                         and not getattr(self.a_features, "include_polarization", False)):
                     feature_blocks.append(
                         self.a_features.transform_density(rho)
@@ -632,7 +684,7 @@ class GridCACEModel(nn.Module):
                 # not a possibly stale beta field supplied by a caller.
                 "beta": 1.0 / (self.boltzmann_constant.to(rho) * temperature),
                 "reference_energy": self.reference_energy.to(rho),
-                "free_energy_mode": getattr(self, "free_energy_mode", "beta"),
+                "free_energy_mode": self.free_energy_mode,
             }
             if local_features is not None:
                 context["local_features"] = local_features
@@ -677,9 +729,7 @@ class GridCACEModel(nn.Module):
             for energy in readout_energies[1:]:
                 readout_energy = readout_energy + energy
 
-            # getattr preserves full-model checkpoints saved before the mode
-            # flag existed; their readouts used the beta-F convention.
-            if getattr(self, "free_energy_mode", "beta") == "physical":
+            if self.free_energy_mode == "physical":
                 # The network represents F_exc / (k_B*T_ref). Therefore
                 # beta*F_exc = readout_energy * T_ref/T. This explicit known
                 # factor leaves the model to learn the physical free energy's

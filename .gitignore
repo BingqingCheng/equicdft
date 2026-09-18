@@ -8,6 +8,7 @@ build/
 dist/
 *.pt
 !examples/lj_paper_v1_regression/model.pt
+!tests/fixtures/*.pt
 *.pth
 *.log
 

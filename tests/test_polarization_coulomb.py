@@ -56,7 +56,8 @@ class TestPolarizationCoulomb(unittest.TestCase):
         buffer = io.BytesIO()
         torch.save(old, buffer)
         buffer.seek(0)
-        loaded = torch.load(buffer, weights_only=False)
+        from equicdft.legacy import upgrade_legacy_model
+        loaded = upgrade_legacy_model(torch.load(buffer, weights_only=False))
         self.assertFalse(loaded.requires_dipole_density)
         self.assertFalse(loaded.requires_state_features)
         torch.testing.assert_close(loaded.energy(data), new.energy(data))

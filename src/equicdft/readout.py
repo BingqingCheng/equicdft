@@ -1,6 +1,6 @@
 """Energy readouts for grid features."""
 
-from typing import Dict, NamedTuple, Optional, Sequence
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -11,7 +11,17 @@ from ._argument_checks import (
     positive_integer,
 )
 from ._component_pairs import symmetric_component_pairs
-from ._nn import build_mlp
+from ._config import (
+    Configurable,
+    build_optional,
+    constructor_arguments,
+    make_config,
+    mlp_input_size,
+    optional_buffer_value,
+    optional_config,
+    register,
+)
+from ._nn import build_mlp, validate_hidden_sizes
 from .energy import EnergyReadout, density_weighted_integral
 from .reciprocal import ReciprocalFeatures
 
@@ -25,7 +35,8 @@ class _LiquidCoulombResult(NamedTuple):
     total_charge: torch.Tensor
 
 
-class LocalReadout(EnergyReadout):
+@register
+class LocalReadout(EnergyReadout, Configurable):
     """Map local invariant features to one output per physical component.
 
     A shared MLP maps a local feature vector at each grid point to one output
@@ -70,10 +81,29 @@ class LocalReadout(EnergyReadout):
 
         self.n_features = optional_positive_integer(n_features, "n_features")
         self.n_types = positive_integer(n_types, "n_types")
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.mlp = build_mlp(
             self.n_features,
-            hidden_sizes,
+            self.hidden_sizes,
             self.n_types,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout.
+
+        A lazily built input layer reports its width once it has been
+        materialized, so a reconstructed readout is never lazy.
+        """
+
+        return make_config(
+            self,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            n_features=(
+                self.n_features
+                if self.n_features is not None
+                else mlp_input_size(self.mlp)
+            ),
         )
 
     def forward(
@@ -103,7 +133,8 @@ class LocalReadout(EnergyReadout):
         )
 
 
-class BulkReadout(EnergyReadout):
+@register
+class BulkReadout(EnergyReadout, Configurable):
     """Map temperature and mean densities to a bulk free energy per particle.
 
     The state vector contains normalized temperature followed by one
@@ -139,11 +170,23 @@ class BulkReadout(EnergyReadout):
 
         self.n_types = positive_integer(n_types, "n_types")
         self.n_state_features = 1 + self.n_types
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = boolean(zero_init, "zero_init")
         self.mlp = build_mlp(
             self.n_state_features,
-            hidden_sizes,
+            self.hidden_sizes,
             self.n_types,
-            zero_init=zero_init,
+            zero_init=self.zero_init,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
         )
 
     def forward(self, state_features: torch.Tensor) -> torch.Tensor:
@@ -175,7 +218,8 @@ class BulkReadout(EnergyReadout):
         )
 
 
-class LongRangeReadout(EnergyReadout):
+@register
+class LongRangeReadout(EnergyReadout, Configurable):
     """Map thermodynamic state to a reciprocal quadratic kernel.
 
     The readout predicts one coefficient for every fixed reciprocal kernel and
@@ -238,14 +282,13 @@ class LongRangeReadout(EnergyReadout):
 
     @property
     def requires_state_features(self) -> bool:
-        return getattr(self, "coulomb_amplitude", None) is None
+        return self.coulomb_amplitude is None
 
     @property
     def requires_dipole_density(self) -> bool:
-        # Old serialized charge-only readouts have no include_polarization.
-        features = getattr(self, "features", None)
+        features = self.features
         return (
-            getattr(self, "include_polarization", False)
+            self.include_polarization
             or (features is not None and features.requires_dipole_density)
         )
 
@@ -287,6 +330,8 @@ class LongRangeReadout(EnergyReadout):
         type_pairs = symmetric_component_pairs(self.n_types)
         self.n_type_pairs = len(type_pairs)
         self.n_state_features = 1 + self.n_types
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = boolean(zero_init, "zero_init")
 
         if charges is None:
             if coulomb_amplitude is not None:
@@ -348,10 +393,33 @@ class LongRangeReadout(EnergyReadout):
             )
             self.mlp = build_mlp(
                 self.n_state_features,
-                hidden_sizes,
+                self.hidden_sizes,
                 output_width,
-                zero_init=zero_init,
+                zero_init=self.zero_init,
             )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            n_kernels=self.n_kernels,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
+            charges=optional_buffer_value(self.charges),
+            coulomb_amplitude=optional_buffer_value(self.coulomb_amplitude),
+            features=optional_config(self.features),
+            include_polarization=self.include_polarization,
+        )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "LongRangeReadout":
+        """Rebuild the readout together with its reciprocal features."""
+
+        arguments = constructor_arguments(cls, config)
+        arguments["features"] = build_optional(arguments.get("features"))
+        return cls(**arguments)
 
     def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""
@@ -361,8 +429,7 @@ class LongRangeReadout(EnergyReadout):
                 "state_features must end with normalized temperature and "
                 "one mean density per type"
             )
-        charges = getattr(self, "charges", None)
-        if charges is None:
+        if self.charges is None:
             return self.mlp(state_features).reshape(
                 *state_features.shape[:-1],
                 self.n_kernels,
@@ -371,7 +438,7 @@ class LongRangeReadout(EnergyReadout):
 
         amplitude = self.amplitude(state_features)[..., None, None]
         pair_weights = self.pair_charge_products.to(state_features)
-        if getattr(self, "include_polarization", False):
+        if self.include_polarization:
             # q is already in each source; applying q_i*q_j here would both
             # double-count charge factors and erase neutral-molecule dipoles.
             pair_weights = torch.ones_like(pair_weights)
@@ -383,14 +450,14 @@ class LongRangeReadout(EnergyReadout):
     def amplitude(self, state_features: torch.Tensor) -> torch.Tensor:
         """Return the shared scalar in charge-factorized mode."""
 
-        if getattr(self, "charges", None) is None:
+        if self.charges is None:
             raise ValueError("a scalar amplitude requires fixed component charges")
         if state_features.shape[-1] != self.n_state_features:
             raise ValueError(
                 "state_features must end with normalized temperature and "
                 "one mean density per type"
             )
-        amplitude = getattr(self, "coulomb_amplitude", None)
+        amplitude = self.coulomb_amplitude
         if amplitude is None:
             return self.mlp(state_features).reshape(state_features.shape[:-1])
         target_shape = state_features.shape[:-1]
@@ -402,9 +469,9 @@ class LongRangeReadout(EnergyReadout):
     def provides_coulomb_potential(self) -> bool:
         """Whether this readout can evaluate its Coulomb potential in space."""
 
-        features = getattr(self, "features", None)
+        features = self.features
         return (
-            getattr(self, "charges", None) is not None
+            self.charges is not None
             and features is not None
             and features.kernel == "coulomb"
             and self.n_kernels == 1
@@ -514,7 +581,7 @@ class LongRangeReadout(EnergyReadout):
         source_options = {}
         if self.requires_dipole_density:
             source_options["dipole_density"] = context["dipole_density"]
-        if getattr(self, "include_polarization", False):
+        if self.include_polarization:
             source_options["charges"] = self.charges
         reciprocal_features = self.features(
             rho=context["rho"],

@@ -1,14 +1,15 @@
 """Finite-range isotropic pair contributions on periodic density grids."""
 
 import math
-from typing import Dict, Sequence
+from typing import Any, Dict, Sequence
 
 import torch
 
 from ._argument_checks import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
+from ._config import Configurable, make_config, register
 from ._grid import common_grid_size
-from ._nn import build_mlp
+from ._nn import build_mlp, validate_hidden_sizes
 from .energy import EnergyReadout
 from .stencil import make_stencil
 
@@ -25,7 +26,8 @@ def _smooth_cutoff_envelope(distance_fraction: torch.Tensor) -> torch.Tensor:
     )
 
 
-class PairwiseReadout(EnergyReadout):
+@register
+class PairwiseReadout(EnergyReadout, Configurable):
     r"""Learn an isotropic finite-range quadratic density functional.
 
     For periodic grid displacement ``q`` and component pair ``ij``, the
@@ -112,11 +114,13 @@ class PairwiseReadout(EnergyReadout):
 
         self.n_offsets = int(offsets.shape[0])
         self.n_shells = int(shell_squared_distances.shape[0])
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.zero_init = zero_init
         self.mlp = build_mlp(
             input_size=2,
-            hidden_sizes=hidden_sizes,
+            hidden_sizes=self.hidden_sizes,
             output_size=self.n_type_pairs,
-            zero_init=zero_init,
+            zero_init=self.zero_init,
         )
         self.register_buffer("offsets", offsets, persistent=False)
         self.register_buffer(
@@ -133,6 +137,17 @@ class PairwiseReadout(EnergyReadout):
             "shell_envelope",
             shell_envelope,
             persistent=False,
+        )
+
+    def to_config(self) -> Dict[str, Any]:
+        """Return the constructor arguments describing this readout."""
+
+        return make_config(
+            self,
+            cutoff_grid=self.cutoff_grid,
+            n_types=self.n_types,
+            hidden_sizes=self.hidden_sizes,
+            zero_init=self.zero_init,
         )
 
     def shell_kernel_values(

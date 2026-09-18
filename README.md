@@ -203,15 +203,14 @@ representation and are rejected.
 
 ## Inference and equilibrium solution
 
-A saved full model can be loaded without reconstructing the architecture:
+A saved model can be loaded without reconstructing the architecture:
 
 ```python
 import torch
-from equicdft import GridData
+from equicdft import GridData, load_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = torch.load("examples/lj_nvt/fit/model.pt", map_location=device)
-model = model.to(device).eval()
+model = load_model("examples/lj_nvt/fit/model.pt", map_location=device)
 
 field = GridData.from_xyz(
     "examples/lj_nvt/mini_lj_nvt.extxyz",
@@ -225,6 +224,36 @@ field = {
 outputs = model(field)
 print(outputs["beta_F_exc"], outputs["c1"])
 ```
+
+`save_model` and `load_model` use a versioned file that stores the model's
+structure (`model.to_config()`, a plain JSON-compatible dictionary) next to
+its fitted `state_dict`. The file contains no Python object references, so
+it loads under PyTorch's default `weights_only` unpickler, and
+`read_model_config` inspects the architecture without building it. Model
+files written before this format by `torch.save(model)` are converted once:
+
+```bash
+python -m equicdft.convert old_model.pt converted_model.pt
+```
+
+The converter rebuilds the model from its configuration, transfers the
+fitted state, and verifies that old and new models evaluate identically.
+Use a distinct destination to preserve the original checkpoint. Only load
+trusted whole-object pickle files.
+
+The format also records polarization A/B flags and normalization, joint
+messages, polarization LDA, Gaussian vector/divergence kernels, and nested
+`MetalWall` geometry and charge constraints. Electrode FFT/LU caches are
+rebuilt, not serialized. For a whole-object electrode model, use the Python
+`convert_legacy_model` API with `verification_data` containing the original
+grid and fields; a guessed cell is not a valid verification geometry.
+Conversion checks polarization derivatives and electrode outputs as well as
+energy and density derivatives.
+
+Application checkpoints containing a configuration and `state_dict` are not
+whole-object files: rebuild them with their original application builder,
+load the state strictly, and then call `save_model`. Inference model files
+do not replace training-resume checkpoints with optimizer/scheduler state.
 
 `GridSolver` provides two complementary operations:
 
@@ -266,6 +295,8 @@ reciprocal kernels with nonperiodic boundary conditions.
 - `metrics.py`, `trainer.py`: fitting, reporting, and restart state
 - `solver.py`: forward thermodynamics and equilibrium density solution
 - `reciprocal.py`: optional reciprocal-space features and readout support
+- `serialization.py`, `legacy.py`: versioned model files and conversion of
+  whole-object pickles
 
 Run the test suite with:
 

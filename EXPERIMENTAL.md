@@ -1,7 +1,7 @@
 # Experimental capabilities
 
-The top-level [`README.md`](README.md) intentionally matches the current
-`main` branch and documents the compact, established workflow. This file
+The top-level [`README.md`](README.md) documents the compact, established
+workflow and model-file API. This file
 collects opt-in model and training capabilities developed for ongoing
 experiments. They are tested software interfaces, but their scientific value
 must be established for each physical system and dataset.
@@ -13,8 +13,10 @@ target.
 ## Compatibility principles
 
 - Omitting every option described here retains the existing model paths.
-- Existing models without message passing, density transformation, radial
-  transforms, or Fourier losses load without an external migration helper.
+- Models saved with `save_model` record every option in their configuration
+  and load unchanged; whole-object `torch.save(model)` files from before that
+  format are converted once with `python -m equicdft.convert`, which fills
+  in the defaults such files implied and verifies the result.
 - Optional energies are summed before functional differentiation.
 - Radial transforms act before invariant products; density transforms act
   before neighborhood gathering and Cartesian moments.
@@ -248,9 +250,9 @@ message = BChiMessage(
 ```
 
 This execution option changes neither learned parameters nor `state_dict`
-keys. A reconstructed model must select it explicitly; whole-object saves
-retain it, while legacy whole objects use the class default `"gather"`.
-`"conv3d"` scatters the spherical stencil into its enclosing dense Cartesian
+keys. It is part of the model configuration, so `save_model` records it and
+`load_model` restores it; converted legacy whole-object files that predate
+the option report `"gather"`. `"conv3d"` scatters the spherical stencil into its enclosing dense Cartesian
 kernel and applies grouped cross-correlation. `"fft"` scatters onto the
 periodic grid and applies the same cross-correlation in reciprocal space;
 duplicate or periodically aliased offsets are summed. Both avoid the explicit
@@ -301,20 +303,21 @@ frames = GridData.from_xyz(
 )
 ```
 
-For a trusted whole-object model that was saved with the legacy gather
-backend, the execution method can be changed without modifying its learned
-state:
+For a model saved with the gather backend, the execution method can be
+changed without modifying its learned state, either on the loaded object or
+in its configuration before rebuilding:
 
 ```python
+model = load_model(path)
 model.a_features.convolution_backend = "fft"
-for message in getattr(model, "message_layers", ()):
+for message in model.message_layers:
     message.convolution_backend = "fft"
 ```
 
 Do this only when inputs provide a complete regular periodic grid. A model
 reconstructed from a `state_dict` should instead set the backend explicitly in
-the constructors, because `convolution_backend` is deliberately not a learned
-or serialized state tensor.
+the constructors, because `convolution_backend` is a configuration entry and
+deliberately not a learned or serialized state tensor.
 
 Gather and FFT evaluate the same periodic cross-correlation. Their outputs are
 mathematically equivalent, but need not be bitwise identical because the FFT
