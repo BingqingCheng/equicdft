@@ -25,26 +25,16 @@ from .numerics import (
     _polarization_residual_norms,
     _project_density_constraints,
     _project_vector_norm,
+    _residuals_converged,
 )
 
 from .evaluation import fixed_dipole_inputs, _set_density_residuals
+from .reporting import finalize_result
 
 __all__ = ["solve_fixed_dipoles"]
 
 
-def fixed_dipole_converged(
-    solver, result, tolerance_residual, tolerance_rms_residual
-):
-    return bool(
-        result["maximum_residual"] <= tolerance_residual
-        and (
-            tolerance_rms_residual is None
-            or result["rms_residual"] <= tolerance_rms_residual
-        )
-    )
-
-
-def apply_fixed_dipole_bounds(solver,
+def apply_fixed_dipole_bounds(
     result,
     maximum_density,
     maximum_polarization_fraction,
@@ -369,14 +359,13 @@ def solve_fixed_dipoles(solver, data, method, options):
         initial_ideal["ideal_polarization_derivative"] * moment[..., None]
     ).detach()
 
-    was_training = solver.model.training if solver.model is not None else None
-    if solver.model is not None:
-        solver.model.eval()
+    was_training = solver.model.training
+    solver.model.eval()
     try:
         result = solver.evaluate(
             dict(data, rho=rho, dipole_density=polarization)
         )
-        result = apply_fixed_dipole_bounds(solver,
+        result = apply_fixed_dipole_bounds(
             result,
             density_cap,
             polarization_fraction_cap,
@@ -429,38 +418,23 @@ def solve_fixed_dipoles(solver, data, method, options):
                 mixing_backtrack_factor,
             )
     finally:
-        if solver.model is not None:
-            solver.model.train(was_training)
+        solver.model.train(was_training)
     result = state["result"]
     result.update(
-        converged=state["converged"],
-        status=state["status"],
-        solver_method=method,
-        solver_beta_multiplier=beta_multiplier,
         solver_maximum_polarization_fraction=(
             None
             if polarization_fraction_cap is None
             else polarization_fraction_cap.detach()
         ),
         solver_fixed_field=fixed_field,
-        n_iter=state["n_iter"],
         iterations=state["n_iter"],
-        n_evaluations=state["n_evaluations"],
-        history=state["history"],
-        objective_history=[item["beta_A"] for item in state["history"]],
-        line_search_failures=state["line_search_failures"],
-        mixing_backtracks=state["mixing_backtracks"],
-        final_mixing=state["final_mixing"],
-        final_relative_density_change=state["density_change"],
-        final_relative_polarization_change=state["polarization_change"],
-        solver_anderson=False,
-        anderson_attempts=0,
-        anderson_accepted=0,
-        anderson_rejected=0,
-        anderson_resets=0,
+        particle_number_error=result["particle_numbers"] - numbers,
     )
-    result["particle_number_error"] = result["particle_numbers"] - numbers
-    return result
+    state["objective_history"] = [item["beta_A"] for item in state["history"]]
+    return finalize_result(
+        result, state, method=method, beta_multiplier=beta_multiplier,
+        converged=state["converged"],
+    )
 
 
 def minimize_fixed_dipoles(
@@ -503,8 +477,9 @@ def minimize_fixed_dipoles(
                 "maximum_residual": float(result["maximum_residual"]),
             }
         )
-        converged = fixed_dipole_converged(solver,
-            result, tolerance_residual, tolerance_rms_residual
+        converged = _residuals_converged(
+            result["maximum_residual"], result["rms_residual"],
+            tolerance_residual, tolerance_rms_residual,
         )
         if converged or iteration == max_iter:
             status = "converged" if converged else "max_iter"
@@ -580,7 +555,7 @@ def minimize_fixed_dipoles(
                 trial = solver.evaluate(
                     dict(data, rho=trial_rho, dipole_density=trial_p)
                 )
-                trial = apply_fixed_dipole_bounds(solver,
+                trial = apply_fixed_dipole_bounds(
                     trial,
                     maximum_density,
                     maximum_polarization_fraction,
@@ -654,8 +629,8 @@ def minimize_fixed_dipoles(
         "line_search_failures": int(status == "line_search_failed"),
         "mixing_backtracks": 0,
         "final_mixing": None,
-        "density_change": density_change,
-        "polarization_change": polarization_change,
+        "final_relative_density_change": density_change,
+        "final_relative_polarization_change": polarization_change,
     }
 
 
@@ -702,8 +677,9 @@ def solve_fixed_dipole_euler(
                 "maximum_residual": float(result["maximum_residual"]),
             }
         )
-        converged = fixed_dipole_converged(solver,
-            result, tolerance_residual, tolerance_rms_residual
+        converged = _residuals_converged(
+            result["maximum_residual"], result["rms_residual"],
+            tolerance_residual, tolerance_rms_residual,
         )
         if converged or iteration == max_iter:
             status = "converged" if converged else "max_iter"
@@ -751,7 +727,7 @@ def solve_fixed_dipole_euler(
             trial = solver.evaluate(
                 dict(data, rho=trial_rho, dipole_density=trial_p)
             )
-            trial = apply_fixed_dipole_bounds(solver,
+            trial = apply_fixed_dipole_bounds(
                 trial,
                 maximum_density,
                 maximum_polarization_fraction,
@@ -786,8 +762,9 @@ def solve_fixed_dipole_euler(
             else mixing
         )
         if max(density_change, polarization_change) <= tolerance_change:
-            converged = fixed_dipole_converged(solver,
-                result, tolerance_residual, tolerance_rms_residual
+            converged = _residuals_converged(
+                result["maximum_residual"], result["rms_residual"],
+                tolerance_residual, tolerance_rms_residual,
             )
             status = "converged" if converged else "max_iter"
             history.append(
@@ -810,6 +787,6 @@ def solve_fixed_dipole_euler(
         "line_search_failures": 0,
         "mixing_backtracks": mixing_backtracks,
         "final_mixing": current_mixing,
-        "density_change": density_change,
-        "polarization_change": polarization_change,
+        "final_relative_density_change": density_change,
+        "final_relative_polarization_change": polarization_change,
     }

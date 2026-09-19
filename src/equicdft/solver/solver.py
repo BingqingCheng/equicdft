@@ -19,6 +19,7 @@ from .symmetry import (
 )
 from .dipoles import solve_fixed_dipoles
 from .evaluation import evaluate, _set_density_residuals
+from .reporting import finalize_result
 from .euler import solve_euler
 from .minimize import minimize_density
 from .options import (
@@ -428,7 +429,7 @@ class GridSolver:
         _set_density_residuals(
             result, residual, chemical_potential, max_residual, rms_residual,
         )
-        result["converged"] = _residuals_converged(
+        converged = _residuals_converged(
             max_residual,
             rms_residual,
             tolerance_residual,
@@ -438,30 +439,10 @@ class GridSolver:
         # these names; for a density-only solve they are the density ones.
         result["maximum_residual"] = max_residual
         result["rms_residual"] = rms_residual
-        if result["converged"]:
-            result["status"] = "converged"
-        elif state.get("line_search_failures"):
-            result["status"] = "line_search_failed"
-        elif state.get("stalled"):
-            result["status"] = "stalled"
-        else:
-            result["status"] = "max_iter"
-        result["solver_method"] = method
-        result["solver_beta_multiplier"] = beta_multiplier
-        result["n_iter"] = state["n_iter"]
-        result["n_evaluations"] = state["n_evaluations"]
-        result["objective_history"] = state["objective_history"]
-        result["final_relative_density_change"] = state[
-            "final_relative_density_change"
-        ]
-        result["line_search_failures"] = state["line_search_failures"]
-        result["mixing_backtracks"] = state.get("mixing_backtracks", 0)
-        result["final_mixing"] = state.get("final_mixing")
-        result["solver_anderson"] = state.get("solver_anderson", False)
-        result["anderson_attempts"] = state.get("anderson_attempts", 0)
-        result["anderson_accepted"] = state.get("anderson_accepted", 0)
-        result["anderson_rejected"] = state.get("anderson_rejected", 0)
-        result["anderson_resets"] = state.get("anderson_resets", 0)
-        return result
+        return finalize_result(
+            result, state, method=method, beta_multiplier=beta_multiplier,
+            converged=converged,
+        )
+
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return move_batch(data, self.device, self._geometry_cache)
