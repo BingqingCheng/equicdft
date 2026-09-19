@@ -33,3 +33,16 @@ that re-export their former contents; those paths are not deprecated.
 Private modules (`equicdft._grid`, `equicdft._fourier`, ...) moved without
 shims. Whole-object pickles that recorded any old path keep loading through
 `equicdft.legacy`.
+
+## Output keys (0.1.0)
+
+Model outputs and solver results carry canonical keys with the `beta_`
+prefix of the other dimensionless quantities; the old names remain as
+aliases of the same tensors and warn when read through `[]` or `.get`.
+
+| old key | canonical key |
+|---|---|
+| `local_chemical_potential` | `beta_mu_local` |
+| `average_chemical_potential` | `beta_mu_average` |
+| `chemical_potential_weights` | `beta_mu_weights` |
+| `equilibrium_chemical_potential` (solver) | `beta_mu` |

@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from equicdft import (
     ReciprocalFeatures,
 )
 from equicdft.geometry.stencil import get_neighbor_indices
+from equicdft.model import OUTPUT_KEY_ALIASES
 
 
 class _DensityFeatures(nn.Module):
@@ -586,8 +588,8 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
         centered_local_mu = (
-            outputs["local_chemical_potential"]
-            - outputs["average_chemical_potential"].unsqueeze(-2)
+            outputs["beta_mu_local"]
+            - outputs["beta_mu_average"].unsqueeze(-2)
         )
         centered_local_mu.square().mean().backward()
 
@@ -872,9 +874,9 @@ class TestGridCACEModel(unittest.TestCase):
             + data["V_ext"] / data["temperature"]
             - outputs["c1"]
         )
-        self.assertIn("local_chemical_potential", outputs)
+        self.assertIn("beta_mu_local", outputs)
         self.assertTrue(
-            torch.allclose(outputs["local_chemical_potential"], expected)
+            torch.allclose(outputs["beta_mu_local"], expected)
         )
         weights = (data["rho"].detach() > 0.5).to(expected.dtype)
         expected_average = (weights * expected).sum(dim=-2) / weights.sum(
@@ -882,12 +884,12 @@ class TestGridCACEModel(unittest.TestCase):
         )
         self.assertTrue(
             torch.allclose(
-                outputs["average_chemical_potential"],
+                outputs["beta_mu_average"],
                 expected_average,
             )
         )
         self.assertTrue(
-            torch.equal(outputs["chemical_potential_weights"], weights)
+            torch.equal(outputs["beta_mu_weights"], weights)
         )
 
     def test_chemical_potential_is_activated_by_compute_local_mu(self):
@@ -897,9 +899,9 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        self.assertNotIn("local_chemical_potential", outputs)
-        self.assertNotIn("average_chemical_potential", outputs)
-        self.assertNotIn("chemical_potential_weights", outputs)
+        self.assertNotIn("beta_mu_local", outputs)
+        self.assertNotIn("beta_mu_average", outputs)
+        self.assertNotIn("beta_mu_weights", outputs)
 
     def test_zero_density_local_chemical_potential_is_finite_sentinel(self):
         model = self._make_model(
@@ -913,11 +915,11 @@ class TestGridCACEModel(unittest.TestCase):
         outputs = model(data)
 
         self.assertEqual(
-            outputs["local_chemical_potential"][0, 0].item(),
+            outputs["beta_mu_local"][0, 0].item(),
             0.0,
         )
         self.assertTrue(
-            torch.all(torch.isfinite(outputs["local_chemical_potential"]))
+            torch.all(torch.isfinite(outputs["beta_mu_local"]))
         )
 
     def test_temperature_is_appended_once_to_each_local_feature_vector(self):
@@ -1328,6 +1330,60 @@ class TestUnitContract(unittest.TestCase):
         batch["beta"] = torch.tensor([1.0 / 1.5, 1.0 / 1.5])
         with self.assertRaisesRegex(ValueError, "unit contract"):
             model(batch)
+
+
+class TestOutputKeyAliases(unittest.TestCase):
+    """Old output keys stay readable as aliases and warn until 0.2.0."""
+
+    def setUp(self):
+        self.model = example_model_for_aliases()
+        self.data = TestGridCACEModel._make_data(self)
+        self.data["V_ext"] = 0.1 * torch.rand_like(self.data["rho"])
+
+    def test_canonical_and_alias_keys_share_tensors(self):
+        outputs = self.model(self.data)
+        for old, new in OUTPUT_KEY_ALIASES.items():
+            self.assertIn(new, outputs)
+            self.assertIs(dict.__getitem__(outputs, old), outputs[new])
+
+    def test_reading_an_alias_warns_and_membership_does_not(self):
+        from equicdft._deprecation import EquicdftDeprecationWarning
+
+        outputs = self.model(self.data)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertIn("local_chemical_potential", outputs)
+            list(outputs.items())
+            outputs["beta_mu_local"]
+        self.assertEqual([w for w in caught if issubclass(w.category, EquicdftDeprecationWarning)], [])
+        with self.assertWarnsRegex(EquicdftDeprecationWarning, "beta_mu_local"):
+            outputs["local_chemical_potential"]
+        with self.assertWarnsRegex(EquicdftDeprecationWarning, "beta_mu_average"):
+            outputs.get("average_chemical_potential")
+
+    def test_solver_results_alias_the_equilibrium_chemical_potential(self):
+        from equicdft import GridSolver
+        from equicdft._deprecation import EquicdftDeprecationWarning
+
+        data = dict(self.data)
+        data["mu"] = torch.tensor([0.0])
+        result = GridSolver(self.model).solve(data, max_iter=2)
+        self.assertIn("beta_mu", result)
+        with self.assertWarnsRegex(EquicdftDeprecationWarning, "beta_mu"):
+            result["equilibrium_chemical_potential"]
+        self.assertIs(dict.__getitem__(result, "equilibrium_chemical_potential"), result["beta_mu"])
+        self.assertIs(dict.__getitem__(result, "local_chemical_potential"), result["beta_mu_local"])
+
+
+def example_model_for_aliases():
+    return GridCACEModel(
+        a_features=_DensityFeatures(),
+        b_features=_IdentityModule(),
+        readout=[_FirstFeatureReadout()],
+        grid_spacing=0.5,
+        boltzmann_constant=1.0,
+        compute_local_mu=True,
+    )
 
 
 if __name__ == "__main__":

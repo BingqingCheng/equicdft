@@ -52,7 +52,11 @@ $$
 
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
-$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. If a reservoir chemical
+$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. The model returns it as
+`beta_mu_local`, its weighted spatial mean as `beta_mu_average` and the hard
+weights as `beta_mu_weights`; the earlier keys `local_chemical_potential`,
+`average_chemical_potential` and `chemical_potential_weights` are still
+present as aliases until 0.2.0 and warn when read. If a reservoir chemical
 potential is known, the same tensor loss can instead target `beta_mu`.
 
 One complete density field is one dataset item. Fields are never split into

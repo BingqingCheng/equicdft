@@ -119,7 +119,7 @@ class TestConfigRoundTrip(unittest.TestCase):
         config = self.assert_round_trip(
             model,
             data,
-            keys=("beta_F_exc", "c1", "local_chemical_potential"),
+            keys=("beta_F_exc", "c1", "beta_mu_local"),
         )
         self.assertEqual(config["type"], "GridCACEModel")
         self.assertEqual(config["a_features"]["radial_basis"], "none")

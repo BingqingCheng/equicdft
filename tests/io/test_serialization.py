@@ -122,7 +122,7 @@ class TestSaveLoadModel(unittest.TestCase):
             self.assertEqual(read_model_config(path), model.to_config())
 
             actual = restored(copy.deepcopy(data))
-            for key in ("beta_F_exc", "c1", "local_chemical_potential"):
+            for key in ("beta_F_exc", "c1", "beta_mu_local"):
                 self.assertTrue(
                     torch.equal(actual[key].detach(), expected[key].detach()),
                     key,

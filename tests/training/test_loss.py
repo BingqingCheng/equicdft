@@ -190,21 +190,21 @@ class TestWeightedTensorLoss(unittest.TestCase):
             requires_grad=True,
         )
         outputs = {
-            "local_chemical_potential": local,
-            "average_chemical_potential": local[:, [0, 1, 3], :].mean(
+            "beta_mu_local": local,
+            "beta_mu_average": local[:, [0, 1, 3], :].mean(
                 dim=-2
             ),
-            "chemical_potential_weights": (rho > 0.5).to(rho.dtype),
+            "beta_mu_weights": (rho > 0.5).to(rho.dtype),
         }
         return outputs, {}
 
     @staticmethod
     def _loss():
         return TensorLoss(
-            name="local_chemical_potential",
-            prediction_key="local_chemical_potential",
-            target_key="average_chemical_potential",
-            weights_key="chemical_potential_weights",
+            name="beta_mu_local",
+            prediction_key="beta_mu_local",
+            target_key="beta_mu_average",
+            weights_key="beta_mu_weights",
         )
 
     def test_unknown_mu_is_masked_spatial_mean(self):
@@ -212,17 +212,17 @@ class TestWeightedTensorLoss(unittest.TestCase):
         loss = self._loss()(outputs, batch)
         self.assertAlmostEqual(loss.item(), 8.0 / 3.0, places=6)
         loss.backward()
-        local = outputs["local_chemical_potential"]
+        local = outputs["beta_mu_local"]
         self.assertTrue(torch.all(torch.isfinite(local.grad)))
         self.assertEqual(local.grad[0, 2, 0].item(), 0.0)
 
     def test_known_beta_mu_is_selected_from_batch(self):
         outputs, _ = self._example()
         loss = TensorLoss(
-            name="local_chemical_potential",
-            prediction_key="local_chemical_potential",
+            name="beta_mu_local",
+            prediction_key="beta_mu_local",
             target_key="beta_mu",
-            weights_key="chemical_potential_weights",
+            weights_key="beta_mu_weights",
         )(outputs, {"beta_mu": torch.tensor([[2.0]])})
         self.assertAlmostEqual(loss.item(), 11.0 / 3.0, places=6)
 
@@ -232,16 +232,16 @@ class TestWeightedTensorLoss(unittest.TestCase):
             requires_grad=True,
         )
         outputs = {
-            "local_chemical_potential": prediction,
-            "average_chemical_potential": torch.tensor([[2.0], [5.0]]),
-            "chemical_potential_weights": torch.ones_like(prediction),
+            "beta_mu_local": prediction,
+            "beta_mu_average": torch.tensor([[2.0], [5.0]]),
+            "beta_mu_weights": torch.ones_like(prediction),
         }
         batch = {"beta_mu": torch.tensor([[float("nan")], [4.0]])}
         term = TensorLoss(
-            name="local_chemical_potential",
-            prediction_key="local_chemical_potential",
-            target_key=("beta_mu", "average_chemical_potential"),
-            weights_key="chemical_potential_weights",
+            name="beta_mu_local",
+            prediction_key="beta_mu_local",
+            target_key=("beta_mu", "beta_mu_average"),
+            weights_key="beta_mu_weights",
         )
         loss = term(outputs, batch)
         loss.backward()
@@ -271,7 +271,7 @@ class TestWeightedTensorLoss(unittest.TestCase):
 
     def test_zero_total_element_weight_is_rejected(self):
         outputs, batch = self._example()
-        outputs["chemical_potential_weights"].zero_()
+        outputs["beta_mu_weights"].zero_()
         with self.assertRaisesRegex(ValueError, "positive sum"):
             self._loss()(outputs, batch)
 

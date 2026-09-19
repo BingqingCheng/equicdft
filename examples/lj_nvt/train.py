@@ -202,20 +202,20 @@ def main():
     loss = Loss(
         terms=[
             TensorLoss(
-                name="local_chemical_potential",
-                prediction_key="local_chemical_potential",
-                target_key="average_chemical_potential",
-                weights_key="chemical_potential_weights",
+                name="beta_mu_local",
+                prediction_key="beta_mu_local",
+                target_key="beta_mu_average",
+                weights_key="beta_mu_weights",
             )
         ]
     )
     metrics = [
         Metrics(
             name="local chemical potential",
-            prediction_key="local_chemical_potential",
-            target_key="average_chemical_potential",
+            prediction_key="beta_mu_local",
+            target_key="beta_mu_average",
             metric_keys=("mae", "rmse", "rmse_percent"),
-            selection_mask_key="chemical_potential_weights",
+            selection_mask_key="beta_mu_weights",
         )
     ]
 

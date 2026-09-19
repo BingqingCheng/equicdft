@@ -35,6 +35,15 @@ from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .functional.thermodynamics import local_chemical_potential
 from .units import DEFAULT_BOLTZMANN_CONSTANT
+from ._deprecation import AliasedOutputs
+
+# Deprecated output keys (equicdft 0.0.x) -> canonical keys. The model still
+# emits the old names as aliases of the same tensors until 0.2.0.
+OUTPUT_KEY_ALIASES = {
+    "local_chemical_potential": "beta_mu_local",
+    "average_chemical_potential": "beta_mu_average",
+    "chemical_potential_weights": "beta_mu_weights",
+}
 
 __all__ = [
     "GridCACEModel",
@@ -118,10 +127,12 @@ class GridCACEModel(nn.Module, Configurable):
     ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
     of ``c2 = delta(c1)/delta(rho)``. If ``V_ext`` is available, the model may
     also return the local and spatially averaged dimensionless chemical
-    potentials. Specifically, the outputs ``local_chemical_potential`` and
-    ``average_chemical_potential`` represent ``beta * mu_local`` and
-    ``beta * mu_average``; despite their established key names, they are not
-    energy-valued chemical potentials. Constructor response flags provide
+    potentials ``beta_mu_local`` (``beta * mu_local`` at every grid point),
+    ``beta_mu_average`` (its ``beta_mu_weights``-weighted spatial average)
+    and the hard weights ``beta_mu_weights`` themselves. The former names
+    ``local_chemical_potential``, ``average_chemical_potential`` and
+    ``chemical_potential_weights`` are emitted as aliases of the same
+    tensors and warn when read. Constructor response flags provide
     defaults that individual forward calls may override. Readouts may also
     return named observables through ``energy_and_outputs``; these are passed
     through unchanged and are not additional energy contributions.
@@ -621,9 +632,8 @@ class GridCACEModel(nn.Module, Configurable):
         """Return dimensionless ``beta*mu_local`` at every grid point.
 
         The returned quantity is
-        ``log(rho*Lambda**3) + beta*V_ext - c1``. It is stored under the
-        established ``local_chemical_potential`` output key but includes the
-        factor ``beta = 1 / (k_B*T)``.
+        ``log(rho*Lambda**3) + beta*V_ext - c1``, stored under the
+        ``beta_mu_local`` output key (formerly ``local_chemical_potential``).
         """
 
         rho = data["rho"].detach()
@@ -647,9 +657,9 @@ class GridCACEModel(nn.Module, Configurable):
     ) -> torch.Tensor:
         """Return dimensionless ``beta*mu_average`` for each component.
 
-        This is the weighted spatial average of ``beta*mu_local``. The result
-        is stored under the established ``average_chemical_potential`` output
-        key and therefore also includes the factor ``beta``.
+        This is the weighted spatial average of ``beta*mu_local``, stored
+        under the ``beta_mu_average`` output key (formerly
+        ``average_chemical_potential``).
         """
 
         weights = weights.detach().to(local_chemical_potential)
@@ -823,9 +833,9 @@ class GridCACEModel(nn.Module, Configurable):
             readout_outputs = {}
             reserved_outputs = {
                 "F_exc", "beta_F_exc", "c1", "c2",
-                "local_chemical_potential", "average_chemical_potential",
-                "chemical_potential_weights",
+                "beta_mu_local", "beta_mu_average", "beta_mu_weights",
                 "polarization_derivative",
+                *OUTPUT_KEY_ALIASES,
             }
             for item in self.readout:
                 energy, extra_outputs = item.energy_and_outputs(context)
@@ -943,22 +953,18 @@ class GridCACEModel(nn.Module, Configurable):
                     self.compute_local_mu
                     and "V_ext" in data
                 ):
-                    local_chemical_potential = (
-                        self._compute_local_chemical_potential(
-                            data=data,
-                            c1=outputs["c1"],
-                        )
+                    beta_mu_local = self._compute_local_chemical_potential(
+                        data=data,
+                        c1=outputs["c1"],
                     )
-                    outputs["local_chemical_potential"] = (
-                        local_chemical_potential
-                    )
+                    outputs["beta_mu_local"] = beta_mu_local
                     weights = self._weight_mask(data["rho"])
-                    outputs["chemical_potential_weights"] = weights
-                    outputs["average_chemical_potential"] = (
+                    outputs["beta_mu_weights"] = weights
+                    outputs["beta_mu_average"] = (
                         self.average_chemical_potential(
-                            local_chemical_potential,
+                            beta_mu_local,
                             weights,
                         )
                     )
 
-        return outputs
+        return AliasedOutputs.with_aliases(outputs, OUTPUT_KEY_ALIASES)

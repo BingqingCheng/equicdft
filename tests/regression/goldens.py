@@ -79,8 +79,13 @@ def _flatten(prefix: str, value, into: Dict[str, torch.Tensor]) -> None:
     if torch.is_tensor(value):
         into[prefix] = value.detach().cpu().clone()
     elif isinstance(value, dict):
-        for key in sorted(value):
-            _flatten("{}/{}".format(prefix, key), value[key], into)
+        # Deprecated alias keys duplicate canonical entries; record the
+        # canonical ones only (and read without triggering their warnings).
+        skip = getattr(value, "_aliases", {})
+        for key, item in sorted(value.items()):
+            if key in skip:
+                continue
+            _flatten("{}/{}".format(prefix, key), item, into)
     elif isinstance(value, (list, tuple)):
         if value and all(isinstance(item, (bool, int, float)) for item in value):
             into[prefix] = torch.tensor(value, dtype=torch.float64)
@@ -439,16 +444,16 @@ def _trainer_epoch():
         loss = Loss([
             TensorLoss(
                 name="mu",
-                prediction_key="local_chemical_potential",
-                target_key="average_chemical_potential",
-                weights_key="chemical_potential_weights",
+                prediction_key="beta_mu_local",
+                target_key="beta_mu_average",
+                weights_key="beta_mu_weights",
             ),
         ])
         metrics = [Metrics(
-            target_key="average_chemical_potential",
-            prediction_key="local_chemical_potential",
+            target_key="beta_mu_average",
+            prediction_key="beta_mu_local",
             name="mu",
-            selection_mask_key="chemical_potential_weights",
+            selection_mask_key="beta_mu_weights",
         )]
         trainer = Trainer(
             model=model, loss=loss, metrics=metrics,

@@ -180,8 +180,8 @@ class TestDensityNoise(unittest.TestCase):
             lambda module, args: seen.append((module.training, args[0]['rho'].detach().clone()))
         )
         t = Trainer(model, Loss([TensorLoss(
-            'mu', 'local_chemical_potential', 'average_chemical_potential',
-            weights_key='chemical_potential_weights')]),
+            'mu', 'beta_mu_local', 'beta_mu_average',
+            weights_key='beta_mu_weights')]),
             density_noise=True, optimizer_args={'lr': 1.e-4}, device='cpu')
         clean = fields[0]['rho'].clone()
         draws = torch.zeros_like(clean).unsqueeze(0)

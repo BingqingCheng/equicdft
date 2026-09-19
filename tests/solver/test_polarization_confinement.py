@@ -127,7 +127,7 @@ class TestPolarizationConfinement(unittest.TestCase):
         target = solver.evaluate(data)
         if gaussian:
             # Both derivatives include Gaussian response and relaxed electrodes.
-            for key, gradient_key in (("rho", "local_chemical_potential"),
+            for key, gradient_key in (("rho", "beta_mu_local"),
                                       ("dipole_density", "polarization_residual")):
                 delta = torch.zeros_like(data[key])
                 delta[9] = .001

@@ -31,6 +31,8 @@ from .numerics import (
     _residuals_converged,
     _thermodynamic_objective,
 )
+from .._deprecation import AliasedOutputs
+from ..model import OUTPUT_KEY_ALIASES
 from ..functional.thermodynamics import (
     density_weighted_integral,
     equilibrium_log_density,
@@ -48,6 +50,18 @@ from ..functional.polarization_ideal import (
 __all__ = [
     "GridSolver",
 ]
+
+
+# Deprecated result keys (equicdft 0.0.x) -> canonical keys; the old names
+# stay as aliases of the same tensors until 0.2.0 and warn when read.
+RESULT_KEY_ALIASES = dict(
+    OUTPUT_KEY_ALIASES,
+    equilibrium_chemical_potential="beta_mu",
+)
+
+
+def _aliased(result):
+    return AliasedOutputs.with_aliases(result, RESULT_KEY_ALIASES)
 
 
 class GridSolver:
@@ -179,9 +193,9 @@ class GridSolver:
             result["beta_Omega"] = (
                 result["beta_F"] + result["beta_V_ext"] - beta_mu_N
             )
-            if "local_chemical_potential" in result:
+            if "beta_mu_local" in result:
                 residual = (
-                    result["local_chemical_potential"]
+                    result["beta_mu_local"]
                     - beta * data["mu"][..., None, :]
                 )
                 result["euler_lagrange_residual"] = residual.masked_fill(
@@ -189,7 +203,7 @@ class GridSolver:
                     0.0,
                 )
 
-        return result
+        return _aliased(result)
 
     def solve(
         self,
@@ -680,7 +694,7 @@ class GridSolver:
             )
             result["solver_homogeneous_axes"] = list(homogeneous_axes)
         result["euler_lagrange_residual"] = residual
-        result["equilibrium_chemical_potential"] = chemical_potential
+        result["beta_mu"] = chemical_potential
         result["max_euler_lagrange_residual"] = max_residual
         result["rms_euler_lagrange_residual"] = rms_residual
         result["converged"] = _residuals_converged(
@@ -705,7 +719,7 @@ class GridSolver:
         result["anderson_accepted"] = state.get("anderson_accepted", 0)
         result["anderson_rejected"] = state.get("anderson_rejected", 0)
         result["anderson_resets"] = state.get("anderson_resets", 0)
-        return result
+        return _aliased(result)
 
     def _minimize(
         self,
@@ -1400,8 +1414,7 @@ class GridSolver:
                 polarization_derivative=polarization_derivative,
                 ideal_density_derivative=ideal_density,
                 ideal_polarization_derivative=ideal_polarization,
-                local_chemical_potential=local_mu,
-                equilibrium_chemical_potential=chemical_potential,
+                beta_mu_local=local_mu,
                 beta_mu=chemical_potential,
                 euler_lagrange_residual=density_residual,
                 density_residual=density_residual,
@@ -1415,10 +1428,10 @@ class GridSolver:
                 maximum_residual=maximum,
                 rms_residual=rms,
             )
-        return {
+        return _aliased({
             key: value.detach() if torch.is_tensor(value) else value
             for key, value in result.items()
-        }
+        })
 
     def _fixed_dipole_converged(
         self, result, tolerance_residual, tolerance_rms_residual
@@ -1448,19 +1461,18 @@ class GridSolver:
             and maximum_polarization_fraction is None
             and fixed_field is None
         ):
-            return result
+            return _aliased(result)
         if fixed_field == "dipole_density":
             residual, chemical_potential, maximum, rms = (
                 _canonical_density_residual(
                     result["rho"],
-                    result["local_chemical_potential"],
+                    result["beta_mu_local"],
                     0.0,
                     maximum_density,
                     accessible,
                     minimum_density=minimum_density,
                 )
             )
-            result["equilibrium_chemical_potential"] = chemical_potential
             result["beta_mu"] = chemical_potential
             result["euler_lagrange_residual"] = residual
             result["density_residual"] = residual
@@ -1476,7 +1488,7 @@ class GridSolver:
             )
             result["maximum_residual"] = result["rho"].new_tensor(maximum)
             result["rms_residual"] = result["rho"].new_tensor(rms)
-            return result
+            return _aliased(result)
         unconstrained_polarization = result[
             "scaled_polarization_residual"
         ]
@@ -1484,7 +1496,7 @@ class GridSolver:
             _fixed_dipole_bound_kkt(
                 result["rho"],
                 result["dipole_density"],
-                result["local_chemical_potential"],
+                result["beta_mu_local"],
                 unconstrained_polarization,
                 moment,
                 maximum_polarization_fraction,
@@ -1501,7 +1513,6 @@ class GridSolver:
                 accessible,
             )
         )
-        result["equilibrium_chemical_potential"] = chemical_potential
         result["beta_mu"] = chemical_potential
         result["euler_lagrange_residual"] = residual
         result["density_residual"] = residual
@@ -1537,7 +1548,7 @@ class GridSolver:
         else:
             result["maximum_residual"] = full_maximum
             result["rms_residual"] = full_rms
-        return result
+        return _aliased(result)
 
     @torch.enable_grad()
     def _solve_fixed_dipoles(
@@ -1915,7 +1926,7 @@ class GridSolver:
             anderson_resets=0,
         )
         result["particle_number_error"] = result["particle_numbers"] - numbers
-        return result
+        return _aliased(result)
 
     def _minimize_fixed_dipoles(
         self,
@@ -2051,7 +2062,7 @@ class GridSolver:
                             0.0
                             if fixed_field == "rho"
                             else (
-                                result["local_chemical_potential"] * rho_delta
+                                result["beta_mu_local"] * rho_delta
                             ).sum()
                         )
                         + (
