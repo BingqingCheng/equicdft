@@ -814,6 +814,12 @@ class GridCACEModel(nn.Module, Configurable):
                 )
             if has_polarization and "dipole_density" not in data:
                 raise ValueError("dipole_density is required by this model")
+            # The response fields passed by the caller are marked as requiring
+            # gradients in place. This is part of the contract: after a
+            # forward pass, callers differentiate any output (including
+            # readout observables) with respect to the very tensors they
+            # supplied, e.g. torch.autograd.grad(outputs["c1"].sum(),
+            # data["rho"]). Detached copies would silently break that.
             response_fields = []
             if compute_c1:
                 response_fields.append(data["rho"])
