@@ -290,7 +290,8 @@ class _Quadratic(IdealOnly):
         super().__init__()
         self.register_buffer("a", torch.tensor(float(a)))
 
-    def forward(self, data, compute_c1=True):
+    def forward(self, data, compute_c1=True, compute_c2=False,
+                compute_polarization_derivative=False):
         rho = data["rho"]
         volume = torch.prod(data["grid_spacing"].to(rho))
         outputs = super().forward(data, compute_c1=compute_c1)
@@ -567,6 +568,18 @@ def compare(
                      "density_derivative", "total_polarization_derivative", "beta_mu_local"}
     for key in list(actual):
         if key not in recorded and key.rsplit("/", 1)[-1] in added_outputs:
+            del actual[key]
+    # Unified solver reporting adds aliases/metadata, not new physical values.
+    # Their identities are tested in test_evaluation; keep every recorded
+    # solver tensor and the original golden file/tolerances unchanged.
+    added_solver_outputs = {
+        "beta_A", "beta_external", "beta_V_ext", "beta_P_ext",
+        "density_residual", "max_density_residual", "rms_density_residual",
+        "grid_spacing", "thermal_wavelength", "grid_center", "particle_numbers",
+    }
+    for key in list(actual):
+        if (key.startswith("solve/") and key not in recorded
+                and key.rsplit("/", 1)[-1] in added_solver_outputs):
             del actual[key]
     if set(recorded) != set(actual):
         raise AssertionError(

@@ -62,7 +62,7 @@ def minimize_density(
         current_data = dict(data)
         current_data["rho"] = rho.detach().clone()
         current_data["V_ext"] = V_ext
-        evaluation = evaluate(current_data, compute_c1=True)
+        evaluation = evaluate(current_data, compute_derivatives=True)
         n_evaluations += 1
         objective = _thermodynamic_objective(
             evaluation,
@@ -132,7 +132,7 @@ def minimize_density(
             trial_data["V_ext"] = V_ext
             trial_evaluation = evaluate(
                 trial_data,
-                compute_c1=False,
+                compute_derivatives=False,
             )
             n_evaluations += 1
             trial_objective = _thermodynamic_objective(

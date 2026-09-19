@@ -271,6 +271,22 @@ do not replace training-resume checkpoints with optimizer/scheduler state.
 - solve an equilibrium density at fixed particle number or fixed chemical
   potential using Euler iteration or direct free-energy minimization.
 
+`solver.evaluate(data, compute_derivatives=True)` returns intrinsic and external
+energies, local chemical potentials and density residuals. Set
+`compute_derivatives=False` for energy-only evaluation; this replaces the old
+solver keyword `compute_c1` and overrides the model's derivative defaults.
+Analytic ideal-reference diagnostics may still be returned; `c2` is never
+requested by solver evaluation. Direct model calls retain their `compute_c1`
+keyword.
+
+`beta_external` is the external coupling (`beta_V_ext` for density-only data),
+`beta_A = beta_F + beta_external`, and `beta_Omega` subtracts `beta_mu_N` when
+a chemical potential is supplied. `density_residual`, `max_density_residual`
+and `rms_density_residual` share the historical `euler_lagrange_residual`,
+`max_euler_lagrange_residual` and `rms_euler_lagrange_residual` values.
+Prescribed-density evaluation reports unconstrained stationarity; a solve
+reports the residuals after its bounds and homogeneous projections.
+
 The solver validates the grid against `model.grid_info`. Its options come in
 validated groups from `equicdft.solver` (`ConvergenceOptions`, `EulerOptions`
 with `AndersonOptions`, `MinimizeOptions`, `Constraints`, `Initialization`),

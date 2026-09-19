@@ -1,4 +1,4 @@
-"""Fixed-dipole (coupled density and polarization) evaluation and solvers.
+"""Fixed-dipole (coupled density and polarization) numerical update drivers.
 
 These drivers mirror :mod:`equicdft.solver.euler` and
 :mod:`equicdft.solver.minimize` for the coupled ``(rho, P)`` problem of a
@@ -17,7 +17,6 @@ from ..functional.polarization_ideal import (
     inverse_langevin,
     log_sinhc,
 )
-from ..geometry.grid import voxel_volume
 from .numerics import (
     _canonical_density_residual,
     _component_tensor,
@@ -26,233 +25,11 @@ from .numerics import (
     _polarization_residual_norms,
     _project_density_constraints,
     _project_vector_norm,
-    _resolve_accessibility_masks,
 )
 
-__all__ = ["evaluate_fixed_dipoles", "solve_fixed_dipoles"]
+from .evaluation import fixed_dipole_inputs, _set_density_residuals
 
-def fixed_dipole_inputs(solver, data):
-    """Validate one coupled fixed-dipole field."""
-
-    potential = data["V_ext"]
-    field = data["E_ext"]
-    if (
-        not torch.is_tensor(potential)
-        or potential.ndim != 2
-        or not potential.is_floating_point()
-        or min(potential.shape) < 1
-        or not torch.isfinite(potential).all()
-    ):
-        raise ValueError("V_ext must be finite floating [grid, species]")
-    if (
-        not torch.is_tensor(field)
-        or field.shape != (*potential.shape, 3)
-        or field.dtype != potential.dtype
-        or field.device != potential.device
-        or not torch.isfinite(field).all()
-    ):
-        raise ValueError(
-            "E_ext must match V_ext dtype/device with shape [grid, species, 3]"
-        )
-    beta = torch.as_tensor(
-        data["beta"], dtype=potential.dtype, device=potential.device
-    )
-    if beta.ndim or not torch.isfinite(beta) or beta <= 0:
-        raise ValueError("beta must be a finite positive scalar")
-    if solver.model is not None and hasattr(solver.model, "boltzmann_constant"):
-        temperature = torch.as_tensor(
-            data["temperature"],
-            dtype=potential.dtype,
-            device=potential.device,
-        )
-        k_b = solver.model.boltzmann_constant.to(potential)
-        if (
-            temperature.ndim
-            or not torch.isfinite(temperature)
-            or temperature <= 0
-            or not torch.allclose(
-                beta * k_b * temperature,
-                beta.new_ones(()),
-                atol=0,
-                rtol=1.0e-6,
-            )
-        ):
-            raise ValueError(
-                "beta must agree with model k_B and data temperature"
-            )
-    spacing = torch.as_tensor(
-        data["grid_spacing"],
-        dtype=potential.dtype,
-        device=potential.device,
-    ).reshape(-1)
-    if (
-        spacing.shape != (3,)
-        or not torch.isfinite(spacing).all()
-        or torch.any(spacing <= 0)
-    ):
-        raise ValueError(
-            "grid_spacing must contain three positive finite values"
-        )
-    if not torch.allclose(
-        spacing,
-        spacing[0].expand_as(spacing),
-        rtol=1.0e-7,
-        atol=0,
-    ):
-        raise ValueError("fixed-dipole solving requires cubic voxels")
-    excluded, accessible = _resolve_accessibility_masks(data, potential)
-    moment = _positive_components(
-        solver.model.ideal.dipole_magnitude,
-        potential,
-        "dipole_magnitude",
-    ).expand(potential.shape[-1])
-    wavelength = _component_tensor(
-        data.get("thermal_wavelength", solver.model.ideal.thermal_wavelength),
-        potential.shape[-1],
-        potential,
-        "thermal_wavelength",
-    )
-    if not torch.isfinite(wavelength).all() or torch.any(wavelength <= 0):
-        raise ValueError("thermal_wavelength values must be finite and positive")
-    return beta, voxel_volume(spacing), moment, wavelength, excluded, accessible
-
-
-@torch.enable_grad()
-def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
-    """Evaluate ideal, excess and external terms for independent rho/P."""
-
-    data = solver._move_data(data)
-    beta, volume, moment, wavelength, excluded, accessible = (
-        fixed_dipole_inputs(solver, data)
-    )
-    potential = data["V_ext"]
-    rho = torch.as_tensor(
-        data["rho"], dtype=potential.dtype, device=potential.device
-    ).detach().clone()
-    polarization = torch.as_tensor(
-        data["dipole_density"],
-        dtype=potential.dtype,
-        device=potential.device,
-    ).detach().clone()
-    if rho.shape != potential.shape:
-        raise ValueError("rho must match V_ext shape")
-    if polarization.shape != (*rho.shape, 3):
-        raise ValueError("dipole_density must have shape rho.shape + (3,)")
-    if torch.any(rho[excluded] != 0) or torch.any(polarization[excluded] != 0):
-        raise ValueError(
-            "rho and dipole_density must be zero in excluded voxels"
-        )
-    rho.requires_grad_(compute_derivatives)
-    polarization.requires_grad_(compute_derivatives)
-
-    model_data = dict(data, rho=rho, dipole_density=polarization)
-    model_outputs = solver.model(
-        model_data, compute_c1=compute_derivatives, compute_c2=False,
-        compute_polarization_derivative=compute_derivatives,
-    )
-    excess = model_outputs["beta_F_exc"]
-    if excess.ndim:
-        raise ValueError("model must return scalar beta_F_exc for one field")
-    external = beta * volume * (
-        (rho * potential).sum()
-        - (polarization * data["E_ext"]).sum()
-    )
-    beta_f = model_outputs["beta_F"]
-    beta_a = beta_f + external
-    if not torch.isfinite(beta_a):
-        raise FloatingPointError("nonfinite fixed-dipole objective")
-
-    result = {
-        key: data[key]
-        for key in (
-            "V_ext",
-            "E_ext",
-            "temperature",
-            "beta",
-            "grid_spacing",
-            "thermal_wavelength",
-            "excluded_mask",
-        )
-        if key in data
-    }
-    result.update(model_outputs)
-    result.update(
-        rho=rho,
-        dipole_density=polarization,
-        beta_F_id=model_outputs["beta_F_id"],
-        beta_F_exc=excess,
-        beta_F=beta_f,
-        beta_external=external,
-        beta_A=beta_a,
-        particle_numbers=volume * rho.sum(dim=0),
-        maximum_alignment=(
-            polarization[accessible].norm(dim=-1)
-            / (rho[accessible] * moment)
-        ).max(),
-    )
-    if compute_derivatives:
-        c1 = model_outputs["c1"]
-        polarization_derivative = model_outputs["polarization_derivative"]
-        ideal_density = model_outputs["ideal_density_derivative"]
-        ideal_polarization = model_outputs["ideal_polarization_derivative"]
-        local_mu = model_outputs["density_derivative"] + beta * potential
-        weights = rho[accessible]
-        chemical_potential = (
-            weights * local_mu[accessible]
-        ).sum(dim=0) / weights.sum(dim=0)
-        density_residual = torch.where(
-            accessible[:, None],
-            local_mu - chemical_potential,
-            torch.zeros_like(local_mu),
-        )
-        polarization_residual = torch.where(
-            accessible[:, None, None],
-            model_outputs["total_polarization_derivative"]
-            - beta * data["E_ext"],
-            torch.zeros_like(polarization),
-        )
-        scaled_polarization_residual = (
-            polarization_residual * moment[..., None]
-        )
-        active_rho = rho[accessible]
-        active_density_residual = density_residual[accessible]
-        max_density = active_density_residual.abs().max()
-        rms_density = torch.sqrt(
-            (active_rho * active_density_residual.square()).sum()
-            / active_rho.sum()
-        )
-        max_polarization, rms_polarization = (
-            _polarization_residual_norms(
-                rho,
-                scaled_polarization_residual,
-                accessible,
-            )
-        )
-        maximum = torch.maximum(max_density, max_polarization)
-        rms = torch.maximum(rms_density, rms_polarization)
-        result.update(
-            c1=c1,
-            polarization_derivative=polarization_derivative,
-            ideal_density_derivative=ideal_density,
-            ideal_polarization_derivative=ideal_polarization,
-            beta_mu_local=local_mu,
-            beta_mu=chemical_potential,
-            euler_lagrange_residual=density_residual,
-            density_residual=density_residual,
-            polarization_euler_lagrange_residual=polarization_residual,
-            polarization_residual=polarization_residual,
-            scaled_polarization_residual=scaled_polarization_residual,
-            max_euler_lagrange_residual=max_density,
-            rms_euler_lagrange_residual=rms_density,
-            max_polarization_residual=max_polarization,
-            rms_polarization_residual=rms_polarization,
-            maximum_residual=maximum,
-            rms_residual=rms,
-        )
-    return {
-        key: value.detach() if torch.is_tensor(value) else value
-        for key, value in result.items()
-    }
+__all__ = ["solve_fixed_dipoles"]
 
 
 def fixed_dipole_converged(
@@ -295,11 +72,7 @@ def apply_fixed_dipole_bounds(solver,
                 minimum_density=minimum_density,
             )
         )
-        result["beta_mu"] = chemical_potential
-        result["euler_lagrange_residual"] = residual
-        result["density_residual"] = residual
-        result["max_euler_lagrange_residual"] = maximum
-        result["rms_euler_lagrange_residual"] = rms
+        _set_density_residuals(result, residual, chemical_potential, maximum, rms)
         result["full_maximum_residual"] = torch.maximum(
             result["max_polarization_residual"],
             result["max_polarization_residual"].new_tensor(maximum),
@@ -335,11 +108,7 @@ def apply_fixed_dipole_bounds(solver,
             accessible,
         )
     )
-    result["beta_mu"] = chemical_potential
-    result["euler_lagrange_residual"] = residual
-    result["density_residual"] = residual
-    result["max_euler_lagrange_residual"] = maximum
-    result["rms_euler_lagrange_residual"] = rms
+    _set_density_residuals(result, residual, chemical_potential, maximum, rms)
 
     max_polarization, rms_polarization = _polarization_residual_norms(
         result["rho"], constrained_polarization, accessible

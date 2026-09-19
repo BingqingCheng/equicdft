@@ -670,6 +670,30 @@ $$
 \frac{\delta\beta F}{\delta\mathbf{P}}=\beta\mathbf{E}_{\mathrm{ext}}.
 $$
 
+Solver evaluation uses `solver.evaluate(data, compute_derivatives=True)` for
+both scalar and coupled fields. This solver keyword replaces `compute_c1`;
+direct model calls keep their separate derivative flags. Set it to `False`
+to skip differentiated outputs; analytic ideal-reference diagnostics may
+remain. The solver never requests `c2` and does not change model defaults.
+
+Both paths return `beta_external` and `beta_A = beta_F + beta_external`.
+For polarized fields, `beta_V_ext` is the density coupling and `beta_P_ext`
+is the **negative** electric-field coupling; their sum is `beta_external`
+up to floating-point summation order. Density diagnostics are named
+`density_residual`, `max_density_residual` and `rms_density_residual`, with
+the historical Euler names retained as aliases. Coupled convergence also
+includes the molecular-moment-scaled polarization residual. A bounded solve
+reports its projected/KKT norms; the raw `polarization_residual` remains
+available separately from `polarization_kkt_residual`.
+
+Evaluation applies no density/polarization bounds or homogeneous projections;
+those belong to `solve`. Scalar evaluation supports batches and either a
+prescribed chemical potential or canonical mean removal. Fixed-dipole
+evaluation remains canonical, unbatched, and requires both `V_ext` and
+`E_ext`. The scalar and coupled numerical update kernels remain separate.
+For differentiable coupled observables use the model directly: coupled
+solver evaluation returns detached tensors, as before.
+
 Canonical fitting can therefore use two ordinary `TensorLoss` terms, without
 a script-defined Euler loss. The following standalone helper uses a fixed
 density mask and independent mean removal for each density field/species.

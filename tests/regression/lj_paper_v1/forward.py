@@ -9,7 +9,7 @@ from .common import check_thresholds, load_case, print_metrics, r2, rmse
 
 def evaluate_forward():
     model, solver, frame = load_case()
-    result = solver.evaluate(frame, compute_c1=True)
+    result = solver.evaluate(frame, compute_derivatives=True)
     rho = result["rho"].detach()
     target = frame["beta"].to(rho) * frame["V_ext"].to(rho)
     # beta*V_ext up to the chemical-potential gauge, which is fixed below by

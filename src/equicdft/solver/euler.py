@@ -75,14 +75,14 @@ def solve_euler(
     current_data = dict(data)
     current_data["rho"] = rho.detach().clone()
     current_data["V_ext"] = V_ext
-    evaluation = evaluate(current_data, compute_c1=True)
+    evaluation = evaluate(current_data, compute_derivatives=True)
     n_evaluations += 1
     objective = _thermodynamic_objective(
         evaluation,
         fixed_N is not None,
         voxel_volume,
         thermal_wavelength,
-                solver.model.ideal,
+        solver.model.ideal,
     )
     objective_history.append(objective.detach().item())
 
@@ -90,7 +90,7 @@ def solve_euler(
         trial_data = dict(data)
         trial_data["rho"] = trial_rho.detach().clone()
         trial_data["V_ext"] = V_ext
-        trial_evaluation = evaluate(trial_data, compute_c1=True)
+        trial_evaluation = evaluate(trial_data, compute_derivatives=True)
         _, _, trial_max_residual, trial_rms_residual = _euler_residual(
             trial_rho, _stationarity_field(trial_evaluation), data["beta"], mu,
             residual_density_threshold, maximum_density, accessible_mask,

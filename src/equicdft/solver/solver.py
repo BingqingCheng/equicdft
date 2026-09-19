@@ -17,7 +17,8 @@ from .symmetry import (
     _HomogeneousDensityProjection,
     _normalize_homogeneous_axes,
 )
-from .dipoles import evaluate_fixed_dipoles, solve_fixed_dipoles
+from .dipoles import solve_fixed_dipoles
+from .evaluation import evaluate, _set_density_residuals
 from .euler import solve_euler
 from .minimize import minimize_density
 from .options import (
@@ -37,9 +38,6 @@ from .numerics import (
     _residuals_converged,
 )
 from .._device import GeometryDeviceCache, module_device, move_batch
-from ..functional.thermodynamics import (
-    density_weighted_integral,
-)
 from ..functional.polarization_ideal import FixedDipoleIdeal
 
 __all__ = [
@@ -83,74 +81,21 @@ class GridSolver:
     def evaluate(
         self,
         data: Dict[str, Any],
-        compute_c1: bool = True,
+        compute_derivatives: bool = True,
     ) -> Dict[str, Any]:
-        """Evaluate a supplied density and its available thermodynamics."""
+        """Evaluate intrinsic energy, external coupling and stationarity.
 
-        if isinstance(self.model.ideal, FixedDipoleIdeal):
-            return evaluate_fixed_dipoles(self, data, compute_c1)
+        compute_derivatives=False skips differentiated outputs independently
+        of model defaults. Analytic ideal-reference diagnostics may remain.
+        Solver evaluation never requests c2.
+        beta_external includes all external coupling; beta_A adds it to beta_F.
+        Density residuals use the prescribed chemical potential when present
+        for scalar fields, otherwise the canonical weighted mean.
+        Fixed-dipole evaluation remains canonical and requires V_ext and E_ext.
+        Bounds and homogeneous projections are applied only by solve.
+        """
 
-        data = self._move_data(data)
-        rho = data["rho"]
-        if torch.any(rho < 0.0).item():
-            raise ValueError("rho must be nonnegative")
-        excluded_mask, _ = _resolve_accessibility_masks(data, rho)
-        excluded_density = excluded_mask[..., None].expand_as(rho)
-        if torch.any(rho[excluded_density] != 0.0).item():
-            raise ValueError("rho must be zero at excluded grid points")
-
-        outputs = self.model(data, compute_c1=compute_c1)
-        result = {
-            key: data[key]
-            for key in (
-                "rho",
-                "V_ext",
-                "mu",
-                "temperature",
-                "beta",
-                "excluded_mask",
-                "grid_center",
-            )
-            if key in data
-        }
-        result.update(outputs)
-        if compute_c1 and "V_ext" in data:
-            result["beta_mu_local"] = (
-                outputs["ideal_density_derivative"]
-                + data["beta"][..., None, None] * data["V_ext"] - outputs["c1"]
-            )
-
-        volume_element = voxel_volume(data["grid_spacing"])
-        if "V_ext" in data:
-            beta = data["beta"][..., None, None]
-            result["beta_V_ext"] = density_weighted_integral(
-                rho,
-                beta * data["V_ext"],
-                volume_element,
-            )
-
-        if "V_ext" in data and "mu" in data:
-            beta = data["beta"][..., None, None]
-            beta_mu_N = density_weighted_integral(
-                rho,
-                beta * data["mu"][..., None, :],
-                volume_element,
-            )
-            result["beta_mu_N"] = beta_mu_N
-            result["beta_Omega"] = (
-                result["beta_F"] + result["beta_V_ext"] - beta_mu_N
-            )
-            if "beta_mu_local" in result:
-                residual = (
-                    result["beta_mu_local"]
-                    - beta * data["mu"][..., None, :]
-                )
-                result["euler_lagrange_residual"] = residual.masked_fill(
-                    excluded_density,
-                    0.0,
-                )
-
-        return result
+        return evaluate(self, data, compute_derivatives)
 
     def solve(
         self,
@@ -456,7 +401,7 @@ class GridSolver:
 
             final_data = dict(data)
             final_data["rho"] = state["rho"].detach().clone()
-            result = self.evaluate(final_data, compute_c1=True)
+            result = self.evaluate(final_data, compute_derivatives=True)
         finally:
             self.model.train(was_training)
 
@@ -478,10 +423,9 @@ class GridSolver:
                 residual_density_threshold, density_cap, accessible_mask,
             )
             result["solver_homogeneous_axes"] = list(homogeneous_axes)
-        result["euler_lagrange_residual"] = residual
-        result["beta_mu"] = chemical_potential
-        result["max_euler_lagrange_residual"] = max_residual
-        result["rms_euler_lagrange_residual"] = rms_residual
+        _set_density_residuals(
+            result, residual, chemical_potential, max_residual, rms_residual,
+        )
         result["converged"] = _residuals_converged(
             max_residual,
             rms_residual,
