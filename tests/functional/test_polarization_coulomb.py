@@ -5,7 +5,6 @@ import math
 import unittest
 
 from tests.ideal_helpers import with_ideal
-from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import (

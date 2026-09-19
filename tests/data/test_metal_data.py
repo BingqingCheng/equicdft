@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.io import write
-from torch import nn
 
 from equicdft import GridData, GridSolver
 

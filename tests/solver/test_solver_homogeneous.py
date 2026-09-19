@@ -4,7 +4,6 @@ import itertools
 
 import torch
 from tests.metal_helpers import _run
-from torch import nn
 
 from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
 from tests.metal_helpers import liquid_coulomb

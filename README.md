@@ -10,6 +10,12 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
+Three longer documents live in `docs/`: `docs/polarization.md` for fixed-dipole
+fluids and the coupled density/polarization solve, `docs/metal-wall.md` for
+electrode boundary conditions, and `docs/experimental.md` for the stability
+regularizers and other features still being evaluated. `docs/migration.md`
+records what changed for existing models and data files.
+
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
@@ -53,14 +59,11 @@ $$
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
 $\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. Fits use the intrinsic
-`density_derivative` against
-`-beta * V_ext`, with explicit loss weights and `TensorLoss(center_axis=-2)`.
-`Metrics(center_axis=-2)` applies the same canonical gauge projection.
-Masks and mean removal belong to these losses/metrics, not the model.
-`GridSolver.evaluate` supplies `beta_mu_local` when external fields are given.
-Old model files automatically discard the retired `compute_local_mu` and
-`rho_min` settings during conversion; keep the original cutoff explicitly in
-the application's loss mask and solver residual settings where needed.
+`density_derivative` against `-beta * V_ext`, with explicit loss weights and
+`TensorLoss(center_axis=-2)`; `Metrics(center_axis=-2)` applies the same
+canonical gauge projection. Masks and mean removal belong to these losses and
+metrics, not the model. `GridSolver.evaluate` supplies `beta_mu_local` when
+external fields are given.
 
 The model owns its ideal reference (`IdealGas` by default for scalar models).
 It returns `beta_F_id`, `beta_F_exc`, their sum `beta_F`, and requested total
@@ -272,26 +275,21 @@ do not replace training-resume checkpoints with optimizer/scheduler state.
   potential using Euler iteration or direct free-energy minimization.
 
 `solver.evaluate(data, compute_derivatives=True)` returns intrinsic and external
-energies, local chemical potentials and density residuals. Set
-`compute_derivatives=False` for energy-only evaluation; this replaces the old
-solver keyword `compute_c1` and overrides the model's derivative defaults.
-Analytic ideal-reference diagnostics may still be returned; `c2` is never
-requested by solver evaluation. Direct model calls retain their `compute_c1`
-keyword.
-
-Solver evaluation returns detached numerical tensors and does not mark caller
-fields for gradients. Use the model directly for training or higher derivatives.
-The model reports `density_derivative` for the total intrinsic response and
-`density_derivative_excess = -c1` for its excess part. With `compute_ideal=False`,
-only excess responses are returned; total-response names are never reused.
+energies, local chemical potentials and density residuals;
+`compute_derivatives=False` is energy-only and overrides the model's
+derivative defaults. It returns detached tensors and does not mark caller
+fields for gradients, so training and higher derivatives go through the model
+directly, which reports `density_derivative` for the total intrinsic response
+and `density_derivative_excess = -c1` for its excess part. With
+`compute_ideal=False` only excess responses are returned; total-response names
+are never reused.
 
 `beta_external` is the external coupling (`beta_V_ext` for density-only data),
 `beta_A = beta_F + beta_external`, and `beta_Omega` subtracts `beta_mu_N` when
 a chemical potential is supplied. The density stationarity residual and its
 norms are `density_residual`, `max_density_residual` and
-`rms_density_residual`, with `polarization_residual` the coupled counterpart;
-these replace the `euler_lagrange_residual` spellings, which carried the same
-values and are no longer returned.
+`rms_density_residual`, with `polarization_residual` the coupled counterpart.
+Renamed and retired keys are listed in `docs/migration.md`.
 Prescribed-density evaluation reports unconstrained stationarity; a solve
 reports the residuals after its bounds and homogeneous projections.
 

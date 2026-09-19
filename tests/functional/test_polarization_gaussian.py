@@ -267,7 +267,7 @@ class TestPolarizationGaussian(unittest.TestCase):
                 minus[field][index] -= 1e-6
                 fd = (model(plus)["beta_F_exc"] - model(minus)["beta_F_exc"]) / (2e-6 * .8**3)
                 torch.testing.assert_close(fd, sign * output[key][index], atol=2e-9, rtol=2e-7)
-            self.assertGreater(float(output["c1"].abs().max()), 1e-8)
+            self.assertGreater(float(output["c1"].detach().abs().max()), 1e-8)
             left = torch.autograd.grad(output["c1"][4, 0], data["dipole_density"], retain_graph=True)[0][5, 0, 2]
             right = torch.autograd.grad(output["polarization_derivative_excess"][5, 0, 2], data["rho"], retain_graph=True)[0][4, 0]
             torch.testing.assert_close(left, -right, atol=1e-12, rtol=1e-12)
@@ -311,8 +311,16 @@ class TestPolarizationGaussian(unittest.TestCase):
         from equicdft.legacy import upgrade_legacy_model
         legacy = upgrade_legacy_model(torch.load(buffer, weights_only=False))
         torch.testing.assert_close(legacy(*args), explicit(*args), atol=0., rtol=0.)
+        # A homogeneous field has no reciprocal structure above k=0, so its
+        # features vanish. The FFT reaches that through cancellation rather
+        # than exactly, so the bound is double-precision round-off of the
+        # scale the same features take on a modulated field of the same size.
         homogeneous = torch.full_like(data["rho"], .4)
-        torch.testing.assert_close(explicit(homogeneous, *args[1:]), torch.zeros(2, 1), atol=0., rtol=0.)
+        round_off = torch.finfo(data["rho"].dtype).eps * explicit(*args).abs().max()
+        torch.testing.assert_close(
+            explicit(homogeneous, *args[1:]), torch.zeros(2, 1),
+            atol=float(round_off), rtol=0.,
+        )
 
     def test_invalid_contracts(self):
         for kernel in ("coulomb", "screened_inverse_laplacian"):

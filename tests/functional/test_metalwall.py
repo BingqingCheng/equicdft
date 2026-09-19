@@ -4,6 +4,7 @@ import itertools
 import io
 import math
 import unittest
+import warnings
 from unittest.mock import patch
 
 import torch
@@ -522,7 +523,11 @@ class TestMetalWall(unittest.TestCase):
             expected["electrode_coulomb_energy"], data["rho"],
         )[0]
         with patch.object(torch.linalg, "lu_solve", None):
-            actual = _run(_module(), data)
+            # torch.lu_solve is deprecated; this is the only place it runs, so
+            # its warning is expected here and kept out of the suite output.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                actual = _run(_module(), data)
         gradient = torch.autograd.grad(actual["electrode_coulomb_energy"], data["rho"])[0]
         torch.testing.assert_close(actual["metal_site_q"], expected["metal_site_q"])
         torch.testing.assert_close(gradient, expected_gradient)

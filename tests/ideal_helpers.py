@@ -2,7 +2,7 @@
 
 import torch
 from torch import nn
-from equicdft import IdealGas, FixedDipoleIdeal
+from equicdft import IdealGas
 
 
 class IdealOnly(nn.Module):

@@ -584,7 +584,6 @@ loss = Loss([
     ),
     FourierStabilityLoss(
         variable="dipole_density",
-        dipole_magnitude=m,
         random_wavevectors_per_field=1,
         wavevector_treatment="independent",
         include_zero_wavevector=True,

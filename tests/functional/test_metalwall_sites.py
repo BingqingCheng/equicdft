@@ -459,7 +459,9 @@ class TestExplicitMetalSites(unittest.TestCase):
             max_iter=1, tolerance_residual=1e-9, mixing=.2,
         )
         self.assertFalse(truncated["converged"])
-        self.assertGreater(float((truncated["metal_site_q"] - initial_q).abs().max()), 1e-8)
+        self.assertGreater(
+            float((truncated["metal_site_q"] - initial_q).detach().abs().max()), 1e-8,
+        )
         self.assert_outputs_close(truncated, _model_reference(dict(data, rho=truncated["rho"])))
 
 
