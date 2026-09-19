@@ -3,8 +3,8 @@
 from ._version import __version__
 from .data import FourierResponseData, GridData, default_data_key, read_metal_sites
 from .energy import EnergyReadout
-from .features import CartesianAFeatures
-from .interaction import BChiMessage
+from .representation.cartesian import CartesianAFeatures
+from .representation.message import BChiMessage
 from .loader import make_dataloaders
 from .loss import FourierResponseLoss, Loss, LossTerm, TensorLoss
 from .metrics import FourierResponseMetrics, MetricCollection, Metrics
@@ -28,7 +28,7 @@ from .serialization import (
 )
 from .solver import GridSolver
 from .stability import FourierStabilityLoss
-from .symmetrize import CartesianBFeatures
+from .representation.invariants import CartesianBFeatures
 from .trainer import Trainer, TrainingStream
 
 __all__ = [

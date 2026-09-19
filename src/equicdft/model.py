@@ -30,7 +30,7 @@ from .geometry.grid import (
 )
 from .derivatives import compute_grid_derivative
 from .energy import EnergyReadout, ReadoutContext
-from .interaction import BChiMessage
+from .representation.message import BChiMessage
 from ._metal_data import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .thermodynamics import local_chemical_potential

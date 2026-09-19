@@ -6,13 +6,13 @@ import unittest
 import numpy as np
 import torch
 
-from equicdft.features import CartesianAFeatures
+from equicdft.representation.cartesian import CartesianAFeatures
 from equicdft.model import GridCACEModel
 from equicdft.readout import LocalReadout
 from equicdft.semilocal import LDAReadout
 from equicdft.solver import GridSolver
 from equicdft.geometry.stencil import get_neighbor_indices
-from equicdft.symmetrize import CartesianBFeatures
+from equicdft.representation.invariants import CartesianBFeatures
 
 
 class TestPolarizationModel(unittest.TestCase):

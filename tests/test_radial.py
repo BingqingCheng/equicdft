@@ -3,13 +3,13 @@ import unittest
 
 import torch
 
-from equicdft._radial import (
+from equicdft.representation.radial import (
     _RadialTransform,
     bessel_radial_values,
     gaussian_radial_values,
     whiten_radial_cartesian_basis,
 )
-from equicdft.features import _make_powers
+from equicdft.representation.cartesian import _make_powers
 from equicdft.geometry.stencil import make_stencil
 
 

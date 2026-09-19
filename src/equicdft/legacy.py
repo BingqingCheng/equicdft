@@ -31,14 +31,14 @@ from torch import nn
 
 from ._config import Configurable, build, mlp_hidden_sizes, mlp_input_size
 from .data import GridData
-from .features import CartesianAFeatures, _DensityMixing
-from .interaction import BChiMessage
+from .representation.cartesian import CartesianAFeatures, _DensityMixing
+from .representation.message import BChiMessage
 from .model import GridCACEModel
 from .metalwall import MetalWall
 from .pairwise import PairwiseReadout
 from .readout import BulkReadout, LocalReadout, LongRangeReadout
 from .reciprocal import ReciprocalFeatures
-from .symmetrize import CartesianBFeatures
+from .representation.invariants import CartesianBFeatures
 from .semilocal import GGAReadout, LDAReadout
 from .serialization import _one_density_scale, default_dtype, model_dtype, save_model
 
@@ -60,6 +60,10 @@ _MODULE_ALIASES: Dict[str, str] = {
     # step 5 package layout (equicdft 0.1.0); the old paths are shims until 0.2.0
     "equicdft.stencil": "equicdft.geometry.stencil",
     "equicdft._grid": "equicdft.geometry.grid",
+    "equicdft.features": "equicdft.representation.cartesian",
+    "equicdft.symmetrize": "equicdft.representation.invariants",
+    "equicdft.interaction": "equicdft.representation.message",
+    "equicdft._radial": "equicdft.representation.radial",
 }
 _CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {}
 

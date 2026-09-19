@@ -157,7 +157,7 @@ class TestBChiMessage(unittest.TestCase):
                 ).double()
                 convolution.load_state_dict(gather.state_dict(), strict=True)
                 with mock.patch(
-                    "equicdft.interaction.gather_neighbors",
+                    "equicdft.representation.message.gather_neighbors",
                     side_effect=AssertionError("gather backend was reached"),
                 ):
                     actual = convolution(
@@ -1198,7 +1198,7 @@ class TestMessagePassingModel(unittest.TestCase):
                     backend,
                 )
                 with mock.patch(
-                    "equicdft.interaction.gather_neighbors",
+                    "equicdft.representation.message.gather_neighbors",
                     side_effect=AssertionError("gather backend was reached"),
                 ):
                     restored_output = restored(
