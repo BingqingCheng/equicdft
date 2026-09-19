@@ -48,6 +48,24 @@ from ._config import TYPE_KEY, Configurable, build
 from ._trainer_io import atomic_torch_save
 from .energy import EnergyReadout
 
+__all__ = [
+    "MODEL_FORMAT",
+    "MODEL_FORMAT_VERSION",
+    "dtype_name",
+    "dtype_from_name",
+    "default_dtype",
+    "model_dtype",
+    "model_payload",
+    "save_model",
+    "read_model_payload",
+    "validate_model_payload",
+    "read_model_config",
+    "migrate_model_state_dict",
+    "migrate_model_payload",
+    "build_model",
+    "load_model",
+]
+
 
 MODEL_FORMAT = "equicdft-model"
 MODEL_FORMAT_VERSION = 2

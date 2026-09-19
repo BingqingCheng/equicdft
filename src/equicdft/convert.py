@@ -15,6 +15,11 @@ from typing import Optional, Sequence
 from .legacy import convert_legacy_model
 from .serialization import read_model_config
 
+__all__ = [
+    "build_parser",
+    "main",
+]
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

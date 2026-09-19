@@ -42,6 +42,14 @@ from .symmetrize import CartesianBFeatures
 from .semilocal import GGAReadout, LDAReadout
 from .serialization import _one_density_scale, default_dtype, model_dtype, save_model
 
+__all__ = [
+    "load_legacy_model",
+    "upgrade_legacy_model",
+    "legacy_model_to_current",
+    "verify_equivalent",
+    "convert_legacy_model",
+]
+
 
 PathLike = Union[str, Path]
 

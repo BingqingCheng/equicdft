@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     finite_scalar,
     nonnegative_scalar,
@@ -41,6 +41,10 @@ from .polarization_ideal import (
     inverse_langevin,
     log_sinhc,
 )
+
+__all__ = [
+    "GridSolver",
+]
 
 
 class GridSolver:

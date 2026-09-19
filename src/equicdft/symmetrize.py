@@ -11,9 +11,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 from torch import nn
 
-from ._argument_checks import boolean, positive_integer
+from ._validation import boolean, positive_integer
 from ._config import Configurable, make_config, register
 from .features import _make_powers
+
+__all__ = [
+    "CartesianBFeatures",
+]
 
 
 def _make_group_actions(

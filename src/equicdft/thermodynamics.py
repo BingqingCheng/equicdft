@@ -19,6 +19,15 @@ from typing import Optional, Union
 
 import torch
 
+__all__ = [
+    "density_weighted_integral",
+    "log_dimensionless_density",
+    "ideal_free_energy",
+    "local_chemical_potential",
+    "equilibrium_log_density",
+    "beta_external_potential",
+]
+
 
 def density_weighted_integral(
     rho: torch.Tensor,

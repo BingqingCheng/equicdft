@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     nonnegative_scalar,
     optional_boolean,
@@ -34,6 +34,10 @@ from .interaction import BChiMessage
 from ._metal_data import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .thermodynamics import local_chemical_potential
+
+__all__ = [
+    "GridCACEModel",
+]
 
 
 # The model relies on these members of its feature modules. Declaring the

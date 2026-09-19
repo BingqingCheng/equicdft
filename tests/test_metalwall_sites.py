@@ -6,7 +6,7 @@ import math
 import unittest
 
 import torch
-from metal_helpers import _run, liquid_coulomb, metal_sites
+from tests.metal_helpers import _run, liquid_coulomb, metal_sites
 
 from equicdft import GridSolver, MetalWall
 
@@ -125,7 +125,7 @@ def _correction(result):
 def _model_fixture(mode="beta"):
     # Import locally to reuse the established weak-coupling fixture without
     # collecting its TestCase a second time through this module.
-    from test_metal_model import TestMetalModel
+    from tests.test_metal_model import TestMetalModel
 
     model = TestMetalModel._model(mode=mode).eval()
     data = TestMetalModel._data()

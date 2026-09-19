@@ -10,8 +10,8 @@ import torch
 from equicdft._fourier_sites import FourierSites
 from equicdft.energy import ReadoutContext
 from equicdft.metalwall import MetalWall
-from metal_helpers import _run, liquid_coulomb, metal_sites
-from test_metalwall import _dense_kernels, _field, _site_rows
+from tests.metal_helpers import _run, liquid_coulomb, metal_sites
+from tests.test_metalwall import _dense_kernels, _field, _site_rows
 
 
 def _grid_potential(charge, kernel, spacing, shape):

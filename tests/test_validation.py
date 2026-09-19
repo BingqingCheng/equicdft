@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from equicdft._argument_checks import (
+from equicdft._validation import (
     boolean,
     finite_scalar,
     nonempty_string,

@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
-from ._argument_checks import boolean
+from ._validation import boolean
 from .metrics import format_metric_value, metric_label
 
 

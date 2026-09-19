@@ -6,8 +6,8 @@ from torch import nn
 
 from equicdft import FourierResponse, FourierStabilityLoss
 from equicdft._fourier import component_fourier_directions
-from test_fourier_amplitudes import batch
-import test_loss as fixtures
+from tests.test_fourier_amplitudes import batch
+from tests import test_loss as fixtures
 
 
 class SpatialQuadratic(nn.Module):

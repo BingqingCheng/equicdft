@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from metal_helpers import _run, liquid_coulomb, liquid_data, metal_sites
+from tests.metal_helpers import _run, liquid_coulomb, liquid_data, metal_sites
 
 from equicdft import (
     GridCACEModel,

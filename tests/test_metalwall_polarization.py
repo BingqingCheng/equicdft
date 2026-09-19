@@ -7,7 +7,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, LongRangeReadout, MetalWall, ReciprocalFeatures
-from metal_helpers import wall_context as ctx
+from tests.metal_helpers import wall_context as ctx
 
 
 def _liquid(charges, alpha=.23, amplitude=1.7, polar=True):

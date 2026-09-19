@@ -21,7 +21,7 @@ from typing import (
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     nonempty_string,
     nonnegative_scalar,
@@ -39,6 +39,11 @@ from ._trainer_io import (
 from .loss import Loss
 from .metrics import MetricCollection
 from .serialization import migrate_model_state_dict
+
+__all__ = [
+    "TrainingStream",
+    "Trainer",
+]
 
 
 _MAX_CACHED_GRID_GEOMETRIES = 2

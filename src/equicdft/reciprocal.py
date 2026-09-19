@@ -6,7 +6,7 @@ from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import boolean, positive_integer
+from ._validation import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
 from ._config import Configurable, make_config, register
 from ._fourier_sites import FourierSites
@@ -16,6 +16,10 @@ from ._grid import (
     grid_spacing_tensor,
     voxel_volume,
 )
+
+__all__ = [
+    "ReciprocalFeatures",
+]
 
 
 def _wavevector_axes(grid_size, grid_spacing, device, dtype, *, derivative=False):

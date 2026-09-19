@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Union
 import torch
 from torch import nn
 
-from ._argument_checks import boolean, positive_integer
+from ._validation import boolean, positive_integer
 from ._config import Configurable, make_config, register
 from ._grid import gather_neighbors, periodic_stencil_convolution
 from ._nn import build_mlp, validate_hidden_sizes
@@ -15,6 +15,10 @@ from ._radial import (
     prepare_radial_exponents,
 )
 from .features import CartesianAFeatures
+
+__all__ = [
+    "BChiMessage",
+]
 
 
 @register

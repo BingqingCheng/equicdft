@@ -6,7 +6,7 @@ from typing import Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import positive_integer
+from ._validation import positive_integer
 
 
 DEFAULT_RADIAL_EXPONENTS = (0.125,)

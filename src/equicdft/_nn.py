@@ -5,7 +5,7 @@ from typing import Sequence, Tuple
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     positive_integer,
 )

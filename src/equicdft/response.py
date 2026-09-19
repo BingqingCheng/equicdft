@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import boolean, finite_scalar, optional_positive_integer
+from ._validation import boolean, finite_scalar, optional_positive_integer
 from ._fourier import (
     expand_probe_amplitudes,
     fourier_curvature_matrix,
@@ -16,6 +16,10 @@ from ._fourier import (
     validate_response,
     validated_wavevector_domain,
 )
+
+__all__ = [
+    "FourierResponse",
+]
 
 
 class FourierResponse(nn.Module):

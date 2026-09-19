@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     nonnegative_integer,
     optional_positive_integer,
@@ -22,6 +22,10 @@ from ._radial import (
     prepare_radial_exponents,
 )
 from .stencil import make_stencil
+
+__all__ = [
+    "CartesianAFeatures",
+]
 
 
 def _make_powers(max_power: int) -> torch.Tensor:

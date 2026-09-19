@@ -16,12 +16,17 @@ from typing import (
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, default_collate
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     finite_scalar,
     nonnegative_integer,
     positive_integer,
 )
+
+__all__ = [
+    "LoaderResult",
+    "make_dataloaders",
+]
 
 
 LoaderResult = Dict[str, Union[DataLoader, float, None]]

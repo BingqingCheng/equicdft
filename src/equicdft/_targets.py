@@ -4,7 +4,7 @@ from typing import Dict, Sequence, Tuple, Union
 
 import torch
 
-from ._argument_checks import unique_strings
+from ._validation import unique_strings
 
 
 TargetKeys = Union[str, Sequence[str]]

@@ -5,7 +5,7 @@ from typing import Dict, Optional, Sequence, Union
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     boolean,
     finite_scalar,
     nonempty_string,
@@ -22,6 +22,10 @@ from ._fourier import (
 )
 from .loss import LossTerm
 from .response import FourierResponse
+
+__all__ = [
+    "FourierStabilityLoss",
+]
 
 
 class FourierStabilityLoss(LossTerm):

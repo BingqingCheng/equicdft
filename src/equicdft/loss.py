@@ -5,7 +5,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from ._argument_checks import (
+from ._validation import (
     nonempty_string,
     nonnegative_scalar,
 )
@@ -15,6 +15,13 @@ from ._fourier import (
 )
 from .response import FourierResponse
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
+
+__all__ = [
+    "LossTerm",
+    "TensorLoss",
+    "FourierResponseLoss",
+    "Loss",
+]
 
 
 class LossTerm(nn.Module):

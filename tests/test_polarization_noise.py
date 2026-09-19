@@ -263,7 +263,7 @@ class TestPolarizationNoise(unittest.TestCase):
                     self.assertFalse(resumed.polarization_noise)
 
     def test_complete_functional_training_has_finite_gradients(self):
-        from test_polarization_symmetry import TestFullPolarizationSymmetry
+        from tests.test_polarization_symmetry import TestFullPolarizationSymmetry
 
         model = TestFullPolarizationSymmetry.model("fft", 0.)
         data = TestFullPolarizationSymmetry.data()

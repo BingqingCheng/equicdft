@@ -12,7 +12,17 @@ from typing import NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from ._argument_checks import nonnegative_integer
+from ._validation import nonnegative_integer
+
+__all__ = [
+    "grid_size_array",
+    "grid_spacing_array",
+    "GridOrder",
+    "canonical_grid_order",
+    "make_stencil",
+    "coarsen_grid",
+    "get_neighbor_indices",
+]
 
 
 def grid_size_array(value: object, name: str = "grid_size") -> np.ndarray:

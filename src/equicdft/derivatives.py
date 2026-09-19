@@ -2,6 +2,10 @@
 
 import torch
 
+__all__ = [
+    "compute_grid_derivative",
+]
+
 
 def compute_grid_derivative(
     scalar_output: torch.Tensor,

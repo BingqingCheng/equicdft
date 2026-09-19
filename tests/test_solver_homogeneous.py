@@ -3,11 +3,11 @@ import unittest
 import itertools
 
 import torch
-from metal_helpers import _run
+from tests.metal_helpers import _run
 from torch import nn
 
 from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
-from metal_helpers import liquid_coulomb
+from tests.metal_helpers import liquid_coulomb
 from equicdft._solver_symmetry import _HomogeneousDensityProjection
 
 

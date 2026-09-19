@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from equicdft import FourierResponse, FourierStabilityLoss, Loss, Trainer
-import test_loss as fixtures
+from tests import test_loss as fixtures
 
 
 def batch(n_fields=2):

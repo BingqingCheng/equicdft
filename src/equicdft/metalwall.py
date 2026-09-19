@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, NamedTuple
 
 import torch
 
-from ._argument_checks import positive_scalar
+from ._validation import positive_scalar
 from ._config import Configurable, build, constructor_arguments, make_config, register
 from ._fourier_sites import FourierSites
 from ._grid import common_grid_size, grid_spacing_tensor
@@ -13,6 +13,10 @@ from ._metal_data import normalize_metal_site_mapping
 from .energy import EnergyReadout, ReadoutContext
 from .readout import LongRangeReadout
 from .reciprocal import _coulomb_values, _squared_wavevectors
+
+__all__ = [
+    "MetalWall",
+]
 
 
 def _field_vector(value, name):

@@ -6,7 +6,7 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._argument_checks import finite_scalar
+from ._validation import finite_scalar
 from ._grid import voxel_volume
 from .thermodynamics import ideal_free_energy
 

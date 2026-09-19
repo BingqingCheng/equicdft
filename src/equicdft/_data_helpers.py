@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from ase import Atoms
 
-from ._argument_checks import (
+from ._validation import (
     boolean as _strict_boolean,
     nonnegative_integer as _strict_nonnegative_integer,
     positive_integer as _strict_positive_integer,

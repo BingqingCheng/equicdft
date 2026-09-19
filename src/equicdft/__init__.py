@@ -32,6 +32,7 @@ from .symmetrize import CartesianBFeatures
 from .trainer import Trainer, TrainingStream
 
 __all__ = [
+    "__version__",
     "CartesianAFeatures",
     "CartesianBFeatures",
     "BulkReadout",

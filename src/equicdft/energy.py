@@ -16,6 +16,12 @@ from torch import nn
 
 from ._grid import grid_spacing_tensor, voxel_volume as compute_voxel_volume
 
+__all__ = [
+    "FREE_ENERGY_MODES",
+    "ReadoutContext",
+    "EnergyReadout",
+]
+
 
 FREE_ENERGY_MODES = ("beta", "physical")
 

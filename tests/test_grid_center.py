@@ -6,14 +6,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from metal_helpers import _run
+from tests.metal_helpers import _run
 from ase import Atoms
 from ase.io import write
 from torch.utils.data import DataLoader
 
 from equicdft import GridData, GridSolver, MetalWall, read_metal_sites
-from test_metal_sites_data import _atoms, _grid_values
-from test_metalwall_sites import (
+from tests.test_metal_sites_data import _atoms, _grid_values
+from tests.test_metalwall_sites import (
     _data, _inverse_fixture, _one_electrode, _reference, _wall,
 )
 

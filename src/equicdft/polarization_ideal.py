@@ -13,6 +13,14 @@ from .thermodynamics import (
     log_dimensionless_density,
 )
 
+__all__ = [
+    "langevin",
+    "log_sinhc",
+    "inverse_langevin",
+    "dipole_alignment",
+    "FixedDipoleIdeal",
+]
+
 
 def _langevin_ratio_series(square):
     """Small-field series for L(x)/x, expressed in x^2 for vector inputs."""
