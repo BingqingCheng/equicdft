@@ -184,7 +184,7 @@ class BulkReadout(EnergyReadout, Configurable):
     def __init__(
         self,
         n_types: int = 1,
-        hidden_sizes: Sequence[int] = (16, 16),
+        hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = True,
     ) -> None:
         super().__init__()
@@ -308,7 +308,7 @@ class LongRangeReadout(EnergyReadout, Configurable):
         self,
         n_kernels: Optional[int] = None,
         n_types: Optional[int] = None,
-        hidden_sizes: Sequence[int] = (16, 16),
+        hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = True,
         charges: Optional[Sequence[float]] = None,
         coulomb_amplitude: Optional[float] = None,

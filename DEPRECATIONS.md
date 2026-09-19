@@ -46,3 +46,16 @@ aliases of the same tensors and warn when read through `[]` or `.get`.
 | `average_chemical_potential` | `beta_mu_average` |
 | `chemical_potential_weights` | `beta_mu_weights` |
 | `equilibrium_chemical_potential` (solver) | `beta_mu` |
+
+## Changed defaults (0.1.0)
+
+These change freshly built models only; saved models record every
+constructor argument.
+
+- `GridCACEModel(boltzmann_constant=...)` defaults to
+  `equicdft.units.DEFAULT_BOLTZMANN_CONSTANT` (8.617333262e-5 eV/K, the
+  `GridData` default) instead of `1.0`; the model also rejects a batch whose
+  `beta` was built with another constant. Reduced-unit work passes
+  `boltzmann_constant=1.0` to both `GridData` and `GridCACEModel`.
+- `BulkReadout`, `LongRangeReadout` and `GGAReadout` default to
+  `hidden_sizes=(32, 16)` like every other readout, instead of `(16, 16)`.

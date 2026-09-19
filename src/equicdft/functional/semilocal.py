@@ -207,7 +207,7 @@ class GGAReadout(EnergyReadout, Configurable):
 
     def __init__(
         self,
-        hidden_sizes: Sequence[int] = (16, 16),
+        hidden_sizes: Sequence[int] = (32, 16),
         n_features: Optional[int] = None,
         n_types: int = 1,
         minimum_coefficient: float = 0.0,
