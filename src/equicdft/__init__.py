@@ -1,7 +1,7 @@
 """Neural density-functional models for periodic Cartesian grids."""
 
 from ._version import __version__
-from .data.grid_data import GridData, default_data_key, read_metal_sites
+from .data.grid_data import GridData, GridDataset, default_data_key, read_metal_sites
 from .data.loaders import make_dataloaders
 from .functional.base import EnergyReadout
 from .functional.metalwall import MetalWall
@@ -38,6 +38,7 @@ __all__ = [
     "BulkReadout",
     "BChiMessage",
     "GridData",
+    "GridDataset",
     "GridCACEModel",
     "GridSolver",
     "GGAReadout",

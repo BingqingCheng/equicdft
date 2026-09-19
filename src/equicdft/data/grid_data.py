@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 import numpy as np
 from ase import Atoms
 from ase.io import read
+from torch.utils.data import Dataset
 
 from .._validation import boolean, nonnegative_integer, positive_scalar
 from .extxyz import (
@@ -22,6 +23,7 @@ from ..geometry.stencil import grid_size_array, grid_spacing_array
 
 __all__ = [
     "DEFAULT_BOLTZMANN_CONSTANT",
+    "GridDataset",
     "default_data_key",
     "read_metal_sites",
     "GridData",
@@ -142,6 +144,17 @@ def _normalize_xyz_paths(
     return [Path(value).expanduser() for value in values]
 
 
+class GridDataset(list, Dataset):
+    """A list of :class:`GridData` fields that is also a torch ``Dataset``.
+
+    :meth:`GridData.from_xyz` returns one. Every list operation (indexing,
+    slicing, ``len``, iteration, concatenation) keeps working, and the
+    object can be handed to ``torch.utils.data.DataLoader`` or
+    :func:`equicdft.make_dataloaders` like :class:`FourierResponseData`.
+    Slices are plain lists; wrap them again when a ``Dataset`` is needed.
+    """
+
+
 class GridData(dict):
     """Dictionary-like data for one complete periodic density configuration.
 
@@ -206,10 +219,12 @@ class GridData(dict):
         ] = 1.0,
         grid_info: Optional[Mapping[str, Any]] = None,
         include_local_density_index: bool = True,
-    ) -> List["GridData"]:
+    ) -> "GridDataset":
         """Read selected EXTXYZ frames into complete periodic grid records.
 
-        ``path`` may contain one path or an ordered sequence. ``data_key``
+        Returns a :class:`GridDataset`, a list of :class:`GridData` records
+        that is also a torch ``Dataset``. ``path`` may contain one path or an
+        ordered sequence. ``data_key``
         maps canonical field names to EXTXYZ names. If
         ``target_grid_spacing`` is supplied, available fields are block-
         averaged before neighborhoods are constructed. ``grid_info`` may be
@@ -280,7 +295,7 @@ class GridData(dict):
         if resolved_grid_info is not None:
             for frame in data:
                 validate_frame_grid_info(frame, resolved_grid_info)
-        return data
+        return GridDataset(data)
 
     @classmethod
     def from_dict(

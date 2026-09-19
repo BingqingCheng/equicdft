@@ -1003,3 +1003,24 @@ class TestFourierResponseData(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGridDataset(unittest.TestCase):
+    def test_from_xyz_returns_a_list_that_is_a_dataset(self):
+        from pathlib import Path
+
+        from torch.utils.data import DataLoader, Dataset
+
+        from equicdft import GridData, GridDataset
+
+        path = Path(__file__).resolve().parents[2] / "examples" / "lj_nvt" / "mini_lj_nvt.extxyz"
+        fields = GridData.from_xyz(path, cutoff_grid=1, boltzmann_constant=1.0)
+        self.assertIsInstance(fields, GridDataset)
+        self.assertIsInstance(fields, Dataset)
+        self.assertIsInstance(fields, list)
+        self.assertEqual(len(fields), 5)
+        self.assertIsInstance(fields[0], GridData)
+        self.assertEqual(len(fields[1:3]), 2)
+        self.assertEqual(len(fields + fields), 10)
+        batch = next(iter(DataLoader(fields, batch_size=2)))
+        self.assertEqual(tuple(batch["rho"].shape[:1]), (2,))

@@ -7,6 +7,7 @@ keeps its historical meaning as the module that offered them.
 from .grid_data import (
     DEFAULT_BOLTZMANN_CONSTANT,
     GridData,
+    GridDataset,
     default_data_key,
     read_metal_sites,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "DEFAULT_BOLTZMANN_CONSTANT",
     "FourierResponseData",
     "GridData",
+    "GridDataset",
     "LoaderResult",
     "default_data_key",
     "make_dataloaders",
