@@ -68,8 +68,8 @@ def minimize_density(
             evaluation,
             fixed_N is not None,
             voxel_volume,
+            solver.model.ideal,
             thermal_wavelength,
-                solver.model.ideal,
         ).detach()
         if not torch.isfinite(objective).item():
             raise ValueError(
@@ -139,8 +139,8 @@ def minimize_density(
                 trial_evaluation,
                 fixed_N is not None,
                 voxel_volume,
-                thermal_wavelength,
                 solver.model.ideal,
+                thermal_wavelength,
             ).detach()
 
             sufficient_decrease = (

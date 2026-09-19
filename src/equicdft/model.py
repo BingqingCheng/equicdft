@@ -32,6 +32,7 @@ from .functional.base import EnergyReadout, ReadoutContext
 from .representation.message import BChiMessage
 from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
+from ._species import species_vector
 from .functional.ideal import IdealReference, IdealGas
 from .units import DEFAULT_BOLTZMANN_CONSTANT
 
@@ -413,26 +414,6 @@ class GridCACEModel(nn.Module, Configurable):
             dtype=torch.get_default_dtype(),
         )
 
-        thermal_wavelength_tensor = torch.as_tensor(
-            thermal_wavelength,
-            dtype=torch.get_default_dtype(),
-        ).detach().clone().reshape(-1)
-        if thermal_wavelength_tensor.numel() == 1:
-            thermal_wavelength_tensor = thermal_wavelength_tensor.repeat(
-                self.n_types
-            )
-        if thermal_wavelength_tensor.shape != (self.n_types,):
-            raise ValueError(
-                "thermal_wavelength must contain one value or one per type"
-            )
-        if (
-            not torch.all(torch.isfinite(thermal_wavelength_tensor)).item()
-            or torch.any(thermal_wavelength_tensor <= 0.0).item()
-        ):
-            raise ValueError(
-                "thermal_wavelength values must be finite and positive"
-            )
-
         self.register_buffer("grid_spacing", spacing)
         self.register_buffer("mean_density", density_scale)
         self.register_buffer("mean_temperature", mean_temperature_tensor)
@@ -440,11 +421,20 @@ class GridCACEModel(nn.Module, Configurable):
             "boltzmann_constant",
             boltzmann_constant_tensor,
         )
-        if ideal is None and self.ideal is not None:
-            self.ideal.thermal_wavelength = thermal_wavelength_tensor
-        # The ideal reference owns the physical wavelength; the property below
-        # remains a read-only convenience for grid metadata and conversion.
+        # The ideal reference validated its own constants in its constructor.
+        # A default one built from this model's ``thermal_wavelength`` is
+        # widened to one value per component, which is the shape model files
+        # and ``grid_info`` have always carried; an explicitly supplied
+        # reference keeps the shape it was given and is only checked here.
         if self.ideal is not None:
+            if ideal is None:
+                self.ideal.thermal_wavelength = species_vector(
+                    self.ideal.thermal_wavelength,
+                    self.n_types,
+                    spacing,
+                    "thermal_wavelength",
+                    positive=True,
+                )
             for name in ("thermal_wavelength", "dipole_magnitude"):
                 value = getattr(self.ideal, name, None)
                 if value is not None and value.numel() not in (1, self.n_types):
@@ -621,8 +611,13 @@ class GridCACEModel(nn.Module, Configurable):
             "boltzmann_constant": (
                 self.boltzmann_constant.detach().cpu().item()
             ),
+            # An excess-only model (a polarized one with no explicit ideal
+            # reference) defines no wavelength, and the property below says
+            # so. Data still needs the entry, and this model never reads it,
+            # so the neutral value is written rather than a guess at the
+            # physical one: unlike a model file, nothing fitted depends on it.
             "thermal_wavelength": (
-                self.thermal_wavelength.detach().cpu().tolist()
+                self.thermal_wavelength.detach().cpu().expand(self.n_types).tolist()
                 if self.ideal is not None else [1.0] * self.n_types
             ),
         }

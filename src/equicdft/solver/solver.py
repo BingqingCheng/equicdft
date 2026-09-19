@@ -4,7 +4,6 @@ from typing import (
     Any,
     Dict,
     Optional,
-    Sequence,
     Union,
 )
 
@@ -32,12 +31,12 @@ from .options import (
 )
 from .numerics import (
     _resolve_accessibility_masks,
-    _component_tensor,
     _euler_residual,
     _stationarity_field,
     _project_density_constraints,
     _residuals_converged,
 )
+from .._species import species_vector
 from .._device import GeometryDeviceCache, module_device, move_batch
 from ..functional.polarization_ideal import FixedDipoleIdeal
 
@@ -281,7 +280,7 @@ class GridSolver:
         )
 
         n_types = V_ext.shape[-1]
-        thermal_wavelength = _component_tensor(
+        thermal_wavelength = species_vector(
             data.get("thermal_wavelength", self.model.ideal.thermal_wavelength),
             n_types,
             V_ext,
@@ -291,7 +290,7 @@ class GridSolver:
 
         density_cap = None
         if maximum_density is not None:
-            density_cap = _component_tensor(
+            density_cap = species_vector(
                 maximum_density,
                 n_types,
                 V_ext,
@@ -307,9 +306,9 @@ class GridSolver:
 
         fixed_N = None
         if particle_numbers is None:
-            mu = _component_tensor(data["mu"], n_types, V_ext, "mu")
+            mu = species_vector(data["mu"], n_types, V_ext, "mu")
         else:
-            fixed_N = _component_tensor(
+            fixed_N = species_vector(
                 particle_numbers,
                 n_types,
                 V_ext,

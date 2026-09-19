@@ -2,11 +2,11 @@
 
 import torch
 
-from ..functional.polarization_ideal import FixedDipoleIdeal, _positive_components
+from .._species import species_vector
+from ..functional.polarization_ideal import FixedDipoleIdeal
 from ..functional.thermodynamics import density_weighted_integral
 from ..geometry.grid import voxel_volume
 from .numerics import (
-    _component_tensor,
     _polarization_residual_norms,
     _resolve_accessibility_masks,
 )
@@ -82,19 +82,20 @@ def fixed_dipole_inputs(solver, data):
     ):
         raise ValueError("fixed-dipole solving requires cubic voxels")
     excluded, accessible = _resolve_accessibility_masks(data, potential)
-    moment = _positive_components(
+    moment = species_vector(
         solver.model.ideal.dipole_magnitude,
+        potential.shape[-1],
         potential,
         "dipole_magnitude",
-    ).expand(potential.shape[-1])
-    wavelength = _component_tensor(
+        positive=True,
+    )
+    wavelength = species_vector(
         data.get("thermal_wavelength", solver.model.ideal.thermal_wavelength),
         potential.shape[-1],
         potential,
         "thermal_wavelength",
+        positive=True,
     )
-    if not torch.isfinite(wavelength).all() or torch.any(wavelength <= 0):
-        raise ValueError("thermal_wavelength values must be finite and positive")
     return beta, voxel_volume(spacing), moment, wavelength, excluded, accessible
 
 

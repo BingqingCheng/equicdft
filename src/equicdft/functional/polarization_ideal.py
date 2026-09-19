@@ -7,7 +7,12 @@ grid evaluator handles exact vacuum; perfect alignment remains a boundary limit.
 
 import torch
 from .._config import make_config, register
-from .ideal import IdealReference, _positive_parameter, _wavelength
+from .._species import (
+    broadcast_species_field,
+    species_parameter,
+    species_vector,
+)
+from .ideal import IdealReference
 
 from .thermodynamics import (
     log_dimensionless_density,
@@ -108,7 +113,7 @@ class FixedDipoleIdeal(IdealReference):
 
     def __init__(self, dipole_magnitude, *, thermal_wavelength=1.0):
         super().__init__(thermal_wavelength=thermal_wavelength)
-        self.register_buffer("dipole_magnitude", _positive_parameter(
+        self.register_buffer("dipole_magnitude", species_parameter(
             dipole_magnitude, "dipole_magnitude",
         ))
 
@@ -126,12 +131,15 @@ class FixedDipoleIdeal(IdealReference):
             raise ValueError("rho and dipole_density must share dtype and device")
         if not torch.isfinite(dipole_density).all():
             raise ValueError("dipole_density must be finite")
-        moment = _positive_components(self.dipole_magnitude, rho, "dipole_magnitude")
-        wavelength = _wavelength(
+        moment = species_vector(
+            self.dipole_magnitude, rho.shape[-1], rho, "dipole_magnitude",
+            positive=True,
+        )
+        wavelength = broadcast_species_field(
             self.thermal_wavelength
             if thermal_wavelength is None
             else thermal_wavelength,
-            rho,
+            rho, "thermal_wavelength",
         )
         reduced = dipole_density / (rho * moment)[..., None]
         square = reduced.square().sum(dim=-1)

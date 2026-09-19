@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .._config import Configurable, make_config, register
+from .._species import broadcast_species_field, species_parameter
 from .thermodynamics import log_dimensionless_density
 
 
@@ -28,7 +29,7 @@ class IdealReference(nn.Module, Configurable):
 
     def __init__(self, *, thermal_wavelength=1.0):
         super().__init__()
-        self.register_buffer("thermal_wavelength", _positive_parameter(
+        self.register_buffer("thermal_wavelength", species_parameter(
             thermal_wavelength, "thermal_wavelength",
         ))
 
@@ -85,27 +86,6 @@ class IdealReference(nn.Module, Configurable):
         return result
 
 
-def _format_values(tensor):
-    """Render a species vector for an error message, without dtype noise."""
-
-    return "[{}]".format(
-        ", ".join("{:.6g}".format(value) for value in tensor.reshape(-1).tolist())
-    )
-
-
-def _positive_parameter(value, name):
-    tensor = (value if isinstance(value, torch.Tensor)
-              else torch.as_tensor(value, dtype=torch.float64))
-    if tensor.is_complex():
-        raise ValueError(name + " must be real")
-    if (tensor.ndim > 1 or not tensor.numel()
-            or not torch.isfinite(tensor).all() or torch.any(tensor <= 0)):
-        raise ValueError(name + " must be a positive scalar or species vector")
-    if not tensor.is_floating_point():
-        tensor = tensor.to(torch.get_default_dtype())
-    return tensor.detach().clone()
-
-
 @register
 class IdealGas(IdealReference):
     """Translational ideal gas, with angular measure absent/normalized to one."""
@@ -114,9 +94,9 @@ class IdealGas(IdealReference):
         return make_config(self, thermal_wavelength=self.thermal_wavelength)
 
     def local(self, rho, dipole_density=None, thermal_wavelength=None):
-        wavelength = _wavelength(
+        wavelength = broadcast_species_field(
             self.thermal_wavelength if thermal_wavelength is None else thermal_wavelength,
-            rho,
+            rho, "thermal_wavelength",
         )
         log_rho = log_dimensionless_density(rho, wavelength)
         return {
@@ -124,16 +104,3 @@ class IdealGas(IdealReference):
             "ideal_density_derivative": log_rho,
         }
 
-
-def _wavelength(value, rho):
-    """Validate scalar/species/batched wavelengths without flattening fields."""
-    raw = torch.as_tensor(value, device=rho.device)
-    if raw.is_complex() or not torch.isfinite(raw).all() or torch.any(raw <= 0):
-        raise ValueError("thermal_wavelength must be finite, positive and real")
-    value = raw.to(rho)
-    if value.ndim == 0:
-        value = value.reshape(1)
-    target = rho.shape[:-2] + (rho.shape[-1],)
-    if torch.broadcast_shapes(value.shape, target) != target:
-        raise ValueError("thermal_wavelength must match field and species axes")
-    return value

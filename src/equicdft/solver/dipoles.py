@@ -11,15 +11,14 @@ rather than one loop.
 
 import torch
 
+from .._species import species_vector
 from ..functional.polarization_ideal import (
-    _positive_components,
     dipole_alignment,
     inverse_langevin,
     log_sinhc,
 )
 from .numerics import (
     _canonical_density_residual,
-    _component_tensor,
     _fixed_dipole_bound_kkt,
     _maximum_relative_change,
     _polarization_residual_norms,
@@ -182,12 +181,13 @@ def solve_fixed_dipoles(solver, data, method, options):
         fixed_dipole_inputs(solver, data)
     )
     potential = data["V_ext"]
-    numbers = _positive_components(
-        particle_numbers, potential, "particle_numbers"
-    ).expand(potential.shape[-1])
+    numbers = species_vector(
+        particle_numbers, potential.shape[-1], potential, "particle_numbers",
+        positive=True,
+    )
     density_cap = None
     if maximum_density is not None:
-        density_cap = _component_tensor(
+        density_cap = species_vector(
             maximum_density,
             potential.shape[-1],
             potential,
@@ -207,7 +207,7 @@ def solve_fixed_dipoles(solver, data, method, options):
             )
     polarization_fraction_cap = None
     if maximum_polarization_fraction is not None:
-        polarization_fraction_cap = _component_tensor(
+        polarization_fraction_cap = species_vector(
             maximum_polarization_fraction,
             potential.shape[-1],
             potential,

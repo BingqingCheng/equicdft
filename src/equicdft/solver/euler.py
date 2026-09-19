@@ -81,8 +81,8 @@ def solve_euler(
         evaluation,
         fixed_N is not None,
         voxel_volume,
-        thermal_wavelength,
         solver.model.ideal,
+        thermal_wavelength,
     )
     objective_history.append(objective.detach().item())
 
@@ -248,8 +248,8 @@ def solve_euler(
                     candidate_evaluation,
                     fixed_N is not None,
                     voxel_volume,
+                    solver.model.ideal,
                     thermal_wavelength,
-                solver.model.ideal,
                 )
                 accept_anderson = (
                     torch.all(torch.isfinite(candidate_rho)).item()
@@ -280,8 +280,8 @@ def solve_euler(
             evaluation,
             fixed_N is not None,
             voxel_volume,
+            solver.model.ideal,
             thermal_wavelength,
-                solver.model.ideal,
         )
         objective_history.append(objective.detach().item())
 

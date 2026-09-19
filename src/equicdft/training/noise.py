@@ -5,12 +5,10 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from .._species import species_vector
 from .._validation import boolean, nonnegative_scalar
 from ..functional.thermodynamics import local_chemical_potential
-from ..functional.polarization_ideal import (
-    FixedDipoleIdeal,
-    _positive_components,
-)
+from ..functional.polarization_ideal import FixedDipoleIdeal
 
 __all__ = ["NoiseOptions", "add_density_noise", "add_field_noise"]
 
@@ -306,7 +304,10 @@ def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
     if (not torch.isfinite(rho).all() or torch.any(rho < 0)
             or not torch.isfinite(polar).all()):
         raise ValueError("noise requires finite fields and nonnegative rho")
-    moment = _positive_components(dipole_magnitude, rho, "noise_dipole_magnitude")
+    moment = species_vector(
+        dipole_magnitude, rho.shape[-1], rho, "noise_dipole_magnitude",
+        positive=True,
+    )
     rho_std = _noise_std(batch, "rho_std", rho, density_noise)
     polar_std = _noise_std(batch, "dipole_density_std", polar, polarization_noise)
     valid = batch.get("valid")

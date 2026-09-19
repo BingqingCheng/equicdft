@@ -1,6 +1,6 @@
 """Private numerical kernels used by the equilibrium grid solver."""
 
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -9,32 +9,19 @@ from ..functional.thermodynamics import (
 )
 
 
-def _component_tensor(
-    values: Union[float, Sequence[float], torch.Tensor],
-    n_types: int,
-    reference: torch.Tensor,
-    name: str,
-) -> torch.Tensor:
-    values = torch.as_tensor(
-        values,
-        dtype=reference.dtype,
-        device=reference.device,
-    ).reshape(-1)
-    if values.numel() == 1:
-        values = values.repeat(n_types)
-    if values.shape != (n_types,):
-        raise ValueError("{} must contain one value per type".format(name))
-    return values
-
-
 def _thermodynamic_objective(
     evaluation: Dict[str, torch.Tensor],
     fixed_particle_numbers: bool,
     voxel_volume: torch.Tensor,
-    thermal_wavelength: torch.Tensor,
     ideal,
+    thermal_wavelength: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the objective with high-precision scalar accumulation."""
+    """Return the objective with high-precision scalar accumulation.
+
+    ``thermal_wavelength`` is the value this solve resolved, which is the
+    batch's when it carries one and the ideal reference's otherwise, so the
+    objective and the model forward use the same Lambda.
+    """
 
     rho = evaluation["rho"]
     accumulation_dtype = _accumulation_dtype(rho.dtype)
