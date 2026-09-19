@@ -13,6 +13,15 @@ class IdealReference(nn.Module, Configurable):
     Exact vacuum has zero energy. Derivatives there are returned as zero
     placeholders with ``ideal_derivative_mask=False``: they are not finite
     thermodynamic derivatives. Exclusions and statistical masks are distinct.
+
+    ``thermal_wavelength`` is the stored default, not a unit contract. A
+    batch that carries its own ``thermal_wavelength`` overrides it, because
+    ``Lambda = h / sqrt(2*pi*m*k_B*T)`` varies with temperature and species
+    mass and one batch may hold several thermodynamic states. This is the
+    opposite of the Boltzmann constant, which fixes the unit system and is
+    checked against every batch's ``beta`` in
+    :meth:`GridCACEModel._check_unit_contract`. Build data with
+    ``grid_info=model.grid_info`` to carry the model's own value.
     """
 
     requires_dipole_density = False
@@ -54,8 +63,16 @@ class IdealReference(nn.Module, Configurable):
         # Safe placeholders avoid evaluating logarithms/inverse Langevin at
         # vacuum; their local energy/derivatives are removed before integration.
         safe_rho = torch.where(active, rho, torch.ones_like(rho))
-        wavelength = data.get("thermal_wavelength", self.thermal_wavelength)
-        local = self.local(safe_rho, data.get("dipole_density"), wavelength)
+        # A batch wavelength wins over the stored one on purpose, unlike the
+        # Boltzmann constant: Lambda = h / sqrt(2*pi*m*k_B*T) depends on the
+        # temperature and the species mass, so one batch may legitimately
+        # hold several, while k_B fixes the unit system and may not vary.
+        # The buffer is therefore the default for data that carries none.
+        local = self.local(
+            safe_rho,
+            data.get("dipole_density"),
+            data.get("thermal_wavelength"),
+        )
         density_energy = safe_rho * local.pop("energy_per_particle")
         volume = torch.as_tensor(voxel_volume, dtype=rho.dtype, device=rho.device)
         result = {
@@ -66,6 +83,14 @@ class IdealReference(nn.Module, Configurable):
             mask = active[..., None] if value.ndim == rho.ndim + 1 else active
             result[key] = torch.where(mask, value, torch.zeros_like(value))
         return result
+
+
+def _format_values(tensor):
+    """Render a species vector for an error message, without dtype noise."""
+
+    return "[{}]".format(
+        ", ".join("{:.6g}".format(value) for value in tensor.reshape(-1).tolist())
+    )
 
 
 def _positive_parameter(value, name):

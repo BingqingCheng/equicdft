@@ -176,9 +176,17 @@ class TestLegacyConversion(unittest.TestCase):
         readout.n_features = None
         with tempfile.TemporaryDirectory() as directory:
             legacy_file = _whole_object_file(model, directory)
-            self.assert_converted_matches(reference, data, legacy_file)
+            restored = self.assert_converted_matches(reference, data, legacy_file)
+        converted = next(
+            item for item in restored.readout if isinstance(item, LocalReadout)
+        )
+        self.assertEqual(converted.n_features, first.in_features)
 
     def assert_converted_matches(self, model, data, legacy_file):
+        # load_model returns an evaluation-mode model, and forward selects
+        # create_graph from self.training, so a train-mode reference takes a
+        # different autograd path and lands one ulp away in c1.
+        model.eval()
         expected = model(copy.deepcopy(data))
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "converted.pt"

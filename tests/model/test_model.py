@@ -1281,6 +1281,29 @@ class TestUnitContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unit contract"):
             model(batch)
 
+    def test_batch_thermal_wavelength_overrides_the_stored_default(self):
+        """Lambda is per-state data, unlike k_B; the buffer is only a default.
+
+        Lambda = h / sqrt(2*pi*m*k_B*T) varies with temperature and species
+        mass, so a batch may carry its own and it wins. Pinned here so the
+        asymmetry with the Boltzmann constant above stays deliberate.
+        """
+
+        model = self._model(boltzmann_constant=1.0, thermal_wavelength=0.3)
+        data = TestGridCACEModel._make_data(self)
+        stored = model(dict(data))["beta_F_id"]
+        same = model(dict(data, thermal_wavelength=torch.tensor([0.3])))["beta_F_id"]
+        torch.testing.assert_close(same, stored, atol=0.0, rtol=0.0)
+        other = model(dict(data, thermal_wavelength=torch.tensor([1.0])))["beta_F_id"]
+        self.assertNotEqual(other.item(), stored.item())
+        # The documented way to make data follow the model.
+        from equicdft.data.extxyz import normalize_grid_info
+
+        self.assertEqual(
+            normalize_grid_info(model.grid_info)["thermal_wavelength"],
+            model.thermal_wavelength.tolist(),
+        )
+
 
 class TestOutputKeys(unittest.TestCase):
     """Chemical potentials belong to solver results, not intrinsic outputs."""

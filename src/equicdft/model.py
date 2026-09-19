@@ -38,6 +38,7 @@ from .units import DEFAULT_BOLTZMANN_CONSTANT
 
 __all__ = [
     "GridCACEModel",
+    "RESERVED_OUTPUT_KEYS",
 ]
 
 
@@ -71,6 +72,30 @@ _A_FEATURE_MESSAGE_CONTRACT = (
     "coordinate_scaling",
 )
 _B_FEATURE_CONTRACT = ("n_features", "validate_a_features")
+
+# Output names a readout may not claim through ``energy_and_outputs``. Most
+# are produced by the model itself; ``beta_mu_local`` comes from the solver,
+# and ``beta_mu_average``/``beta_mu_weights`` are the conventional names an
+# application gives the gauge and mask it supplies to its own losses. All of
+# them are reserved so a readout's extra output can never shadow one.
+RESERVED_OUTPUT_KEYS = frozenset((
+    "F_exc",
+    "beta_F_exc",
+    "beta_F_id",
+    "beta_F",
+    "c1",
+    "c2",
+    "density_derivative",
+    "density_derivative_excess",
+    "ideal_density_derivative",
+    "ideal_derivative_mask",
+    "polarization_derivative",
+    "polarization_derivative_excess",
+    "ideal_polarization_derivative",
+    "beta_mu_local",
+    "beta_mu_average",
+    "beta_mu_weights",
+))
 
 
 def _validate_feature_modules(
@@ -807,14 +832,6 @@ class GridCACEModel(nn.Module, Configurable):
 
             readout_energies = []
             readout_outputs = {}
-            reserved_outputs = {
-                "F_exc", "beta_F_exc", "c1", "c2",
-                "beta_mu_local", "beta_mu_average", "beta_mu_weights",
-                "polarization_derivative_excess", "beta_F_id", "beta_F",
-                "ideal_density_derivative", "ideal_polarization_derivative",
-                "density_derivative", "density_derivative_excess", "polarization_derivative",
-                "ideal_derivative_mask",
-            }
             for item in self.readout:
                 energy, extra_outputs = item.energy_and_outputs(context)
                 if energy.shape != rho.shape[:-2]:
@@ -823,7 +840,7 @@ class GridCACEModel(nn.Module, Configurable):
                     )
                 readout_energies.append(energy)
                 conflicts = set(extra_outputs) & (
-                    reserved_outputs | set(readout_outputs)
+                    RESERVED_OUTPUT_KEYS | set(readout_outputs)
                 )
                 if conflicts:
                     raise ValueError(
