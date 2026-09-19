@@ -34,6 +34,7 @@ from .representation.message import BChiMessage
 from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .functional.thermodynamics import local_chemical_potential
+from .units import DEFAULT_BOLTZMANN_CONSTANT
 
 __all__ = [
     "GridCACEModel",
@@ -132,6 +133,14 @@ class GridCACEModel(nn.Module, Configurable):
     field or a complete orientational chemical potential. Polarization
     descriptors require cubic voxels; the box dimensions may differ.
 
+    ``boltzmann_constant`` and ``mean_temperature`` fix the unit contract:
+    ``reference_energy = k_B * mean_temperature`` scales physical readouts and
+    ``free_energy_mode="physical"`` outputs, and every batch's ``beta`` must
+    equal ``1 / (k_B * temperature)`` under this constant or the forward pass
+    raises. The default constant is the one ``GridData`` uses
+    (:data:`equicdft.units.DEFAULT_BOLTZMANN_CONSTANT`, eV/K); reduced-unit
+    data and models both pass ``boltzmann_constant=1.0``.
+
     ``mean_density`` is the one density scale shared by every normalized
     density input (feature moments, LDA inputs, bulk and long-range state
     vectors). It defaults to the scale of ``a_features`` and must agree with
@@ -146,7 +155,7 @@ class GridCACEModel(nn.Module, Configurable):
         readout: Sequence[EnergyReadout],
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
         mean_temperature: Union[float, torch.Tensor] = 1.0,
-        boltzmann_constant: float = 1.0,
+        boltzmann_constant: float = DEFAULT_BOLTZMANN_CONSTANT,
         thermal_wavelength: Union[
             float,
             Sequence[float],
@@ -566,6 +575,44 @@ class GridCACEModel(nn.Module, Configurable):
             ),
         }
 
+    def _check_unit_contract(
+        self,
+        batch_beta: torch.Tensor,
+        model_beta: torch.Tensor,
+    ) -> None:
+        """Reject a batch whose ``beta`` was built with another Boltzmann constant.
+
+        Data carries ``beta = 1 / (k_B T)`` from the constant it was built
+        with; the model derives the same quantity from its own constant. The
+        two agree to rounding when the constants match and differ by orders
+        of magnitude when kelvin/eV data meets a reduced-unit model or vice
+        versa, which used to pass silently.
+        """
+
+        batch_beta = torch.as_tensor(batch_beta).detach()
+        expected = model_beta.detach().to(batch_beta)
+        if batch_beta.shape != expected.shape:
+            try:
+                batch_beta = batch_beta.expand_as(expected)
+            except RuntimeError:
+                raise ValueError(
+                    "beta must be scalar for one field or match the batch shape"
+                ) from None
+        if torch.allclose(batch_beta, expected, rtol=1.0e-4, atol=0.0):
+            return
+        ratio = (
+            expected.reshape(-1)[0].double() / batch_beta.reshape(-1)[0].double()
+        ).item()
+        model_constant = self.boltzmann_constant.item()
+        raise ValueError(
+            "the batch beta does not match this model's unit contract: the "
+            "data implies k_B = {:.6g} but the model uses boltzmann_constant "
+            "= {:.6g}; build the model with the dataset's boltzmann_constant "
+            "or the data with grid_info=model.grid_info".format(
+                ratio * model_constant, model_constant,
+            )
+        )
+
     def _compute_local_chemical_potential(
         self,
         data: Dict[str, torch.Tensor],
@@ -754,6 +801,8 @@ class GridCACEModel(nn.Module, Configurable):
                 ),
                 free_energy_mode=self.free_energy_mode,
             )
+            if "beta" in data:
+                self._check_unit_contract(data["beta"], context.beta)
             rho = context.rho
             normalized_temperature = context.normalized_temperature
             volume_element = context.voxel_volume

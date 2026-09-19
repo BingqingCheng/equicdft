@@ -261,7 +261,7 @@ class TestMetalWallPolarization(unittest.TestCase):
         right = torch.autograd.grad(actual_gradients[1][5, 2, 0], fields[0], retain_graph=True)[0][4, 1]
         self.assertGreater(left.abs().item(), 1e-8)
         torch.testing.assert_close(left, right, atol=2e-13, rtol=2e-12)
-        model = GridCACEModel(None, None, [wall], grid_spacing=data["grid_spacing"], compute_polarization_derivative=True).eval()
+        model = GridCACEModel(None, None, [wall], grid_spacing=data["grid_spacing"], compute_polarization_derivative=True, boltzmann_constant=1.0).eval()
         result = model(_copy(data))
         torch.testing.assert_close(result["beta_F_exc"], energy, atol=2e-13, rtol=2e-12)
         torch.testing.assert_close(result["c1"], -actual_gradients[0] / data["grid_spacing"].prod(), atol=2e-12, rtol=2e-12)

@@ -234,8 +234,12 @@ class TestMetalModel(unittest.TestCase):
         physical_model = self._model(mode="physical")
         data = self._data()
         # The configured Coulomb coefficient represents the same physical
-        # prefactor in both conventions at mean_temperature.
-        data["beta"] = torch.tensor(123.0, dtype=torch.float64)
+        # prefactor in both conventions at mean_temperature. The model
+        # derives beta from its own unit contract and rejects a batch whose
+        # beta was built with another Boltzmann constant.
+        stale = dict(data, beta=torch.tensor(123.0, dtype=torch.float64))
+        with self.assertRaisesRegex(ValueError, "unit contract"):
+            _run(beta_model, stale)
         beta_outputs = _run(beta_model, data)
         physical_outputs = _run(physical_model, data)
         beta = 1.0 / (beta_model.boltzmann_constant * data["temperature"])
@@ -269,6 +273,7 @@ class TestMetalModel(unittest.TestCase):
     def test_batched_fields_preserve_independent_temperature(self):
         fields = [self._data(), self._data()]
         fields[1]["temperature"] = torch.tensor(3.0, dtype=torch.float64)
+        fields[1]["beta"] = torch.tensor(1.0 / 4.5, dtype=torch.float64)
         batch = liquid_data({
             key: torch.stack([item[key] for item in fields])
             if torch.is_tensor(fields[0][key]) else fields[0][key]

@@ -1080,6 +1080,7 @@ class TestCartesianAFeatureBesselBasis(unittest.TestCase):
                 grid_spacing=1.0,
                 compute_c1=True,
                 compute_c2=True,
+                boltzmann_constant=1.0,
             ).double()
 
         torch.manual_seed(37)
@@ -1204,6 +1205,7 @@ class TestCartesianAFeatureBesselBasis(unittest.TestCase):
                 readout=[LocalReadout(n_types=2, hidden_sizes=(8,))],
                 grid_spacing=1.0,
                 compute_c1=True,
+                boltzmann_constant=1.0,
             ).double()
 
         torch.manual_seed(41)

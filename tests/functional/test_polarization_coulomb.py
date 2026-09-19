@@ -48,6 +48,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
 
     @staticmethod
     def model(readout, spacing=.8, **kwargs):
+        kwargs.setdefault("boltzmann_constant", 1.0)
         return GridCACEModel(None, None, [readout], grid_spacing=spacing,
                              compute_polarization_derivative=True,
                              mean_density=.4, **kwargs)
@@ -68,7 +69,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         self.assertFalse(loaded.requires_dipole_density)
         self.assertIsNotNone(loaded.coulomb_amplitude)
         torch.testing.assert_close(loaded.energy(ctx(data)), new.energy(ctx(data)))
-        scalar = GridCACEModel(None, None, [loaded], grid_spacing=.8).eval()
+        scalar = GridCACEModel(None, None, [loaded], grid_spacing=.8, boltzmann_constant=1.0).eval()
         polar = self.model(new).eval()
         for key, value in scalar(self.clone(data)).items():
             torch.testing.assert_close(value, polar(self.clone(data))[key])
@@ -225,7 +226,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         for readouts in ([lda, coulomb], [coulomb, lda]):
             model = GridCACEModel(None, None, readouts, grid_spacing=.8,
                                  compute_polarization_derivative=True,
-                                 mean_density=.4).eval()
+                                 mean_density=.4, boltzmann_constant=1.0).eval()
             result = model(self.clone(data))
             for key in result:
                 torch.testing.assert_close(result[key], separate[0][key] + separate[1][key], atol=2e-12, rtol=2e-12)
@@ -261,7 +262,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         lda = LDAReadout(n_types=2, zero_init=True)
         model = GridCACEModel(None, None, [lda, readout], grid_spacing=.8,
                              compute_polarization_derivative=True,
-                             mean_density=.4).train()
+                             mean_density=.4, boltzmann_constant=1.0).train()
         # A spatially varying target tests response-loss training even from
         # zero amplitude; a constant target is orthogonal to these modes.
         output = model(self.data(n_types=2))

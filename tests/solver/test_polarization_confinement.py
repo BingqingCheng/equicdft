@@ -120,7 +120,7 @@ class TestPolarizationConfinement(unittest.TestCase):
                 response.mlp[-1].weight.zero_()
                 response.mlp[-1].bias.copy_(torch.tensor([.2, .1, .03, .02]))
             readouts.append(response)
-        model = GridCACEModel(None, None, readouts, grid_spacing=.8, mean_density=.4).eval()
+        model = GridCACEModel(None, None, readouts, grid_spacing=.8, mean_density=.4, boltzmann_constant=1.0).eval()
         solver = GridSolver(model, dipole_magnitude=.7)
         data["V_ext"] = torch.zeros_like(data["rho"])
         data["E_ext"] = torch.zeros_like(data["dipole_density"])

@@ -173,8 +173,12 @@ and a mixture to `[n_grid, n_types]`.
 
 All numerical units must be mutually consistent. `GridData` computes
 $\beta=1/(k_BT)$ from `T` and the `boltzmann_constant` argument, while
-`thermal_wavelength` fixes the ideal-gas logarithm. The bundled example uses
-Lennard--Jones reduced units with $k_B=\Lambda=1$.
+`thermal_wavelength` fixes the ideal-gas logarithm. `GridData` and
+`GridCACEModel` share one default, `equicdft.units.DEFAULT_BOLTZMANN_CONSTANT`
+(eV/K, temperatures in kelvin), and the model checks every batch's $\beta$
+against its own constant, so a dataset and a model built with different
+constants raise instead of mixing units. The bundled example uses
+Lennard--Jones reduced units with $k_B=\Lambda=1$ on both sides.
 
 ```python
 from equicdft import GridData

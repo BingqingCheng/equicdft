@@ -11,6 +11,7 @@ from equicdft import (
     CartesianBFeatures,
     GGAReadout,
     GridCACEModel,
+    GridData,
     LDAReadout,
     LocalReadout,
     LongRangeReadout,
@@ -130,6 +131,7 @@ class TestGridLDABranch(unittest.TestCase):
             compute_c2=compute_c2,
             free_energy_mode="beta",
             mean_density=1.0,
+            boltzmann_constant=1.0,
         )
 
     def test_lda_energy_and_c1_need_no_neighborhood_data(self):
@@ -181,6 +183,7 @@ class TestGridLDABranch(unittest.TestCase):
             grid_spacing=1.0,
             compute_c1=False,
             mean_density=1.0,
+            boltzmann_constant=1.0,
         )
         rho = torch.tensor([[0.2, 0.3], [0.4, 0.1]])
         data = {
@@ -222,6 +225,7 @@ class TestGridLDABranch(unittest.TestCase):
             readout=[lda_readout, _FirstFeatureReadout()],
             grid_spacing=0.5,
             free_energy_mode="beta",
+            boltzmann_constant=1.0,
         )
         data = self._data()
 
@@ -240,31 +244,34 @@ class TestGridLDABranch(unittest.TestCase):
                 b_features=None,
                 readout=[],
                 grid_spacing=1.0,
+                boltzmann_constant=1.0,
             )
 
     def test_model_owns_the_one_density_scale(self):
         features = _DensityFeatures()
         readouts = [LDAReadout(hidden_sizes=()), _FirstFeatureReadout()]
-        implicit = GridCACEModel(features, _IdentityModule(), readouts, grid_spacing=0.5)
+        implicit = GridCACEModel(features, _IdentityModule(), readouts, grid_spacing=0.5, boltzmann_constant=1.0)
         self.assertEqual(implicit.mean_density.item(), 1.0)
         self.assertIn("mean_density", implicit.state_dict())
         explicit = GridCACEModel(
             features, _IdentityModule(), readouts, grid_spacing=0.5, mean_density=1.0,
+            boltzmann_constant=1.0,
         )
         self.assertEqual(explicit.mean_density.item(), 1.0)
         with self.assertRaisesRegex(ValueError, "mean_density must equal"):
             GridCACEModel(
                 features, _IdentityModule(), readouts, grid_spacing=0.5, mean_density=2.0,
+                boltzmann_constant=1.0,
             )
         with self.assertRaisesRegex(ValueError, "mean_density"):
-            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=-1.0)
-        unscaled = GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5)
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=-1.0, boltzmann_constant=1.0)
+        unscaled = GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, boltzmann_constant=1.0)
         self.assertIsNone(unscaled.mean_density)
         self.assertIsNone(unscaled.to_config()["mean_density"])
         rebuilt = GridCACEModel.from_config(unscaled.to_config())
         self.assertIsNone(rebuilt.mean_density)
         scaled = GridCACEModel.from_config(
-            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=0.7).to_config()
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=0.7, boltzmann_constant=1.0).to_config()
         )
         self.assertAlmostEqual(scaled.mean_density.item(), 0.7)
 
@@ -278,7 +285,7 @@ class TestGridLDABranch(unittest.TestCase):
         gga = GGAReadout(hidden_sizes=(2,), n_types=2)
         expected_width = 2 + 2 * b_features.n_features * 2 + 1
 
-        model = GridCACEModel(a_features, b_features, [local, gga], grid_spacing=0.5)
+        model = GridCACEModel(a_features, b_features, [local, gga], grid_spacing=0.5, boltzmann_constant=1.0)
 
         self.assertEqual(model.n_local_features, expected_width)
         for readout in (local, gga):
@@ -291,13 +298,14 @@ class TestGridLDABranch(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bound to 5 input features"):
             GridCACEModel(
                 a_features, b_features, [LocalReadout(n_types=2, n_features=5)], grid_spacing=0.5,
+                boltzmann_constant=1.0,
             )
         # Readouts bound beforehand keep their own dtype.
         prebound = LocalReadout(n_types=2, hidden_sizes=(3,), n_features=expected_width)
-        GridCACEModel(a_features, b_features, [prebound], grid_spacing=0.5)
+        GridCACEModel(a_features, b_features, [prebound], grid_spacing=0.5, boltzmann_constant=1.0)
         self.assertEqual(prebound.mlp[0].weight.dtype, torch.float32)
         self.assertEqual(
-            GridCACEModel(None, None, [LDAReadout()], grid_spacing=1.0).n_local_features, 0,
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=1.0, boltzmann_constant=1.0).n_local_features, 0,
         )
 
     def test_feature_modules_must_satisfy_the_declared_contract(self):
@@ -309,17 +317,18 @@ class TestGridLDABranch(unittest.TestCase):
                 return data["rho"].unsqueeze(-2).unsqueeze(-2)
 
         with self.assertRaisesRegex(TypeError, "a_features.*mean_density.*transform_density"):
-            GridCACEModel(_Incomplete(), _IdentityModule(), [_FirstFeatureReadout()], grid_spacing=1.0)
+            GridCACEModel(_Incomplete(), _IdentityModule(), [_FirstFeatureReadout()], grid_spacing=1.0, boltzmann_constant=1.0)
         with self.assertRaisesRegex(TypeError, "b_features.*validate_a_features"):
-            GridCACEModel(_DensityFeatures(), nn.Identity(), [_FirstFeatureReadout()], grid_spacing=1.0)
+            GridCACEModel(_DensityFeatures(), nn.Identity(), [_FirstFeatureReadout()], grid_spacing=1.0, boltzmann_constant=1.0)
         with self.assertRaisesRegex(ValueError, "supplied together"):
-            GridCACEModel(_DensityFeatures(), None, [_FirstFeatureReadout()], grid_spacing=1.0)
+            GridCACEModel(_DensityFeatures(), None, [_FirstFeatureReadout()], grid_spacing=1.0, boltzmann_constant=1.0)
         # Message layers rely on the stencil geometry of the feature module.
         message = BChiMessage(n_invariant_features=1, n_radial_channels=1, n_channels=1)
         with self.assertRaisesRegex(TypeError, "stencil_basis.*local_density_positions"):
             GridCACEModel(
                 _DensityFeatures(), _IdentityModule(), [_FirstFeatureReadout()],
                 grid_spacing=1.0, message_layers=[message],
+                boltzmann_constant=1.0,
             )
 
 
@@ -362,6 +371,7 @@ class TestGridLDAGGABranch(unittest.TestCase):
             readout=readouts,
             grid_spacing=1.0,
             compute_c1=True,
+            boltzmann_constant=1.0,
         )
 
     @staticmethod
@@ -421,6 +431,7 @@ class TestGridLDAGGABranch(unittest.TestCase):
             b_features=_IdentityModule(),
             readout=[_FirstFeatureReadout(), gga_readout],
             grid_spacing=1.0,
+            boltzmann_constant=1.0,
         )
         self.assertEqual(len(model.readout), 2)
         with self.assertRaisesRegex(ValueError, "required by"):
@@ -429,6 +440,7 @@ class TestGridLDAGGABranch(unittest.TestCase):
                 b_features=None,
                 readout=[LDAReadout(), gga_readout],
                 grid_spacing=1.0,
+                boltzmann_constant=1.0,
             )
 
     def test_lda_cace_and_gga_are_all_additive_before_autodiff(self):
@@ -447,6 +459,7 @@ class TestGridLDAGGABranch(unittest.TestCase):
             ],
             grid_spacing=1.0,
             compute_c1=True,
+            boltzmann_constant=1.0,
         )
 
         outputs = model(self._data())
@@ -555,6 +568,7 @@ class TestGridCACEModel(unittest.TestCase):
             CartesianBFeatures(max_power=2, max_product_order=3),
             [LocalReadout(n_types=1, hidden_sizes=(8,))],
             grid_spacing=0.5,
+            boltzmann_constant=1.0,
         )
 
         self.assertEqual(model.free_energy_mode, "beta")
@@ -605,6 +619,7 @@ class TestGridCACEModel(unittest.TestCase):
             mean_temperature=1.0,
             compute_c1=True,
             free_energy_mode="beta",
+            boltzmann_constant=1.0,
         )
         data = self._make_data()
 
@@ -712,6 +727,7 @@ class TestGridCACEModel(unittest.TestCase):
             grid_spacing=0.5,
             compute_c1=True,
             free_energy_mode="beta",
+            boltzmann_constant=1.0,
         )
         data = self._make_data()
         data = {
@@ -739,6 +755,7 @@ class TestGridCACEModel(unittest.TestCase):
             free_energy_mode="physical",
         )
         data = self._make_data()
+        data["beta"] = torch.tensor(1.0 / (3.0 * 1.5))
 
         outputs = model(data)
 
@@ -773,6 +790,8 @@ class TestGridCACEModel(unittest.TestCase):
         second = self._make_data()
         first["temperature"] = torch.tensor(1.0)
         second["temperature"] = torch.tensor(2.0)
+        first["beta"] = torch.tensor(1.0 / 3.0)
+        second["beta"] = torch.tensor(1.0 / 6.0)
         data = {
             key: torch.stack((first[key], second[key]))
             for key in first
@@ -822,6 +841,7 @@ class TestGridCACEModel(unittest.TestCase):
             grid_spacing=0.5,
             compute_c2=True,
             free_energy_mode="beta",
+            boltzmann_constant=1.0,
         )
         data = self._make_data()
         data = {
@@ -917,11 +937,13 @@ class TestGridCACEModel(unittest.TestCase):
             mean_temperature=2.0,
             compute_c1=False,
             free_energy_mode="beta",
+            boltzmann_constant=1.0,
         )
 
         first = self._make_data()
         second = self._make_data()
         second["temperature"] = torch.tensor(2.0)
+        second["beta"] = torch.tensor(0.5)
         data = {
             key: torch.stack((first[key], second[key]))
             for key in first
@@ -994,6 +1016,7 @@ class TestGridCACEModel(unittest.TestCase):
             readout=[readout],
             grid_spacing=0.5,
             compute_c2=True,
+            boltzmann_constant=1.0,
         )
 
         outputs = model(self._make_data(), c2_reference=(0, 0))
@@ -1103,6 +1126,7 @@ class TestGridCACEModel(unittest.TestCase):
                 [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_c1=1,
+                boltzmann_constant=1.0,
             )
 
         with self.assertRaises(TypeError):
@@ -1116,6 +1140,7 @@ class TestGridCACEModel(unittest.TestCase):
                 [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_c2=1,
+                boltzmann_constant=1.0,
             )
 
         with self.assertRaises(TypeError):
@@ -1129,6 +1154,7 @@ class TestGridCACEModel(unittest.TestCase):
                 [LocalReadout(n_types=1)],
                 grid_spacing=0.5,
                 compute_local_mu=1,
+                boltzmann_constant=1.0,
             )
 
         with self.assertRaisesRegex(ValueError, "requires compute_c1"):
@@ -1143,6 +1169,7 @@ class TestGridCACEModel(unittest.TestCase):
                 grid_spacing=0.5,
                 compute_c1=False,
                 compute_local_mu=True,
+                boltzmann_constant=1.0,
             )
 
     def test_multicomponent_latent_channels_feed_physical_readout(self):
@@ -1168,6 +1195,7 @@ class TestGridCACEModel(unittest.TestCase):
             b_features,
             [readout],
             grid_spacing=0.5,
+            boltzmann_constant=1.0,
         )
 
         outputs = model(data)
@@ -1204,6 +1232,7 @@ class TestGridCACEModel(unittest.TestCase):
             b_features,
             [readout],
             grid_spacing=0.5,
+            boltzmann_constant=1.0,
         )
 
         outputs = model(data)
@@ -1234,6 +1263,7 @@ class TestGridCACEModel(unittest.TestCase):
             b_features,
             [readout],
             grid_spacing=0.5,
+            boltzmann_constant=1.0,
         )
 
         outputs = model(data)
@@ -1242,6 +1272,62 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(outputs["c1"].shape, data["rho"].shape)
         outputs["c1"].square().mean().backward()
         self.assertTrue(torch.all(torch.isfinite(data["rho"].grad)))
+
+
+class TestUnitContract(unittest.TestCase):
+    """The model and the data share one Boltzmann constant, and say so."""
+
+    def _model(self, **overrides):
+        arguments = dict(
+            a_features=_DensityFeatures(),
+            b_features=_IdentityModule(),
+            readout=[_FirstFeatureReadout()],
+            grid_spacing=0.5,
+        )
+        arguments.update(overrides)
+        return GridCACEModel(**arguments)
+
+    def test_default_constant_is_the_data_default(self):
+        from equicdft.units import BOLTZMANN_CONSTANT_EV_PER_K, DEFAULT_BOLTZMANN_CONSTANT
+        from equicdft.data import DEFAULT_BOLTZMANN_CONSTANT as DATA_DEFAULT
+
+        self.assertEqual(DEFAULT_BOLTZMANN_CONSTANT, BOLTZMANN_CONSTANT_EV_PER_K)
+        self.assertEqual(DATA_DEFAULT, DEFAULT_BOLTZMANN_CONSTANT)
+        self.assertAlmostEqual(self._model().boltzmann_constant.item(), DEFAULT_BOLTZMANN_CONSTANT)
+
+    def test_grid_info_round_trip_passes_the_check(self):
+        model = self._model(mean_temperature=300.0)
+        data = GridData.from_dict(
+            {"grid_size": [2, 2, 2], "n_types": 1, "grid_spacing": 0.5, "temperature": 350.0},
+            cutoff_grid=0,
+            grid_info=model.grid_info,
+        )
+        data["rho"] = torch.full((8, 1), 0.3)
+        outputs = model(data)
+        self.assertIn("beta_F_exc", outputs)
+
+    def test_mismatched_constants_are_rejected_with_both_values(self):
+        model = self._model(boltzmann_constant=1.0)
+        data = TestGridCACEModel._make_data(self)
+        model(dict(data))
+        data["beta"] = torch.tensor(1.0 / (8.617333262e-5 * 1.5))
+        with self.assertRaisesRegex(ValueError, "implies k_B = 8.617.*boltzmann_constant = 1"):
+            model(data)
+
+    def test_batched_beta_is_checked_per_field(self):
+        model = self._model(boltzmann_constant=1.0)
+        first = TestGridCACEModel._make_data(self)
+        second = TestGridCACEModel._make_data(self)
+        batch = {
+            key: torch.stack([first[key], second[key]]) if torch.is_tensor(first[key]) else first[key]
+            for key in first
+        }
+        batch["temperature"] = torch.tensor([1.5, 2.0])
+        batch["beta"] = torch.tensor([1.0 / 1.5, 1.0 / 2.0])
+        model(dict(batch))
+        batch["beta"] = torch.tensor([1.0 / 1.5, 1.0 / 1.5])
+        with self.assertRaisesRegex(ValueError, "unit contract"):
+            model(batch)
 
 
 if __name__ == "__main__":

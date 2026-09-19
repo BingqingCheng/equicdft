@@ -266,6 +266,7 @@ class TestLegacyConversion(unittest.TestCase):
                 None, None,
                 [LDAReadout(n_types=1, hidden_sizes=()) for _ in scales],
                 grid_spacing=1.0,
+                boltzmann_constant=1.0,
             )
             for readout, scale in zip(model.readout, scales):
                 readout.register_buffer("mean_density", torch.tensor(scale))

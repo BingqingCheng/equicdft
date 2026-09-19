@@ -139,6 +139,7 @@ def gaussian_message_model(
         mean_temperature=1.0,
         message_layers=[message],
         free_energy_mode="physical",
+        boltzmann_constant=1.0,
     )
 
 
@@ -170,6 +171,7 @@ def bessel_message_model():
         ],
         grid_spacing=1.0,
         message_layers=[message],
+        boltzmann_constant=1.0,
     )
 
 
@@ -199,4 +201,5 @@ def long_range_model(charges=None, coulomb_amplitude=None):
         grid_spacing=0.5,
         mean_temperature=1.3,
         mean_density=0.4,
+        boltzmann_constant=1.0,
     )

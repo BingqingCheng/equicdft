@@ -555,6 +555,7 @@ class TestBChiMessage(unittest.TestCase):
                     readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
                     grid_spacing=1.0,
                     message_layers=[message],
+                    boltzmann_constant=1.0,
                 )
                 expected = model(data)["beta_F_exc"].detach().clone()
 
@@ -777,6 +778,7 @@ class TestBChiMessage(unittest.TestCase):
             readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
             grid_spacing=1.0,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
 
         basis = message.stencil_basis(
@@ -821,6 +823,7 @@ class TestBChiMessage(unittest.TestCase):
             readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
             grid_spacing=1.0,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
         before = message.stencil_basis(
             a_features,
@@ -868,6 +871,7 @@ class TestBChiMessage(unittest.TestCase):
                     n_radial_functions=3,
                 )
             ],
+            boltzmann_constant=1.0,
         )
         transformed_data = dict(data)
         transformed_data["rho"] = _transform_cubic_field(data["rho"], shape)
@@ -932,6 +936,7 @@ class TestMessagePassingModel(unittest.TestCase):
             compute_c1=True,
             compute_c2=compute_c2,
             message_layers=message_layers(a_features, b_features),
+            boltzmann_constant=1.0,
         )
 
     def test_one_layer_concatenates_both_invariant_levels(self):
@@ -1011,6 +1016,7 @@ class TestMessagePassingModel(unittest.TestCase):
                         convolution_backend=message_backend,
                     )
                 ],
+                boltzmann_constant=1.0,
             ).double()
 
         source_data = _grid_data(shape=(3, 4, 5), cutoff_grid=1)
@@ -1102,6 +1108,7 @@ class TestMessagePassingModel(unittest.TestCase):
                 readout=[LocalReadout(n_types=1, hidden_sizes=(8,))],
                 grid_spacing=1.0,
                 message_layers=messages,
+                boltzmann_constant=1.0,
             )
 
         # Objects saved before the backend option existed used gathering;
@@ -1151,6 +1158,7 @@ class TestMessagePassingModel(unittest.TestCase):
                         convolution_backend=backend,
                     )
                 ],
+                boltzmann_constant=1.0,
             ).double()
 
         source_data = _grid_data(shape=(3, 4, 5), cutoff_grid=1)
@@ -1266,6 +1274,7 @@ class TestMessagePassingModel(unittest.TestCase):
             compute_c1=True,
             compute_c2=True,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
 
@@ -1305,6 +1314,7 @@ class TestMessagePassingModel(unittest.TestCase):
                     hidden_sizes=(6,),
                 )
             ],
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
 
@@ -1343,6 +1353,7 @@ class TestMessagePassingModel(unittest.TestCase):
             compute_c1=True,
             compute_c2=True,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
 
@@ -1383,6 +1394,7 @@ class TestMessagePassingModel(unittest.TestCase):
             grid_spacing=0.125,
             compute_c1=True,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(3, 3, 3), cutoff_grid=6)
         data["rho"] = torch.rand(27, 2) + 0.1
@@ -1421,6 +1433,7 @@ class TestMessagePassingModel(unittest.TestCase):
             grid_spacing=1.0,
             compute_c1=True,
             message_layers=messages,
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
 
@@ -1467,6 +1480,7 @@ class TestMessagePassingModel(unittest.TestCase):
                         n_radial_functions=3,
                     )
                 ],
+                boltzmann_constant=1.0,
             )
 
         torch.manual_seed(19)
@@ -1510,6 +1524,7 @@ class TestMessagePassingModel(unittest.TestCase):
                 readout=[LocalReadout(n_types=1, hidden_sizes=(4,))],
                 grid_spacing=1.0,
                 message_layers=[message],
+                boltzmann_constant=1.0,
             )
 
     def test_bessel_message_rejects_incompatible_rebinding(self):
@@ -1558,6 +1573,7 @@ class TestMessagePassingModel(unittest.TestCase):
             grid_spacing=1.0,
             compute_c1=True,
             message_layers=[message],
+            boltzmann_constant=1.0,
         )
         data = _grid_data(shape=(5, 5, 5), cutoff_grid=2)
         for key in ("rho", "grid_spacing", "temperature", "beta"):

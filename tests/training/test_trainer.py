@@ -756,6 +756,7 @@ class TestTrainer(unittest.TestCase):
             readout=[LDAReadout(n_types=1, hidden_sizes=(2,))],
             grid_spacing=1.0,
             compute_c1=False,
+            boltzmann_constant=1.0,
         )
         loss = Loss([TensorLoss("energy", "beta_F_exc", "beta_F_exc")])
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -814,6 +815,7 @@ class TestTrainer(unittest.TestCase):
             readout=[readout()],
             grid_spacing=1.0,
             compute_c1=False,
+            boltzmann_constant=1.0,
         )
 
     def _resume_from_legacy_scale_layout(self, readout, rewrite, corrupt=None):

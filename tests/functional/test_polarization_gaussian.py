@@ -62,6 +62,7 @@ class TestPolarizationGaussian(unittest.TestCase):
     def model(readout, spacing=.8, **kwargs):
         # The zero LDA exercises a second readout on the same density scale.
         lda = LDAReadout(n_types=readout.n_types, zero_init=True)
+        kwargs.setdefault("boltzmann_constant", 1.0)
         return GridCACEModel(
             None, None, [lda, readout], grid_spacing=spacing,
             compute_polarization_derivative=True, mean_density=.4, **kwargs,
@@ -128,6 +129,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         model = GridCACEModel(
             None, None, [lda, gaussian, coulomb], grid_spacing=spacing,
             compute_polarization_derivative=True, mean_density=.4,
+            boltzmann_constant=1.0,
         ).eval()
         k = 2 * math.pi / (shape[0] * spacing)
         damping = math.exp(-alpha * k*k)
@@ -252,6 +254,8 @@ class TestPolarizationGaussian(unittest.TestCase):
                 readout.mlp[-1].weight[:] = torch.tensor([[.2, .6]])
             data = self.data()
             data["temperature"] = torch.tensor(2.)
+            if "beta" in data:
+                data["beta"] = torch.tensor(1. / (.8 * 2.))
             model = self.model(readout, free_energy_mode=mode, mean_temperature=1.4, boltzmann_constant=.8).train()
             output = model(data)
             for field, index, key, sign in (
@@ -280,6 +284,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         model = GridCACEModel(
             None, None, [lda, gaussian, coulomb], grid_spacing=.8,
             compute_polarization_derivative=True, mean_density=.4,
+            boltzmann_constant=1.0,
         ).eval()
         result = model(self.clone(data))
         for key, value in result.items():

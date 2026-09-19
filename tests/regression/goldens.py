@@ -234,6 +234,7 @@ def _polarization_model(mode="beta", with_scalar=False):
         mean_temperature=1.5,
         free_energy_mode=mode,
         compute_polarization_derivative=True,
+        boltzmann_constant=1.0,
     )
 
 
@@ -264,6 +265,7 @@ def _polar_coulomb():
                 None, None, [LDAReadout(hidden_sizes=(2,)), response],
                 grid_spacing=0.5, mean_density=0.4,
                 compute_polarization_derivative=True,
+                boltzmann_constant=1.0,
             )
             data = _polarization_data()
             return _outputs(model, data)

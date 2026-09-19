@@ -37,7 +37,7 @@ class TestPolarizationLDA(unittest.TestCase):
     def model(readouts, spacing=.5, mode="beta"):
         return GridCACEModel(None, None, readouts, grid_spacing=spacing,
                              mean_temperature=1.5, free_energy_mode=mode,
-                             compute_polarization_derivative=True, mean_density=.5)
+                             compute_polarization_derivative=True, mean_density=.5, boltzmann_constant=1.0)
 
     @staticmethod
     def clone(data):
@@ -156,11 +156,11 @@ class TestPolarizationLDA(unittest.TestCase):
         separate = [
             self.model([lda]).eval()(self.clone(data)),
             GridCACEModel(a, b, [polar], grid_spacing=.5, mean_temperature=1.5,
-                          compute_polarization_derivative=True).eval()(self.clone(data)),
+                          compute_polarization_derivative=True, boltzmann_constant=1.0).eval()(self.clone(data)),
         ]
         for readouts in ([lda, polar], [polar, lda]):
             model = GridCACEModel(a, b, readouts, grid_spacing=.5, mean_temperature=1.5,
-                                 compute_polarization_derivative=True).eval()
+                                 compute_polarization_derivative=True, boltzmann_constant=1.0).eval()
             self.assertEqual(model.cutoff_grid, 1)
             self.assertTrue(model.requires_local_density_index)
             actual = model(self.clone(data))
@@ -200,7 +200,7 @@ class TestPolarizationLDA(unittest.TestCase):
         self.assertNotIn("dipole_density_scale", scalar.state_dict())
         for readout in (scalar, self.readout()):
             model = GridCACEModel(None, None, [readout], grid_spacing=.5, mean_density=.5,
-                                  compute_polarization_derivative=readout.requires_dipole_density).eval()
+                                  compute_polarization_derivative=readout.requires_dipole_density, boltzmann_constant=1.0).eval()
             data = self.data()
             output = model(data)
             stream = io.BytesIO()

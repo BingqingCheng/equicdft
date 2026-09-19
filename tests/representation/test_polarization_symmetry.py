@@ -83,6 +83,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 radial_exponents=(.2, .6), trainable_radial_exponents=True,
                 convolution_backend=backend,
             ) for _ in range(message_count)],
+            boltzmann_constant=1.0,
         ).eval()
 
     @staticmethod

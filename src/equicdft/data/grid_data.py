@@ -28,9 +28,10 @@ __all__ = [
 ]
 
 
-# Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
-# datasets can recover beta = 1 / T by passing boltzmann_constant=1.0.
-DEFAULT_BOLTZMANN_CONSTANT = 8.617333262e-5
+# Temperatures in kelvin and energies in electronvolts unless a dataset says
+# otherwise; reduced-unit datasets pass boltzmann_constant=1.0. The model
+# shares this default (see equicdft.units).
+from ..units import DEFAULT_BOLTZMANN_CONSTANT  # noqa: E402
 
 
 # Canonical GridData field -> source field in the EXTXYZ/ASE Atoms object.
