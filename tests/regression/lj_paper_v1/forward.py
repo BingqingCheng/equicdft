@@ -19,7 +19,7 @@ def evaluate_forward():
         result["c1"].detach(),
         model.thermal_wavelength.to(rho),
     )
-    mask = rho > model.rho_min
+    mask = rho > 1.0e-3  # Frozen regression mask, not a model parameter.
     gauge_offset = torch.mean(target[mask] - raw_prediction[mask])
     prediction = raw_prediction + gauge_offset
     metrics = {

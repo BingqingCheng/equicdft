@@ -119,7 +119,7 @@ class TestConfigRoundTrip(unittest.TestCase):
         config = self.assert_round_trip(
             model,
             data,
-            keys=("beta_F_exc", "c1", "beta_mu_local"),
+            keys=("beta_F_exc", "c1", "density_derivative"),
         )
         self.assertEqual(config["type"], "GridCACEModel")
         self.assertEqual(config["a_features"]["radial_basis"], "none")
@@ -236,11 +236,11 @@ class TestConfigRoundTrip(unittest.TestCase):
         model = example_model()
         model(copy.deepcopy(grid_data()))
         config = model.to_config()
-        config["compute_local_mu"] = False
-        config["rho_min"] = 0.0
+        config["compute_c1"] = False
         rebuilt = GridCACEModel.from_config(config)
-        self.assertFalse(rebuilt.compute_local_mu)
-        self.assertEqual(rebuilt.rho_min, 0.0)
+        self.assertFalse(rebuilt.compute_c1)
+        self.assertNotIn("compute_local_mu", config)
+        self.assertNotIn("rho_min", config)
         rebuilt.load_state_dict(model.state_dict(), strict=True)
 
 

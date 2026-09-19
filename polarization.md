@@ -730,9 +730,10 @@ are $\lambda_\rho=\lambda_P=1$. The physical per-species moment $m$ is inside
 the square to make both residuals dimensionless; it is not a statistical task
 weight. No sigma normalization or inverse-SEM weighting is applied.
 External targets stay fixed under SEM augmentation because ideal derivatives
-are reevaluated by the model on the perturbed fields. The separate legacy
-`compute_local_mu` outputs remain available for old configurations; new fitting
-code can keep masks and gauge projection entirely in the losses.
+are reevaluated by the model on the perturbed fields. Masks and gauge projection
+belong entirely to the losses; the model does not accept `rho_min` or
+`compute_local_mu`, and does not produce masked/averaged chemical potentials.
+The solver supplies local chemical potentials when external fields are given.
 
 ### Excess-only evaluation and old models
 
@@ -768,3 +769,80 @@ preserve the source. For a trusted whole-object pickle, use the existing
 conversion command with `--dipole-magnitude` and, if needed,
 `--thermal-wavelength`. Do not pass an ideal override when loading a file that
 already stores its ideal reference.
+
+Model format 4 also discards `compute_local_mu` and `rho_min` from older
+configurations, without changing fitted parameters. Move the original density
+cutoff into the fitting mask and, where previously used, the solver's
+`residual_density_threshold`. Converting a model does not reconstruct its
+training objective or automatically migrate an application script.
+
+## 10. Explicit Fourier stability references
+
+`FourierStabilityLoss` obtains the fixed molecular moment exclusively from
+`model.ideal`. Do not pass a second `dipole_magnitude` to the loss or to
+`polarization_fourier_curvature`. Polarization probes require the model to
+own a `FixedDipoleIdeal`, even though they do not evaluate its exact entropy.
+
+The two regularizers retain their original ideal **reference approximations**:
+
+| Variable | `ideal_reference` label | Ideal reference added to excess curvature |
+| --- | --- | --- |
+| `rho` | `translational_ideal_gas` | Translational ideal gas, without orientational entropy |
+| `dipole_density` | `quadratic_alignment` | Weak-alignment fixed-dipole quadratic term |
+
+The label is a read-only property, appears in the module representation, and
+is returned in `term.evaluate(...)["ideal_reference"]` and the corresponding
+`Loss.evaluate` details. It labels the existing formula; it is not an option
+that silently changes the objective.
+
+For species a the quadratic polarization reference is
+
+$$
+\beta f_{\mathrm{ref},P}
+=\frac{3|\mathbf{P}_a|^2}{2m_a^2\rho_a}.
+$$
+
+The displacement is still
+$\delta\mathbf{P}_a=\epsilon m_a\rho_a w\mathbf{u}$, with real spatial wave
+$w$ and one random unit direction $\mathbf{u}$ per field. The ideal second
+difference is therefore $3\Delta V\sum_{g,a}\rho_{g,a}\epsilon^2w_g^2$.
+The exact nonzero-alignment orientational curvature is not substituted.
+Density probes likewise do not include the density curvature of orientational
+entropy. These decoupled tests are not the exact full coupled Hessian at
+nonzero polarization and do not certify its positive definiteness.
+
+The following standalone helper constructs both terms. The caller chooses
+wavevectors, amplitude and weights; no new fitting defaults are proposed here.
+Add the returned terms to the same `Loss` as the field-fitting terms.
+
+```python
+from equicdft import FourierStabilityLoss
+
+
+def build_stability_terms(*, wavevector_indices, relative_amplitude,
+                          density_weight, polarization_weight):
+    return [
+        FourierStabilityLoss(
+            name="density_stability", variable="rho",
+            wavevector_indices=wavevector_indices,
+            relative_amplitude=relative_amplitude, weight=density_weight,
+        ),
+        FourierStabilityLoss(
+            name="polarization_stability", variable="dipole_density",
+            wavevector_indices=wavevector_indices,
+            relative_amplitude=relative_amplitude, weight=polarization_weight,
+        ),
+    ]
+```
+
+Each weight multiplies the mean squared hinge of normalized curvature below
+the existing threshold (zero by default), over valid probes. Polarization
+includes its uniform mode by default; density conserves particle numbers.
+The existing density masking, amplitudes, random draws, normalization and
+relaxed local polarization bound are unchanged. Perturbed model calls use
+`compute_ideal=False` so the exact ideal-domain restriction is not reintroduced.
+
+When a trainer loads an old loss state, a stored Fourier dipole moment must
+agree with the model's ideal reference before that redundant buffer is removed.
+Conflicting physical metadata cause an error. New checkpoints have no separate
+Fourier moment buffer. Existing run scripts still need the explicit API migration.

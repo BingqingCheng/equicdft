@@ -402,7 +402,6 @@ class TestExplicitMetalSites(unittest.TestCase):
 
     def test_solver_evaluate_preserves_explicit_metadata_exclusions_and_fresh_state(self):
         model, data = _inverse_fixture()
-        model.compute_local_mu = True
         data["mu"] = torch.zeros(2, dtype=DTYPE)
         solver = GridSolver(model)
         result = _run(solver.evaluate, data)

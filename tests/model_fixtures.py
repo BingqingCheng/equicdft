@@ -81,8 +81,6 @@ def example_model(**overrides):
         boltzmann_constant=1.0,
         thermal_wavelength=1.0,
         compute_c1=True,
-        compute_local_mu=True,
-        rho_min=1.0e-3,
     )
     arguments.update(overrides)
     return GridCACEModel(**arguments)

@@ -52,11 +52,15 @@ $$
 
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
-$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. The model returns it as
-`beta_mu_local` for older configurations, with `beta_mu_average` and
-`beta_mu_weights`. New fits use the intrinsic `density_derivative` against
+$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. Fits use the intrinsic
+`density_derivative` against
 `-beta * V_ext`, with explicit loss weights and `TensorLoss(center_axis=-2)`.
 `Metrics(center_axis=-2)` applies the same canonical gauge projection.
+Masks and mean removal belong to these losses/metrics, not the model.
+`GridSolver.evaluate` supplies `beta_mu_local` when external fields are given.
+Old model files automatically discard the retired `compute_local_mu` and
+`rho_min` settings during conversion; keep the original cutoff explicitly in
+the application's loss mask and solver residual settings where needed.
 
 The model owns its ideal reference (`IdealGas` by default for scalar models).
 It returns `beta_F_id`, `beta_F_exc`, their sum `beta_F`, and requested total

@@ -7,6 +7,28 @@ from equicdft.serialization import migrate_model_state_dict
 
 
 class TestIntrinsicFieldLoss(unittest.TestCase):
+    def test_model_derivative_loss_matches_old_local_mu_loss_and_gradients(self):
+        from tests.model_fixtures import example_model, grid_data
+        model = example_model().double()
+        batch = {key: value.double() if value.is_floating_point() else value
+                 for key, value in grid_data().items()}
+        batch["target"] = -batch["beta"] * batch["V_ext"]
+        batch["weights"] = (batch["rho"] > .4).to(batch["rho"])
+        outputs = model(batch)
+        actual = TensorLoss("mu", "density_derivative", "target",
+                            center_axis=-2, weights_key="weights")(outputs, batch)
+        local = (outputs["ideal_density_derivative"] + batch["beta"] * batch["V_ext"]
+                 - outputs["c1"])
+        weights = batch["weights"]
+        mean = (weights * local).sum(-2, keepdim=True) / weights.sum(-2, keepdim=True)
+        expected = (weights * (local - mean).square()).sum() / weights.sum()
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-13)
+        parameters = tuple(model.parameters())
+        actual_grad = torch.autograd.grad(actual, parameters, retain_graph=True)
+        expected_grad = torch.autograd.grad(expected, parameters)
+        for actual_value, expected_value in zip(actual_grad, expected_grad):
+            torch.testing.assert_close(actual_value, expected_value, rtol=1e-11, atol=1e-12)
+
     def test_masked_gauge_and_scaling(self):
         prediction = torch.tensor([[[1.], [3.], [50.]], [[2.], [6.], [-30.]]],
                                   dtype=torch.float64, requires_grad=True)

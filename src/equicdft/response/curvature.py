@@ -1,4 +1,4 @@
-"""Symmetric finite-difference curvature of beta(F_id + F_exc) along Fourier probes."""
+"""Excess finite-difference curvature plus declared ideal stability references."""
 
 from typing import (
     Dict,
@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from ..geometry.grid import voxel_volume
 from ..functional.thermodynamics import ideal_free_energy
+from ..functional.polarization_ideal import FixedDipoleIdeal
 from .modes import (
     _real_fourier_waves,
     _validated_probe_amplitudes,
@@ -36,7 +37,7 @@ def projected_fourier_curvature(
     relative_amplitude: Union[float, torch.Tensor],
     perturbations_per_forward: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate normalized total intrinsic curvature along fixed directions."""
+    """Evaluate excess plus translational ideal curvature along fixed directions."""
 
     second_difference, perturbation_norm = _symmetric_energy_difference(
         model=model,
@@ -237,13 +238,15 @@ def polarization_fourier_curvature(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     wavevector_indices: torch.Tensor,
-    dipole_magnitude: torch.Tensor,
     relative_amplitude: Union[float, torch.Tensor],
     polarization_directions: torch.Tensor,
     perturbations_per_forward: Optional[int] = None,
     wavevector_phases: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Return one ideal-normalized polarization curvature per field.
+    r"""Return excess plus quadratic-alignment ideal curvature per field.
+
+    The moment comes from model.ideal; exact orientational entropy is not
+    evaluated, so probes may cross its local physical domain boundary.
 
     The selected basis displacement applies one shared Cartesian alignment
     change to every species, scaled locally by ``m_a*rho_a``. The result has
@@ -266,7 +269,10 @@ def polarization_fourier_curvature(
     if torch.any(zero_density[..., None] & (polarization != 0.0)).item():
         raise ValueError("dipole_density must be zero where rho is zero")
 
-    moment = dipole_magnitude.to(rho).reshape(-1)
+    ideal = getattr(model, "ideal", None)
+    if not isinstance(ideal, FixedDipoleIdeal):
+        raise TypeError("polarization stability requires model.ideal=FixedDipoleIdeal(...)")
+    moment = ideal.dipole_magnitude.to(rho).reshape(-1)
     if moment.numel() not in (1, rho.shape[-1]):
         raise ValueError("dipole_magnitude must contain one value per density type")
 

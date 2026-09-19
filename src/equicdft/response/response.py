@@ -30,6 +30,10 @@ class FourierResponse(nn.Module):
     ``wavevector_domain="sphere"`` retains the physical isotropic Nyquist sphere;
     ``"cube"`` admits all componentwise grid-representable wavevectors,
     including the high-wavevector corners outside that sphere.
+
+    Density curvature adds the translational ideal-gas reference to excess
+    curvature. It does not include orientational ideal density curvature for
+    a polarized base state, and is not that model's exact full Hessian.
     """
 
     def __init__(

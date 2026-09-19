@@ -365,9 +365,9 @@ def _upgrade_model(module: GridCACEModel) -> None:
     _set_default(module, "free_energy_mode", "beta")
     _set_default(module, "compute_c1", True)
     _set_default(module, "compute_c2", False)
-    _set_default(module, "compute_local_mu", False)
     _set_default(module, "compute_polarization_derivative", False)
-    _set_default(module, "rho_min", 0.0)
+    module.__dict__.pop("compute_local_mu", None)
+    module.__dict__.pop("rho_min", None)
     if not _defines(module, "ideal"):
         wavelength = module._buffers.pop("thermal_wavelength", None)
         if wavelength is None:

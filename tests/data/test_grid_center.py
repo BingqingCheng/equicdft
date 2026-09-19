@@ -196,7 +196,6 @@ class TestGridCenter(unittest.TestCase):
 
     def test_model_solver_and_two_start_inverse_keep_physical_coordinates(self):
         model, legacy = _inverse_fixture()
-        model.compute_local_mu = True
         legacy["mu"] = torch.zeros(2, dtype=torch.float64)
         origin = torch.tensor([.125, .25, -.5], dtype=torch.float64)
         physical = dict(legacy, grid_center=_centers(legacy, origin),

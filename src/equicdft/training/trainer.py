@@ -1,5 +1,6 @@
 """Training orchestration for grid density-functional models."""
 
+import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,30 @@ __all__ = [
     "TrainingStream",
     "Trainer",
 ]
+
+
+def _load_loss_state(loss, state, model):
+    """Retire old Fourier moment buffers only after checking model ownership."""
+    from ..response.stability import FourierStabilityLoss
+    from ..functional.polarization_ideal import FixedDipoleIdeal
+
+    state = copy.copy(state)
+    for name, term in loss.named_modules():
+        if not isinstance(term, FourierStabilityLoss):
+            continue
+        key = (name + "." if name else "") + "dipole_magnitude"
+        if key not in state:
+            continue
+        saved = state.pop(key)
+        ideal = getattr(model, "ideal", None)
+        if term.variable != "dipole_density" or not isinstance(ideal, FixedDipoleIdeal):
+            raise ValueError("legacy Fourier moment requires model.ideal=FixedDipoleIdeal(...)")
+        expected = ideal.dipole_magnitude.reshape(-1)
+        saved = saved.to(expected).reshape(-1)
+        if (saved.numel() != expected.numel() and min(saved.numel(), expected.numel()) != 1
+                or not torch.allclose(saved, expected)):
+            raise ValueError("legacy Fourier dipole magnitude conflicts with model ideal")
+    loss.load_state_dict(state, strict=True)
 
 
 @dataclass
@@ -644,7 +669,7 @@ class Trainer:
         stream_noise = _checkpoint_stream_noise(checkpoint)
         for stream in self._streams:
             stream.noise = stream_noise.get(stream.name, NoiseOptions())
-        self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
+        _load_loss_state(self.loss, checkpoint["loss_state_dict"], self.model)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:
             expected_names = checkpoint.get("stream_names", [])
@@ -653,7 +678,7 @@ class Trainer:
                 raise ValueError(
                     "checkpoint stream names do not match configured streams"
                 )
-            self.stream_losses.load_state_dict(stream_loss_state, strict=True)
+            _load_loss_state(self.stream_losses, stream_loss_state, self.model)
         elif self._streams:
             raise ValueError(
                 "checkpoint has no stream-loss state for configured streams"

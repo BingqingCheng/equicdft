@@ -184,15 +184,16 @@ class TestDensityNoise(unittest.TestCase):
             readout=[LDAReadout(n_types=2, hidden_sizes=(4,)),
                      LocalReadout(n_types=2, hidden_sizes=(4,))],
             grid_spacing=.5, mean_temperature=1., boltzmann_constant=1.,
-            thermal_wavelength=1., free_energy_mode='beta', compute_local_mu=True,
+            thermal_wavelength=1., free_energy_mode='beta',
         )
+        for frame in fields:
+            frame['negative_beta_V_ext'] = -frame['beta'] * frame['V_ext']
         seen = []
         hook = model.register_forward_pre_hook(
             lambda module, args: seen.append((module.training, args[0]['rho'].detach().clone()))
         )
         t = Trainer(model, Loss([TensorLoss(
-            'mu', 'beta_mu_local', 'beta_mu_average',
-            weights_key='beta_mu_weights')]),
+            'mu', 'density_derivative', 'negative_beta_V_ext', center_axis=-2)]),
             noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4}, device='cpu')
         clean = fields[0]['rho'].clone()
         draws = torch.zeros_like(clean).unsqueeze(0)

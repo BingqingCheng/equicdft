@@ -1,6 +1,6 @@
 """Physics-based stability objectives for learned density functionals."""
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -40,8 +40,10 @@ class FourierStabilityLoss(LossTerm):
     so the particle number of every component is unchanged. The selected
     component treatment either keeps these component directions independent
     or combines them. Symmetric evaluations at ``rho +/- delta_rho`` estimate
-    the projected curvature of the total intrinsic dimensionless free energy
-    ``beta * (F_id + F_exc)``. External-potential and reservoir terms are linear
+    the projected curvature of excess energy plus translational ideal-gas
+    entropy. For a polarized base state this omits the density curvature of
+    orientational entropy: it is a stability reference, not the exact complete
+    functional Hessian. External-potential and reservoir terms are linear
     in density and therefore cancel from the second difference.
 
     For a single wavevector in a homogeneous one-component fluid, curvature
@@ -71,7 +73,10 @@ class FourierStabilityLoss(LossTerm):
 
     ``delta_P_a = epsilon * m_a * rho_a * wave * u``,
 
-    so ``epsilon`` is a dimensionless change in local alignment fraction.
+    where ``m_a`` comes exclusively from ``model.ideal``, which must be a
+    ``FixedDipoleIdeal``. The added ideal term is the quadratic weak-alignment
+    reference, not the exact finite-polarization entropy. Thus
+    ``epsilon`` is a dimensionless change in local alignment fraction.
     The same ``u`` is used for all wavevectors and phases of one field.
     The selected direction is normalized by the isotropic small-alignment
     fixed-dipole ideal curvature, so the ideal reference has unit curvature.
@@ -149,10 +154,6 @@ class FourierStabilityLoss(LossTerm):
         ``"rho"`` (default) preserves the fixed-particle-number density loss.
         ``"dipole_density"`` probes one random unit-vector polarization
         curvature per field at fixed density.
-    dipole_magnitude
-        Positive scalar or one value per species. Required only for
-        ``variable="dipole_density"``. This is the physical fixed molecular
-        dipole magnitude, not a statistical loss weight.
     include_zero_wavevector
         Whether to add the uniform polarization wavevector. It defaults to
         true for polarization and false for density. Density cannot include
@@ -178,7 +179,6 @@ class FourierStabilityLoss(LossTerm):
         perturbations_per_forward: Optional[int] = None,
         wavevector_domain: str = "sphere",
         variable: str = "rho",
-        dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
         include_zero_wavevector: Optional[bool] = None,
     ) -> None:
         super().__init__(name, weight)
@@ -329,38 +329,6 @@ class FourierStabilityLoss(LossTerm):
                 raise ValueError("charges require charge component_treatment")
             charge_tensor = None
 
-        if variable == "rho":
-            if dipole_magnitude is not None:
-                raise ValueError(
-                    "dipole_magnitude requires variable='dipole_density'"
-                )
-            dipole_tensor = None
-        else:
-            if dipole_magnitude is None:
-                raise ValueError(
-                    "dipole_magnitude is required for dipole-density stability"
-                )
-            dipole_tensor = (
-                dipole_magnitude
-                if isinstance(dipole_magnitude, torch.Tensor)
-                else torch.as_tensor(dipole_magnitude, dtype=torch.float64)
-            )
-            if (
-                dipole_tensor.dtype == torch.bool
-                or torch.is_complex(dipole_tensor)
-            ):
-                raise ValueError("dipole_magnitude must be finite and positive")
-            if not dipole_tensor.is_floating_point():
-                dipole_tensor = dipole_tensor.to(torch.get_default_dtype())
-            if (
-                dipole_tensor.ndim > 1
-                or dipole_tensor.numel() == 0
-                or not torch.all(torch.isfinite(dipole_tensor)).item()
-                or torch.any(dipole_tensor <= 0.0).item()
-            ):
-                raise ValueError("dipole_magnitude must be finite and positive")
-            dipole_tensor = dipole_tensor.reshape(-1)
-
         if isinstance(relative_amplitude, (tuple, list)):
             if len(relative_amplitude) != 2:
                 raise ValueError(
@@ -403,17 +371,28 @@ class FourierStabilityLoss(LossTerm):
         )
         self.register_buffer("wavevector_indices", selected_indices)
         self.register_buffer("charges", charge_tensor)
-        self.register_buffer("dipole_magnitude", dipole_tensor)
+
+    @property
+    def ideal_reference(self) -> str:
+        """Name of the fixed ideal approximation used by this regularizer."""
+        return ("quadratic_alignment" if self.variable == "dipole_density"
+                else "translational_ideal_gas")
+
+    def extra_repr(self) -> str:
+        return "variable={!r}, ideal_reference={!r}".format(
+            self.variable, self.ideal_reference,
+        )
 
     def evaluate(
         self,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
         model: Optional[nn.Module] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Return the mean squared stability hinge over valid directions."""
+    ) -> Dict[str, Any]:
+        """Return the stability hinge and its explicitly named ideal reference."""
 
-        return {"loss": self._hinge_loss(outputs, batch, model)}
+        return {"loss": self._hinge_loss(outputs, batch, model),
+                "ideal_reference": self.ideal_reference}
 
     def _hinge_loss(
         self,
@@ -504,7 +483,6 @@ class FourierStabilityLoss(LossTerm):
             "outputs": outputs,
             "batch": batch,
             "rho": rho,
-            "dipole_magnitude": self.dipole_magnitude,
             "polarization_directions": directions,
             "perturbations_per_forward": self.response.perturbations_per_forward,
         }

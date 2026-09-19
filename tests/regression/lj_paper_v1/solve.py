@@ -19,7 +19,7 @@ def evaluate_solve():
         max_iter=200,
         tolerance_residual=1.0e-2,
         tolerance_change=1.0e-6,
-        residual_density_threshold=model.rho_min,
+        residual_density_threshold=1.0e-3,  # Frozen regression mask.
         maximum_density=2.0,
     )
     prediction = result["rho"].detach()

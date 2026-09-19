@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    FixedDipoleIdeal,
     FourierResponse,
     FourierResponseLoss,
     FourierStabilityLoss,
@@ -87,12 +88,13 @@ class _CoupledQuadraticExcessModel(nn.Module):
 class _PolarizationQuadraticExcessModel(nn.Module):
     """Analytic local polarization functional with a Cartesian Hessian."""
 
-    def __init__(self, matrix):
+    def __init__(self, matrix, moment=1.0):
         super().__init__()
         self.matrix = nn.Parameter(torch.as_tensor(matrix, dtype=torch.float64))
+        self.ideal = FixedDipoleIdeal(moment)
         self.last_polarization = None
 
-    def forward(self, data, compute_c1=None):
+    def forward(self, data, compute_c1=None, compute_ideal=False):
         polarization = data["dipole_density"]
         volume_element = voxel_volume(data["grid_spacing"].to(polarization))
         self.last_polarization = polarization.detach()
@@ -325,7 +327,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         common = {
             "wavevector_indices": ((1, 0, 0), (2, 0, 0)),
             "variable": "dipole_density",
-            "dipole_magnitude": 1.0,
             "include_zero_wavevector": False,
         }
 
@@ -365,7 +366,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0), (2, 0, 0)),
             variable="dipole_density",
-            dipole_magnitude=1.0,
             wavevector_treatment="superposition",
             include_zero_wavevector=True,
         )
@@ -388,7 +388,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         common = {
             "wavevector_indices": ((1, 0, 0),),
             "variable": "dipole_density",
-            "dipole_magnitude": 1.0,
             "relative_amplitude": 2.0**-10,
             "include_zero_wavevector": False,
         }
@@ -431,6 +430,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         batch["rho"] = torch.cat((batch["rho"], 0.6 * batch["rho"]), dim=-1)
         self._add_polarization(batch)
         model = _PolarizationQuadraticExcessModel(torch.zeros(3, 3))
+        model.ideal = FixedDipoleIdeal([0.7, 1.3])
         modes = torch.tensor([[[1, 0, 0]]])
 
         curvature, active = polarization_fourier_curvature(
@@ -439,7 +439,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             batch=batch,
             rho=batch["rho"],
             wavevector_indices=modes,
-            dipole_magnitude=torch.tensor([0.7, 1.3]),
             relative_amplitude=0.05,
             polarization_directions=torch.tensor([[0.0, 0.0, 1.0]]),
         )
@@ -463,7 +462,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
             variable="dipole_density",
-            dipole_magnitude=1.0,
             relative_amplitude=0.05,
             include_zero_wavevector=False,
         )
@@ -484,7 +482,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
             variable="dipole_density",
-            dipole_magnitude=1.0,
         )
 
         selected = torch.zeros((1, 1, 3), dtype=torch.long)
@@ -494,7 +491,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             batch=batch,
             rho=batch["rho"],
             wavevector_indices=selected,
-            dipole_magnitude=term.dipole_magnitude,
             relative_amplitude=0.05,
             polarization_directions=torch.tensor([[0.0, 1.0, 0.0]]),
         )
@@ -518,7 +514,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
             variable="dipole_density",
-            dipole_magnitude=1.0,
             relative_amplitude=0.1,
             include_zero_wavevector=False,
         )
@@ -549,6 +544,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             a_features=None,
             b_features=None,
             readout=[readout],
+            ideal=FixedDipoleIdeal(1.0),
             grid_spacing=1.0,
             mean_temperature=1.0,
             compute_c1=False,
@@ -557,7 +553,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
             variable="dipole_density",
-            dipole_magnitude=1.0,
             include_zero_wavevector=False,
         )
 
@@ -998,16 +993,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             FourierStabilityLoss()
         with self.assertRaisesRegex(ValueError, "variable"):
             FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="unknown")
-        with self.assertRaisesRegex(ValueError, "dipole_magnitude is required"):
-            FourierStabilityLoss(
-                wavevector_indices=((1, 0, 0),),
-                variable="dipole_density",
-            )
-        with self.assertRaisesRegex(ValueError, "requires variable"):
-            FourierStabilityLoss(
-                wavevector_indices=((1, 0, 0),),
-                dipole_magnitude=1.0,
-            )
         with self.assertRaisesRegex(ValueError, "zero wavevector"):
             FourierStabilityLoss(
                 wavevector_indices=((1, 0, 0),),
@@ -1028,7 +1013,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             FourierStabilityLoss(
                 wavevector_indices=((1, 0, 0),),
                 variable="dipole_density",
-                dipole_magnitude=1.0,
                 component_treatment="full_matrix",
             )
         for modes in ((), ((0, 0, 0),), ((1.5, 0, 0),)):

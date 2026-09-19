@@ -502,8 +502,6 @@ class TestGridCACEModel(unittest.TestCase):
         self,
         compute_c1=True,
         compute_c2=False,
-        compute_chemical_potential=False,
-        rho_min=0.0,
         mean_temperature=1.0,
         with_bulk=False,
         with_long_range=False,
@@ -553,8 +551,6 @@ class TestGridCACEModel(unittest.TestCase):
             thermal_wavelength=1.0,
             compute_c1=compute_c1,
             compute_c2=compute_c2,
-            compute_local_mu=compute_chemical_potential,
-            rho_min=rho_min,
             free_energy_mode=free_energy_mode,
         )
 
@@ -573,10 +569,9 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(model.free_energy_mode, "beta")
 
-    def test_long_range_energy_is_combined_before_local_mu_derivative(self):
+    def test_long_range_energy_is_combined_before_total_derivative(self):
         model = self._make_model(
             compute_c1=True,
-            compute_chemical_potential=True,
             with_long_range=True,
         )
         with torch.no_grad():
@@ -586,8 +581,8 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
         centered_local_mu = (
-            outputs["beta_mu_local"]
-            - outputs["beta_mu_average"].unsqueeze(-2)
+            outputs["density_derivative"]
+            - outputs["density_derivative"].mean(dim=-2, keepdim=True)
         )
         centered_local_mu.square().mean().backward()
 
@@ -856,69 +851,26 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(outputs["c2"].shape, (2, 27, 1))
         self.assertTrue(torch.equal(outputs["c2"], expected))
 
-    def test_collects_local_chemical_potential_with_external_field(self):
-        model = self._make_model(
-            compute_c1=True,
-            compute_chemical_potential=True,
-            rho_min=0.5,
-        )
+    def test_intrinsic_model_does_not_depend_on_external_field(self):
+        model = self._make_model()
         data = self._make_data()
-        data["V_ext"] = torch.linspace(-1.0, 1.0, steps=27).reshape(27, 1)
+        first = model(dict(data))
+        data["V_ext"] = torch.randn_like(data["rho"])
+        second = model(dict(data))
+        for key in first:
+            torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+        for key in ("beta_mu_local", "beta_mu_average", "beta_mu_weights"):
+            self.assertNotIn(key, second)
+        for name in ("compute_local_mu", "rho_min", "average_chemical_potential"):
+            self.assertFalse(hasattr(model, name))
 
-        outputs = model(data)
-
-        expected = (
-            torch.log(data["rho"].detach())
-            + data["V_ext"] / data["temperature"]
-            - outputs["c1"]
-        )
-        self.assertIn("beta_mu_local", outputs)
-        self.assertTrue(
-            torch.allclose(outputs["beta_mu_local"], expected)
-        )
-        weights = (data["rho"].detach() > 0.5).to(expected.dtype)
-        expected_average = (weights * expected).sum(dim=-2) / weights.sum(
-            dim=-2
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["beta_mu_average"],
-                expected_average,
-            )
-        )
-        self.assertTrue(
-            torch.equal(outputs["beta_mu_weights"], weights)
-        )
-
-    def test_chemical_potential_is_activated_by_compute_local_mu(self):
-        model = self._make_model(compute_c1=True)
+    def test_vacuum_ideal_derivative_is_marked_invalid(self):
+        model = self._make_model()
         data = self._make_data()
-        data["V_ext"] = torch.zeros_like(data["rho"])
-
+        data["rho"][0] = 0.
         outputs = model(data)
-
-        self.assertNotIn("beta_mu_local", outputs)
-        self.assertNotIn("beta_mu_average", outputs)
-        self.assertNotIn("beta_mu_weights", outputs)
-
-    def test_zero_density_local_chemical_potential_is_finite_sentinel(self):
-        model = self._make_model(
-            compute_c1=True,
-            compute_chemical_potential=True,
-        )
-        data = self._make_data()
-        data["rho"][0] = 0.0
-        data["V_ext"] = torch.zeros_like(data["rho"])
-
-        outputs = model(data)
-
-        self.assertEqual(
-            outputs["beta_mu_local"][0, 0].item(),
-            0.0,
-        )
-        self.assertTrue(
-            torch.all(torch.isfinite(outputs["beta_mu_local"]))
-        )
+        self.assertEqual(outputs["ideal_density_derivative"][0, 0].item(), 0.)
+        self.assertFalse(outputs["ideal_derivative_mask"][0, 0])
 
     def test_temperature_is_appended_once_to_each_local_feature_vector(self):
         readout = LocalReadout(
@@ -1157,7 +1109,7 @@ class TestGridCACEModel(unittest.TestCase):
                 boltzmann_constant=1.0,
             )
 
-        with self.assertRaisesRegex(ValueError, "requires compute_c1"):
+        with self.assertRaisesRegex(TypeError, "compute_local_mu"):
             GridCACEModel(
                 CartesianAFeatures(
                     mean_density=0.5,
@@ -1331,7 +1283,7 @@ class TestUnitContract(unittest.TestCase):
 
 
 class TestOutputKeys(unittest.TestCase):
-    """Model and solver outputs use the beta_mu_* names and nothing else."""
+    """Chemical potentials belong to solver results, not intrinsic outputs."""
 
     def test_canonical_keys_only(self):
         from equicdft import GridSolver
@@ -1342,14 +1294,13 @@ class TestOutputKeys(unittest.TestCase):
             readout=[_FirstFeatureReadout()],
             grid_spacing=0.5,
             boltzmann_constant=1.0,
-            compute_local_mu=True,
         )
         data = TestGridCACEModel._make_data(self)
         data["V_ext"] = 0.1 * torch.rand_like(data["rho"])
         outputs = model(dict(data))
         self.assertIs(type(outputs), dict)
         for key in ("beta_mu_local", "beta_mu_average", "beta_mu_weights"):
-            self.assertIn(key, outputs)
+            self.assertNotIn(key, outputs)
         for old in ("local_chemical_potential", "average_chemical_potential", "chemical_potential_weights"):
             self.assertNotIn(old, outputs)
         data["mu"] = torch.tensor([0.0])

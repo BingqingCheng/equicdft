@@ -5,7 +5,7 @@ holding a plain dictionary::
 
     {
         "format": "equicdft-model",
-        "format_version": 3,
+        "format_version": 4,
         "equicdft_version": "...",
         "torch_version": "...",
         "default_dtype": "float32",
@@ -36,6 +36,11 @@ Format 3 stores the model-owned ideal reference. Older polarized files lack
 the physical molecular moment: load/conversion requires an explicit
 FixedDipoleIdeal supplied from the original run metadata, never inferred
 from descriptor scales. Original files are not modified by loading.
+
+Format 4 removes model-owned training masks and chemical-potential averaging.
+Migration discards compute_local_mu and rho_min from old configurations;
+fitted parameters and intrinsic thermodynamics are unchanged. Applications
+must specify their original masks and gauges in losses/metrics explicitly.
 """
 
 from contextlib import contextmanager
@@ -73,7 +78,7 @@ __all__ = [
 
 
 MODEL_FORMAT = "equicdft-model"
-MODEL_FORMAT_VERSION = 3
+MODEL_FORMAT_VERSION = 4
 
 _DTYPE_NAMES = {
     "float16": torch.float16,
@@ -424,7 +429,16 @@ def _migrate_v2_to_v3(payload):
     return payload
 
 
-_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
+def _migrate_v3_to_v4(payload):
+    """Discard retired training policy; fitted functional parameters are unchanged."""
+    config = payload["config"]
+    if config.get(TYPE_KEY) == "GridCACEModel":
+        config.pop("compute_local_mu", None)
+        config.pop("rho_min", None)
+    return payload
+
+
+_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
 
 
 def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

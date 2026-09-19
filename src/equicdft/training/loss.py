@@ -1,6 +1,6 @@
 """Composable objectives for training grid density-functional models."""
 
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -22,7 +22,7 @@ class LossTerm(nn.Module):
     """Base class of every named, weighted scalar loss term.
 
     Subclasses implement :meth:`evaluate`, which returns a mapping holding
-    the weighted scalar ``"loss"`` together with any diagnostic tensors that
+    the weighted scalar ``"loss"`` together with any diagnostics that
     a :class:`equicdft.metrics.MetricCollection` may reuse. :meth:`forward`
     returns the scalar alone. :class:`Loss` accepts only ``LossTerm``
     instances and passes the model to every term, so a term that needs the
@@ -40,7 +40,7 @@ class LossTerm(nn.Module):
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
         model: Optional[nn.Module] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """Return ``{"loss": weighted scalar, ...diagnostics}``."""
 
         raise NotImplementedError
@@ -222,7 +222,7 @@ class Loss(nn.Module):
         model: Optional[nn.Module] = None,
     ) -> Tuple[
         Dict[str, torch.Tensor],
-        Dict[str, Dict[str, torch.Tensor]],
+        Dict[str, Dict[str, Any]],
     ]:
         """Return scalar terms and every term's reusable details.
 

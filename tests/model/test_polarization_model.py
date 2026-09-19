@@ -252,8 +252,8 @@ class TestPolarizationModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dipole_density is required"):
             model(data)
 
-    def test_rejects_scalar_chemical_potential_and_unsupported_response(self):
-        model = self.model(compute_local_mu=True)
+    def test_total_derivative_and_unsupported_scalar_response(self):
+        model = self.model()
         from equicdft import FixedDipoleIdeal
         model.ideal = FixedDipoleIdeal(1.)
         self.assertIn("density_derivative", model(self.data()))

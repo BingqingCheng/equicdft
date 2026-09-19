@@ -446,6 +446,18 @@ def _trainer_epoch():
             frame["V_ext"] = 0.3 * frame["V_ext"]
             frames.append(frame)
         model = example_model()
+        # Frozen historical trainer regression only: reproduce retired output
+        # arithmetic in the fixture, not in the production model. New fitting
+        # uses total derivatives and loss-side gauge projection instead.
+        def legacy_observables(module, arguments, outputs):
+            batch = arguments[0]
+            local = (outputs["ideal_density_derivative"].detach()
+                     + batch["beta"][..., None, None] * batch["V_ext"]
+                     - outputs["c1"])
+            weights = (batch["rho"].detach() > 1.e-3).to(local)
+            outputs.update(beta_mu_local=local, beta_mu_weights=weights,
+                           beta_mu_average=(weights * local).sum(-2) / weights.sum(-2))
+        model.register_forward_hook(legacy_observables)
         loss = Loss([
             TensorLoss(
                 name="mu",
@@ -542,6 +554,12 @@ def compare(
     """
 
     actual = dict(actual)
+    # Model training-policy outputs were retired; preserve all energy,
+    # derivative, solver and historical trainer comparisons.
+    retired = {"out/beta_mu_local", "out/beta_mu_average", "out/beta_mu_weights",
+               "solve/beta_mu_average", "solve/beta_mu_weights"}
+    recorded = {k: v for k, v in recorded.items()
+                if k in actual or k not in retired}
     if "state/thermal_wavelength" in recorded and "state/ideal.thermal_wavelength" in actual:
         actual["state/thermal_wavelength"] = actual.pop("state/ideal.thermal_wavelength")
     added_outputs = {"beta_F_id", "beta_F", "ideal_derivative_mask",

@@ -9,7 +9,6 @@ from torch import nn
 
 from ._validation import (
     boolean,
-    nonnegative_scalar,
     optional_boolean,
     positive_scalar,
 )
@@ -33,7 +32,6 @@ from .functional.base import EnergyReadout, ReadoutContext
 from .representation.message import BChiMessage
 from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
-from .functional.thermodynamics import local_chemical_potential
 from .functional.ideal import IdealReference, IdealGas
 from .units import DEFAULT_BOLTZMANN_CONSTANT
 
@@ -128,12 +126,7 @@ class GridCACEModel(nn.Module, Configurable):
     ``beta_F_exc`` is differentiated with respect to the complete density to
     obtain
     ``c1 = -delta(beta_F_exc)/delta(rho)`` and, optionally, one selected row
-    of ``c2 = delta(c1)/delta(rho)``. If ``V_ext`` is available, the model may
-    also return the local and spatially averaged dimensionless chemical
-    potentials ``beta_mu_local`` (``beta * mu_local`` at every grid point),
-    ``beta_mu_average`` (its ``beta_mu_weights``-weighted spatial average)
-    and the hard weights ``beta_mu_weights`` themselves. Constructor
-    response flags provide
+    of ``c2 = delta(c1)/delta(rho)``. Constructor response flags provide
     defaults that individual forward calls may override. Readouts may also
     return named observables through ``energy_and_outputs``; these are passed
     through unchanged and are not additional energy contributions.
@@ -178,8 +171,6 @@ class GridCACEModel(nn.Module, Configurable):
         ]] = None,
         compute_c1: bool = True,
         compute_c2: bool = False,
-        compute_local_mu: bool = False,
-        rho_min: float = 0.0,
         free_energy_mode: str = "beta",
         message_layers: Optional[Sequence[BChiMessage]] = None,
         compute_polarization_derivative: bool = False,
@@ -194,13 +185,10 @@ class GridCACEModel(nn.Module, Configurable):
 
         compute_c1 = boolean(compute_c1, "compute_c1")
         compute_c2 = boolean(compute_c2, "compute_c2")
-        compute_local_mu = boolean(compute_local_mu, "compute_local_mu")
         compute_polarization_derivative = boolean(
             compute_polarization_derivative,
             "compute_polarization_derivative",
         )
-        if compute_local_mu and not (compute_c1 or compute_c2):
-            raise ValueError("compute_local_mu requires compute_c1=True")
         if free_energy_mode not in ("beta", "physical"):
             raise ValueError(
                 "free_energy_mode must be 'beta' or 'physical'"
@@ -320,7 +308,6 @@ class GridCACEModel(nn.Module, Configurable):
         for item in readouts:
             if item.n_types is not None and item.n_types != n_types:
                 raise ValueError("all readouts must use the same n_types")
-        rho_min = nonnegative_scalar(rho_min, "rho_min")
 
         density_scale = None
         if mean_density is not None:
@@ -363,9 +350,7 @@ class GridCACEModel(nn.Module, Configurable):
         self.readout = nn.ModuleList(readouts)
         self.compute_c1 = compute_c1 or compute_c2
         self.compute_c2 = compute_c2
-        self.compute_local_mu = compute_local_mu
         self.compute_polarization_derivative = compute_polarization_derivative
-        self.rho_min = rho_min
         self.free_energy_mode = free_energy_mode
 
         spacing = grid_spacing_tensor(
@@ -461,9 +446,7 @@ class GridCACEModel(nn.Module, Configurable):
             n_types=self.n_types,
             compute_c1=self.compute_c1,
             compute_c2=self.compute_c2,
-            compute_local_mu=self.compute_local_mu,
             compute_polarization_derivative=self.compute_polarization_derivative,
-            rho_min=self.rho_min,
             free_energy_mode=self.free_energy_mode,
             message_layers=[
                 optional_config(item) for item in self.message_layers
@@ -654,55 +637,6 @@ class GridCACEModel(nn.Module, Configurable):
             "or the data with grid_info=model.grid_info".format(
                 ratio * model_constant, model_constant,
             )
-        )
-
-    def _compute_local_chemical_potential(
-        self,
-        data: Dict[str, torch.Tensor],
-        c1: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return dimensionless ``beta*mu_local`` at every grid point.
-
-        The returned quantity is
-        ``log(rho*Lambda**3) + beta*V_ext - c1``, stored under the
-        ``beta_mu_local`` output key (formerly ``local_chemical_potential``).
-        """
-
-        rho = data["rho"].detach()
-        return local_chemical_potential(
-            rho,
-            data["V_ext"].detach(),
-            data["beta"].detach().to(rho),
-            c1,
-            self.thermal_wavelength.to(rho),
-        )
-
-    def _weight_mask(self, rho: torch.Tensor) -> torch.Tensor:
-        """Return hard averaging weights from the physical density."""
-
-        return (rho.detach() > self.rho_min).to(dtype=rho.dtype)
-
-    def average_chemical_potential(
-        self,
-        local_chemical_potential: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return dimensionless ``beta*mu_average`` for each component.
-
-        This is the weighted spatial average of ``beta*mu_local``, stored
-        under the ``beta_mu_average`` output key (formerly
-        ``average_chemical_potential``).
-        """
-
-        weights = weights.detach().to(local_chemical_potential)
-        total_weight = weights.sum(dim=-2)
-        if torch.any(total_weight <= 0.0).item():
-            raise ValueError(
-                "every field and component must have positive total weight"
-            )
-        return (
-            (weights * local_chemical_potential).sum(dim=-2)
-            / total_weight
         )
 
     def _validate_c2_reference(
@@ -1002,19 +936,6 @@ class GridCACEModel(nn.Module, Configurable):
                     outputs["total_polarization_derivative"] = (
                         outputs["ideal_polarization_derivative"]
                         + outputs["polarization_derivative"]
-                    )
-                if self.compute_local_mu and compute_c1 and "V_ext" in data:
-                    # Legacy training observables retain their established
-                    # evaluation order/gauge; intrinsic derivatives above do not.
-                    outputs["beta_mu_local"] = (
-                        self._compute_local_chemical_potential(data, outputs["c1"])
-                        if not has_polarization else
-                        outputs["density_derivative"] + context.beta[..., None, None] * data["V_ext"]
-                    )
-                    weights = self._weight_mask(rho)
-                    outputs["beta_mu_weights"] = weights
-                    outputs["beta_mu_average"] = self.average_chemical_potential(
-                        outputs["beta_mu_local"], weights,
                     )
 
         return outputs
