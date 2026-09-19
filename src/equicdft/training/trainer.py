@@ -374,12 +374,24 @@ class Trainer:
         epochs: int,
         verbose: bool = True,
         print_interval: int = 1,
+        record_initial_validation: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Run complete train/validation epochs and return their history."""
+        """Run complete train/validation epochs and return their history.
+
+        ``fit`` is the single-stream form of :meth:`fit_streams`: it wraps
+        the loaders, the trainer's loss, metrics and noise settings in one
+        ``TrainingStream`` named ``"default"`` and records history and
+        checkpoints in the flat (unprefixed) layout. With
+        ``record_initial_validation`` the untrained validation result is
+        first recorded as epoch 0, as in :meth:`fit_streams`.
+        """
 
         epochs = positive_integer(epochs, "epochs")
         verbose = boolean(verbose, "verbose")
         print_interval = positive_integer(print_interval, "print_interval")
+        record_initial_validation = boolean(
+            record_initial_validation, "record_initial_validation",
+        )
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization()
@@ -392,6 +404,9 @@ class Trainer:
             metrics=tuple(self.metrics),
             noise=self.noise,
         )
+        if record_initial_validation and not self.history:
+            self._record_baseline(stream, verbose)
+            start_epoch = self._next_epoch()
 
         if self._stop_before_training(verbose):
             return self.history
@@ -532,13 +547,29 @@ class Trainer:
             for stream in streams
         }
 
+    def _record_baseline(self, stream: TrainingStream, verbose: bool) -> None:
+        """Append the validation-only epoch 0 of :meth:`fit`."""
+
+        valid_losses, valid_metrics = self._evaluate_stream(stream, subset="valid")
+        self._append_baseline(
+            {
+                "epoch": 0,
+                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                "train_losses": {},
+                "valid_losses": valid_losses,
+                "train_metrics": {},
+                "valid_metrics": valid_metrics,
+            },
+            verbose,
+        )
+
     def _record_stream_baseline(
         self,
         streams: Sequence[TrainingStream],
         weights: Mapping[str, float],
         verbose: bool,
     ) -> None:
-        """Append validation-only epoch 0 before the first optimizer update."""
+        """Append the validation-only epoch 0 of :meth:`fit_streams`."""
 
         evaluated = {
             stream.name: self._evaluate_stream(
@@ -551,15 +582,20 @@ class Trainer:
             evaluated,
             weights,
         )
-        record = {
-            "epoch": 0,
-            "learning_rate": self.optimizer.param_groups[0]["lr"],
-            "stream_weights": weights,
-            "train_losses": {},
-            "valid_losses": valid_losses,
-            "train_metrics": {},
-            "valid_metrics": valid_metrics,
-        }
+        self._append_baseline(
+            {
+                "epoch": 0,
+                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                "stream_weights": weights,
+                "train_losses": {},
+                "valid_losses": valid_losses,
+                "train_metrics": {},
+                "valid_metrics": valid_metrics,
+            },
+            verbose,
+        )
+
+    def _append_baseline(self, record: Dict[str, Any], verbose: bool) -> None:
         self.history.append(record)
         self._write_history_csv()
         if verbose:

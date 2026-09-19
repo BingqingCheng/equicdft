@@ -94,6 +94,20 @@ def _functional_dataset(n_fields=2):
 
 
 class TestTrainer(unittest.TestCase):
+    def test_fit_can_record_the_untrained_validation_baseline(self):
+        trainer = self._make_trainer()
+        history = trainer.fit(
+            DataLoader(_dataset([1, 2]), batch_size=2),
+            DataLoader(_dataset([3]), batch_size=1),
+            epochs=2,
+            verbose=False,
+            record_initial_validation=True,
+        )
+        self.assertEqual([record["epoch"] for record in history], [0, 1, 2])
+        self.assertEqual(history[0]["train_losses"], {})
+        self.assertIn("total", history[0]["valid_losses"])
+        self.assertNotIn("stream_weights", history[0])
+
     def test_trainer_is_a_plain_object_that_moves_its_modules(self):
         trainer = self._make_trainer()
         self.assertNotIsInstance(trainer, nn.Module)
