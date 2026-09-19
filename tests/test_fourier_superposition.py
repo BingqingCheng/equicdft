@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from equicdft import FourierResponse, FourierStabilityLoss
-from equicdft._fourier import component_fourier_directions
+from equicdft.response.modes import component_fourier_directions
 from tests.test_fourier_amplitudes import batch
 from tests import test_loss as fixtures
 

@@ -1,20 +1,23 @@
 """Neural density-functional models for periodic Cartesian grids."""
 
 from ._version import __version__
-from .data import FourierResponseData, GridData, default_data_key, read_metal_sites
+from .response.data import FourierResponseData
+from .data import GridData, default_data_key, read_metal_sites
 from .functional.base import EnergyReadout
 from .representation.cartesian import CartesianAFeatures
 from .representation.message import BChiMessage
 from .loader import make_dataloaders
-from .loss import FourierResponseLoss, Loss, LossTerm, TensorLoss
-from .metrics import FourierResponseMetrics, MetricCollection, Metrics
+from .response.loss import FourierResponseLoss
+from .loss import Loss, LossTerm, TensorLoss
+from .response.metrics import FourierResponseMetrics
+from .metrics import MetricCollection, Metrics
 from .functional.metalwall import MetalWall
 from .model import GridCACEModel
 from .functional.pairwise import PairwiseReadout
 from .functional.polarization_ideal import FixedDipoleIdeal
 from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
 from .functional.reciprocal import ReciprocalFeatures
-from .response import FourierResponse
+from .response.response import FourierResponse
 from .functional.semilocal import GGAReadout, LDAReadout
 from .serialization import (
     MODEL_FORMAT,
@@ -24,7 +27,7 @@ from .serialization import (
     save_model,
 )
 from .solver import GridSolver
-from .stability import FourierStabilityLoss
+from .response.stability import FourierStabilityLoss
 from .representation.invariants import CartesianBFeatures
 from .trainer import Trainer, TrainingStream
 

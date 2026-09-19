@@ -5,17 +5,16 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ._validation import boolean, finite_scalar, optional_positive_integer
-from ._fourier import (
+from .._validation import boolean, finite_scalar, optional_positive_integer
+from .modes import (
     expand_probe_amplitudes,
-    fourier_curvature_matrix,
     fourier_directions,
-    projected_fourier_curvature,
     probe_shape,
     validate_wavevector_indices,
     validate_response,
     validated_wavevector_domain,
 )
+from .curvature import fourier_curvature_matrix, projected_fourier_curvature
 
 __all__ = [
     "FourierResponse",

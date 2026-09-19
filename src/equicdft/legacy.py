@@ -74,6 +74,8 @@ _MODULE_ALIASES: Dict[str, str] = {
     "equicdft.polarization_ideal": "equicdft.functional.polarization_ideal",
     "equicdft._component_pairs": "equicdft.functional._pairs",
     "equicdft._fourier_sites": "equicdft.functional._sites",
+    "equicdft._fourier": "equicdft.response.modes",
+    "equicdft.stability": "equicdft.response.stability",
 }
 _CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {}
 

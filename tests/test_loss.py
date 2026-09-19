@@ -15,8 +15,8 @@ from equicdft import (
     TensorLoss,
 )
 from equicdft.geometry.grid import voxel_volume
-from equicdft._fourier import polarization_fourier_curvature
-from equicdft.stability import _feasible_wavevector_indices
+from equicdft.response.curvature import polarization_fourier_curvature
+from equicdft.response.stability import _feasible_wavevector_indices
 
 
 class _PredictionPenalty(LossTerm):
@@ -339,7 +339,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
                     **common,
                 )
                 with patch(
-                    "equicdft.stability.polarization_fourier_curvature",
+                    "equicdft.response.stability.polarization_fourier_curvature",
                     wraps=polarization_fourier_curvature,
                 ) as response:
                     value = term(model(batch), batch, model=model)
@@ -371,7 +371,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         )
 
         with patch(
-            "equicdft.stability.polarization_fourier_curvature",
+            "equicdft.response.stability.polarization_fourier_curvature",
             wraps=polarization_fourier_curvature,
         ) as response:
             term(model(batch), batch, model=model)
@@ -468,7 +468,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             include_zero_wavevector=False,
         )
 
-        with patch("equicdft.stability.torch.randn", return_value=draws):
+        with patch("equicdft.response.stability.torch.randn", return_value=draws):
             term(model(batch), batch, model=model)
 
         first_cosine_plus = model.last_polarization[:, 0, 0, 0]
@@ -504,7 +504,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         torch.testing.assert_close(curvature[0, 0, 0], curvature.new_tensor(1.0))
 
         with patch(
-            "equicdft.stability.polarization_fourier_curvature",
+            "equicdft.response.stability.polarization_fourier_curvature",
             wraps=polarization_fourier_curvature,
         ) as response:
             term(model(batch), batch, model=model)
@@ -524,7 +524,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
         )
 
         direction = torch.tensor([[1.0, 0.0, 0.0]], dtype=batch["rho"].dtype)
-        with patch("equicdft.stability.torch.randn", return_value=direction):
+        with patch("equicdft.response.stability.torch.randn", return_value=direction):
             value = term(model(batch), batch, model=model)
 
         perturbed_q = model.last_polarization / batch["rho"][:, None, :, :, None]

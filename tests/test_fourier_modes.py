@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from equicdft import FourierResponse, FourierStabilityLoss
-from equicdft._fourier import (
+from equicdft.response.modes import (
     canonical_grid_wavevector_index,
     canonical_wavevector_indices,
     feasible_wavevector_indices,
