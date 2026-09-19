@@ -12,8 +12,16 @@ from ._argument_checks import (
     positive_integer as _strict_positive_integer,
     positive_scalar as _strict_positive_scalar,
 )
-from .stencil import coarsen_grid, get_neighbor_indices, make_stencil
+from .stencil import (
+    canonical_grid_order,
+    coarsen_grid,
+    get_neighbor_indices,
+    grid_size_array,
+    grid_spacing_array,
+    make_stencil,
+)
 from ._grid import _grid_center_origin
+from .thermodynamics import local_chemical_potential
 
 
 GRID_INFO_KEYS = {
@@ -47,7 +55,7 @@ def normalize_grid_info(grid_info: Mapping[str, Any]) -> Dict[str, Any]:
         grid_info["cutoff_grid"],
         "grid_info cutoff_grid",
     )
-    grid_spacing = _metadata_grid_spacing(
+    grid_spacing = grid_spacing_array(
         grid_info["grid_spacing"],
         "grid_info grid_spacing",
     )
@@ -106,41 +114,19 @@ def process_atoms(
         ),
         dtype=float,
     )
-    grid_positions = np.rint(positions).astype(np.int64)
-    if not np.allclose(positions, grid_positions, atol=1.0e-8, rtol=0.0):
-        raise ValueError("EXTXYZ positions must contain integer grid coordinates")
-
     indexing_value = _get_source_value(atoms, data_key["grid_indexing"])
     indexing = str(
         "zero_based" if indexing_value is None else indexing_value
     ).lower()
     if indexing in ("one_based", "one-based", "1_based"):
-        grid_positions -= 1
-    if np.any(grid_positions.min(axis=0) != 0):
-        raise ValueError("grid positions must use zero-based indexing")
+        positions = positions - 1.0
 
     grid_size_value = _get_source_value(atoms, data_key["grid_size"])
-    if grid_size_value is None:
-        grid_size = grid_positions.max(axis=0) + 1
-    else:
-        grid_size = _metadata_grid_size(grid_size_value)
+    ordering = canonical_grid_order(positions, grid_size_value)
+    grid_size = ordering.grid_size
     n_grid = int(np.prod(grid_size))
-    if len(atoms) != n_grid:
-        raise ValueError("frame does not contain one complete regular grid")
-    if np.any(grid_positions.max(axis=0) + 1 != grid_size):
-        raise ValueError("grid positions are inconsistent with grid_size")
-
-    flat_positions = np.ravel_multi_index(
-        grid_positions.T,
-        tuple(grid_size),
-        order="C",
-    )
-    if np.unique(flat_positions).size != n_grid:
-        raise ValueError("grid positions contain duplicate grid points")
-    order = np.argsort(flat_positions)
-    if not np.array_equal(flat_positions[order], np.arange(n_grid)):
-        raise ValueError("grid positions do not cover the complete grid")
-    grid_positions = grid_positions[order]
+    order = ordering.order
+    grid_positions = ordering.positions[order]
 
     grid_center = _get_source_value(atoms, data_key["grid_center"])
     if grid_center is not None:
@@ -192,7 +178,7 @@ def process_atoms(
     if dipole_density_std is not None:
         dipole_density_std = dipole_density_std.reshape(n_grid, n_types, 3)
 
-    grid_spacing = _metadata_grid_spacing(
+    grid_spacing = grid_spacing_array(
         _required_source_value(
             atoms,
             data_key["grid_spacing"],
@@ -203,7 +189,7 @@ def process_atoms(
         _grid_center_origin(grid_center, grid_positions, grid_spacing)
     if target_grid_spacing is not None:
         if not np.allclose(
-            _metadata_grid_spacing(target_grid_spacing),
+            grid_spacing_array(target_grid_spacing),
             grid_spacing,
             rtol=1.0e-10,
             atol=1.0e-10,
@@ -328,8 +314,8 @@ def build_grid_data(
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
-    grid_size_values = _metadata_grid_size(grid_size)
-    grid_spacing_values = _metadata_grid_spacing(grid_spacing)
+    grid_size_values = grid_size_array(grid_size)
+    grid_spacing_values = grid_spacing_array(grid_spacing)
     temperature_value = _metadata_positive_scalar(temperature, "temperature")
     n_type_values = _metadata_positive_integer(n_types, "n_types")
     cutoff_value = _metadata_nonnegative_integer(cutoff_grid, "cutoff_grid")
@@ -502,46 +488,6 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
         )
         frame["mu"] = missing_mu.clone()
         frame["beta_mu"] = missing_mu
-
-
-def _metadata_grid_size(value: Any) -> np.ndarray:
-    """Coerce serialized metadata to three positive grid dimensions."""
-
-    try:
-        raw = np.asarray(value, dtype=float).reshape(-1)
-    except (TypeError, ValueError):
-        raise ValueError("grid_size must contain three values")
-    if raw.size != 3:
-        raise ValueError("grid_size must contain three values")
-    grid_size = np.rint(raw).astype(np.int64)
-    if not np.allclose(raw, grid_size) or np.any(grid_size <= 0):
-        raise ValueError("grid_size values must be positive integers")
-    return grid_size
-
-
-def _metadata_grid_spacing(
-    value: Any,
-    name: str = "grid_spacing",
-) -> np.ndarray:
-    """Coerce serialized metadata to one spacing per Cartesian axis."""
-
-    try:
-        spacing = np.asarray(value, dtype=float).reshape(-1)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "{} must contain one or three finite positive values".format(name)
-        )
-    if spacing.size == 1:
-        spacing = np.repeat(spacing, 3)
-    if (
-        spacing.size != 3
-        or not np.all(np.isfinite(spacing))
-        or np.any(spacing <= 0.0)
-    ):
-        raise ValueError(
-            "{} must contain one or three finite positive values".format(name)
-        )
-    return spacing
 
 
 def _metadata_scalar(value: Any, name: str) -> float:
@@ -825,20 +771,22 @@ def _add_thermodynamic_fields(
         or not np.all(rho[~excluded_mask] > 0.0)
     ):
         return
-    safe_rho = rho.copy()
-    safe_rho[excluded_mask] = 1.0
-    c1_plus_beta_mu = (
-        np.log(safe_rho * thermal_wavelength[None, :] ** 3) + beta * V_ext
+    # The Euler-Lagrange target is evaluated in double precision from the
+    # parsed fields and only then cast to the working dtype.
+    accessible = torch.as_tensor(~excluded_mask)[:, None]
+    c1_plus_beta_mu = local_chemical_potential(
+        torch.as_tensor(rho, dtype=torch.float64),
+        torch.as_tensor(V_ext, dtype=torch.float64),
+        float(beta),
+        None,
+        torch.as_tensor(thermal_wavelength, dtype=torch.float64),
+        mask=accessible,
     )
-    c1_plus_beta_mu[excluded_mask] = 0.0
-    data["c1_plus_beta_mu"] = torch.tensor(
-        c1_plus_beta_mu,
-        dtype=dtype,
-    )
+    data["c1_plus_beta_mu"] = c1_plus_beta_mu.to(dtype=dtype)
     if mu is not None:
-        c1 = c1_plus_beta_mu - beta * mu[None, :]
-        c1[excluded_mask] = 0.0
-        data["c1"] = torch.tensor(
-            c1,
-            dtype=dtype,
-        )
+        c1 = c1_plus_beta_mu - float(beta) * torch.as_tensor(
+            mu, dtype=torch.float64,
+        )[None, :]
+        data["c1"] = torch.where(
+            accessible, c1, torch.zeros_like(c1),
+        ).to(dtype=dtype)

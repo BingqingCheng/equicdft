@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, LDAReadout, LongRangeReadout, ReciprocalFeatures
+from equicdft.energy import ReadoutContext
 from equicdft.loss import TensorLoss
 
 
@@ -53,23 +54,23 @@ class TestPolarizationGaussian(unittest.TestCase):
 
     @staticmethod
     def context(data):
-        return dict(data, state_features=torch.cat((
-            data["temperature"][..., None], data["rho"].mean(-2) / .4,
-        ), dim=-1))
+        return ReadoutContext.from_data(
+            data, grid_spacing=data["grid_spacing"], mean_density=.4,
+        )
 
     @staticmethod
     def model(readout, spacing=.8, **kwargs):
-        # The zero LDA supplies the existing model-level density scale only.
-        lda = LDAReadout(mean_density=.4, n_types=readout.n_types, zero_init=True)
+        # The zero LDA exercises a second readout on the same density scale.
+        lda = LDAReadout(n_types=readout.n_types, zero_init=True)
         return GridCACEModel(
             None, None, [lda, readout], grid_spacing=spacing,
-            compute_polarization_derivative=True, **kwargs,
+            compute_polarization_derivative=True, mean_density=.4, **kwargs,
         )
 
     def test_uniform_p_energy_and_restoring_derivative(self):
         readout = self.readout(exponents=(.2, 1.3), coefficients=(1.2, -.3))
         self.assertTrue(readout.requires_dipole_density)
-        self.assertTrue(readout.requires_state_features)
+        self.assertIsNone(readout.coulomb_amplitude)
         self.assertFalse(readout.requires_local_density_index)
         for spacing in (.5, 2.):
             data = self.data(spacing=spacing)
@@ -123,10 +124,10 @@ class TestPolarizationGaussian(unittest.TestCase):
             1, charges=(0.,), coulomb_amplitude=1.3, include_polarization=True,
             features=ReciprocalFeatures((alpha,), kernel="coulomb"),
         )
-        lda = LDAReadout(mean_density=.4, zero_init=True)
+        lda = LDAReadout(zero_init=True)
         model = GridCACEModel(
             None, None, [lda, gaussian, coulomb], grid_spacing=spacing,
-            compute_polarization_derivative=True,
+            compute_polarization_derivative=True, mean_density=.4,
         ).eval()
         k = 2 * math.pi / (shape[0] * spacing)
         damping = math.exp(-alpha * k*k)
@@ -146,7 +147,7 @@ class TestPolarizationGaussian(unittest.TestCase):
                 torch.testing.assert_close(output["polarization_derivative"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
                 torch.testing.assert_close(
                     output["beta_F_exc"],
-                    gaussian.energy(self.context(data)) + coulomb.energy(data),
+                    gaussian.energy(self.context(data)) + coulomb.energy(self.context(data)),
                     atol=1e-13, rtol=1e-12,
                 )
 
@@ -269,7 +270,7 @@ class TestPolarizationGaussian(unittest.TestCase):
 
     def test_model_batch_and_additivity_with_lda_and_coulomb(self):
         gaussian = self.readout()
-        lda = LDAReadout(mean_density=.4, dipole_density_scale=.2, hidden_sizes=(4,))
+        lda = LDAReadout(dipole_density_scale=.2, hidden_sizes=(4,))
         coulomb = LongRangeReadout(
             1, charges=(0.,), coulomb_amplitude=1.3, include_polarization=True,
             features=ReciprocalFeatures((.3,), kernel="coulomb"),
@@ -278,7 +279,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         individual = [self.model(item).eval()(self.clone(data)) for item in (gaussian, lda, coulomb)]
         model = GridCACEModel(
             None, None, [lda, gaussian, coulomb], grid_spacing=.8,
-            compute_polarization_derivative=True,
+            compute_polarization_derivative=True, mean_density=.4,
         ).eval()
         result = model(self.clone(data))
         for key, value in result.items():

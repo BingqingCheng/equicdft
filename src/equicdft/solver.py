@@ -28,10 +28,11 @@ from ._solver_numerics import (
     _residuals_converged,
     _thermodynamic_objective,
 )
-from .energy import (
+from .thermodynamics import (
     density_weighted_integral,
+    equilibrium_log_density,
     ideal_free_energy,
-    log_dimensionless_density,
+    local_chemical_potential,
 )
 from .polarization_ideal import (
     FixedDipoleIdeal,
@@ -775,20 +776,20 @@ class GridSolver:
             # Armijo needs the true objective derivative, whereas the
             # update and convergence test use the projected KKT residual
             # when an upper density bound is active.
-            line_search_gradient = (
-                log_dimensionless_density(rho, thermal_wavelength)
-                + data["beta"] * V_ext
-                - evaluation["c1"].detach()
+            line_search_gradient = local_chemical_potential(
+                rho,
+                V_ext,
+                data["beta"],
+                evaluation["c1"].detach(),
+                thermal_wavelength,
+                mask=accessible_mask[:, None],
             )
             if fixed_N is None:
-                line_search_gradient = (
-                    line_search_gradient - data["beta"] * mu[None, :]
+                line_search_gradient = torch.where(
+                    accessible_mask[:, None],
+                    line_search_gradient - data["beta"] * mu[None, :],
+                    torch.zeros_like(line_search_gradient),
                 )
-            line_search_gradient = torch.where(
-                accessible_mask[:, None],
-                line_search_gradient,
-                torch.zeros_like(line_search_gradient),
-            )
 
             accepted = False
             trial_step_size = next_step_size
@@ -965,10 +966,8 @@ class GridSolver:
                 torch.clamp(rho, min=torch.finfo(rho.dtype).tiny)
             )
             if fixed_N is None:
-                target_log_density = (
-                    data["beta"] * (mu[None, :] - V_ext)
-                    + c1
-                    - 3.0 * torch.log(thermal_wavelength)[None, :]
+                target_log_density = equilibrium_log_density(
+                    V_ext, data["beta"], mu, c1, thermal_wavelength,
                 )
                 log_change = torch.clamp(
                     target_log_density - current_log_density,

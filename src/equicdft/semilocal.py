@@ -16,10 +16,8 @@ from ._argument_checks import (
 from ._config import (
     Configurable,
     make_config,
-    mlp_input_size,
     optional_buffer_value,
     register,
-    scalar_value,
 )
 from ._grid import grid_spacing_tensor
 from ._nn import (
@@ -27,7 +25,8 @@ from ._nn import (
     positive_scalar_tensor,
     validate_hidden_sizes,
 )
-from .energy import EnergyReadout, density_weighted_integral
+from .energy import EnergyReadout, ReadoutContext
+from .thermodynamics import density_weighted_integral
 
 
 @register
@@ -37,7 +36,10 @@ class LDAReadout(EnergyReadout, Configurable):
     The input at every grid point contains all locally normalized component
     densities followed by normalized temperature,
 
-    ``(rho_1 / mean_density, ..., rho_M / mean_density, T / mean_T)``.
+    ``(rho_1 / mean_density, ..., rho_M / mean_density, T / mean_T)``,
+
+    where ``mean_density`` is the density scale owned by the containing
+    :class:`equicdft.model.GridCACEModel`.
 
     The shared MLP returns one reduced scalar ``a_exc_lda``. The model
     multiplies it by total local density and the voxel volume, giving
@@ -62,8 +64,6 @@ class LDAReadout(EnergyReadout, Configurable):
 
     Parameters
     ----------
-    mean_density
-        Positive scalar used only to scale the local density inputs.
     n_types
         Number of physical density components.
     hidden_sizes
@@ -75,11 +75,8 @@ class LDAReadout(EnergyReadout, Configurable):
         and species. Omit to preserve the density-only architecture.
     """
 
-    requires_local_density_index = False
-
     def __init__(
         self,
-        mean_density: Union[float, torch.Tensor],
         n_types: int = 1,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = False,
@@ -89,8 +86,6 @@ class LDAReadout(EnergyReadout, Configurable):
 
         self.n_types = positive_integer(n_types, "n_types")
         self.n_state_features = self.n_types + 1
-        density_scale = positive_scalar_tensor(mean_density, "mean_density")
-        self.register_buffer("mean_density", density_scale)
         if dipole_density_scale is not None:
             self.register_buffer(
                 "dipole_density_scale",
@@ -113,7 +108,6 @@ class LDAReadout(EnergyReadout, Configurable):
 
         return make_config(
             self,
-            mean_density=scalar_value(self.mean_density),
             n_types=self.n_types,
             hidden_sizes=self.hidden_sizes,
             zero_init=self.zero_init,
@@ -136,21 +130,17 @@ class LDAReadout(EnergyReadout, Configurable):
             )
         return self.mlp(local_state)
 
-    def energy(
-        self,
-        context: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the integrated pointwise LDA contribution."""
 
-        rho = context["rho"]
-        if rho.ndim < 2 or rho.shape[-1] != self.n_types:
+        rho = context.rho
+        if rho.shape[-1] != self.n_types:
             raise ValueError("rho must have shape [..., n_grid, n_types]")
-        normalized_density = rho / self.mean_density.to(rho)
-        inputs = [normalized_density]
+        inputs = [context.normalized_rho()]
         if self.requires_dipole_density:
-            if "dipole_density" not in context:
+            if context.dipole_density is None:
                 raise ValueError("dipole_density is required by this LDAReadout")
-            dipole = context["dipole_density"]
+            dipole = context.dipole_density
             if dipole.shape != (*rho.shape, 3):
                 raise ValueError("dipole_density must have shape [..., n_grid, n_types, 3]")
             if dipole.dtype != rho.dtype or dipole.device != rho.device:
@@ -159,12 +149,10 @@ class LDAReadout(EnergyReadout, Configurable):
                 raise ValueError("dipole_density must be finite")
             normalized_dipole = dipole / self.dipole_density_scale.to(rho)
             inputs.append(normalized_dipole.square().sum(dim=-1))
-        temperature_feature = context["normalized_temperature"][
-            ..., None, None
-        ].expand(*rho.shape[:-1], 1)
-        local_state = torch.cat(
-            (*inputs, temperature_feature),
-            dim=-1,
+        local_state = (
+            context.pointwise_state()
+            if len(inputs) == 1
+            else torch.cat((*inputs, context.temperature_feature()), dim=-1)
         )
         scalar_per_particle = self(local_state)
         if scalar_per_particle.shape != (*rho.shape[:-1], 1):
@@ -175,7 +163,7 @@ class LDAReadout(EnergyReadout, Configurable):
         return density_weighted_integral(
             rho,
             per_particle,
-            context["voxel_volume"],
+            context.voxel_volume,
         )
 
 
@@ -199,9 +187,9 @@ class GGAReadout(EnergyReadout, Configurable):
     hidden_sizes
         Width of each hidden layer.
     n_features
-        Input width, including temperature. If omitted, the first hidden layer
-        is initialized lazily from the first input. An explicit width is needed
-        when ``hidden_sizes`` is empty.
+        Input width, including temperature. When omitted, the readout stays
+        unbound until :meth:`bind_input_size` is called;
+        :class:`equicdft.model.GridCACEModel` does this at construction.
     minimum_coefficient
         Nonnegative lower bound on the returned coefficient.
     initial_coefficient
@@ -210,6 +198,7 @@ class GGAReadout(EnergyReadout, Configurable):
     """
 
     requires_local_features = True
+
     def __init__(
         self,
         hidden_sizes: Sequence[int] = (16, 16),
@@ -221,8 +210,6 @@ class GGAReadout(EnergyReadout, Configurable):
         super().__init__()
 
         self.n_types = positive_integer(n_types, "n_types")
-        n_features = optional_positive_integer(n_features, "n_features")
-
         minimum_coefficient = nonnegative_scalar(
             minimum_coefficient,
             "minimum_coefficient",
@@ -235,41 +222,56 @@ class GGAReadout(EnergyReadout, Configurable):
             raise ValueError(
                 "initial_coefficient must be finite and exceed the minimum"
             )
+        self.minimum_coefficient = minimum_coefficient
+        self.initial_coefficient = initial_coefficient
+        self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
+        self.n_features = None
+        self.mlp = None
+        n_features = optional_positive_integer(n_features, "n_features")
+        if n_features is not None:
+            self.bind_input_size(n_features)
 
-        validated_hidden_sizes = validate_hidden_sizes(hidden_sizes)
-        if n_features is None and not validated_hidden_sizes:
-            raise ValueError(
-                "n_features is required when hidden_sizes is empty"
-            )
+    @property
+    def is_bound(self) -> bool:
+        return self.mlp is not None
 
-        self.mlp = build_mlp(n_features, validated_hidden_sizes, 1)
-        final_layer = self.mlp[-1]
+    def bind_input_size(self, n_features: int) -> None:
+        """Build the coefficient network for ``n_features`` inputs, once.
+
+        The final layer starts at the constant ``initial_coefficient``.
+        Rebinding to the same width is a no-op; a different width is an error.
+        """
+
+        n_features = positive_integer(n_features, "n_features")
+        if self.is_bound:
+            if n_features != self.n_features:
+                raise ValueError(
+                    "GGAReadout is bound to {} input features, not {}".format(
+                        self.n_features, n_features,
+                    )
+                )
+            return
+        mlp = build_mlp(n_features, self.hidden_sizes, 1)
+        final_layer = mlp[-1]
         nn.init.zeros_(final_layer.weight)
-        softplus_value = initial_coefficient - minimum_coefficient
+        softplus_value = self.initial_coefficient - self.minimum_coefficient
         inverse_softplus = softplus_value + math.log(
             -math.expm1(-softplus_value)
         )
         nn.init.constant_(final_layer.bias, inverse_softplus)
-        self.minimum_coefficient = minimum_coefficient
-        self.initial_coefficient = initial_coefficient
-        self.hidden_sizes = validated_hidden_sizes
         self.n_features = n_features
+        self.mlp = mlp
 
     def to_config(self) -> Dict[str, Any]:
         """Return the constructor arguments describing this readout.
 
-        A lazily built input layer reports its width once it has been
-        materialized, so a reconstructed readout is never lazy.
+        ``n_features`` is ``None`` while the readout is unbound.
         """
 
         return make_config(
             self,
             hidden_sizes=self.hidden_sizes,
-            n_features=(
-                self.n_features
-                if self.n_features is not None
-                else mlp_input_size(self.mlp)
-            ),
+            n_features=self.n_features,
             n_types=self.n_types,
             minimum_coefficient=self.minimum_coefficient,
             initial_coefficient=self.initial_coefficient,
@@ -278,20 +280,21 @@ class GGAReadout(EnergyReadout, Configurable):
     def forward(self, local_features: torch.Tensor) -> torch.Tensor:
         """Return ``kappa`` with shape ``[..., n_grid, 1]``."""
 
+        if not self.is_bound:
+            raise RuntimeError(
+                "GGAReadout has no input width yet; pass n_features or let "
+                "GridCACEModel bind it"
+            )
         return self.minimum_coefficient + torch.nn.functional.softplus(
             self.mlp(local_features)
         )
 
-    def energy(
-        self,
-        context: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the positive periodic density-gradient contribution."""
 
-        if "grid_size" not in context:
-            raise KeyError("GGA evaluation requires data['grid_size']")
-        rho = context["rho"]
-        coefficient = self(context["local_features"])
+        grid_size = context.require("grid_size")
+        rho = context.rho
+        coefficient = self(context.local_features())
         if coefficient.shape != (*rho.shape[:-1], 1):
             raise ValueError(
                 "GGAReadout must return one coefficient per grid point"
@@ -299,10 +302,10 @@ class GGAReadout(EnergyReadout, Configurable):
         free_energy_density = periodic_gradient_energy_density(
             rho=rho,
             coefficient=coefficient,
-            grid_size=context["grid_size"],
-            grid_spacing=context["grid_spacing"],
+            grid_size=grid_size,
+            grid_spacing=context.require("grid_spacing"),
         )
-        return context["voxel_volume"] * torch.sum(
+        return context.voxel_volume * torch.sum(
             free_energy_density,
             dim=-1,
         )

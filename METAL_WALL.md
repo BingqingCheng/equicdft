@@ -62,9 +62,15 @@ model.readout[2] = MetalWall(
 ```
 
 `MetalWall` wraps and evaluates the existing `liquid_coulomb` readout. Replace
-the original entry as shown above. If the original entry is left in the model
-and `MetalWall` is appended as another entry, the liquid long-range energy is
-evaluated twice.
+the original entry as shown above; leaving it in place and appending
+`MetalWall` as another entry would evaluate the liquid long-range energy twice,
+and `GridCACEModel` rejects a `readout` list that contains both at construction.
+
+Electrode coordinates and charges are stored in the default floating dtype
+active when `MetalWall` is constructed, like every other module buffer, so a
+`float32` model keeps one dtype and can be evaluated and saved as is. Set
+`torch.set_default_dtype(torch.float64)` before construction to keep
+double-precision electrode geometry.
 
 Constructor arguments:
 

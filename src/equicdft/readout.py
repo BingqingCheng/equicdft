@@ -16,14 +16,14 @@ from ._config import (
     build_optional,
     constructor_arguments,
     make_config,
-    mlp_input_size,
     optional_buffer_value,
     optional_config,
     register,
 )
 from ._nn import build_mlp, validate_hidden_sizes
-from .energy import EnergyReadout, density_weighted_integral
+from .energy import EnergyReadout, ReadoutContext
 from .reciprocal import ReciprocalFeatures
+from .thermodynamics import density_weighted_integral
 
 
 class _LiquidCoulombResult(NamedTuple):
@@ -53,19 +53,17 @@ class LocalReadout(EnergyReadout, Configurable):
     Parameters
     ----------
     n_features
-        Width of the complete local input vector. If supplied, the first layer
-        is a regular ``Linear`` module. If ``None``, a ``LazyLinear``
-        module infers this width from the first forward pass.
+        Width of the complete local input vector. When omitted, the readout
+        stays unbound until :meth:`bind_input_size` is called;
+        :class:`equicdft.model.GridCACEModel` does this at construction with
+        the width its feature modules produce.
     n_types
         Number of physical density components and per-particle outputs.
     hidden_sizes
         Width of each hidden layer. An empty sequence gives a linear readout.
+
     Notes
     -----
-    When ``n_features`` is ``None``, materialize the lazy input layer with one
-    representative batch before constructing an optimizer or saving its
-    initial state.
-
     Smooth SiLU activations keep higher functional derivatives well defined.
     """
 
@@ -79,31 +77,48 @@ class LocalReadout(EnergyReadout, Configurable):
     ) -> None:
         super().__init__()
 
-        self.n_features = optional_positive_integer(n_features, "n_features")
         self.n_types = positive_integer(n_types, "n_types")
         self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
-        self.mlp = build_mlp(
-            self.n_features,
-            self.hidden_sizes,
-            self.n_types,
-        )
+        self.n_features = None
+        self.mlp = None
+        n_features = optional_positive_integer(n_features, "n_features")
+        if n_features is not None:
+            self.bind_input_size(n_features)
+
+    @property
+    def is_bound(self) -> bool:
+        return self.mlp is not None
+
+    def bind_input_size(self, n_features: int) -> None:
+        """Build the network for ``n_features`` inputs, once.
+
+        Rebinding to the same width is a no-op; a different width is an
+        error, because the fitted parameters would no longer fit.
+        """
+
+        n_features = positive_integer(n_features, "n_features")
+        if self.is_bound:
+            if n_features != self.n_features:
+                raise ValueError(
+                    "{} is bound to {} input features, not {}".format(
+                        type(self).__name__, self.n_features, n_features,
+                    )
+                )
+            return
+        self.n_features = n_features
+        self.mlp = build_mlp(n_features, self.hidden_sizes, self.n_types)
 
     def to_config(self) -> Dict[str, Any]:
         """Return the constructor arguments describing this readout.
 
-        A lazily built input layer reports its width once it has been
-        materialized, so a reconstructed readout is never lazy.
+        ``n_features`` is ``None`` while the readout is unbound.
         """
 
         return make_config(
             self,
             n_types=self.n_types,
             hidden_sizes=self.hidden_sizes,
-            n_features=(
-                self.n_features
-                if self.n_features is not None
-                else mlp_input_size(self.mlp)
-            ),
+            n_features=self.n_features,
         )
 
     def forward(
@@ -112,16 +127,18 @@ class LocalReadout(EnergyReadout, Configurable):
     ) -> torch.Tensor:
         """Return local outputs with shape ``[..., n_grid, n_types]``."""
 
+        if not self.is_bound:
+            raise RuntimeError(
+                "{} has no input width yet; pass n_features or let "
+                "GridCACEModel bind it".format(type(self).__name__)
+            )
         return self.mlp(local_features)
 
-    def energy(
-        self,
-        context: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the integrated density-weighted local contribution."""
 
-        rho = context["rho"]
-        per_particle = self(context["local_features"])
+        rho = context.rho
+        per_particle = self(context.local_features())
         if per_particle.shape != rho.shape:
             raise ValueError(
                 "LocalReadout must return one value per grid and type"
@@ -129,7 +146,7 @@ class LocalReadout(EnergyReadout, Configurable):
         return density_weighted_integral(
             rho,
             per_particle,
-            context["voxel_volume"],
+            context.voxel_volume,
         )
 
 
@@ -157,8 +174,6 @@ class BulkReadout(EnergyReadout, Configurable):
         If true, initialize the final layer to zero. Attaching the branch then
         leaves a pretrained local model unchanged before fine-tuning.
     """
-
-    requires_state_features = True
 
     def __init__(
         self,
@@ -199,14 +214,11 @@ class BulkReadout(EnergyReadout, Configurable):
             )
         return self.mlp(state_features)
 
-    def energy(
-        self,
-        context: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the extensive homogeneous free-energy contribution."""
 
-        rho = context["rho"]
-        per_particle = self(context["state_features"])
+        rho = context.rho
+        per_particle = self(context.state_features())
         if per_particle.shape != rho.mean(dim=-2).shape:
             raise ValueError(
                 "BulkReadout must return one value per field and type"
@@ -214,7 +226,7 @@ class BulkReadout(EnergyReadout, Configurable):
         return density_weighted_integral(
             rho,
             per_particle.unsqueeze(-2),
-            context["voxel_volume"],
+            context.voxel_volume,
         )
 
 
@@ -277,12 +289,6 @@ class LongRangeReadout(EnergyReadout, Configurable):
         model's physical mode with A=C/(k_B*T_ref). No dielectric scaling,
         dipole-magnitude factor, or particle self subtraction is implicit.
     """
-
-    requires_local_density_index = False
-
-    @property
-    def requires_state_features(self) -> bool:
-        return self.coulomb_amplitude is None
 
     @property
     def requires_dipole_density(self) -> bool:
@@ -477,10 +483,7 @@ class LongRangeReadout(EnergyReadout, Configurable):
             and self.n_kernels == 1
         )
 
-    def _coulomb_state(
-        self,
-        context: Dict[str, torch.Tensor],
-    ):
+    def _coulomb_state(self, context: ReadoutContext):
         """Return the unit-amplitude Coulomb state and configured amplitude."""
 
         if not self.provides_coulomb_potential:
@@ -488,33 +491,38 @@ class LongRangeReadout(EnergyReadout, Configurable):
                 "a reusable Coulomb potential requires fixed charges and one "
                 "Coulomb kernel"
             )
-        if "grid_size" not in context:
-            raise KeyError("long-range evaluation requires data['grid_size']")
         state = self.features._coulomb_evaluation(
-            rho=context["rho"],
-            grid_size=context["grid_size"],
-            grid_spacing=context["grid_spacing"],
+            rho=context.rho,
+            grid_size=context.require("grid_size"),
+            grid_spacing=context.require("grid_spacing"),
             charges=self.charges,
             dipole_density=(
-                context["dipole_density"] if self.requires_dipole_density else None
+                context.require("dipole_density")
+                if self.requires_dipole_density else None
             ),
         )
-        expected_shape = context["rho"].shape[:-2]
-        amplitude = self.amplitude(self._state_features(context))
+        expected_shape = context.rho.shape[:-2]
+        amplitude = self.amplitude(self._state_input(context))
         if state.base_energy.shape != expected_shape or amplitude.shape != expected_shape:
             raise ValueError("LongRangeReadout must return one scalar per field")
         return state, amplitude
 
-    def _state_features(self, context):
-        if self.requires_state_features:
-            return context["state_features"]
-        return context["rho"].new_zeros(
-            *context["rho"].shape[:-2], self.n_state_features,
+    def _state_input(self, context: ReadoutContext) -> torch.Tensor:
+        """Return the state vector, or a placeholder for fixed amplitudes.
+
+        With a fixed ``coulomb_amplitude`` the coefficients have no state
+        dependence, so the model's density scale is not needed at all.
+        """
+
+        if self.coulomb_amplitude is None:
+            return context.state_features()
+        return context.rho.new_zeros(
+            *context.rho.shape[:-2], self.n_state_features,
         )
 
     def coulomb_at(
         self,
-        context: Dict[str, torch.Tensor],
+        context: ReadoutContext,
         positions: torch.Tensor,
         target_sigma: float = 0.0,
     ) -> _LiquidCoulombResult:
@@ -530,7 +538,7 @@ class LongRangeReadout(EnergyReadout, Configurable):
         state, amplitude = self._coulomb_state(context)
         potential = state.potential_at(
             positions,
-            grid_center=context.get("grid_center"),
+            grid_center=context.grid_center,
             target_sigma=target_sigma,
         )
         return _LiquidCoulombResult(
@@ -564,33 +572,26 @@ class LongRangeReadout(EnergyReadout, Configurable):
             dim=(-2, -1),
         )
 
-    def energy(
-        self,
-        context: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the reciprocal-space contribution for a complete field."""
 
         if self.features is None:
             raise ValueError(
                 "LongRangeReadout requires ReciprocalFeatures for model use"
             )
-        if "grid_size" not in context:
-            raise KeyError(
-                "long-range evaluation requires data['grid_size']"
-            )
         source_options = {}
         if self.requires_dipole_density:
-            source_options["dipole_density"] = context["dipole_density"]
+            source_options["dipole_density"] = context.require("dipole_density")
         if self.include_polarization:
             source_options["charges"] = self.charges
         reciprocal_features = self.features(
-            rho=context["rho"],
-            grid_size=context["grid_size"],
-            grid_spacing=context["grid_spacing"],
+            rho=context.rho,
+            grid_size=context.require("grid_size"),
+            grid_spacing=context.require("grid_spacing"),
             **source_options,
         )
-        energy = self(reciprocal_features, self._state_features(context))
-        if energy.shape != context["rho"].shape[:-2]:
+        energy = self(reciprocal_features, self._state_input(context))
+        if energy.shape != context.rho.shape[:-2]:
             raise ValueError(
                 "LongRangeReadout must return one scalar per field"
             )

@@ -16,8 +16,6 @@ from ._argument_checks import (
     positive_scalar,
 )
 from ._data_helpers import (
-    _metadata_grid_size,
-    _metadata_grid_spacing,
     _metadata_positive_integer,
     _metadata_positive_scalar,
     build_grid_data,
@@ -28,6 +26,7 @@ from ._data_helpers import (
 )
 from ._metal_data import normalize_metal_sites
 from ._fourier import canonical_wavevector_indices, integer_wavevector_indices
+from .stencil import grid_size_array, grid_spacing_array
 
 
 # Default to temperatures in kelvin and energies in electronvolts. Reduced-unit
@@ -315,7 +314,7 @@ class GridData(dict):
         if grid_info is not None:
             resolved = normalize_grid_info(grid_info)
             if "grid_spacing" in values:
-                supplied_spacing = _metadata_grid_spacing(
+                supplied_spacing = grid_spacing_array(
                     values["grid_spacing"]
                 )
                 if not np.allclose(
@@ -381,8 +380,8 @@ class GridData(dict):
                 "values is missing required field 'temperature'"
             )
 
-        grid_size = _metadata_grid_size(values["grid_size"])
-        grid_spacing = _metadata_grid_spacing(values["grid_spacing"])
+        grid_size = grid_size_array(values["grid_size"])
+        grid_spacing = grid_spacing_array(values["grid_spacing"])
         temperature = _metadata_positive_scalar(temperature, "temperature")
         n_types = _metadata_positive_integer(values["n_types"], "n_types")
         grid_positions = np.indices(

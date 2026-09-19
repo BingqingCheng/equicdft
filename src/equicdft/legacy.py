@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ._config import Configurable, build, mlp_hidden_sizes
+from ._config import Configurable, build, mlp_hidden_sizes, mlp_input_size
 from .data import GridData
 from .features import CartesianAFeatures, _DensityMixing
 from .interaction import BChiMessage
@@ -40,7 +40,7 @@ from .readout import BulkReadout, LocalReadout, LongRangeReadout
 from .reciprocal import ReciprocalFeatures
 from .symmetrize import CartesianBFeatures
 from .semilocal import GGAReadout, LDAReadout
-from .serialization import default_dtype, model_dtype, save_model
+from .serialization import _one_density_scale, default_dtype, model_dtype, save_model
 
 
 PathLike = Union[str, Path]
@@ -300,6 +300,24 @@ def _upgrade_model(module: GridCACEModel) -> None:
         module.message_layers = nn.ModuleList()
     _set_default(module, "a_features", None)
     _set_default(module, "b_features", None)
+    if not _defines(module, "mean_density"):
+        # The density scale used to live on the feature module and on every
+        # LDA readout; the model now owns it. Readout copies are dropped by
+        # _upgrade_mlp_readout. Disagreeing copies cannot be merged.
+        scales = {}
+        if module.a_features is not None:
+            scales["a_features"] = module.a_features.mean_density
+        for index, readout in enumerate(module.readout):
+            candidate = readout._buffers.get("mean_density")
+            if candidate is not None:
+                scales["readout.{}".format(index)] = candidate
+        scale = (
+            _one_density_scale(scales, "this legacy model") if scales else None
+        )
+        module.register_buffer(
+            "mean_density",
+            None if scale is None else scale.detach().clone().reshape(()),
+        )
     _set_default(module, "free_energy_mode", "beta")
     _set_default(module, "compute_c1", True)
     _set_default(module, "compute_c2", False)
@@ -330,15 +348,21 @@ def _upgrade_mlp_readout(module: nn.Module) -> None:
             _constructor_default(type(module), "zero_init"),
         )
     if isinstance(module, (LocalReadout, GGAReadout)):
-        _set_default(module, "n_features", None)
+        # Lazily built input layers recorded no width; a pickled object is
+        # always materialized, so the width is that of its first layer.
+        if module.__dict__.get("n_features") is None:
+            module.n_features = mlp_input_size(mlp) if mlp is not None else None
     if isinstance(module, LongRangeReadout):
         _set_default(module, "include_polarization", False)
         for name in ("charges", "pair_charge_products", "coulomb_amplitude"):
             if not _defines(module, name):
                 module.register_buffer(name, None)
         _set_default(module, "features", None)
-    if isinstance(module, LDAReadout) and not _defines(module, "dipole_density_scale"):
-        module.register_buffer("dipole_density_scale", None)
+    if isinstance(module, LDAReadout):
+        if not _defines(module, "dipole_density_scale"):
+            module.register_buffer("dipole_density_scale", None)
+        # Moved to GridCACEModel.mean_density (see _upgrade_model).
+        module._buffers.pop("mean_density", None)
 
 
 def _upgrade_cartesian_b_features(module: CartesianBFeatures) -> None:

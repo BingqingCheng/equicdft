@@ -20,15 +20,29 @@ class _DensityFeatures(nn.Module):
         super().__init__()
         self.cutoff_grid = 0
         self.n_types = 1
+        self.n_radial_channels = 1
+        self.n_output_channels = 1
         self.separate_center = False
         self.convolution_backend = "gather"
+        self.include_polarization = False
+        self.requires_dipole_density = False
         self.register_buffer("mean_density", torch.tensor(1.0))
+
+    def transform_density(self, rho):
+        return rho
 
     def forward(self, data):
         return data["rho"].unsqueeze(-2).unsqueeze(-2)
 
 
 class _IdentityModule(nn.Module):
+    """Stand-in symmetrizer returning the single density feature unchanged."""
+
+    n_features = 1
+
+    def validate_a_features(self, a_features):
+        pass
+
     def forward(self, values):
         return values
 

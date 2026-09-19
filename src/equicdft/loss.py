@@ -1,6 +1,6 @@
 """Composable objectives for training grid density-functional models."""
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -17,7 +17,45 @@ from .response import FourierResponse
 from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 
-class TensorLoss(nn.Module):
+class LossTerm(nn.Module):
+    """Base class of every named, weighted scalar loss term.
+
+    Subclasses implement :meth:`evaluate`, which returns a mapping holding
+    the weighted scalar ``"loss"`` together with any diagnostic tensors that
+    a :class:`equicdft.metrics.MetricCollection` may reuse. :meth:`forward`
+    returns the scalar alone. :class:`Loss` accepts only ``LossTerm``
+    instances and passes the model to every term, so a term that needs the
+    model documents that by raising when ``model`` is ``None``.
+    """
+
+    def __init__(self, name: str, weight: float = 1.0) -> None:
+        super().__init__()
+
+        self.name = nonempty_string(name, "loss term name")
+        self.weight = nonnegative_scalar(weight, "weight")
+
+    def evaluate(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return ``{"loss": weighted scalar, ...diagnostics}``."""
+
+        raise NotImplementedError
+
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
+        """Return this term's weighted scalar loss."""
+
+        return self.evaluate(outputs, batch, model)["loss"]
+
+
+class TensorLoss(LossTerm):
     """Apply one weighted scalar loss to a prediction/target tensor pair.
 
     ``target_key`` may contain one key or an ordered sequence. For every key,
@@ -36,9 +74,8 @@ class TensorLoss(nn.Module):
         weights_key: Optional[str] = None,
         weight: float = 1.0,
     ) -> None:
-        super().__init__()
+        super().__init__(name, weight)
 
-        self.name = nonempty_string(name, "loss term name")
         self.prediction_key = nonempty_string(
             prediction_key,
             "prediction_key",
@@ -62,14 +99,14 @@ class TensorLoss(nn.Module):
             raise TypeError("loss_fn must be a torch.nn.Module")
 
         self.loss_fn = loss_fn
-        self.weight = nonnegative_scalar(weight, "weight")
 
-    def forward(
+    def evaluate(
         self,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Return this term's weighted scalar loss."""
+        model: Optional[nn.Module] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return the weighted scalar loss; the model is not needed."""
 
         if self.prediction_key not in outputs:
             raise KeyError(
@@ -102,10 +139,10 @@ class TensorLoss(nn.Module):
             if total_weight.item() <= 0.0:
                 raise ValueError("weights must have a positive sum")
             value = torch.sum(weights * value) / total_weight
-        return self.weight * value
+        return {"loss": self.weight * value}
 
 
-class FourierResponseLoss(nn.Module):
+class FourierResponseLoss(LossTerm):
     r"""Fit projected homogeneous Fourier curvatures to response data.
 
     Each batch item is one homogeneous, periodic, unmasked state. Integer
@@ -116,9 +153,6 @@ class FourierResponseLoss(nn.Module):
     A one-component target is ``1/S(k)``. Mixture targets must project the full
     inverse response matrix using the same direction convention.
     """
-
-    requires_model = True
-    provides_details = True
 
     def __init__(
         self,
@@ -133,14 +167,13 @@ class FourierResponseLoss(nn.Module):
         weight: float = 1.0,
         name: str = "fourier_response",
     ) -> None:
-        super().__init__()
+        super().__init__(name, weight)
 
         if loss_fn is None:
             loss_fn = nn.SmoothL1Loss(reduction="none")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a torch.nn.Module")
 
-        self.name = nonempty_string(name, "name")
         self.wavevector_indices_key = nonempty_string(
             wavevector_indices_key,
             "wavevector_indices_key",
@@ -154,18 +187,7 @@ class FourierResponseLoss(nn.Module):
             require_uniform=True,
         )
         self.loss_fn = loss_fn
-        self.weight = nonnegative_scalar(weight, "weight")
         self.register_buffer("directions", normalized_directions(directions))
-
-    def forward(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        batch: Dict[str, torch.Tensor],
-        model: Optional[nn.Module] = None,
-    ) -> torch.Tensor:
-        """Return the weighted projected-response loss."""
-
-        return self.evaluate(outputs, batch, model=model)["loss"]
 
     def evaluate(
         self,
@@ -288,9 +310,9 @@ def _required_batch_value(
 
 
 class Loss(nn.Module):
-    """Aggregate uniquely named scalar loss terms into one objective."""
+    """Aggregate uniquely named :class:`LossTerm` objects into one objective."""
 
-    def __init__(self, terms: Sequence[nn.Module]) -> None:
+    def __init__(self, terms: Sequence[LossTerm]) -> None:
         super().__init__()
 
         terms = list(terms)
@@ -298,17 +320,17 @@ class Loss(nn.Module):
             raise ValueError("Loss requires at least one loss term")
         names = []
         for term in terms:
-            if not isinstance(term, nn.Module):
-                raise TypeError("every loss term must be a torch.nn.Module")
-            name = nonempty_string(
-                getattr(term, "name", None),
-                "loss term name",
-            )
-            if name == "total":
+            if not isinstance(term, LossTerm):
+                raise TypeError(
+                    "every loss term must be an equicdft.LossTerm, got {}".format(
+                        type(term).__name__
+                    )
+                )
+            if term.name == "total":
                 raise ValueError("'total' is reserved for the aggregate loss")
-            if name in names:
+            if term.name in names:
                 raise ValueError("loss term names must be unique")
-            names.append(name)
+            names.append(term.name)
         self.terms = nn.ModuleList(terms)
 
     def forward(
@@ -331,33 +353,25 @@ class Loss(nn.Module):
         Dict[str, torch.Tensor],
         Dict[str, Dict[str, torch.Tensor]],
     ]:
-        """Return scalar terms and optional reusable term details.
+        """Return scalar terms and every term's reusable details.
 
-        Terms defining an ``evaluate`` method may return a mapping containing
-        their scalar ``loss`` and diagnostic tensors. Ordinary scalar terms
-        retain the exact existing calling convention.
+        ``details[name]`` is the mapping returned by that term's
+        :meth:`LossTerm.evaluate`, so metric collections can reuse expensive
+        diagnostics without repeating the evaluation.
         """
 
         values = {}
         details = {}
         total = None
         for term in self.terms:
-            if getattr(term, "provides_details", False):
-                if getattr(term, "requires_model", False):
-                    term_details = term.evaluate(outputs, batch, model=model)
-                else:
-                    term_details = term.evaluate(outputs, batch)
-                if not isinstance(term_details, dict) or "loss" not in term_details:
-                    raise ValueError(
-                        "loss term '{}' evaluate must return a mapping with "
-                        "'loss'".format(term.name)
-                    )
-                value = term_details["loss"]
-                details[term.name] = term_details
-            elif getattr(term, "requires_model", False):
-                value = term(outputs, batch, model=model)
-            else:
-                value = term(outputs, batch)
+            term_details = term.evaluate(outputs, batch, model)
+            if not isinstance(term_details, Mapping) or "loss" not in term_details:
+                raise ValueError(
+                    "loss term '{}' evaluate must return a mapping with "
+                    "'loss'".format(term.name)
+                )
+            value = term_details["loss"]
+            details[term.name] = dict(term_details)
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError(
                     "loss term '{}' must return one scalar tensor".format(

@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from equicdft import FourierResponseMetrics, Metrics
+from equicdft import FourierResponseMetrics, MetricCollection, Metrics
 from equicdft.metrics import compute_metric
 from equicdft.metrics import format_metric_value, metric_label
 
@@ -440,7 +440,9 @@ class TestFourierResponseMetrics(unittest.TestCase):
             ("number", "charge"),
             subsets=("valid",),
         )
-        metrics.update_metrics("valid", self._details())
+        metrics.update_metrics(
+            "valid", {}, {}, {"fourier_response": self._details()},
+        )
 
         values = metrics.retrieve_metrics("valid")
 
@@ -463,9 +465,26 @@ class TestFourierResponseMetrics(unittest.TestCase):
         details = self._details()
         details.pop("scale")
         with self.assertRaisesRegex(KeyError, "missing"):
-            metrics.update_metrics("train", details)
+            metrics.update_metrics("train", {}, {}, {"fourier_response": details})
         with self.assertRaisesRegex(KeyError, "subset"):
-            metrics.update_metrics("unknown", self._details())
+            metrics.update_metrics(
+                "unknown", {}, {}, {"fourier_response": self._details()},
+            )
+        with self.assertRaisesRegex(KeyError, "loss term 'fourier_response'"):
+            metrics.update_metrics("train", {}, {}, {})
+        with self.assertRaisesRegex(KeyError, "loss term 'fourier_response'"):
+            metrics.update_metrics("train", {}, {})
+
+    def test_loss_name_selects_the_recorded_term(self):
+        metrics = FourierResponseMetrics(
+            ("number", "charge"), name="response_diagnostics", loss_name="k_fit",
+        )
+        self.assertIsInstance(metrics, MetricCollection)
+        self.assertEqual(metrics.subsets, ("train", "valid", "test"))
+        metrics.update_metrics("test", {}, {}, {"k_fit": self._details()})
+        self.assertAlmostEqual(
+            metrics.retrieve_metrics("test")["loss"].item(), 0.5,
+        )
 
 
 if __name__ == "__main__":

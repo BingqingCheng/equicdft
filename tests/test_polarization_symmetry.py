@@ -58,7 +58,8 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         readouts = [
             LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
-            LDAReadout(mean_density=.5, dipole_density_scale=.3,
+            LDAReadout(
+                       dipole_density_scale=.3,
                        hidden_sizes=(5,), zero_init=False),
             LongRangeReadout(
                 n_kernels=1, charges=(charge,), include_polarization=True,

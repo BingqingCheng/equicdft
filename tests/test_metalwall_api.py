@@ -5,7 +5,8 @@ import unittest
 
 import torch
 
-from equicdft import LongRangeReadout, MetalWall, ReciprocalFeatures
+from equicdft import GridCACEModel, LongRangeReadout, MetalWall, ReciprocalFeatures
+from equicdft.serialization import build_model, model_payload
 from metal_helpers import _run, liquid_coulomb, metal_sites
 from test_metalwall_sites import _data, _reference
 
@@ -57,6 +58,70 @@ class TestMetalWallAPI(unittest.TestCase):
             with self.subTest(liquid=type(liquid).__name__):
                 with self.assertRaises((TypeError, ValueError)):
                     _wall(liquid_coulomb=liquid)
+
+    def test_wall_follows_the_default_dtype_and_round_trips_in_float32(self):
+        """A float32 model containing a wall has one dtype and can be saved."""
+
+        sites = _one_electrode(_data())
+        liquid = LongRangeReadout(
+            n_kernels=1, n_types=2, charges=(1., -1.), coulomb_amplitude=1.7,
+            features=ReciprocalFeatures(
+                kernel="coulomb", radial_exponents=(.2,), n_types=2,
+            ),
+        )
+        wall = MetalWall(
+            liquid_coulomb=liquid, metal_sites=metal_sites(sites), metal_sigma=.35,
+            external_field=(0., 0., .01),
+        )
+        for name in ("metal_positions", "metal_total_charge", "external_field"):
+            self.assertEqual(getattr(wall, name).dtype, torch.float32, name)
+        self.assertEqual(wall.metal_site_groups.dtype, torch.long)
+        model = GridCACEModel(
+            None, None, [wall], grid_spacing=sites["grid_spacing"].float(),
+        ).eval()
+        data = {
+            "rho": sites["rho"].float(),
+            "grid_size": sites["grid_size"],
+            "grid_spacing": sites["grid_spacing"].float(),
+            "temperature": torch.tensor(1.0),
+        }
+
+        outputs = model(dict(data))
+
+        self.assertEqual(outputs["metal_site_q"].dtype, torch.float32)
+        self.assertEqual(outputs["c1"].dtype, torch.float32)
+        payload = model_payload(model)
+        self.assertEqual(payload["default_dtype"], "float32")
+        restored = build_model(payload).eval()
+        for key in ("beta_F_exc", "metal_site_q", "metal_potential"):
+            torch.testing.assert_close(restored(dict(data))[key], outputs[key])
+        # Double-precision geometry is kept when the wall is built under a
+        # float64 default.
+        with torch.no_grad():
+            previous = torch.get_default_dtype()
+            torch.set_default_dtype(torch.float64)
+            try:
+                precise = MetalWall(
+                    liquid_coulomb=liquid_coulomb(), metal_sites=metal_sites(sites),
+                    metal_sigma=.35,
+                )
+            finally:
+                torch.set_default_dtype(previous)
+        self.assertEqual(precise.metal_positions.dtype, torch.float64)
+        torch.testing.assert_close(precise.metal_positions, sites["metal_positions"])
+
+    def test_model_rejects_listing_the_wrapped_liquid_readout_twice(self):
+        liquid = liquid_coulomb()
+        wall = _wall(liquid_coulomb=liquid)
+        for readouts in ([liquid, wall], [wall, liquid]):
+            with self.assertRaisesRegex(ValueError, "counts that energy twice"):
+                GridCACEModel(None, None, readouts, grid_spacing=.5)
+        with self.assertRaisesRegex(ValueError, "same module twice"):
+            GridCACEModel(None, None, [wall, wall], grid_spacing=.5)
+        self.assertEqual(wall.wrapped_readouts(), (liquid,))
+        self.assertEqual(liquid.wrapped_readouts(), ())
+        # The wall alone is the supported composition.
+        GridCACEModel(None, None, [wall], grid_spacing=.5)
 
     def test_obsolete_independent_liquid_electrostatics_arguments_are_absent(self):
         for name, value in (

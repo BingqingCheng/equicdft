@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, LongRangeReadout, MetalWall, ReciprocalFeatures
+from metal_helpers import wall_context as ctx
 
 
 def _liquid(charges, alpha=.23, amplitude=1.7, polar=True):
@@ -124,9 +125,9 @@ class TestMetalWallPolarization(unittest.TestCase):
                 data, sites, charges = _case(shape)
                 liquid = _liquid(charges)
                 reference = _oracle(data, sites, charges)
-                state = liquid.coulomb_at(data, sites["metal_positions"], target_sigma=.35)
+                state = liquid.coulomb_at(ctx(data), sites["metal_positions"], target_sigma=.35)
                 wall = MetalWall(liquid, sites, metal_sigma=.35)
-                energy, result = wall.energy_and_outputs(data)
+                energy, result = wall.energy_and_outputs(ctx(data))
                 torch.testing.assert_close(state.energy, reference["energy"], atol=2e-13, rtol=2e-12)
                 torch.testing.assert_close(state.potential, reference["potential"], atol=2e-13, rtol=2e-12)
                 torch.testing.assert_close(energy, reference["total_energy"], atol=2e-13, rtol=2e-12)
@@ -141,27 +142,27 @@ class TestMetalWallPolarization(unittest.TestCase):
         liquid = _liquid(charges)
         wall = MetalWall(liquid, sites, metal_sigma=.35)
         self.assertTrue(wall.requires_dipole_density)
-        self.assertFalse(wall.requires_state_features)
-        positive = wall(data)
+        self.assertIsNotNone(wall.liquid_coulomb.coulomb_amplitude)
+        positive = wall(ctx(data))
         self.assertGreater(positive["metal_site_q"].abs().max().item(), 1e-4)
-        self.assertEqual(liquid.coulomb_at(data, sites["metal_positions"]).total_charge.item(), 0.)
-        negative = wall(dict(data, dipole_density=-data["dipole_density"]))
+        self.assertEqual(liquid.coulomb_at(ctx(data), sites["metal_positions"]).total_charge.item(), 0.)
+        negative = wall(ctx(dict(data, dipole_density=-data["dipole_density"])))
         torch.testing.assert_close(negative["metal_site_q"], -positive["metal_site_q"])
         torch.testing.assert_close(negative["electrode_coulomb_energy"], positive["electrode_coulomb_energy"])
-        zero = wall(dict(data, dipole_density=torch.zeros_like(data["dipole_density"])))
+        zero = wall(ctx(dict(data, dipole_density=torch.zeros_like(data["dipole_density"]))))
         torch.testing.assert_close(zero["metal_site_q"], torch.zeros_like(zero["metal_site_q"]), atol=0., rtol=0.)
         # The neutral species' number density cannot create Coulomb energy.
         doubled_rho = dict(data, rho=2 * data["rho"])
-        torch.testing.assert_close(wall.energy(doubled_rho), wall.energy(data), atol=0., rtol=0.)
+        torch.testing.assert_close(wall.energy(ctx(doubled_rho)), wall.energy(ctx(data)), atol=0., rtol=0.)
 
     def test_complement_changes_site_potential_only_not_liquid_lr_energy(self):
         data, sites, charges = _case()
         states = []
         for alpha in (.08, .6):
             liquid = _liquid(charges, alpha=alpha)
-            state = liquid.coulomb_at(data, sites["metal_positions"], target_sigma=.35)
+            state = liquid.coulomb_at(ctx(data), sites["metal_positions"], target_sigma=.35)
             reference = _oracle(data, sites, charges, alpha=alpha)
-            torch.testing.assert_close(state.energy, liquid.energy(data), atol=2e-13, rtol=2e-12)
+            torch.testing.assert_close(state.energy, liquid.energy(ctx(data)), atol=2e-13, rtol=2e-12)
             torch.testing.assert_close(state.energy, reference["energy"], atol=2e-13, rtol=2e-12)
             torch.testing.assert_close(state.potential, reference["potential"], atol=2e-13, rtol=2e-12)
             states.append(state)
@@ -173,8 +174,8 @@ class TestMetalWallPolarization(unittest.TestCase):
         data["dipole_density"].zero_()
         scalar = MetalWall(_liquid(charges, polar=False), sites, metal_sigma=.35)
         polar = MetalWall(_liquid(charges), sites, metal_sigma=.35)
-        old_energy, old_output = scalar.energy_and_outputs(data)
-        energy, output = polar.energy_and_outputs(data)
+        old_energy, old_output = scalar.energy_and_outputs(ctx(data))
+        energy, output = polar.energy_and_outputs(ctx(data))
         torch.testing.assert_close(energy, old_energy, atol=1e-13, rtol=1e-13)
         for key in output:
             torch.testing.assert_close(output[key], old_output[key], atol=1e-13, rtol=1e-13)
@@ -188,9 +189,9 @@ class TestMetalWallPolarization(unittest.TestCase):
         for key in ("rho", "dipole_density", "grid_center", "temperature", "beta"):
             batch[key] = torch.stack((first[key], second[key]))
         wall = MetalWall(_liquid(charges), sites, metal_sigma=.35)
-        energy, output = wall.energy_and_outputs(batch)
+        energy, output = wall.energy_and_outputs(ctx(batch))
         for index, data in enumerate((first, second)):
-            single_energy, single_output = wall.energy_and_outputs(data)
+            single_energy, single_output = wall.energy_and_outputs(ctx(data))
             torch.testing.assert_close(energy[index], single_energy, atol=2e-13, rtol=2e-12)
             for key in output:
                 torch.testing.assert_close(output[key][index], single_output[key], atol=2e-13, rtol=2e-12)
@@ -203,9 +204,9 @@ class TestMetalWallPolarization(unittest.TestCase):
         data["rho"][excluded] = 0.
         wall = MetalWall(_liquid(charges), sites, metal_sigma=.35)
         with self.assertRaisesRegex(ValueError, "dipole_density.*zero.*excluded"):
-            wall.energy(data)
+            wall.energy(ctx(data))
         data["dipole_density"][excluded] = 0.
-        self.assertTrue(torch.isfinite(wall.energy(data)).item())
+        self.assertTrue(torch.isfinite(wall.energy(ctx(data))).item())
 
     def test_charge_dipole_cross_sign_cancels_at_sites_and_in_energy(self):
         data, sites, _ = _case((7, 3, 3), neutral_species=True)
@@ -217,11 +218,11 @@ class TestMetalWallPolarization(unittest.TestCase):
         # -div(P) = -q*a*cos(k*x), cancelling the ionic density fluctuation.
         data["dipole_density"][:, 0, 0] = valence * rho_amplitude / k * torch.sin(k * x)
         liquid = _liquid((valence,))
-        cancelled = liquid.coulomb_at(data, sites["metal_positions"], target_sigma=.35)
+        cancelled = liquid.coulomb_at(ctx(data), sites["metal_positions"], target_sigma=.35)
         self.assertLess(cancelled.energy.abs().item(), 1e-27)
         self.assertLess(cancelled.potential.abs().max().item(), 1e-13)
-        ionic = liquid.coulomb_at(dict(data, dipole_density=torch.zeros_like(data["dipole_density"])), sites["metal_positions"], target_sigma=.35)
-        added = liquid.coulomb_at(dict(data, dipole_density=-data["dipole_density"]), sites["metal_positions"], target_sigma=.35)
+        ionic = liquid.coulomb_at(ctx(dict(data, dipole_density=torch.zeros_like(data["dipole_density"]))), sites["metal_positions"], target_sigma=.35)
+        added = liquid.coulomb_at(ctx(dict(data, dipole_density=-data["dipole_density"])), sites["metal_positions"], target_sigma=.35)
         torch.testing.assert_close(added.energy, 4 * ionic.energy, atol=1e-13, rtol=1e-12)
         torch.testing.assert_close(added.potential, 2 * ionic.potential, atol=1e-13, rtol=1e-12)
 
@@ -231,15 +232,15 @@ class TestMetalWallPolarization(unittest.TestCase):
         wall = MetalWall(liquid, sites, metal_sigma=.35)
         shift = torch.tensor([.31, -.47, .19])
         shifted = MetalWall(_liquid(charges), dict(sites, metal_positions=sites["metal_positions"] + shift), metal_sigma=.35)
-        energy, output = wall.energy_and_outputs(data)
-        moved_energy, moved_output = shifted.energy_and_outputs(dict(data, grid_center=data["grid_center"] + shift))
+        energy, output = wall.energy_and_outputs(ctx(data))
+        moved_energy, moved_output = shifted.energy_and_outputs(ctx(dict(data, grid_center=data["grid_center"] + shift)))
         torch.testing.assert_close(moved_energy, energy, atol=2e-13, rtol=2e-12)
         for key in output:
             torch.testing.assert_close(moved_output[key], output[key], atol=2e-13, rtol=2e-12)
         data["dipole_density"].zero_()
         checker = (-1.) ** torch.arange(4)
         data["dipole_density"][:, 0, 0] = .02 * checker[:, None, None].expand(4, 3, 2).reshape(-1)
-        state = liquid.coulomb_at(data, sites["metal_positions"], target_sigma=.35)
+        state = liquid.coulomb_at(ctx(data), sites["metal_positions"], target_sigma=.35)
         self.assertLess(state.energy.abs().item(), 1e-27)
         self.assertLess(state.potential.abs().max().item(), 1e-13)
 
@@ -248,7 +249,7 @@ class TestMetalWallPolarization(unittest.TestCase):
         data["rho"].requires_grad_()
         data["dipole_density"].requires_grad_()
         wall = MetalWall(_liquid(charges), sites, metal_sigma=.35)
-        energy = wall.energy(data)
+        energy = wall.energy(ctx(data))
         expected = _oracle(data, sites, charges)["total_energy"]
         fields = (data["rho"], data["dipole_density"])
         actual_gradients = torch.autograd.grad(energy, fields, create_graph=True)
@@ -273,7 +274,7 @@ class TestMetalWallPolarization(unittest.TestCase):
             plus, minus = _copy(data), _copy(data)
             plus[field] += 1e-6 * direction
             minus[field] -= 1e-6 * direction
-            difference = (wall.energy(plus) - wall.energy(minus)) / 2e-6
+            difference = (wall.energy(ctx(plus)) - wall.energy(ctx(minus))) / 2e-6
             gradient = actual_gradients[0 if field == "rho" else 1]
             torch.testing.assert_close(difference, (gradient * direction).sum(), atol=2e-10, rtol=2e-7)
 

@@ -10,6 +10,12 @@ from equicdft import (
     FixedDipoleIdeal, GridCACEModel, LDAReadout, LongRangeReadout,
     GridSolver, ReciprocalFeatures,
 )
+from equicdft.energy import ReadoutContext
+
+
+def ctx(data):
+    """Standalone readout context with the data's own grid spacing."""
+    return ReadoutContext.from_data(data, grid_spacing=data["grid_spacing"])
 
 
 class TestPolarizationCoulomb(unittest.TestCase):
@@ -43,7 +49,8 @@ class TestPolarizationCoulomb(unittest.TestCase):
     @staticmethod
     def model(readout, spacing=.8, **kwargs):
         return GridCACEModel(None, None, [readout], grid_spacing=spacing,
-                             compute_polarization_derivative=True, **kwargs)
+                             compute_polarization_derivative=True,
+                             mean_density=.4, **kwargs)
 
     def test_charge_only_limit_and_legacy_serialization(self):
         charges = (1.3, -.7, 0.)
@@ -51,7 +58,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         new.load_state_dict(old.state_dict(), strict=True)
         data = self.data(n_types=3)
         data["dipole_density"].zero_()
-        torch.testing.assert_close(old.energy(data), new.energy(data), atol=1e-13, rtol=1e-13)
+        torch.testing.assert_close(old.energy(ctx(data)), new.energy(ctx(data)), atol=1e-13, rtol=1e-13)
         del old.include_polarization  # simulate a pre-extension whole-module checkpoint
         buffer = io.BytesIO()
         torch.save(old, buffer)
@@ -59,8 +66,8 @@ class TestPolarizationCoulomb(unittest.TestCase):
         from equicdft.legacy import upgrade_legacy_model
         loaded = upgrade_legacy_model(torch.load(buffer, weights_only=False))
         self.assertFalse(loaded.requires_dipole_density)
-        self.assertFalse(loaded.requires_state_features)
-        torch.testing.assert_close(loaded.energy(data), new.energy(data))
+        self.assertIsNotNone(loaded.coulomb_amplitude)
+        torch.testing.assert_close(loaded.energy(ctx(data)), new.energy(ctx(data)))
         scalar = GridCACEModel(None, None, [loaded], grid_spacing=.8).eval()
         polar = self.model(new).eval()
         for key, value in scalar(self.clone(data)).items():
@@ -87,7 +94,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         reference = amplitude * 2 * math.pi / (math.prod(shape) * spacing**3) * (
             torch.exp(-alpha * k2) / k2 * source.abs().square()
         ).sum()
-        actual = self.readout(charges, amplitude, alpha).energy(data)
+        actual = self.readout(charges, amplitude, alpha).energy(ctx(data))
         torch.testing.assert_close(actual, reference, atol=2e-13, rtol=2e-13)
         for a, b in zip(torch.autograd.grad(actual, (rho, p), retain_graph=True),
                         torch.autograd.grad(reference, (rho, p))):
@@ -110,7 +117,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
             torch.testing.assert_close(result["polarization_derivative"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
             torch.testing.assert_close(result["c1"], torch.zeros_like(data["rho"]), atol=0., rtol=0.)
             data["dipole_density"] = data["dipole_density"].roll(1, -1)
-            transverse = self.readout().energy(data)
+            transverse = self.readout().energy(ctx(data))
             self.assertLess(abs(float(transverse)), 1e-28)
 
     def test_mixed_cross_term_sign_and_cancellation(self):
@@ -125,30 +132,30 @@ class TestPolarizationCoulomb(unittest.TestCase):
         data["dipole_density"][:, 0, 0] = b * sine
         readout = self.readout((q,))
         prefactor = 1.7 * math.prod(shape) * math.pi * math.exp(-.3*k*k) / (k*k)
-        torch.testing.assert_close(readout.energy(data), torch.tensor(prefactor * (q*a-k*b)**2), atol=1e-13, rtol=1e-12)
+        torch.testing.assert_close(readout.energy(ctx(data)), torch.tensor(prefactor * (q*a-k*b)**2), atol=1e-13, rtol=1e-12)
         scalar, dipole = self.clone(data), self.clone(data)
         scalar["dipole_density"].zero_()
         dipole["rho"].fill_(.4)
-        cross = readout.energy(data) - readout.energy(scalar) - readout.energy(dipole)
+        cross = readout.energy(ctx(data)) - readout.energy(ctx(scalar)) - readout.energy(ctx(dipole))
         torch.testing.assert_close(cross, torch.tensor(-2*prefactor*q*a*k*b), atol=1e-13, rtol=1e-12)
         data["dipole_density"][:, 0, 0] = q*a/k * sine
-        self.assertLess(abs(float(readout.energy(data))), 1e-27)
+        self.assertLess(abs(float(readout.energy(ctx(data)))), 1e-27)
 
     def test_zero_modes_and_nyquist_real_divergence(self):
         data = self.data((4, 4, 4))
         data["rho"].fill_(.4)
         data["dipole_density"][:] = torch.tensor([.01, -.02, .03])
         readout = self.readout((1.,))
-        self.assertLess(abs(float(readout.energy(data))), 1e-28)
+        self.assertLess(abs(float(readout.energy(ctx(data)))), 1e-28)
         checker = (-1.) ** torch.arange(4)
         data["dipole_density"][:, 0, 0] = checker[:, None, None].expand(4, 4, 4).reshape(-1)
-        self.assertLess(abs(float(readout.energy(data))), 1e-28)
+        self.assertLess(abs(float(readout.energy(ctx(data)))), 1e-28)
         # Charge Nyquist energy is retained; only the derivative is zeroed.
         data["rho"][:, 0] += .02 * data["dipole_density"][:, 0, 0]
-        self.assertGreater(float(readout.energy(data)), 0.)
+        self.assertGreater(float(readout.energy(ctx(data))), 0.)
         p = data["dipole_density"].clone()
         data["dipole_density"].zero_()
-        torch.testing.assert_close(readout.energy(dict(data, dipole_density=p)), readout.energy(data))
+        torch.testing.assert_close(readout.energy(ctx(dict(data, dipole_density=p))), readout.energy(ctx(data)))
 
     def test_batch_and_neutral_species_not_erased(self):
         data = self.data(n_types=3)
@@ -156,7 +163,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         readout = self.readout((1., -2., 0.))
         batch = {k: torch.stack((data[k], other[k])) for k in ("rho", "dipole_density", "temperature")}
         batch.update(grid_size=data["grid_size"], grid_spacing=data["grid_spacing"])
-        torch.testing.assert_close(readout.energy(batch), torch.stack((readout.energy(data), readout.energy(other))))
+        torch.testing.assert_close(readout.energy(ctx(batch)), torch.stack((readout.energy(ctx(data)), readout.energy(ctx(other)))))
         model = self.model(readout).eval()
         output = model(batch)
         self.assertEqual(output["polarization_derivative"].shape, (2, 45, 3, 3))
@@ -165,7 +172,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
                 torch.testing.assert_close(value, output[key][i])
         data["rho"].fill_(.4)
         data["dipole_density"][:, :2].zero_()
-        self.assertGreater(float(readout.energy(data)), 0.)
+        self.assertGreater(float(readout.energy(ctx(data))), 0.)
 
     def test_model_finite_differences_and_mixed_hessian(self):
         for mode in ("beta", "physical"):
@@ -211,13 +218,14 @@ class TestPolarizationCoulomb(unittest.TestCase):
         self.assertTrue(torch.autograd.gradgradcheck(energy, (rho, p), atol=2e-8, rtol=2e-6))
 
     def test_additivity_with_squared_p_lda(self):
-        lda = LDAReadout(mean_density=.4, dipole_density_scale=.2, hidden_sizes=(4,))
+        lda = LDAReadout(dipole_density_scale=.2, hidden_sizes=(4,))
         coulomb = self.readout()
         data = self.data()
         separate = [self.model(item).eval()(self.clone(data)) for item in (lda, coulomb)]
         for readouts in ([lda, coulomb], [coulomb, lda]):
             model = GridCACEModel(None, None, readouts, grid_spacing=.8,
-                                 compute_polarization_derivative=True).eval()
+                                 compute_polarization_derivative=True,
+                                 mean_density=.4).eval()
             result = model(self.clone(data))
             for key in result:
                 torch.testing.assert_close(result[key], separate[0][key] + separate[1][key], atol=2e-12, rtol=2e-12)
@@ -245,14 +253,15 @@ class TestPolarizationCoulomb(unittest.TestCase):
             shifted[key] = grid.roll((1, -2, 1), (0, 1, 2)).reshape_as(data[key])
             tiled[key] = grid.repeat(2, 1, 1, *([1] * (grid.ndim-3))).reshape(-1, *data[key].shape[1:])
         tiled["grid_size"] = torch.tensor([8, 4, 4])
-        torch.testing.assert_close(readout.energy(shifted), reference["beta_F_exc"], atol=1e-12, rtol=1e-12)
-        torch.testing.assert_close(readout.energy(tiled), 2*reference["beta_F_exc"], atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(readout.energy(ctx(shifted)), reference["beta_F_exc"], atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(readout.energy(ctx(tiled)), 2*reference["beta_F_exc"], atol=1e-12, rtol=1e-12)
 
     def test_learned_amplitude_has_response_loss_gradients(self):
         readout = self.readout((0., 1.), amplitude=None)
-        lda = LDAReadout(mean_density=.4, n_types=2, zero_init=True)
+        lda = LDAReadout(n_types=2, zero_init=True)
         model = GridCACEModel(None, None, [lda, readout], grid_spacing=.8,
-                             compute_polarization_derivative=True).train()
+                             compute_polarization_derivative=True,
+                             mean_density=.4).train()
         # A spatially varying target tests response-loss training even from
         # zero amplitude; a constant target is orthogonal to these modes.
         output = model(self.data(n_types=2))

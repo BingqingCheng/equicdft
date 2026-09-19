@@ -60,10 +60,10 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
 
     @staticmethod
     def model(readout, spacing=.8, **kwargs):
-        lda = LDAReadout(mean_density=.4, n_types=readout.n_types, zero_init=True)
+        lda = LDAReadout(n_types=readout.n_types, zero_init=True)
         return GridCACEModel(
             None, None, [lda, readout], grid_spacing=spacing,
-            compute_polarization_derivative=True, **kwargs,
+            compute_polarization_derivative=True, mean_density=.4, **kwargs,
         )
 
     def test_uniform_has_only_a_energy_and_derivative(self):

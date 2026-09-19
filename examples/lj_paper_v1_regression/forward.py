@@ -2,6 +2,8 @@
 
 import torch
 
+from equicdft.thermodynamics import beta_external_potential
+
 from .common import check_thresholds, load_case, print_metrics, r2, rmse
 
 
@@ -10,12 +12,12 @@ def evaluate_forward():
     result = solver.evaluate(frame, compute_c1=True)
     rho = result["rho"].detach()
     target = frame["beta"].to(rho) * frame["V_ext"].to(rho)
-    wavelength = model.thermal_wavelength.to(rho)
-    raw_prediction = result["c1"].detach() - torch.log(
-        torch.clamp(
-            rho * wavelength.pow(3),
-            min=torch.finfo(rho.dtype).tiny,
-        )
+    # beta*V_ext up to the chemical-potential gauge, which is fixed below by
+    # matching the masked mean of the target.
+    raw_prediction = beta_external_potential(
+        rho,
+        result["c1"].detach(),
+        model.thermal_wavelength.to(rho),
     )
     mask = rho > model.rho_min
     gauge_offset = torch.mean(target[mask] - raw_prediction[mask])

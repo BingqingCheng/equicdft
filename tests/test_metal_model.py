@@ -27,7 +27,6 @@ class TestMetalModel(unittest.TestCase):
                 data["metal_external_field"] = torch.tensor([0.07, 0., 0.], dtype=torch.float64)
                 result = _run(model, data, compute_c2=True, c2_reference=(2, 0))
                 wall = model.readout[1]
-                state = _run(wall, data)
                 readout_energy = _run(wall.energy, data)
                 expected = (
                     readout_energy
@@ -56,9 +55,7 @@ class TestMetalModel(unittest.TestCase):
     @classmethod
     def _model(cls, mode="beta", with_metal=True):
         readouts = [
-            LDAReadout(
-                mean_density=1.0, n_types=2, hidden_sizes=(), zero_init=True
-            )
+            LDAReadout(n_types=2, hidden_sizes=(), zero_init=True),
         ]
         if with_metal:
             readouts.append(cls._wall())
@@ -70,6 +67,7 @@ class TestMetalModel(unittest.TestCase):
             mean_temperature=2.0,
             boltzmann_constant=1.5,
             free_energy_mode=mode,
+            mean_density=1.0,
         ).double()
 
     @staticmethod
@@ -167,13 +165,11 @@ class TestMetalModel(unittest.TestCase):
         spacing = torch.tensor([0.5, 0.75, 1.25], dtype=torch.float64)
         model = GridCACEModel(
             None, None, [
-                LDAReadout(
-                    mean_density=1.0, n_types=2,
-                    hidden_sizes=(), zero_init=True,
-                ),
+                LDAReadout(n_types=2, hidden_sizes=(), zero_init=True),
                 self._wall(),
             ],
             grid_spacing=spacing, mean_temperature=2.0, boltzmann_constant=1.5,
+            mean_density=1.0,
         ).double()
         data = self._data()
         data["grid_spacing"] = spacing
@@ -220,13 +216,11 @@ class TestMetalModel(unittest.TestCase):
         model = GridCACEModel(
             a_features=None, b_features=None,
             readout=[
-                LDAReadout(
-                    mean_density=1.0, n_types=2,
-                    hidden_sizes=(), zero_init=True,
-                ),
+                LDAReadout(n_types=2, hidden_sizes=(), zero_init=True),
                 self._wall(),
             ],
             grid_spacing=0.75, mean_temperature=2.0, boltzmann_constant=1.5,
+            mean_density=1.0,
         ).double()
         data = self._data()
         self.assertEqual(model.n_types, 2)

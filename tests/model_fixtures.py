@@ -1,7 +1,8 @@
 """Small model and field builders shared by the serialization tests.
 
-Each builder returns a fresh module; tests materialize lazy readouts with one
-forward pass before describing or saving the model.
+Each builder returns a fresh, fully constructed module: the model binds its
+local readouts at construction, so no forward pass is needed before describing
+or saving it.
 """
 
 import numpy as np
@@ -68,7 +69,7 @@ def example_model(**overrides):
     )
     b_features = CartesianBFeatures(max_power=2, max_product_order=2)
     readouts = [
-        LDAReadout(mean_density=0.4, n_types=n_types, hidden_sizes=(4,)),
+        LDAReadout(n_types=n_types, hidden_sizes=(4,)),
         LocalReadout(n_types=n_types, hidden_sizes=(4,)),
     ]
     arguments = dict(
@@ -179,7 +180,7 @@ def long_range_model(charges=None, coulomb_amplitude=None):
         n_types=2,
     )
     readouts = [
-        LDAReadout(mean_density=0.4, n_types=2, hidden_sizes=(3,)),
+        LDAReadout(n_types=2, hidden_sizes=(3,)),
         BulkReadout(n_types=2, hidden_sizes=(3,), zero_init=False),
         PairwiseReadout(cutoff_grid=2, n_types=2, hidden_sizes=(3,)),
         LongRangeReadout(
@@ -197,4 +198,5 @@ def long_range_model(charges=None, coulomb_amplitude=None):
         readout=readouts,
         grid_spacing=0.5,
         mean_temperature=1.3,
+        mean_density=0.4,
     )

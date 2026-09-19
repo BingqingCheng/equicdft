@@ -17,10 +17,10 @@
   },
   "artifacts": {
     "model": {
-      "source": "model/model.pt from the production tag, converted with python -m equicdft.convert",
+      "source": "model/model.pt from the production tag, converted with python -m equicdft.convert and re-saved in format version 2",
       "format": "equicdft-model",
-      "format_version": 1,
-      "sha256": "95464f2e9af3df38c2177828b930ee230092d0d531c5a8ec29ebbd1af678b96f",
+      "format_version": 2,
+      "sha256": "44419dd3d15ce0e330fe476f62431465fc32f9ad923cca3af29fbf405c13e6a1",
       "converted_from": "tests/fixtures/lj_paper_v1_whole_object_model.pt"
     },
     "field": {

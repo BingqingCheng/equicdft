@@ -1,6 +1,7 @@
 import csv
 import contextlib
 import io
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ from equicdft import (
 )
 from equicdft._grid import voxel_volume
 from equicdft._trainer_io import format_record
+from equicdft.stencil import get_neighbor_indices
 
 
 class _LinearDictionaryModel(nn.Module):
@@ -751,7 +753,7 @@ class TestTrainer(unittest.TestCase):
                 n_types=1,
             ),
             b_features=CartesianBFeatures(max_power=1, max_product_order=1),
-            readout=[LDAReadout(mean_density=0.5, n_types=1, hidden_sizes=(2,))],
+            readout=[LDAReadout(n_types=1, hidden_sizes=(2,))],
             grid_spacing=1.0,
             compute_c1=False,
         )
@@ -776,6 +778,132 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(checkpoint["model_config"], model.to_config())
         rebuilt = GridCACEModel.from_config(checkpoint["model_config"])
         rebuilt.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    @staticmethod
+    def _grid_frame(seed):
+        shape = (2, 2, 2)
+        generator = torch.Generator().manual_seed(seed)
+        n_grid = 8
+        return {
+            "rho": torch.rand(n_grid, 1, generator=generator) + 0.1,
+            "grid_positions": torch.tensor(
+                list(itertools.product(range(2), range(2), range(2)))
+            ),
+            "local_density_index": torch.tensor(
+                get_neighbor_indices(
+                    list(itertools.product(range(2), range(2), range(2))),
+                    cutoff_grid=1,
+                )[0]
+            ),
+            "grid_spacing": torch.ones(3),
+            "grid_size": torch.tensor(shape),
+            "temperature": torch.tensor(1.0),
+            "beta": torch.tensor(1.0),
+            "beta_F_exc": torch.tensor(0.5),
+        }
+
+    @staticmethod
+    def _grid_model(readout):
+        from equicdft import CartesianAFeatures, CartesianBFeatures, GridCACEModel
+
+        return GridCACEModel(
+            a_features=CartesianAFeatures(
+                mean_density=0.5, cutoff_grid=1, max_power=1, n_types=1,
+            ),
+            b_features=CartesianBFeatures(max_power=1, max_product_order=1),
+            readout=[readout()],
+            grid_spacing=1.0,
+            compute_c1=False,
+        )
+
+    def _resume_from_legacy_scale_layout(self, readout, rewrite, corrupt=None):
+        """Fit one epoch, rewrite the checkpoint's model state, and resume.
+
+        ``rewrite`` turns the saved model state into the layout written
+        before model file format 2 and returns it; the resumed trainer must
+        then hold the original state exactly. ``corrupt`` makes the scales
+        of that layout disagree, which must be rejected.
+        """
+
+        loss = Loss([TensorLoss("energy", "beta_F_exc", "beta_F_exc")])
+        train = DataLoader(
+            [self._grid_frame(1), self._grid_frame(2)], batch_size=2,
+        )
+        valid = DataLoader([self._grid_frame(3)], batch_size=1)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            torch.manual_seed(5)
+            trainer = Trainer(
+                model=self._grid_model(readout), loss=loss,
+                optimizer_args={"lr": 1.0e-3}, checkpoint_dir=temporary_directory,
+            )
+            trainer.fit(train, valid, epochs=1, verbose=False)
+            path = Path(temporary_directory) / "last.pt"
+            checkpoint = torch.load(path, weights_only=False)
+            expected_state = {
+                key: value.clone()
+                for key, value in checkpoint["model_state_dict"].items()
+            }
+            self.assertIn("mean_density", expected_state)
+            legacy_state = rewrite(dict(checkpoint["model_state_dict"]))
+            self.assertNotIn("mean_density", legacy_state)
+            checkpoint["model_state_dict"] = legacy_state
+            torch.save(checkpoint, path)
+
+            torch.manual_seed(6)
+            resumed = Trainer(
+                model=self._grid_model(readout), loss=loss,
+                optimizer_args={"lr": 1.0e-3},
+            )
+            completed = resumed.load_checkpoint(path, train)
+
+            self.assertEqual(completed, 1)
+            self.assertEqual(set(resumed.model.state_dict()), set(expected_state))
+            for key, value in resumed.model.state_dict().items():
+                self.assertTrue(torch.equal(value, expected_state[key]), key)
+
+            if corrupt is None:
+                return
+            checkpoint["model_state_dict"] = corrupt(legacy_state)
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "different density scales"):
+                Trainer(
+                    model=self._grid_model(readout), loss=loss,
+                    optimizer_args={"lr": 1.0e-3},
+                ).load_checkpoint(path, train)
+
+    def test_checkpoints_with_readout_density_scales_are_migrated(self):
+        """Checkpoints written before model format 2 stored LDA scales."""
+
+        from equicdft import LDAReadout
+
+        def rewrite(state):
+            state["readout.0.mean_density"] = state.pop("mean_density").clone()
+            return state
+
+        def corrupt(state):
+            state["readout.0.mean_density"] = 2.0 * state["readout.0.mean_density"]
+            return state
+
+        self._resume_from_legacy_scale_layout(
+            lambda: LDAReadout(n_types=1, hidden_sizes=(2,)), rewrite, corrupt,
+        )
+
+    def test_checkpoints_without_lda_readouts_recover_the_feature_scale(self):
+        """Before model format 2 no checkpoint held a model-level scale.
+
+        A model without LDA readouts recorded the density scale only on its
+        feature module, so resuming takes ``mean_density`` from there.
+        """
+
+        from equicdft import LocalReadout
+
+        def rewrite(state):
+            del state["mean_density"]
+            return state
+
+        self._resume_from_legacy_scale_layout(
+            lambda: LocalReadout(n_types=1, hidden_sizes=(2,)), rewrite,
+        )
 
     def test_checkpoint_resume_restores_complete_training_state(self):
         train_values = [1, 2, 3, 4]

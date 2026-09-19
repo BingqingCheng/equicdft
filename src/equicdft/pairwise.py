@@ -10,7 +10,7 @@ from ._component_pairs import symmetric_component_pairs
 from ._config import Configurable, make_config, register
 from ._grid import common_grid_size
 from ._nn import build_mlp, validate_hidden_sizes
-from .energy import EnergyReadout
+from .energy import EnergyReadout, ReadoutContext
 from .stencil import make_stencil
 
 
@@ -283,28 +283,22 @@ class PairwiseReadout(EnergyReadout, Configurable):
             dim=(-3, -2, -1),
         ).movedim(-4, -1).reshape_as(rho)
 
-    def energy(self, context: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the periodic pair contribution for a complete field."""
 
-        if "grid_size" not in context:
-            raise KeyError("pairwise evaluation requires data['grid_size']")
-        rho = context["rho"]
-        if rho.ndim < 2 or rho.shape[-1] != self.n_types:
+        grid_size = context.require("grid_size")
+        rho = context.rho
+        if rho.shape[-1] != self.n_types:
             raise ValueError(
                 "rho must have shape [..., n_grid, n_types] with the "
                 "configured n_types"
             )
-        normalized_temperature = context["normalized_temperature"]
-        if normalized_temperature.shape != rho.shape[:-2]:
-            raise ValueError(
-                "normalized_temperature must match rho's leading shape"
-            )
         kernel = self.real_space_kernel(
-            normalized_temperature,
-            context["grid_size"],
+            context.normalized_temperature,
+            grid_size,
         )
         potential = self._periodic_convolution(rho, kernel)
-        volume_element = context["voxel_volume"].to(rho)
+        volume_element = context.voxel_volume.to(rho)
         return (
             0.5
             * volume_element.square()

@@ -113,8 +113,9 @@ class TestConfigRoundTrip(unittest.TestCase):
     def testexample_model(self):
         model = example_model()
         data = grid_data(cutoff_grid=1)
-        # Materialize the lazy local readout before describing the model.
-        model(copy.deepcopy(data))
+        # The model bound its local readout at construction; no forward pass
+        # is needed before describing it.
+        self.assertTrue(model.readout[1].is_bound)
         config = self.assert_round_trip(
             model,
             data,
@@ -131,13 +132,14 @@ class TestConfigRoundTrip(unittest.TestCase):
         self.assertEqual(config["message_layers"], [])
         self.assertIsInstance(config["readout"][1]["n_features"], int)
 
-    def test_lazy_readout_reports_unknown_width_before_first_forward(self):
+    def test_unbound_readout_reports_unknown_width_until_bound(self):
         readout = LocalReadout(n_types=1, hidden_sizes=(4,))
         self.assertIsNone(readout.to_config()["n_features"])
-        readout(torch.zeros(3, 7))
+        readout.bind_input_size(7)
         self.assertEqual(readout.to_config()["n_features"], 7)
         rebuilt = LocalReadout.from_config(readout.to_config())
         rebuilt.load_state_dict(readout.state_dict(), strict=True)
+        self.assertTrue(rebuilt.is_bound)
 
     def test_gaussian_message_model_with_density_transform(self):
         torch.manual_seed(1)

@@ -6,12 +6,10 @@ import unittest
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from equicdft import (
     CartesianAFeatures,
     GridCACEModel,
-    LDAReadout,
     LocalReadout,
     load_model,
     read_model_config,
@@ -259,6 +257,27 @@ class TestLegacyConversion(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     legacy_file = _whole_object_file(model, directory)
                     self.assert_converted_matches(model, data, legacy_file)
+
+    def test_upgrade_moves_readout_density_scales_onto_the_model(self):
+        from equicdft import LDAReadout
+
+        def legacy_object(scales):
+            model = GridCACEModel(
+                None, None,
+                [LDAReadout(n_types=1, hidden_sizes=()) for _ in scales],
+                grid_spacing=1.0,
+            )
+            for readout, scale in zip(model.readout, scales):
+                readout.register_buffer("mean_density", torch.tensor(scale))
+            del model._buffers["mean_density"]
+            return model
+
+        upgraded = upgrade_legacy_model(legacy_object((0.4, 0.4)))
+        self.assertAlmostEqual(upgraded.mean_density.item(), 0.4)
+        self.assertNotIn("readout.0.mean_density", upgraded.state_dict())
+        self.assertNotIn("readout.1.mean_density", upgraded.state_dict())
+        with self.assertRaisesRegex(ValueError, "different density scales"):
+            upgrade_legacy_model(legacy_object((0.4, 0.5)))
 
     def test_upgrade_is_idempotent_on_current_objects(self):
         model = example_model()

@@ -20,7 +20,6 @@ from typing import (
 
 import torch
 from torch import nn
-from torch.nn.parameter import UninitializedParameter
 
 from ._argument_checks import (
     boolean,
@@ -38,6 +37,8 @@ from ._trainer_io import (
     write_history_csv,
 )
 from .loss import Loss
+from .metrics import MetricCollection
+from .serialization import migrate_model_state_dict
 
 
 _MAX_CACHED_GRID_GEOMETRIES = 2
@@ -81,7 +82,7 @@ class TrainingStream:
     train_loader: Iterable[Dict[str, torch.Tensor]]
     valid_loader: Iterable[Dict[str, torch.Tensor]]
     loss: Loss
-    metrics: Sequence[nn.Module] = ()
+    metrics: Sequence[MetricCollection] = ()
     batches_per_step: int = 1
     model_kwargs: Optional[Dict[str, Any]] = None
     cycle: bool = False
@@ -96,9 +97,10 @@ class TrainingStream:
             raise TypeError("stream loss must be a equicdft.Loss")
         self.metrics = tuple(self.metrics)
         for metric in self.metrics:
-            if not isinstance(metric, nn.Module):
-                raise TypeError("stream metrics must be torch modules")
-            nonempty_string(getattr(metric, "name", None), "metric name")
+            if not isinstance(metric, MetricCollection):
+                raise TypeError(
+                    "stream metrics must be equicdft.MetricCollection objects"
+                )
         metric_names = [metric.name for metric in self.metrics]
         if len(set(metric_names)) != len(metric_names):
             raise ValueError("metric collection names must be unique per stream")
@@ -124,9 +126,10 @@ class Trainer(nn.Module):
     """Train a model with composable losses and dataset-level metrics.
 
     The trainer owns optimization and epoch orchestration while the model,
-    loss, and metric modules retain their separate responsibilities. Optimizer
-    construction is delayed until :meth:`fit`, after any lazy parameters have
-    been materialized from the first training batch.
+    loss, and metric modules retain their separate responsibilities. The
+    optimizer and scheduler are constructed on the first :meth:`fit`,
+    :meth:`fit_streams` or :meth:`load_checkpoint` call from the parameters
+    the model and loss modules already own.
 
     Parameters
     ----------
@@ -183,7 +186,7 @@ class Trainer(nn.Module):
         self,
         model: nn.Module,
         loss: Loss,
-        metrics: Sequence[nn.Module] = (),
+        metrics: Sequence[MetricCollection] = (),
         optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_args: Optional[Dict[str, Any]] = None,
         scheduler_cls: Optional[Type[Any]] = None,
@@ -216,14 +219,10 @@ class Trainer(nn.Module):
         )
 
         metrics = list(metrics)
-        if any(not isinstance(metric, nn.Module) for metric in metrics):
-            raise TypeError("metrics must contain only torch modules")
-        for metric in metrics:
-            for method in ("update_metrics", "retrieve_metrics", "clear_metrics"):
-                if not callable(getattr(metric, method, None)):
-                    raise TypeError(
-                        "every metric must define {}".format(method)
-                    )
+        if any(not isinstance(metric, MetricCollection) for metric in metrics):
+            raise TypeError(
+                "metrics must contain only equicdft.MetricCollection objects"
+            )
         metric_names = [metric.name for metric in metrics]
         if len(set(metric_names)) != len(metric_names):
             raise ValueError("metric collection names must be unique")
@@ -288,7 +287,7 @@ class Trainer(nn.Module):
         print_interval = positive_integer(print_interval, "print_interval")
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
-        self._initialize_optimization(train_loader)
+        self._initialize_optimization()
         start_epoch = self._next_epoch()
         stream = TrainingStream(
             "default",
@@ -373,10 +372,7 @@ class Trainer(nn.Module):
                 )
             )
 
-        self._initialize_optimization(
-            streams[0].train_loader,
-            model_kwargs=streams[0].model_kwargs,
-        )
+        self._initialize_optimization()
         if record_initial_validation and not self.history:
             self._record_stream_baseline(
                 streams,
@@ -556,14 +552,13 @@ class Trainer(nn.Module):
         self,
         path: Union[str, Path],
         train_loader: Iterable[Dict[str, torch.Tensor]],
-        model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Restore a complete training state and return its completed epoch.
 
-        Lazy parameters are first materialized from ``train_loader`` so that
-        model, optimizer, and scheduler state dictionaries can be restored in
-        their normal order. Random states are restored last, undoing any draws
-        made while constructing the replacement process.
+        ``train_loader`` is the loader the resumed run will iterate; its
+        random generator state is restored from the checkpoint. Random states
+        are restored last, undoing any draws made while constructing the
+        replacement process.
         """
 
         checkpoint_path = Path(path).expanduser()
@@ -573,7 +568,7 @@ class Trainer(nn.Module):
             )
 
         self._train_loader_generator = getattr(train_loader, "generator", None)
-        self._initialize_optimization(train_loader, model_kwargs=model_kwargs)
+        self._initialize_optimization()
         checkpoint = torch.load(
             str(checkpoint_path),
             map_location=self.device,
@@ -598,7 +593,14 @@ class Trainer(nn.Module):
                 )
             )
 
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        # Checkpoints written before model file format 2 have no model-level
+        # density scale: recover it from the feature module (or from the LDA
+        # readouts, whose copies are dropped) before the strict load.
+        model_state = migrate_model_state_dict(
+            checkpoint["model_state_dict"],
+            expects_model_scale="mean_density" in self.model.state_dict(),
+        )
+        self.model.load_state_dict(model_state, strict=True)
         self.density_noise = boolean(
             checkpoint.get("density_noise", False), "density_noise"
         )
@@ -733,11 +735,11 @@ class Trainer(nn.Module):
                 generator.set_state(state.cpu())
 
         for metric in self.metrics:
-            for subset in metric.logs:
+            for subset in metric.subsets:
                 metric.clear_metrics(subset)
         for metrics in self.stream_metrics.values():
             for metric in metrics:
-                for subset in metric.logs:
+                for subset in metric.subsets:
                     metric.clear_metrics(subset)
         self._write_history_csv()
         return epoch
@@ -750,38 +752,18 @@ class Trainer(nn.Module):
         """Restore a joint-stream checkpoint using the same stream layout."""
 
         streams = self._configure_streams(streams)
-        return self.load_checkpoint(
-            path,
-            train_loader=streams[0].train_loader,
-            model_kwargs=streams[0].model_kwargs,
-        )
+        return self.load_checkpoint(path, train_loader=streams[0].train_loader)
 
     def log_message(self, message: str, display: bool = True) -> None:
         """Print a message and append it to the human-readable training log."""
 
         append_log_message(message, self.training_log_path, display)
 
-    def _initialize_optimization(
-        self,
-        train_loader: Iterable[Dict[str, torch.Tensor]],
-        model_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Materialize lazy parameters and construct optimizer/scheduler."""
+    def _initialize_optimization(self) -> None:
+        """Construct the optimizer and scheduler once."""
 
         if self.optimizer is not None:
             return
-
-        if self._has_uninitialized_parameters():
-            try:
-                first_batch = next(iter(train_loader))
-            except StopIteration:
-                raise ValueError("train_loader must contain at least one batch")
-            first_batch = self._move_batch(first_batch)
-            was_training = self.model.training
-            self.model.eval()
-            with torch.no_grad():
-                self.model(first_batch, **dict(model_kwargs or {}))
-            self.model.train(was_training)
 
         # Loss modules may later contain trainable nuisance parameters, such
         # as latent chemical-potential offsets, so optimize them with the model.
@@ -1048,27 +1030,18 @@ class Trainer(nn.Module):
 
     @staticmethod
     def _update_metrics(
-        metrics: Sequence[nn.Module],
+        metrics: Sequence[MetricCollection],
         subset: str,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
         details: Dict[str, Dict[str, torch.Tensor]],
     ) -> None:
         for metric in metrics:
-            if getattr(metric, "requires_loss_details", False):
-                if metric.name not in details:
-                    raise KeyError(
-                        "metric '{}' has no matching loss details".format(
-                            metric.name
-                        )
-                    )
-                metric.update_metrics(subset, details[metric.name])
-            else:
-                metric.update_metrics(subset, outputs, batch)
+            metric.update_metrics(subset, outputs, batch, details)
 
     @staticmethod
     def _retrieve_metrics(
-        metrics: Sequence[nn.Module],
+        metrics: Sequence[MetricCollection],
         subset: str,
     ) -> Dict[str, Dict[str, float]]:
         return {
@@ -1265,15 +1238,6 @@ class Trainer(nn.Module):
             self._grid_geometry_device_cache[identity] = cached
             moved[key] = cached[2].unsqueeze(0).expand(value.shape)
         return moved
-
-    def _has_uninitialized_parameters(self) -> bool:
-        """Return whether model or loss contains lazy parameters."""
-
-        return any(
-            isinstance(parameter, UninitializedParameter)
-            for parameter in list(self.model.parameters())
-            + list(self.loss.parameters())
-        )
 
     def _next_epoch(self) -> int:
         """Return the next positive training epoch after optional epoch 0."""

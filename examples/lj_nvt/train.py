@@ -174,7 +174,6 @@ def main():
     # correction. Both MLPs use smooth SiLU activations internally.
     readouts = [
         LDAReadout(
-            mean_density=loaders["mean_density"],
             n_types=n_types,
             hidden_sizes=(32, 16),
         ),

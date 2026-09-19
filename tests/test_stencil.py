@@ -2,7 +2,14 @@ import unittest
 
 import numpy as np
 
-from equicdft.stencil import coarsen_grid, get_neighbor_indices, make_stencil
+from equicdft.stencil import (
+    canonical_grid_order,
+    coarsen_grid,
+    get_neighbor_indices,
+    grid_size_array,
+    grid_spacing_array,
+    make_stencil,
+)
 
 
 class TestGridStencil(unittest.TestCase):
@@ -113,6 +120,58 @@ class TestGridStencil(unittest.TestCase):
         self.assertTrue(np.allclose(coarse[:, 1], -expected.reshape(-1)))
         self.assertTrue(np.array_equal(coarse_positions[1], (0, 0, 1)))
         self.assertTrue(np.allclose(spacing, (0.5, 0.5, 0.5)))
+
+
+class TestCanonicalGridOrder(unittest.TestCase):
+    def test_shuffled_rows_are_sorted_into_c_order(self):
+        shape = (2, 3, 4)
+        positions = np.indices(shape, dtype=int).reshape(3, -1).T
+        permutation = np.random.RandomState(0).permutation(len(positions))
+
+        ordering = canonical_grid_order(positions[permutation].astype(float))
+
+        self.assertTrue(np.array_equal(ordering.grid_size, shape))
+        self.assertEqual(ordering.positions.dtype, np.int64)
+        self.assertTrue(
+            np.array_equal(ordering.positions[ordering.order], positions)
+        )
+        self.assertTrue(
+            np.array_equal(ordering.flat_index[ordering.order], np.arange(24))
+        )
+
+    def test_explicit_grid_size_must_agree(self):
+        positions = np.indices((2, 2, 2), dtype=int).reshape(3, -1).T
+        ordering = canonical_grid_order(positions, grid_size=(2, 2, 2))
+        self.assertTrue(np.array_equal(ordering.grid_size, (2, 2, 2)))
+        with self.assertRaisesRegex(ValueError, "inconsistent with grid_size"):
+            canonical_grid_order(positions, grid_size=(2, 2, 3))
+
+    def test_invalid_grids_are_rejected(self):
+        positions = np.indices((2, 2, 2), dtype=int).reshape(3, -1).T
+        with self.assertRaisesRegex(ValueError, "integer-valued"):
+            canonical_grid_order(positions + 0.3)
+        with self.assertRaisesRegex(ValueError, "zero-based"):
+            canonical_grid_order(positions + 1)
+        with self.assertRaisesRegex(ValueError, "complete regular grid"):
+            canonical_grid_order(positions[:-1])
+        duplicated = positions.copy()
+        duplicated[0] = duplicated[1]
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            canonical_grid_order(duplicated)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            canonical_grid_order(positions[:, :2])
+
+    def test_metadata_coercion(self):
+        self.assertTrue(
+            np.array_equal(grid_size_array([4.0, 5.0, 6.0]), (4, 5, 6))
+        )
+        self.assertTrue(np.allclose(grid_spacing_array(0.5), (0.5, 0.5, 0.5)))
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            grid_size_array((4, 0, 6))
+        with self.assertRaisesRegex(ValueError, "three values"):
+            grid_size_array((4, 6))
+        with self.assertRaisesRegex(ValueError, "target_grid_spacing"):
+            grid_spacing_array((0.5, -0.5, 0.5), "target_grid_spacing")
 
 
 if __name__ == "__main__":

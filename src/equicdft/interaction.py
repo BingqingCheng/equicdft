@@ -242,7 +242,7 @@ class BChiMessage(nn.Module, Configurable):
         self.radial_basis = resolved_radial_basis
         # A Bessel basis is conditioned on the feature geometry of the
         # containing model, so its buffers and transform are bound later by
-        # GridCACEModel through _bind_bessel_basis. The slots exist from
+        # GridCACEModel through bind_geometry. The slots exist from
         # construction; None marks an unbound layer.
         self.radial_transform = None
         self.register_buffer("fixed_bessel_stencil_basis", None)
@@ -336,8 +336,14 @@ class BChiMessage(nn.Module, Configurable):
             and self.radial_transform is not None
         )
 
-    def _bind_bessel_basis(self, a_features: nn.Module) -> None:
-        """Bind an independent Bessel basis to the model's grid geometry."""
+    def bind_geometry(self, a_features: nn.Module) -> None:
+        """Bind a Bessel layer to the stencil geometry of ``a_features``.
+
+        Shared and Gaussian layers need no geometry of their own, so the call
+        is a no-op for them. Binding is idempotent for the same geometry and
+        rejects a different one, because the conditioned basis and its
+        transform would no longer match the fitted state.
+        """
 
         if self.radial_basis != "bessel":
             return
@@ -358,7 +364,7 @@ class BChiMessage(nn.Module, Configurable):
                     "incompatible feature geometry"
                 )
             return
-        basis, eigenvalues = a_features._bessel_stencil_basis(
+        basis, eigenvalues = a_features.bessel_stencil_basis(
             self.n_radial_functions
         )
         self.register_buffer("fixed_bessel_stencil_basis", basis)
@@ -370,12 +376,18 @@ class BChiMessage(nn.Module, Configurable):
         ).to(device=basis.device, dtype=basis.dtype)
         self._bessel_geometry_signature = geometry_signature
 
-    def _stencil_basis(
+    def stencil_basis(
         self,
         a_features: nn.Module,
         shared_basis: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the shared, Gaussian, or message-owned Bessel stencil."""
+        """Return this layer's ``[J, N, K]`` stencil basis.
+
+        ``shared_basis`` is the basis of ``a_features`` including its
+        transform; shared layers return it unchanged, Gaussian layers evaluate
+        their own exponents on the same stencil, and Bessel layers apply their
+        own transform to the geometry bound by :meth:`bind_geometry`.
+        """
 
         if self.radial_basis == "shared":
             return shared_basis

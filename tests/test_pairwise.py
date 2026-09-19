@@ -3,26 +3,27 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, PairwiseReadout
+from equicdft.energy import ReadoutContext
 from equicdft.pairwise import _smooth_cutoff_envelope
 
 
-def _context(rho, shape, temperature=1.1, voxel_volume=0.7):
+def _context(rho, shape, temperature=1.1, voxel_volume=0.7, grid_size=True):
     leading_shape = rho.shape[:-2]
     normalized_temperature = torch.as_tensor(
         temperature,
         dtype=rho.dtype,
         device=rho.device,
     ).expand(leading_shape)
-    return {
-        "rho": rho,
-        "normalized_temperature": normalized_temperature,
-        "voxel_volume": torch.as_tensor(
+    return ReadoutContext(
+        rho=rho,
+        normalized_temperature=normalized_temperature,
+        voxel_volume=torch.as_tensor(
             voxel_volume,
             dtype=rho.dtype,
             device=rho.device,
         ),
-        "grid_size": torch.tensor(shape, device=rho.device),
-    }
+        grid_size=torch.tensor(shape, device=rho.device) if grid_size else None,
+    )
 
 
 def _set_linear_kernel(readout):
@@ -42,11 +43,11 @@ def _set_linear_kernel(readout):
 
 
 def _brute_force_energy(readout, context):
-    rho = context["rho"]
-    nx, ny, nz = context["grid_size"].tolist()
+    rho = context.rho
+    nx, ny, nz = context.grid_size.tolist()
     rho_grid = rho.reshape(nx, ny, nz, readout.n_types)
     shell_values = readout.shell_kernel_values(
-        context["normalized_temperature"]
+        context.normalized_temperature
     )
     offset_values = shell_values.index_select(
         -2,
@@ -71,7 +72,7 @@ def _brute_force_energy(readout, context):
                 energy
                 + offset_values[offset_index, pair_index] * contraction
             )
-    return 0.5 * context["voxel_volume"].square() * energy
+    return 0.5 * context.voxel_volume.square() * energy
 
 
 class TestSmoothCutoffEnvelope(unittest.TestCase):
@@ -132,8 +133,8 @@ class TestPairwiseReadout(unittest.TestCase):
         context = _context(rho, (5, 5, 5))
 
         kernel = readout.real_space_kernel(
-            context["normalized_temperature"],
-            context["grid_size"],
+            context.normalized_temperature,
+            context.grid_size,
         )
         energy = readout.energy(context)
         gradient = torch.autograd.grad(
@@ -265,14 +266,16 @@ class TestPairwiseReadout(unittest.TestCase):
             readout.energy(context)
 
         readout = PairwiseReadout(cutoff_grid=2, n_types=2)
-        context = _context(rho, (5, 5, 5))
-        context["normalized_temperature"] = torch.tensor([1.0, 1.0])
         with self.assertRaisesRegex(ValueError, "temperature"):
-            readout.energy(context)
+            ReadoutContext(
+                rho=rho,
+                normalized_temperature=torch.tensor([1.0, 1.0]),
+                voxel_volume=0.7,
+                grid_size=torch.tensor([5, 5, 5]),
+            )
 
-        context = _context(rho, (5, 5, 5))
-        del context["grid_size"]
-        with self.assertRaises(KeyError):
+        context = _context(rho, (5, 5, 5), grid_size=False)
+        with self.assertRaisesRegex(KeyError, "grid_size"):
             readout.energy(context)
 
     def test_model_c2_is_negative_kernel_and_zero_at_self(self):

@@ -20,6 +20,8 @@ from equicdft.serialization import (
     default_dtype,
     dtype_from_name,
     dtype_name,
+    migrate_model_payload,
+    migrate_model_state_dict,
     model_dtype,
     model_payload,
     read_model_payload,
@@ -38,7 +40,6 @@ def _materialized_example():
     torch.manual_seed(11)
     model = example_model()
     data = grid_data(cutoff_grid=1)
-    model(copy.deepcopy(data))
     model.eval()
     return model, data
 
@@ -89,10 +90,14 @@ class TestModelPayload(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mixes floating dtypes"):
             model_dtype(model)
 
-    def test_lazy_models_must_see_a_batch_before_saving(self):
-        model = example_model()
-        with self.assertRaisesRegex(ValueError, "uninitialized lazy"):
-            model_payload(model)
+    def test_unbound_readouts_cannot_be_saved(self):
+        from equicdft import LocalReadout
+
+        with self.assertRaisesRegex(ValueError, "unbound readouts \\(LocalReadout\\)"):
+            model_payload(LocalReadout(n_types=1))
+        # Inside a model the width is bound at construction, so a fresh
+        # model is immediately serializable.
+        model_payload(example_model())
 
     def test_default_dtype_context_restores_previous_value(self):
         previous = torch.get_default_dtype()
@@ -230,6 +235,140 @@ class TestSaveLoadModel(unittest.TestCase):
             path = Path(directory) / "nested" / "model.pt"
             save_model(model, path)
             self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["model.pt"])
+
+    def test_format_version_one_payloads_are_migrated(self):
+        """Version 1 stored ``mean_density`` on every LDA readout."""
+
+        model, data = _materialized_example()
+        expected = model(copy.deepcopy(data))
+        current = model_payload(model)
+        self.assertEqual(MODEL_FORMAT_VERSION, 2)
+        legacy = copy.deepcopy(current)
+        legacy["format_version"] = 1
+        scale = legacy["config"].pop("mean_density")
+        legacy["config"]["readout"][0]["mean_density"] = scale
+        legacy["state_dict"]["readout.0.mean_density"] = legacy["state_dict"].pop("mean_density")
+        legacy_copy = copy.deepcopy(legacy)
+
+        migrated = migrate_model_payload(legacy)
+
+        self.assertEqual(migrated["format_version"], 2)
+        self.assertEqual(migrated["config"], current["config"])
+        self.assertEqual(set(migrated["state_dict"]), set(current["state_dict"]))
+        self.assertEqual(migrated["state_dict"]["mean_density"].dtype, torch.float32)
+        # Migration never edits the payload it was given.
+        self.assertEqual(legacy["format_version"], 1)
+        self.assertEqual(legacy["config"], legacy_copy["config"])
+        self.assertEqual(set(legacy["state_dict"]), set(legacy_copy["state_dict"]))
+        restored = build_model(legacy).eval()
+        actual = restored(copy.deepcopy(data))
+        for key in ("beta_F_exc", "c1"):
+            self.assertTrue(torch.equal(actual[key].detach(), expected[key].detach()), key)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v1.pt"
+            torch.save(legacy, str(path))
+            self.assertEqual(read_model_config(path), current["config"])
+            self.assertEqual(read_model_payload(path)["format_version"], 1)
+            load_model(path)
+
+    def test_version_one_files_with_disagreeing_scales_are_rejected(self):
+        model, _ = _materialized_example()
+        legacy = copy.deepcopy(model_payload(model))
+        legacy["format_version"] = 1
+        scale = legacy["config"].pop("mean_density")
+        legacy["config"]["readout"][0]["mean_density"] = 2.0 * scale
+        legacy["state_dict"]["readout.0.mean_density"] = 2.0 * legacy["state_dict"].pop("mean_density")
+        with self.assertRaisesRegex(ValueError, "different density scales"):
+            migrate_model_payload(legacy)
+        # The state migration used for checkpoints applies the same rule.
+        with self.assertRaisesRegex(ValueError, "different density scales"):
+            migrate_model_state_dict(legacy["state_dict"], expects_model_scale=True)
+        agreeing = dict(legacy["state_dict"])
+        agreeing["readout.0.mean_density"] = agreeing["a_features.mean_density"].clone()
+        migrated = migrate_model_state_dict(agreeing, expects_model_scale=True)
+        self.assertNotIn("readout.0.mean_density", migrated)
+        self.assertTrue(torch.equal(migrated["mean_density"], agreeing["a_features.mean_density"]))
+        untouched = {"readout.0.mlp.0.weight": torch.zeros(1, 2)}
+        self.assertEqual(migrate_model_state_dict(untouched, True), untouched)
+
+    def test_states_without_readout_scales_recover_the_feature_scale(self):
+        """Models without LDA readouts kept the scale on the feature module only."""
+
+        from equicdft import LocalReadout
+
+        model = example_model(readout=[LocalReadout(n_types=1, hidden_sizes=(4,))])
+        state = model_payload(model)["state_dict"]
+        self.assertNotIn("readout.0.mean_density", state)
+        legacy = dict(state)
+        del legacy["mean_density"]
+
+        migrated = migrate_model_state_dict(legacy, expects_model_scale=True)
+
+        self.assertEqual(set(migrated), set(state))
+        self.assertEqual(migrated["mean_density"].shape, ())
+        self.assertTrue(
+            torch.equal(migrated["mean_density"], state["a_features.mean_density"].reshape(()))
+        )
+        GridCACEModel.from_config(model.to_config()).load_state_dict(migrated, strict=True)
+        # A model that keeps no scale is given none.
+        self.assertEqual(set(migrate_model_state_dict(legacy, expects_model_scale=False)), set(legacy))
+        # A model-level copy that disagrees with the feature scale is rejected too.
+        inconsistent = dict(state)
+        inconsistent["mean_density"] = 2.0 * state["mean_density"]
+        with self.assertRaisesRegex(ValueError, "different density scales"):
+            migrate_model_state_dict(inconsistent, expects_model_scale=True)
+
+    def test_format_version_one_payloads_without_lda_readouts_are_migrated(self):
+        from equicdft import LocalReadout
+
+        model = example_model(readout=[LocalReadout(n_types=1, hidden_sizes=(4,))])
+        current = model_payload(model)
+        legacy = copy.deepcopy(current)
+        legacy["format_version"] = 1
+        del legacy["config"]["mean_density"]
+        del legacy["state_dict"]["mean_density"]
+
+        migrated = migrate_model_payload(legacy)
+
+        self.assertEqual(migrated["config"], current["config"])
+        self.assertEqual(set(migrated["state_dict"]), set(current["state_dict"]))
+        self.assertTrue(
+            torch.equal(migrated["state_dict"]["mean_density"], current["state_dict"]["mean_density"])
+        )
+        restored = build_model(legacy)
+        self.assertTrue(torch.equal(restored.mean_density, model.mean_density))
+
+    def test_version_one_without_local_features_keeps_the_readout_scale(self):
+        readout_config = {
+            "type": "LDAReadout", "mean_density": 0.7, "n_types": 1,
+            "hidden_sizes": [], "zero_init": True, "dipole_density_scale": None,
+        }
+        legacy = {
+            "format": MODEL_FORMAT,
+            "format_version": 1,
+            "default_dtype": "float64",
+            "config": {
+                "type": "GridCACEModel", "a_features": None, "b_features": None,
+                "readout": [readout_config], "grid_spacing": [0.5, 0.5, 0.5],
+                "mean_temperature": 1.0, "boltzmann_constant": 1.0,
+                "thermal_wavelength": [1.0], "compute_c1": True, "compute_c2": False,
+                "compute_local_mu": False, "compute_polarization_derivative": False,
+                "rho_min": 0.0, "free_energy_mode": "beta", "message_layers": [],
+            },
+            "state_dict": {
+                "readout.0.mean_density": torch.tensor(0.7, dtype=torch.float64),
+                "readout.0.mlp.0.weight": torch.zeros(1, 2, dtype=torch.float64),
+                "readout.0.mlp.0.bias": torch.zeros(1, dtype=torch.float64),
+                "grid_spacing": torch.full((3,), 0.5, dtype=torch.float64),
+                "mean_temperature": torch.tensor(1.0, dtype=torch.float64),
+                "boltzmann_constant": torch.tensor(1.0, dtype=torch.float64),
+                "thermal_wavelength": torch.ones(1, dtype=torch.float64),
+            },
+        }
+        model = build_model(legacy)
+        self.assertEqual(model.mean_density.dtype, torch.float64)
+        self.assertAlmostEqual(model.mean_density.item(), 0.7)
+        self.assertNotIn("mean_density", model.readout[0].to_config())
 
     def test_payload_survives_in_memory_round_trip(self):
         model, data = _materialized_example()

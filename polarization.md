@@ -74,11 +74,10 @@ def build_short_range_model(
     )
 ```
 
-`LocalReadout` infers its input dimension on the first forward pass. After
-constructing a model and preparing a representative batch, evaluate that batch
-once before constructing the optimizer or saving the initialized model.
-The model above contains only the short-range learned term, not a complete
-physical free-energy specification.
+`GridCACEModel` binds `LocalReadout` to the width of the local feature vector
+at construction, so the model is complete (and can be optimized or saved)
+as soon as it is built. The model above contains only the short-range learned
+term, not a complete physical free-energy specification.
 
 The input fields are:
 
@@ -327,8 +326,9 @@ of all preceding gates. The physical input fields are never overwritten.
 The existing radial–Cartesian convolution aggregates $u$ and $\mathbf{w}$ into
 the same joint A layout. With `separate_center=True`, their gated center values
 are appended within each field block. The same joint B constructor then gives
-the next invariant level. The lazy readout receives flattened
-`[B0, B1, ..., T/T_ref]`; no separate message symmetrizer is needed.
+the next invariant level. The local readout, bound by the model to the width
+of `[B0, B1, ..., T/T_ref]`, receives that flattened vector; no separate
+message symmetrizer is needed.
 
 Messages add no voxel-volume factor, extra density normalization or update to
 the physical fields used by energy integration, LDA, Coulomb or ideal terms.
@@ -600,8 +600,7 @@ wavelength conventions. Targets may be full-grid tensors or packed using the
 original `valid` mask. Custom target names are untouched and must be computed
 from the live perturbed fields by the application.
 
-All flags default off. Validation, explicit evaluation and lazy initialization
-remain clean. Ordinary and per-`TrainingStream` settings and PyTorch RNG states
+All flags default off. Validation and explicit evaluation remain clean. Ordinary and per-`TrainingStream` settings and PyTorch RNG states
 are restored by checkpoints; older checkpoints without flags restore noise off.
 Turning noise on for a new fit therefore requires an explicit configuration,
 not resuming an old clean checkpoint unchanged.

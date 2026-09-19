@@ -5,7 +5,7 @@ holding a plain dictionary::
 
     {
         "format": "equicdft-model",
-        "format_version": 1,
+        "format_version": 2,
         "equicdft_version": "...",
         "torch_version": "...",
         "default_dtype": "float32",
@@ -18,26 +18,39 @@ so it loads under PyTorch's restricted ``weights_only`` unpickler and never
 references package module paths. :func:`load_model` rebuilds the module from
 its configuration through the type registry and then restores the state.
 
+Format history
+--------------
+1
+    Initial configuration-plus-state format.
+2
+    The containing ``GridCACEModel`` owns the density scale ``mean_density``,
+    which version 1 kept on the feature module and repeated on every
+    ``LDAReadout``. :func:`migrate_model_payload` upgrades a version-1 payload
+    in memory and :func:`migrate_model_state_dict` a bare model state (as a
+    training checkpoint holds it), so old files keep loading.
+
 Whole-object ``torch.save(model)`` files predating this format are converted
 by :mod:`equicdft.legacy`.
 """
 
 from contextlib import contextmanager
+import copy
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Union
 
 import torch
 from torch import nn
-from torch.nn.parameter import UninitializedParameter
 
 from ._version import __version__
-from ._config import Configurable, build
+from ._config import TYPE_KEY, Configurable, build
 from ._trainer_io import atomic_torch_save
+from .energy import EnergyReadout
 
 
 MODEL_FORMAT = "equicdft-model"
-MODEL_FORMAT_VERSION = 1
+MODEL_FORMAT_VERSION = 2
 
 _DTYPE_NAMES = {
     "float16": torch.float16,
@@ -120,13 +133,17 @@ def model_payload(model: nn.Module) -> Dict[str, Any]:
                 type(model).__name__
             )
         )
-    if any(
-        isinstance(parameter, UninitializedParameter)
-        for parameter in model.parameters()
-    ):
+    unbound = [
+        type(module).__name__
+        for module in model.modules()
+        if isinstance(module, EnergyReadout) and not module.is_bound
+    ]
+    if unbound:
         raise ValueError(
-            "model has uninitialized lazy parameters; run one forward pass "
-            "(or construct readouts with explicit n_features) before saving"
+            "model has unbound readouts ({}); pass n_features or construct "
+            "them inside GridCACEModel before saving".format(
+                ", ".join(unbound)
+            )
         )
     config = model.to_config()
     try:
@@ -228,22 +245,145 @@ def validate_model_payload(payload: Any, source: Any = "<payload>") -> Dict[str,
 
 
 def read_model_config(path: PathLike) -> Dict[str, Any]:
-    """Return the configuration stored in a model file."""
+    """Return the configuration stored in a model file, in the current format."""
 
-    return read_model_payload(path)["config"]
+    return migrate_model_payload(read_model_payload(path))["config"]
+
+
+_READOUT_SCALE_KEY = re.compile(r"readout\.(\d+)\.mean_density")
+
+
+def _one_density_scale(scales: Dict[str, Any], source: str) -> Any:
+    """Return the first value in ``scales`` or reject disagreeing ones.
+
+    The feature module's scale is listed first by every caller, because the
+    version-1 constructor made each readout scale match it (within
+    ``allclose``) and used it for the feature normalization.
+    """
+
+    values = list(scales.values())
+    reference = values[0]
+    for value in values[1:]:
+        same = torch.allclose(
+            torch.as_tensor(reference, dtype=torch.float64),
+            torch.as_tensor(value, dtype=torch.float64),
+        )
+        if not same:
+            raise ValueError(
+                "cannot migrate {}: it records different density scales {} "
+                "but the model owns one mean_density".format(
+                    source,
+                    ", ".join(
+                        "{}={}".format(name, float(value))
+                        for name, value in scales.items()
+                    ),
+                )
+            )
+    return reference
+
+
+def migrate_model_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    expects_model_scale: bool,
+) -> Dict[str, torch.Tensor]:
+    """Return ``state_dict`` with the density scale where the model keeps it.
+
+    Before model file format 2 the model had no ``mean_density`` buffer: the
+    feature module carried the scale as ``a_features.mean_density`` and every
+    LDA readout repeated it as ``readout.<i>.mean_density``. The readout
+    entries are always removed. When the current model expects a
+    ``mean_density`` buffer and the state has none, the feature module's
+    scale supplies it, whether or not the model has LDA readouts; a state
+    without a feature module falls back to the readouts' common scale. Every
+    scale the state records must agree, so a state whose copies disagree is
+    rejected rather than silently altered. Training checkpoints written
+    before format version 2 go through this before they are loaded strictly.
+    """
+
+    state = dict(state_dict)
+    scales = {}
+    if "a_features.mean_density" in state:
+        scales["a_features.mean_density"] = state["a_features.mean_density"]
+    for key in list(state):
+        if _READOUT_SCALE_KEY.fullmatch(key):
+            scales[key] = state.pop(key)
+    if "mean_density" in state:
+        scales["mean_density"] = state["mean_density"]
+    if not scales:
+        return state
+    scale = _one_density_scale(scales, "the model state")
+    if expects_model_scale and "mean_density" not in state:
+        state["mean_density"] = scale.detach().clone().reshape(())
+    return state
+
+
+def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Give the model the density scale that version 1 kept elsewhere.
+
+    The configuration takes the feature module's scale (the readouts' common
+    scale when there is no feature module) and loses the per-readout copies;
+    the state is migrated by :func:`migrate_model_state_dict`.
+    """
+
+    config = payload["config"]
+    if config.get(TYPE_KEY) != "GridCACEModel":
+        return payload
+    scales = {}
+    a_features = config.get("a_features")
+    if isinstance(a_features, dict) and a_features.get("mean_density") is not None:
+        scales["a_features"] = a_features["mean_density"]
+    for index, item in enumerate(config.get("readout") or ()):
+        if isinstance(item, dict) and item.get(TYPE_KEY) == "LDAReadout":
+            value = item.pop("mean_density", None)
+            if value is not None:
+                scales["readout.{}".format(index)] = value
+    if config.get("mean_density") is None:
+        config["mean_density"] = (
+            _one_density_scale(scales, "this model file") if scales else None
+        )
+    payload["state_dict"] = migrate_model_state_dict(
+        payload["state_dict"],
+        expects_model_scale=config["mean_density"] is not None,
+    )
+    if config["mean_density"] is not None and "mean_density" not in payload["state_dict"]:
+        payload["state_dict"]["mean_density"] = torch.tensor(
+            config["mean_density"],
+            dtype=dtype_from_name(payload["default_dtype"]),
+        )
+    return payload
+
+
+_MIGRATIONS = {1: _migrate_v1_to_v2}
+
+
+def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of ``payload`` upgraded to ``MODEL_FORMAT_VERSION``."""
+
+    payload = validate_model_payload(payload)
+    version = payload["format_version"]
+    if version == MODEL_FORMAT_VERSION:
+        return payload
+    upgraded = dict(payload)
+    upgraded["config"] = copy.deepcopy(payload["config"])
+    upgraded["state_dict"] = dict(payload["state_dict"])
+    while version < MODEL_FORMAT_VERSION:
+        upgraded = _MIGRATIONS[version](upgraded)
+        version += 1
+        upgraded["format_version"] = version
+    return upgraded
 
 
 def build_model(payload: Dict[str, Any]) -> nn.Module:
-    """Construct a model from a validated payload and load its state."""
+    """Construct a model from a validated payload and load its state.
 
-    payload = validate_model_payload(payload)
+    Payloads written by earlier format versions are migrated in memory first.
+    """
+
+    payload = migrate_model_payload(payload)
     with default_dtype(dtype_from_name(payload["default_dtype"])):
         model = build(payload["config"])
     if not isinstance(model, nn.Module):
         raise TypeError("model configuration did not build a torch module")
-    # Some fixed-geometry constructors deliberately use float64. Restore the
-    # saved model's uniform dtype before copying its fitted state into buffers.
-    model.to(dtype=dtype_from_name(payload["default_dtype"]))
     model.load_state_dict(payload["state_dict"], strict=True)
     return model
 

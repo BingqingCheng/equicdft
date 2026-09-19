@@ -4,8 +4,9 @@ from typing import Dict, Optional, Sequence, Union
 
 import torch
 
-from .energy import (
+from .thermodynamics import (
     density_weighted_integral,
+    local_chemical_potential as _local_chemical_potential,
     log_dimensionless_density,
 )
 
@@ -452,15 +453,13 @@ def _euler_residual(
     """
 
     accessible = _accessible_density_mask(rho, accessible_mask)
-    local_chemical_potential = (
-        log_dimensionless_density(rho, thermal_wavelength)
-        + beta * V_ext
-        - c1
-    )
-    local_chemical_potential = torch.where(
-        accessible,
-        local_chemical_potential,
-        torch.zeros_like(local_chemical_potential),
+    local_chemical_potential = _local_chemical_potential(
+        rho,
+        V_ext,
+        beta,
+        c1,
+        thermal_wavelength,
+        mask=accessible,
     )
     if mu is None:
         return _canonical_density_residual(

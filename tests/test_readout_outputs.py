@@ -5,14 +5,14 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel
-from equicdft.energy import EnergyReadout
+from equicdft.energy import EnergyReadout, ReadoutContext
 
 
 class _QuadraticReadout(EnergyReadout):
     n_types = 1
 
     def energy(self, context):
-        return context["rho"].square().sum(dim=(-2, -1))
+        return context.rho.square().sum(dim=(-2, -1))
 
 
 class _ObservedReadout(_QuadraticReadout):
@@ -21,7 +21,7 @@ class _ObservedReadout(_QuadraticReadout):
         self.key = key
 
     def energy_and_outputs(self, context):
-        return self.energy(context), {self.key: context["rho"] * 3.0}
+        return self.energy(context), {self.key: context.rho * 3.0}
 
 
 class TestReadoutOutputs(unittest.TestCase):
@@ -39,8 +39,9 @@ class TestReadoutOutputs(unittest.TestCase):
     def test_scalar_only_readout_retains_default_interface(self):
         readout = _QuadraticReadout()
         data = self._data()
-        energy, extra = readout.energy_and_outputs(data)
-        torch.testing.assert_close(energy, readout.energy(data))
+        context = ReadoutContext.from_data(data, grid_spacing=1.0)
+        energy, extra = readout.energy_and_outputs(context)
+        torch.testing.assert_close(energy, readout.energy(context))
         self.assertEqual(extra, {})
         result = self._model([readout])(data)
         self.assertEqual(set(result), {"beta_F_exc", "c1"})

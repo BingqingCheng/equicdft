@@ -82,7 +82,7 @@ class TestPolarizationMessage(unittest.TestCase):
                     rho = torch.einsum("...gt,ct->...gc", data["rho"], weights) / .7
                     polar = torch.einsum("...gtv,ct->...gvc", data["dipole_density"], weights) / .3
                     fields = torch.cat((rho, polar.flatten(-2)), dim=-1)
-                    raw, scales = a._polarization_fields(data)
+                    raw, scales = a.polarization_fields(data)
                     torch.testing.assert_close(raw/scales, fields, atol=1e-14, rtol=1e-14)
                     flat = B.flatten(-3)
                     gates = message.mlp(flat) - message.mlp(torch.zeros_like(flat))

@@ -8,7 +8,10 @@ alignment are boundary limits, not finite states accepted by this interface.
 import torch
 from torch import nn
 
-from .energy import density_weighted_integral
+from .thermodynamics import (
+    density_weighted_integral,
+    log_dimensionless_density,
+)
 
 
 def _langevin_ratio_series(square):
@@ -157,7 +160,7 @@ class FixedDipoleIdeal(nn.Module):
         )
         ratio = torch.where(square < 1e-6, ratio_series, xi / safe_p)
         log_z = ratio * square - entropy
-        log_rho = torch.log(rho) + 3 * torch.log(wavelength)
+        log_rho = log_dimensionless_density(rho, wavelength)
         return {
             "beta_F_id": density_weighted_integral(
                 rho, log_rho - 1 + entropy, voxel_volume

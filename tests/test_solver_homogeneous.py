@@ -232,9 +232,10 @@ class TestHomogeneousSolver(unittest.TestCase):
                          liquid_coulomb=liquid_coulomb(amplitude=.02),
                          metal_sigma=.4).double()
         model = GridCACEModel(a_features=None, b_features=None,
-            readout=[LDAReadout(mean_density=1., n_types=2, hidden_sizes=(), zero_init=True),
+            readout=[LDAReadout(n_types=2, hidden_sizes=(), zero_init=True),
                      wall],
-            grid_spacing=.5, mean_temperature=1., boltzmann_constant=1., free_energy_mode="beta").double()
+            grid_spacing=.5, mean_temperature=1., boltzmann_constant=1., free_energy_mode="beta",
+            mean_density=1.).double()
         solver = GridSolver(model)
         r = _run(solver.solve, d, particle_numbers=[2., 2.], method="minimize", homogeneous_axes=(0, 1),
                          tolerance_residual=1e-7, max_iter=200)

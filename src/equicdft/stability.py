@@ -20,10 +20,11 @@ from ._fourier import (
     polarization_fourier_curvature,
     wavevector_magnitude as _wavevector_magnitude,
 )
+from .loss import LossTerm
 from .response import FourierResponse
 
 
-class FourierStabilityLoss(nn.Module):
+class FourierStabilityLoss(LossTerm):
     r"""Penalize negative density or fixed-dipole Fourier curvature.
 
     Selected wavevectors can be evaluated as independent cosine/sine probes
@@ -154,8 +155,6 @@ class FourierStabilityLoss(nn.Module):
         the zero wavevector because its perturbations preserve particle number.
     """
 
-    requires_model = True
-
     def __init__(
         self,
         *,
@@ -178,9 +177,8 @@ class FourierStabilityLoss(nn.Module):
         dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
         include_zero_wavevector: Optional[bool] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(name, weight)
 
-        self.name = nonempty_string(name, "name")
         variable = nonempty_string(variable, "variable")
         if variable not in ("rho", "dipole_density"):
             raise ValueError("variable must be 'rho' or 'dipole_density'")
@@ -399,19 +397,26 @@ class FourierStabilityLoss(nn.Module):
             minimum_curvature,
             "minimum_curvature",
         )
-        self.weight = nonnegative_scalar(weight, "weight")
         self.register_buffer("wavevector_indices", selected_indices)
         self.register_buffer("charges", charge_tensor)
         self.register_buffer("dipole_magnitude", dipole_tensor)
 
-    def forward(
+    def evaluate(
         self,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
         model: Optional[nn.Module] = None,
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """Return the mean squared stability hinge over valid directions."""
 
+        return {"loss": self._hinge_loss(outputs, batch, model)}
+
+    def _hinge_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        model: Optional[nn.Module],
+    ) -> torch.Tensor:
         if model is None:
             raise ValueError("FourierStabilityLoss requires the model")
         if "beta_F_exc" not in outputs:

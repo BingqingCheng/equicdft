@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, LongRangeReadout, MetalWall, ReciprocalFeatures
+from metal_helpers import wall_context as ctx
 from test_metalwall_polarization import _case, _liquid, _oracle
 import test_polarization_ideal as ideal_reference
 
@@ -75,7 +76,7 @@ class TestPolarizationConfinement(unittest.TestCase):
         for shape in ((3, 5, 3), (4, 3, 2)):
             data, sites, charges = _case(shape, neutral_species=True)
             liquid = _liquid(charges, alpha=0.)
-            energy, outputs = MetalWall(liquid, sites, metal_sigma=.35).energy_and_outputs(data)
+            energy, outputs = MetalWall(liquid, sites, metal_sigma=.35).energy_and_outputs(ctx(data))
             expected = _oracle(data, sites, charges, alpha=0.)
             torch.testing.assert_close(energy, expected["total_energy"], atol=1e-12, rtol=1e-12)
             torch.testing.assert_close(outputs["metal_site_q"], expected["metal_site_q"], atol=1e-12, rtol=1e-12)
@@ -108,7 +109,7 @@ class TestPolarizationConfinement(unittest.TestCase):
         wall = MetalWall(_liquid(charges, alpha=0., amplitude=.3), sites, .35, external_field=(0., 0., -.03))
         readouts = [wall]
         if gaussian:
-            readouts.append(LDAReadout(mean_density=.4, zero_init=True))
+            readouts.append(LDAReadout(zero_init=True))
             response = LongRangeReadout(
                 features=ReciprocalFeatures(
                     (.1, .8), variable="dipole_density", include_divergence=True,
@@ -119,7 +120,7 @@ class TestPolarizationConfinement(unittest.TestCase):
                 response.mlp[-1].weight.zero_()
                 response.mlp[-1].bias.copy_(torch.tensor([.2, .1, .03, .02]))
             readouts.append(response)
-        model = GridCACEModel(None, None, readouts, grid_spacing=.8).eval()
+        model = GridCACEModel(None, None, readouts, grid_spacing=.8, mean_density=.4).eval()
         solver = GridSolver(model, dipole_magnitude=.7)
         data["V_ext"] = torch.zeros_like(data["rho"])
         data["E_ext"] = torch.zeros_like(data["dipole_density"])

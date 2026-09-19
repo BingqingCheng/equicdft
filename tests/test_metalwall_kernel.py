@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from equicdft._fourier_sites import FourierSites
+from equicdft.energy import ReadoutContext
 from equicdft.metalwall import MetalWall
 from metal_helpers import _run, liquid_coulomb, metal_sites
 from test_metalwall import _dense_kernels, _field, _site_rows
@@ -22,14 +23,12 @@ class TestMetalWallKernel(unittest.TestCase):
     def test_liquid_coulomb_evaluates_potential_at_requested_sites(self):
         data = _field()
         readout = liquid_coulomb(exponent=.2).double()
-        context = dict(
+        context = ReadoutContext(
             rho=data["rho"],
+            normalized_temperature=torch.ones((), dtype=data["rho"].dtype),
+            voxel_volume=data["grid_spacing"].prod(),
             grid_size=data["grid_size"],
             grid_spacing=data["grid_spacing"],
-            state_features=torch.cat((
-                torch.ones(1, dtype=data["rho"].dtype),
-                data["rho"].mean(0),
-            )),
         )
         result = readout.coulomb_at(
             context, data["metal_positions"], target_sigma=.35,
@@ -65,11 +64,6 @@ class TestMetalWallKernel(unittest.TestCase):
                     sites = FourierSites(
                         coordinates[selected] * spacing,
                         shape, spacing, dtype, torch.device("cpu"),
-                    )
-                    rho = torch.zeros((n_grid, 2), dtype=dtype)
-                    state = liquid_coulomb().features._coulomb_evaluation(
-                        rho, torch.tensor(shape), spacing,
-                        torch.tensor([1., -1.], dtype=dtype),
                     )
                     k2 = _wavevector_squared(shape, spacing, dtype)
                     kernel = _full_coulomb_kernel(k2) * torch.exp(-.35**2 * k2)
@@ -129,7 +123,7 @@ class TestMetalWallKernel(unittest.TestCase):
                 "amplitude",
                 wraps=wall.liquid_coulomb.amplitude,
             ) as amplitude:
-                result = _run(wall, data)
+                _run(wall, data)
         self.assertEqual(fft.call_count, 1)
         self.assertEqual(amplitude.call_count, 1)
         torch.testing.assert_close(

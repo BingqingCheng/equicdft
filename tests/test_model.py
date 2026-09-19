@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from equicdft import (
+    BChiMessage,
     BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
@@ -21,24 +22,38 @@ from equicdft.stencil import get_neighbor_indices
 class _DensityFeatures(nn.Module):
     """Expose rho directly for an analytic model-integration test.
 
-    The stand-in satisfies the feature interface the model relies on:
-    ``separate_center`` and ``convolution_backend`` alongside the geometry
-    and normalization attributes.
+    The stand-in satisfies the feature-module contract the model declares
+    (geometry, normalization, polarization flags and the pointwise density
+    transform) without computing any Cartesian moments.
     """
 
     def __init__(self):
         super().__init__()
         self.cutoff_grid = 0
         self.n_types = 1
+        self.n_radial_channels = 1
+        self.n_output_channels = 1
         self.separate_center = False
         self.convolution_backend = "gather"
+        self.include_polarization = False
+        self.requires_dipole_density = False
         self.register_buffer("mean_density", torch.tensor(1.0))
+
+    def transform_density(self, rho):
+        return rho
 
     def forward(self, data):
         return data["rho"].unsqueeze(-2).unsqueeze(-2)
 
 
 class _IdentityModule(nn.Module):
+    """Stand-in symmetrizer returning the single density feature unchanged."""
+
+    n_features = 1
+
+    def validate_a_features(self, a_features):
+        pass
+
     def forward(self, values):
         return values
 
@@ -54,8 +69,8 @@ class _ConstantPerParticleReadout(LocalReadout):
     """Return a trainable constant, making the functional linear in rho."""
 
     def __init__(self):
-        nn.Module.__init__(self)
-        self.n_types = 1
+        # Left unbound so the containing model assigns the feature width.
+        super().__init__(n_types=1, hidden_sizes=())
         self.value = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, local_features):
@@ -76,7 +91,6 @@ class TestGridLDABranch(unittest.TestCase):
     @staticmethod
     def _quadratic_model(compute_c2=False, with_long_range=False):
         lda_readout = LDAReadout(
-            mean_density=1.0,
             n_types=1,
             hidden_sizes=(),
         )
@@ -115,6 +129,7 @@ class TestGridLDABranch(unittest.TestCase):
             compute_c1=True,
             compute_c2=compute_c2,
             free_energy_mode="beta",
+            mean_density=1.0,
         )
 
     def test_lda_energy_and_c1_need_no_neighborhood_data(self):
@@ -153,7 +168,6 @@ class TestGridLDABranch(unittest.TestCase):
 
     def test_multicomponent_lda_uses_complete_local_composition(self):
         readout = LDAReadout(
-            mean_density=1.0,
             n_types=2,
             hidden_sizes=(),
         )
@@ -166,6 +180,7 @@ class TestGridLDABranch(unittest.TestCase):
             readout=[readout],
             grid_spacing=1.0,
             compute_c1=False,
+            mean_density=1.0,
         )
         rho = torch.tensor([[0.2, 0.3], [0.4, 0.1]])
         data = {
@@ -197,10 +212,7 @@ class TestGridLDABranch(unittest.TestCase):
         self.assertIsNotNone(model.readout[1].mlp[-1].bias.grad)
 
     def test_cace_is_an_additive_correction_to_lda(self):
-        lda_readout = LDAReadout(
-            mean_density=1.0,
-            hidden_sizes=(),
-        )
+        lda_readout = LDAReadout(hidden_sizes=())
         with torch.no_grad():
             lda_readout.mlp[-1].weight.copy_(torch.tensor([[1.0, 0.0]]))
             lda_readout.mlp[-1].bias.zero_()
@@ -230,12 +242,91 @@ class TestGridLDABranch(unittest.TestCase):
                 grid_spacing=1.0,
             )
 
+    def test_model_owns_the_one_density_scale(self):
+        features = _DensityFeatures()
+        readouts = [LDAReadout(hidden_sizes=()), _FirstFeatureReadout()]
+        implicit = GridCACEModel(features, _IdentityModule(), readouts, grid_spacing=0.5)
+        self.assertEqual(implicit.mean_density.item(), 1.0)
+        self.assertIn("mean_density", implicit.state_dict())
+        explicit = GridCACEModel(
+            features, _IdentityModule(), readouts, grid_spacing=0.5, mean_density=1.0,
+        )
+        self.assertEqual(explicit.mean_density.item(), 1.0)
+        with self.assertRaisesRegex(ValueError, "mean_density must equal"):
+            GridCACEModel(
+                features, _IdentityModule(), readouts, grid_spacing=0.5, mean_density=2.0,
+            )
+        with self.assertRaisesRegex(ValueError, "mean_density"):
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=-1.0)
+        unscaled = GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5)
+        self.assertIsNone(unscaled.mean_density)
+        self.assertIsNone(unscaled.to_config()["mean_density"])
+        rebuilt = GridCACEModel.from_config(unscaled.to_config())
+        self.assertIsNone(rebuilt.mean_density)
+        scaled = GridCACEModel.from_config(
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=0.5, mean_density=0.7).to_config()
+        )
+        self.assertAlmostEqual(scaled.mean_density.item(), 0.7)
+
+    def test_local_readouts_are_bound_to_the_feature_width_at_construction(self):
+        a_features = CartesianAFeatures(
+            mean_density=0.5, cutoff_grid=1, max_power=2, radial_basis="gaussian",
+            radial_exponents=(0.2, 0.5), n_types=2, separate_center=True,
+        ).double()
+        b_features = CartesianBFeatures(max_power=2, max_product_order=2).double()
+        local = LocalReadout(n_types=2, hidden_sizes=(3,))
+        gga = GGAReadout(hidden_sizes=(2,), n_types=2)
+        expected_width = 2 + 2 * b_features.n_features * 2 + 1
+
+        model = GridCACEModel(a_features, b_features, [local, gga], grid_spacing=0.5)
+
+        self.assertEqual(model.n_local_features, expected_width)
+        for readout in (local, gga):
+            self.assertTrue(readout.is_bound)
+            self.assertEqual(readout.n_features, expected_width)
+            # Freshly built layers follow the feature module's dtype.
+            self.assertEqual(readout.mlp[0].weight.dtype, torch.float64)
+        self.assertEqual(model.to_config()["readout"][0]["n_features"], expected_width)
+        # A readout bound elsewhere must agree with the feature layout.
+        with self.assertRaisesRegex(ValueError, "bound to 5 input features"):
+            GridCACEModel(
+                a_features, b_features, [LocalReadout(n_types=2, n_features=5)], grid_spacing=0.5,
+            )
+        # Readouts bound beforehand keep their own dtype.
+        prebound = LocalReadout(n_types=2, hidden_sizes=(3,), n_features=expected_width)
+        GridCACEModel(a_features, b_features, [prebound], grid_spacing=0.5)
+        self.assertEqual(prebound.mlp[0].weight.dtype, torch.float32)
+        self.assertEqual(
+            GridCACEModel(None, None, [LDAReadout()], grid_spacing=1.0).n_local_features, 0,
+        )
+
+    def test_feature_modules_must_satisfy_the_declared_contract(self):
+        class _Incomplete(nn.Module):
+            n_types = 1
+            cutoff_grid = 0
+
+            def forward(self, data):
+                return data["rho"].unsqueeze(-2).unsqueeze(-2)
+
+        with self.assertRaisesRegex(TypeError, "a_features.*mean_density.*transform_density"):
+            GridCACEModel(_Incomplete(), _IdentityModule(), [_FirstFeatureReadout()], grid_spacing=1.0)
+        with self.assertRaisesRegex(TypeError, "b_features.*validate_a_features"):
+            GridCACEModel(_DensityFeatures(), nn.Identity(), [_FirstFeatureReadout()], grid_spacing=1.0)
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            GridCACEModel(_DensityFeatures(), None, [_FirstFeatureReadout()], grid_spacing=1.0)
+        # Message layers rely on the stencil geometry of the feature module.
+        message = BChiMessage(n_invariant_features=1, n_radial_channels=1, n_channels=1)
+        with self.assertRaisesRegex(TypeError, "stencil_basis.*local_density_positions"):
+            GridCACEModel(
+                _DensityFeatures(), _IdentityModule(), [_FirstFeatureReadout()],
+                grid_spacing=1.0, message_layers=[message],
+            )
+
 
 class TestGridLDAGGABranch(unittest.TestCase):
     @staticmethod
     def _model(with_long_range=False):
         lda_readout = LDAReadout(
-            mean_density=1.0,
             n_types=1,
             hidden_sizes=(),
             zero_init=True,
@@ -336,16 +427,12 @@ class TestGridLDAGGABranch(unittest.TestCase):
             GridCACEModel(
                 a_features=None,
                 b_features=None,
-                readout=[LDAReadout(mean_density=1.0), gga_readout],
+                readout=[LDAReadout(), gga_readout],
                 grid_spacing=1.0,
             )
 
     def test_lda_cace_and_gga_are_all_additive_before_autodiff(self):
-        lda_readout = LDAReadout(
-            mean_density=1.0,
-            hidden_sizes=(),
-            zero_init=True,
-        )
+        lda_readout = LDAReadout(hidden_sizes=(), zero_init=True)
         model = GridCACEModel(
             a_features=_DensityFeatures(),
             b_features=_IdentityModule(),

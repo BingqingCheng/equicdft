@@ -160,7 +160,7 @@ class TestDensityNoise(unittest.TestCase):
             resumed.load_checkpoint(legacy, train)
             self.assertFalse(resumed.density_noise)
 
-    def test_real_functional_gradients_and_lazy_initialization_are_safe(self):
+    def test_real_functional_gradients_and_clean_validation_forwards(self):
         atoms = TestDensityUncertaintyData.frame(n_types=2)
         atoms.arrays['V_ext'] = .2 * np.sin(atoms.arrays['density'])
         fields = TestDensityUncertaintyData().read(atoms)
@@ -170,7 +170,7 @@ class TestDensityNoise(unittest.TestCase):
                 radial_basis='gaussian', radial_exponents=(.2,),
                 convolution_backend='fft'),
             b_features=CartesianBFeatures(max_power=1, max_product_order=1),
-            readout=[LDAReadout(mean_density=1., n_types=2, hidden_sizes=(4,)),
+            readout=[LDAReadout(n_types=2, hidden_sizes=(4,)),
                      LocalReadout(n_types=2, hidden_sizes=(4,))],
             grid_spacing=.5, mean_temperature=1., boltzmann_constant=1.,
             thermal_wavelength=1., free_energy_mode='beta', compute_local_mu=True,
@@ -189,7 +189,7 @@ class TestDensityNoise(unittest.TestCase):
         with patch('torch.randn_like', return_value=draws):
             t.fit(DataLoader(fields), DataLoader(fields), epochs=1, verbose=False)
         hook.remove()
-        self.assertGreater(len(seen), 2)  # lazy initialization, train, validation
+        self.assertEqual(len(seen), 2)  # one training and one validation forward
         for is_training, rho in seen:
             if not is_training:
                 torch.testing.assert_close(rho[0], clean)

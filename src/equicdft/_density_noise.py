@@ -2,7 +2,7 @@
 
 import torch
 
-from .energy import log_dimensionless_density
+from .thermodynamics import local_chemical_potential
 from .polarization_ideal import FixedDipoleIdeal, _positive_components
 
 
@@ -47,10 +47,14 @@ def add_density_noise(batch, floor):
         raise ValueError("density noise produced nonfinite rho")
     result = dict(batch, rho=noisy)
     if "c1_plus_beta_mu" in batch or "c1" in batch:
-        target = (log_dimensionless_density(noisy, batch["thermal_wavelength"])
-                  + batch["beta"][..., None, None] * batch["V_ext"])
-        if excluded is not None:
-            target = target.masked_fill(excluded, 0.0)
+        target = local_chemical_potential(
+            noisy,
+            batch["V_ext"],
+            batch["beta"],
+            None,
+            batch["thermal_wavelength"],
+            mask=torch.ones_like(noisy, dtype=torch.bool) if excluded is None else ~excluded,
+        )
         if "c1_plus_beta_mu" in batch:
             result["c1_plus_beta_mu"] = target
         if "c1" in batch:

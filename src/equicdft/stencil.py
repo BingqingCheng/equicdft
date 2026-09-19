@@ -1,11 +1,122 @@
-"""Geometry helpers for periodic neighborhoods on regular density grids."""
+"""Geometry helpers for periodic neighborhoods on regular density grids.
+
+This module is the single NumPy-side authority on what a valid regular grid
+is: :func:`grid_size_array` and :func:`grid_spacing_array` coerce serialized
+metadata, and :func:`canonical_grid_order` validates a complete zero-based
+integer grid and returns its canonical C ordering. The torch-side helpers in
+``equicdft._grid`` validate live tensors during model evaluation.
+"""
 
 from itertools import product
-from typing import Sequence, Tuple, Union
+from typing import NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from ._argument_checks import nonnegative_integer
+
+
+def grid_size_array(value: object, name: str = "grid_size") -> np.ndarray:
+    """Coerce serialized metadata to three positive integer grid dimensions."""
+
+    try:
+        raw = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError("{} must contain three values".format(name)) from None
+    if raw.size != 3:
+        raise ValueError("{} must contain three values".format(name))
+    grid_size = np.rint(raw).astype(np.int64)
+    if not np.allclose(raw, grid_size) or np.any(grid_size <= 0):
+        raise ValueError("{} values must be positive integers".format(name))
+    return grid_size
+
+
+def grid_spacing_array(
+    value: object,
+    name: str = "grid_spacing",
+) -> np.ndarray:
+    """Coerce serialized metadata to one finite positive spacing per axis."""
+
+    try:
+        spacing = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "{} must contain one or three finite positive values".format(name)
+        ) from None
+    if spacing.size == 1:
+        spacing = np.repeat(spacing, 3)
+    if (
+        spacing.size != 3
+        or not np.all(np.isfinite(spacing))
+        or np.any(spacing <= 0.0)
+    ):
+        raise ValueError(
+            "{} must contain one or three finite positive values".format(name)
+        )
+    return spacing
+
+
+class GridOrder(NamedTuple):
+    """Canonical C ordering of one complete regular grid.
+
+    ``positions`` are the validated integer coordinates in the caller's row
+    order, ``grid_size`` the three grid dimensions, ``flat_index`` the C-order
+    flat index of every row, and ``order`` the permutation that sorts the rows
+    into canonical C order (``positions[order]`` enumerates the grid with the
+    last axis varying fastest).
+    """
+
+    positions: np.ndarray
+    grid_size: np.ndarray
+    flat_index: np.ndarray
+    order: np.ndarray
+
+
+def canonical_grid_order(
+    grid_positions: object,
+    grid_size: Optional[object] = None,
+) -> GridOrder:
+    """Validate one complete zero-based regular grid and return its ordering.
+
+    ``grid_positions`` must be integer-valued (within ``1e-8``), zero-based
+    along every axis, and must enumerate every point of the grid exactly
+    once. ``grid_size`` is inferred from the largest coordinates when it is
+    omitted; when supplied it must agree with them.
+    """
+
+    positions = np.asarray(grid_positions)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("grid_positions must have shape [n_grid, 3]")
+    rounded = np.rint(positions).astype(np.int64)
+    if not np.allclose(positions, rounded, atol=1.0e-8, rtol=0.0):
+        raise ValueError("grid_positions must be integer-valued")
+    if positions.shape[0] == 0 or np.any(rounded.min(axis=0) != 0):
+        raise ValueError("grid_positions must use zero-based indexing")
+
+    inferred_size = rounded.max(axis=0) + 1
+    if grid_size is None:
+        size = inferred_size
+    else:
+        size = grid_size_array(grid_size)
+        if np.any(inferred_size != size):
+            raise ValueError("grid_positions are inconsistent with grid_size")
+    n_grid = int(np.prod(size))
+    if rounded.shape[0] != n_grid:
+        raise ValueError(
+            "grid_positions do not contain one complete regular grid"
+        )
+
+    flat_index = np.ravel_multi_index(rounded.T, tuple(size), order="C")
+    if np.unique(flat_index).size != n_grid:
+        raise ValueError("grid_positions contain duplicate grid points")
+    order = np.argsort(flat_index)
+    if not np.array_equal(flat_index[order], np.arange(n_grid)):
+        raise ValueError("grid_positions do not cover the complete grid")
+    return GridOrder(
+        positions=rounded,
+        grid_size=size,
+        flat_index=flat_index,
+        order=order,
+    )
 
 
 def make_stencil(cutoff_grid: int = 3) -> np.ndarray:
@@ -93,8 +204,6 @@ def coarsen_grid(
 
     values = np.asarray(values)
     grid_positions = np.asarray(grid_positions)
-    source_spacing = np.asarray(grid_spacing, dtype=float).reshape(-1)
-    target_spacing = np.asarray(target_grid_spacing, dtype=float).reshape(-1)
 
     scalar_field = values.ndim == 1
     if scalar_field:
@@ -104,34 +213,14 @@ def coarsen_grid(
     if grid_positions.shape != (values.shape[0], 3):
         raise ValueError("grid_positions must have shape [n_grid, 3]")
 
-    if source_spacing.size == 1:
-        source_spacing = np.repeat(source_spacing, 3)
-    if target_spacing.size == 1:
-        target_spacing = np.repeat(target_spacing, 3)
-    if source_spacing.size != 3 or np.any(source_spacing <= 0.0):
-        raise ValueError("grid_spacing must contain three positive values")
-    if target_spacing.size != 3 or np.any(target_spacing <= 0.0):
-        raise ValueError("target_grid_spacing must contain three positive values")
-
-    rounded_positions = np.rint(grid_positions).astype(np.int64)
-    if not np.allclose(grid_positions, rounded_positions, atol=1.0e-8, rtol=0.0):
-        raise ValueError("grid_positions must be integer-valued")
-    if np.any(rounded_positions.min(axis=0) != 0):
-        raise ValueError("grid_positions must use zero-based indexing")
-
-    source_shape = rounded_positions.max(axis=0) + 1
-    n_grid = int(np.prod(source_shape))
-    if values.shape[0] != n_grid:
-        raise ValueError("grid_positions do not contain one complete regular grid")
-
-    flat_positions = np.ravel_multi_index(
-        rounded_positions.T, tuple(source_shape), order="C"
+    source_spacing = grid_spacing_array(grid_spacing)
+    target_spacing = grid_spacing_array(
+        target_grid_spacing,
+        "target_grid_spacing",
     )
-    if np.unique(flat_positions).size != n_grid:
-        raise ValueError("grid_positions contain duplicate grid points")
-    order = np.argsort(flat_positions)
-    if not np.array_equal(flat_positions[order], np.arange(n_grid)):
-        raise ValueError("grid_positions do not cover the complete grid")
+    ordering = canonical_grid_order(grid_positions)
+    source_shape = ordering.grid_size
+    order = ordering.order
 
     factor_float = target_spacing / source_spacing
     factors = np.rint(factor_float).astype(np.int64)
@@ -193,37 +282,20 @@ def get_neighbor_indices(
         Shared relative integer displacements with shape ``[n_neighbors, 3]``.
     """
 
-    grid_positions = np.asarray(grid_positions)
-    if grid_positions.ndim != 2 or grid_positions.shape[1] != 3:
-        raise ValueError("grid_positions must have shape [n_grid, 3]")
-
     local_density_positions = make_stencil(cutoff_grid)
 
     # Grid coordinates must be exact integer lattice points. Keeping them as
     # integer offsets avoids floating-point ambiguity in periodic wrapping.
-    rounded_positions = np.rint(grid_positions).astype(np.int64)
-    if not np.allclose(grid_positions, rounded_positions, atol=1.0e-8, rtol=0.0):
-        raise ValueError("grid_positions must be integer-valued")
-    if np.any(rounded_positions.min(axis=0) != 0):
-        raise ValueError("grid_positions must use zero-based indexing")
-
-    grid_size = rounded_positions.max(axis=0) + 1
+    # The helper remains correct even if its caller supplies shuffled rows.
+    ordering = canonical_grid_order(grid_positions)
+    rounded_positions = ordering.positions
+    grid_size = ordering.grid_size
     n_grid = int(np.prod(grid_size))
-    if rounded_positions.shape[0] != n_grid:
-        raise ValueError("grid_positions do not contain one complete regular grid")
-
-    # Map the input row order onto canonical C-order flat indices. The helper
-    # remains correct even if its caller supplies shuffled grid rows.
-    flat_positions = np.ravel_multi_index(
-        rounded_positions.T, tuple(grid_size), order="C"
-    )
-    if np.unique(flat_positions).size != n_grid:
-        raise ValueError("grid_positions contain duplicate grid points")
 
     # Invert the canonical-index mapping: given a wrapped grid coordinate,
     # recover the row in the caller's density array that stores its value.
     row_from_flat_position = np.empty(n_grid, dtype=np.int64)
-    row_from_flat_position[flat_positions] = np.arange(n_grid)
+    row_from_flat_position[ordering.flat_index] = np.arange(n_grid)
 
     # Add every shared relative offset to every center. `remainder` implements
     # periodic boundary conditions, e.g. [0,0,0] + [0,0,-1] -> [0,0,Nz-1].

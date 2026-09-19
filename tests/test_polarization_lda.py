@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout
+from equicdft.energy import ReadoutContext
 from equicdft.stencil import get_neighbor_indices
 import numpy as np
 
@@ -21,7 +22,8 @@ class TestPolarizationLDA(unittest.TestCase):
 
     @staticmethod
     def readout(n_types=1, **kwargs):
-        return LDAReadout(mean_density=.5, dipole_density_scale=.3,
+        return LDAReadout(
+                          dipole_density_scale=.3,
                           n_types=n_types, hidden_sizes=kwargs.pop("hidden_sizes", (5,)), **kwargs)
 
     @staticmethod
@@ -35,7 +37,7 @@ class TestPolarizationLDA(unittest.TestCase):
     def model(readouts, spacing=.5, mode="beta"):
         return GridCACEModel(None, None, readouts, grid_spacing=spacing,
                              mean_temperature=1.5, free_energy_mode=mode,
-                             compute_polarization_derivative=True)
+                             compute_polarization_derivative=True, mean_density=.5)
 
     @staticmethod
     def clone(data):
@@ -44,14 +46,17 @@ class TestPolarizationLDA(unittest.TestCase):
     def test_exact_multi_species_input_order_and_energy(self):
         readout = self.readout(3, hidden_sizes=())
         data = self.data(3, batched=True)
-        context = dict(data, normalized_temperature=data["temperature"] / 1.5, voxel_volume=.125)
+        context = ReadoutContext(
+            rho=data["rho"], normalized_temperature=data["temperature"] / 1.5,
+            voxel_volume=.125, mean_density=.5, dipole_density=data["dipole_density"],
+        )
         with torch.no_grad():
             readout.mlp[0].weight.copy_(torch.tensor([[1., 2., 3., 4., 5., 6., 7.]]))
             readout.mlp[0].bias.fill_(.2)
         rho, p = data["rho"], data["dipole_density"]
         expected_a = ((rho / .5) * torch.tensor([1., 2., 3.])).sum(-1)
         expected_a += ((p / .3).square().sum(-1) * torch.tensor([4., 5., 6.])).sum(-1)
-        expected_a += 7 * context["normalized_temperature"][:, None] + .2
+        expected_a += 7 * context.normalized_temperature[:, None] + .2
         expected = .125 * (rho.sum(-1) * expected_a).sum(-1)
         torch.testing.assert_close(readout.energy(context), expected, atol=1e-12, rtol=1e-12)
 
@@ -189,12 +194,12 @@ class TestPolarizationLDA(unittest.TestCase):
             torch.testing.assert_close(with_lda[key], ideal[key], atol=1e-12, rtol=1e-12)
 
     def test_serialization_and_density_only_state_layout(self):
-        scalar = LDAReadout(mean_density=.5, hidden_sizes=(5,))
+        scalar = LDAReadout(hidden_sizes=(5,))
         self.assertFalse(scalar.requires_dipole_density)
         self.assertEqual(scalar.n_state_features, 2)
         self.assertNotIn("dipole_density_scale", scalar.state_dict())
         for readout in (scalar, self.readout()):
-            model = GridCACEModel(None, None, [readout], grid_spacing=.5,
+            model = GridCACEModel(None, None, [readout], grid_spacing=.5, mean_density=.5,
                                   compute_polarization_derivative=readout.requires_dipole_density).eval()
             data = self.data()
             output = model(data)
@@ -208,7 +213,7 @@ class TestPolarizationLDA(unittest.TestCase):
     def test_rejects_invalid_scale_shapes_and_nonfinite_p(self):
         for scale in (0., -1., float("nan"), float("inf"), [.1, .2]):
             with self.assertRaisesRegex(ValueError, "dipole_density_scale"):
-                LDAReadout(.5, dipole_density_scale=scale)
+                LDAReadout(dipole_density_scale=scale)
         model = self.model([self.readout()])
         data = self.data()
         del data["dipole_density"]

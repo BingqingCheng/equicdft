@@ -29,9 +29,73 @@ from ._grid import (
     voxel_volume as compute_voxel_volume,
 )
 from .derivatives import compute_grid_derivative
-from .energy import EnergyReadout, log_dimensionless_density
+from .energy import EnergyReadout, ReadoutContext
 from .interaction import BChiMessage
 from ._metal_data import METAL_DATA_KEYS
+from ._nn import positive_scalar_tensor
+from .thermodynamics import local_chemical_potential
+
+
+# The model relies on these members of its feature modules. Declaring the
+# contract here lets custom modules fail at construction with a clear message
+# instead of being silently treated as density-only or center-free features.
+# ``a_features(data)`` must return ``[..., n_grid, n_radial_channels,
+# n_monomials, n_output_channels]`` and ``b_features(A)`` must return
+# ``[..., n_grid, n_radial_channels, n_features, n_output_channels]``; the
+# model flattens the last three axes into the local feature vector.
+_A_FEATURE_CONTRACT = (
+    "n_types",
+    "cutoff_grid",
+    "mean_density",
+    "n_radial_channels",
+    "n_output_channels",
+    "separate_center",
+    "convolution_backend",
+    "include_polarization",
+    "requires_dipole_density",
+    "transform_density",
+)
+# Message layers additionally share the feature module's stencil geometry.
+_A_FEATURE_MESSAGE_CONTRACT = (
+    "stencil_basis",
+    "local_density_positions",
+    "polarization_fields",
+    "bessel_stencil_basis",
+    "max_power",
+    "powers",
+    "coordinate_scaling",
+)
+_B_FEATURE_CONTRACT = ("n_features", "validate_a_features")
+
+
+def _validate_feature_modules(
+    a_features: Optional[nn.Module],
+    b_features: Optional[nn.Module],
+    with_messages: bool = False,
+) -> None:
+    """Check that the feature pair satisfies the model's module contract."""
+
+    if (a_features is None) != (b_features is None):
+        raise ValueError(
+            "a_features and b_features must be supplied together"
+        )
+    if a_features is None:
+        return
+    a_contract = _A_FEATURE_CONTRACT
+    if with_messages:
+        a_contract = a_contract + _A_FEATURE_MESSAGE_CONTRACT
+    for module, contract, label in (
+        (a_features, a_contract, "a_features"),
+        (b_features, _B_FEATURE_CONTRACT, "b_features"),
+    ):
+        missing = [name for name in contract if not hasattr(module, name)]
+        if missing:
+            raise TypeError(
+                "{} ({}) does not provide {}".format(
+                    label, type(module).__name__, ", ".join(missing),
+                )
+            )
+    b_features.validate_a_features(a_features)
 
 
 @register
@@ -63,6 +127,12 @@ class GridCACEModel(nn.Module, Configurable):
     ``delta(beta_F_exc)/delta(dipole_density)``, not an external electric
     field or a complete orientational chemical potential. Polarization
     descriptors require cubic voxels; the box dimensions may differ.
+
+    ``mean_density`` is the one density scale shared by every normalized
+    density input (feature moments, LDA inputs, bulk and long-range state
+    vectors). It defaults to the scale of ``a_features`` and must agree with
+    it when both are given; a model without local features that contains
+    density-normalizing readouts must receive it explicitly.
     """
 
     def __init__(
@@ -85,6 +155,7 @@ class GridCACEModel(nn.Module, Configurable):
         free_energy_mode: str = "beta",
         message_layers: Optional[Sequence[BChiMessage]] = None,
         compute_polarization_derivative: bool = False,
+        mean_density: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
@@ -102,12 +173,6 @@ class GridCACEModel(nn.Module, Configurable):
                 "free_energy_mode must be 'beta' or 'physical'"
             )
 
-        if (a_features is None) != (b_features is None):
-            raise ValueError(
-                "a_features and b_features must be supplied together"
-            )
-        if hasattr(b_features, "validate_a_features"):
-            b_features.validate_a_features(a_features)
         if message_layers is None:
             messages = []
         elif isinstance(message_layers, BChiMessage):
@@ -122,8 +187,11 @@ class GridCACEModel(nn.Module, Configurable):
             raise ValueError(
                 "a_features and b_features are required by message_layers"
             )
+        _validate_feature_modules(
+            a_features, b_features, with_messages=bool(messages),
+        )
         for module in messages:
-            if module.include_polarization != getattr(a_features, "include_polarization", False):
+            if module.include_polarization != a_features.include_polarization:
                 raise ValueError("message layers and A/B include_polarization must match")
             expected = (
                 a_features.n_radial_channels,
@@ -140,7 +208,7 @@ class GridCACEModel(nn.Module, Configurable):
                     "message layer dimensions {} do not match local feature "
                     "dimensions {}".format(actual, expected)
                 )
-            module._bind_bessel_basis(a_features)
+            module.bind_geometry(a_features)
         if isinstance(readout, EnergyReadout):
             raise TypeError(
                 "readout must be a sequence of EnergyReadout modules"
@@ -155,13 +223,28 @@ class GridCACEModel(nn.Module, Configurable):
             raise ValueError("readout must contain at least one energy readout")
         if not all(isinstance(module, EnergyReadout) for module in readouts):
             raise TypeError("every readout must be an EnergyReadout module")
-        polar_readouts = [
-            item for item in readouts
-            if getattr(item, "requires_dipole_density", False)
-        ]
+        if len({id(item) for item in readouts}) != len(readouts):
+            raise ValueError(
+                "readout lists the same module twice; its energy would be "
+                "counted twice"
+            )
+        wrapped = {
+            id(inner): (item, inner)
+            for item in readouts
+            for inner in item.wrapped_readouts()
+        }
+        for item in readouts:
+            if id(item) in wrapped:
+                wrapper, _ = wrapped[id(item)]
+                raise ValueError(
+                    "{} already evaluates its wrapped {}; listing both counts "
+                    "that energy twice".format(
+                        type(wrapper).__name__, type(item).__name__,
+                    )
+                )
         has_polarization = (
-            getattr(a_features, "requires_dipole_density", False) or bool(polar_readouts)
-        )
+            a_features is not None and a_features.requires_dipole_density
+        ) or any(item.requires_dipole_density for item in readouts)
         if compute_polarization_derivative and not has_polarization:
             raise ValueError(
                 "compute_polarization_derivative requires a dipole-density readout "
@@ -192,26 +275,46 @@ class GridCACEModel(nn.Module, Configurable):
             n_types = a_features.n_types
         else:
             typed_readouts = [
-                item for item in readouts if hasattr(item, "n_types")
+                item for item in readouts if item.n_types is not None
             ]
             if not typed_readouts:
                 raise ValueError("n_types cannot be inferred from the readouts")
             n_types = typed_readouts[0].n_types
         for item in readouts:
-            if hasattr(item, "n_types") and item.n_types != n_types:
+            if item.n_types is not None and item.n_types != n_types:
                 raise ValueError("all readouts must use the same n_types")
-            if (
-                a_features is not None
-                and hasattr(item, "mean_density")
-                and not torch.allclose(
-                    a_features.mean_density,
-                    item.mean_density.to(a_features.mean_density),
-                )
-            ):
-                raise ValueError(
-                    "readouts and local features must use the same mean_density"
-                )
         rho_min = nonnegative_scalar(rho_min, "rho_min")
+
+        density_scale = None
+        if mean_density is not None:
+            density_scale = positive_scalar_tensor(mean_density, "mean_density")
+        if a_features is not None:
+            feature_scale = a_features.mean_density.detach().reshape(()).to(
+                dtype=torch.get_default_dtype(), device="cpu",
+            )
+            if density_scale is None:
+                density_scale = feature_scale.clone()
+            elif not torch.allclose(density_scale, feature_scale):
+                raise ValueError(
+                    "mean_density must equal a_features.mean_density; the "
+                    "model owns one density scale for every normalized input"
+                )
+
+        if a_features is not None:
+            # Every readout that consumes the local feature vector is given
+            # its input width now, so all parameters exist with their final
+            # shapes before optimizers, checkpoints or model files see them.
+            n_local_features = self._local_feature_width(
+                a_features, b_features, len(messages),
+            )
+            reference = a_features.mean_density
+            for item in readouts:
+                if not item.requires_local_features:
+                    continue
+                freshly_built = not item.is_bound
+                item.bind_input_size(n_local_features)
+                if freshly_built:
+                    item.to(dtype=reference.dtype, device=reference.device)
 
         self.a_features = a_features
         self.b_features = b_features
@@ -279,6 +382,7 @@ class GridCACEModel(nn.Module, Configurable):
             )
 
         self.register_buffer("grid_spacing", spacing)
+        self.register_buffer("mean_density", density_scale)
         self.register_buffer("mean_temperature", mean_temperature_tensor)
         self.register_buffer(
             "boltzmann_constant",
@@ -317,6 +421,10 @@ class GridCACEModel(nn.Module, Configurable):
             message_layers=[
                 optional_config(item) for item in self.message_layers
             ],
+            mean_density=(
+                None if self.mean_density is None
+                else scalar_value(self.mean_density)
+            ),
         )
 
     @classmethod
@@ -338,6 +446,43 @@ class GridCACEModel(nn.Module, Configurable):
         arguments["message_layers"] = [build(item) for item in messages]
         return cls(**arguments)
 
+    @staticmethod
+    def _local_feature_width(
+        a_features: nn.Module,
+        b_features: nn.Module,
+        n_messages: int,
+    ) -> int:
+        """Return the width of the local feature vector the readouts receive.
+
+        The vector is ``[center_density?, B_0, ..., B_n_messages, T/T_ref]``:
+        the normalized central channels when the feature module separates
+        the center from its neighbor moments (polarized features keep their
+        center slots inside the invariants instead), one flattened invariant
+        block per message level, and the temperature feature.
+        """
+
+        invariant_width = (
+            a_features.n_radial_channels
+            * b_features.n_features
+            * a_features.n_output_channels
+        )
+        center_width = (
+            a_features.n_output_channels
+            if a_features.separate_center and not a_features.include_polarization
+            else 0
+        )
+        return center_width + (1 + n_messages) * invariant_width + 1
+
+    @property
+    def n_local_features(self) -> int:
+        """Width of the local feature vector, or zero without local features."""
+
+        if not self.has_local_features:
+            return 0
+        return self._local_feature_width(
+            self.a_features, self.b_features, len(self.message_layers),
+        )
+
     @property
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
@@ -356,20 +501,9 @@ class GridCACEModel(nn.Module, Configurable):
         if self.has_local_features:
             return self.a_features.n_types
         for item in self.readout:
-            if hasattr(item, "n_types"):
+            if item.n_types is not None:
                 return item.n_types
         raise RuntimeError("n_types is unavailable")
-
-    @property
-    def mean_density(self) -> torch.Tensor:
-        """Density scale fitted from the development data."""
-
-        if self.has_local_features:
-            return self.a_features.mean_density
-        for item in self.readout:
-            if hasattr(item, "mean_density"):
-                return item.mean_density
-        raise RuntimeError("mean_density is unavailable")
 
     @property
     def has_local_features(self) -> bool:
@@ -396,10 +530,9 @@ class GridCACEModel(nn.Module, Configurable):
     def requires_dipole_density(self) -> bool:
         """Whether configured features or readouts depend on polarization."""
 
-        return getattr(self.a_features, "requires_dipole_density", False) or any(
-            getattr(item, "requires_dipole_density", False)
-            for item in self.readout
-        )
+        return (
+            self.has_local_features and self.a_features.requires_dipole_density
+        ) or any(item.requires_dipole_density for item in self.readout)
 
     @property
     def voxel_volume(self) -> torch.Tensor:
@@ -443,18 +576,12 @@ class GridCACEModel(nn.Module, Configurable):
         """
 
         rho = data["rho"].detach()
-        beta = data["beta"].detach().to(rho)
-        wavelength = self.thermal_wavelength.to(rho)
-        positive_density = rho > 0.0
-        local_chemical_potential = (
-            log_dimensionless_density(rho, wavelength)
-            + beta[..., None, None] * data["V_ext"].detach()
-            - c1
-        )
-        return torch.where(
-            positive_density,
-            local_chemical_potential,
-            torch.zeros_like(local_chemical_potential),
+        return local_chemical_potential(
+            rho,
+            data["V_ext"].detach(),
+            data["beta"].detach().to(rho),
+            c1,
+            self.thermal_wavelength.to(rho),
         )
 
     def _weight_mask(self, rho: torch.Tensor) -> torch.Tensor:
@@ -515,24 +642,24 @@ class GridCACEModel(nn.Module, Configurable):
     ) -> torch.Tensor:
         """Return flattened and concatenated ``[B0, B1, ...]`` features."""
 
+        # B has the contract layout [..., n_grid, n_radial, n_B, n_channels];
+        # the three feature axes are flattened into one vector per point.
+        grid_rank = data["rho"].ndim - 1
         A = self.a_features(data)
         B = self.b_features(A)
-        # Custom symmetrizers may use the standard three-axis feature layout
-        # without declaring an override (this is not checkpoint migration).
-        feature_axes = getattr(self.b_features, "n_feature_axes", 3)
-        levels = [B.flatten(start_dim=-feature_axes)]
+        levels = [B.flatten(start_dim=grid_rank)]
 
         if len(self.message_layers) > 0:
             shared_basis = self.a_features.stencil_basis()
             message_fields = {}
-            if getattr(self.a_features, "include_polarization", False):
-                fields, scales = self.a_features._polarization_fields(data)
+            if self.a_features.include_polarization:
+                fields, scales = self.a_features.polarization_fields(data)
                 message_fields = {
                     "normalized_fields": fields / scales,
                     "separate_center": self.a_features.separate_center,
                 }
             for message in self.message_layers:
-                stencil_basis = message._stencil_basis(
+                stencil_basis = message.stencil_basis(
                     self.a_features,
                     shared_basis,
                 )
@@ -546,7 +673,7 @@ class GridCACEModel(nn.Module, Configurable):
                     **message_fields,
                 )
                 B = self.b_features(A)
-                levels.append(B.flatten(start_dim=-feature_axes))
+                levels.append(B.flatten(start_dim=grid_rank))
         return torch.cat(levels, dim=-1)
 
     def forward(
@@ -612,90 +739,32 @@ class GridCACEModel(nn.Module, Configurable):
             for field in response_fields:
                 field.requires_grad_(True)
 
-            rho = data["rho"]
-            temperature = data["temperature"].to(
-                device=rho.device,
-                dtype=rho.dtype,
+            context = ReadoutContext.from_data(
+                data,
+                grid_spacing=self.grid_spacing,
+                mean_temperature=self.mean_temperature,
+                boltzmann_constant=self.boltzmann_constant,
+                mean_density=(
+                    None if self.mean_density is None
+                    else self.mean_density.to(data["rho"])
+                ),
+                free_energy_mode=self.free_energy_mode,
             )
-            if temperature.shape != rho.shape[:-2]:
-                raise ValueError(
-                    "temperature must be scalar for one field or have the "
-                    "same leading batch shape as rho"
-                )
-            normalized_temperature = temperature / self.mean_temperature.to(
-                device=rho.device,
-                dtype=rho.dtype,
-            )
-
-            local_features = None
-            if any(
-                item.requires_local_features for item in self.readout
-            ):
-                B_flat = self._local_invariant_features(data)
-                temperature_feature = normalized_temperature[
-                    ..., None, None
-                ].expand(*B_flat.shape[:-1], 1)
-                feature_blocks = []
-                if (self.a_features.separate_center
-                        and not getattr(self.a_features, "include_polarization", False)):
-                    feature_blocks.append(
+            rho = context.rho
+            normalized_temperature = context.normalized_temperature
+            volume_element = context.voxel_volume
+            if any(item.requires_local_features for item in self.readout):
+                context.invariants = self._local_invariant_features(data)
+                if (
+                    self.a_features.separate_center
+                    and not self.a_features.include_polarization
+                ):
+                    # Polarized features already carry their center slots
+                    # inside the invariant block.
+                    context.center_density = (
                         self.a_features.transform_density(rho)
-                        / self.mean_density.to(
-                            device=rho.device,
-                            dtype=rho.dtype,
-                        )
+                        / context.require("mean_density")
                     )
-                feature_blocks.extend((B_flat, temperature_feature))
-                local_features = torch.cat(feature_blocks, dim=-1)
-
-            # Construct the shared global state only when requested. Mean
-            # density retains its connection to rho, so energy readouts using
-            # this state remain part of the functional derivative.
-            state_features = None
-            if any(
-                item.requires_state_features for item in self.readout
-            ):
-                mean_density = data["rho"].mean(dim=-2)
-                mean_density_feature = (
-                    mean_density
-                    / self.mean_density.to(
-                        device=data["rho"].device,
-                        dtype=data["rho"].dtype,
-                    )
-                )
-                state_features = torch.cat(
-                    (
-                        normalized_temperature[..., None],
-                        mean_density_feature,
-                    ),
-                    dim=-1,
-                )
-
-            volume_element = self.voxel_volume.to(
-                device=rho.device,
-                dtype=rho.dtype,
-            )
-            context = {
-                "rho": rho,
-                "normalized_temperature": normalized_temperature,
-                "voxel_volume": volume_element,
-                "grid_spacing": self.grid_spacing.to(rho),
-                # Physical analytical readouts use the model's unit contract,
-                # not a possibly stale beta field supplied by a caller.
-                "beta": 1.0 / (self.boltzmann_constant.to(rho) * temperature),
-                "reference_energy": self.reference_energy.to(rho),
-                "free_energy_mode": self.free_energy_mode,
-            }
-            if local_features is not None:
-                context["local_features"] = local_features
-            if state_features is not None:
-                context["state_features"] = state_features
-            for name in (
-                "grid_size", "dipole_density", "local_density_index",
-                "grid_positions", "grid_center", "excluded_mask",
-            ):
-                if name in data:
-                    context[name] = data[name]
 
             readout_energies = []
             readout_outputs = {}

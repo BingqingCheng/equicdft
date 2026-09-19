@@ -13,10 +13,45 @@ from equicdft import (
     ReciprocalFeatures,
 )
 from equicdft.derivatives import compute_grid_derivative
+from equicdft.energy import ReadoutContext
 from equicdft.stencil import get_neighbor_indices
 
 
 class TestBulkReadout(unittest.TestCase):
+    def test_energy_reads_the_shared_state_vector(self):
+        readout = BulkReadout(n_types=2, hidden_sizes=(), zero_init=False)
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(
+                torch.tensor([[1.0, 2.0, -1.0], [0.5, 0.0, 3.0]])
+            )
+            readout.mlp[-1].bias.zero_()
+        rho = torch.tensor([[[0.2, 0.4], [0.6, 0.8]], [[1.0, 1.0], [0.0, 2.0]]])
+        context = ReadoutContext(
+            rho=rho,
+            normalized_temperature=torch.tensor([1.5, 0.5]),
+            voxel_volume=0.25,
+            mean_density=2.0,
+        )
+
+        energy = readout.energy(context)
+
+        state = torch.cat(
+            (context.normalized_temperature[:, None], rho.mean(-2) / 2.0), -1,
+        )
+        per_particle = state @ readout.mlp[-1].weight.T
+        expected = 0.25 * (rho.sum(-2) * per_particle).sum(-1)
+        torch.testing.assert_close(energy, expected)
+        # The shared state is composed once and cached on the context.
+        self.assertIs(context.state_features(), context.state_features())
+        with self.assertRaisesRegex(KeyError, "mean_density"):
+            readout.energy(
+                ReadoutContext(
+                    rho=rho,
+                    normalized_temperature=torch.tensor([1.5, 0.5]),
+                    voxel_volume=0.25,
+                )
+            )
+
     def test_zero_initialization_gives_zero_per_particle_energy(self):
         readout = BulkReadout(n_types=2, hidden_sizes=(4,))
         state = torch.randn(3, 3)
@@ -69,12 +104,15 @@ class TestFixedLongRangeReadout(unittest.TestCase):
                     1, n_types=2, charges=(1., -2.),
                     coulomb_amplitude=1.5, features=features,
                 ).double()
-                self.assertFalse(readout.requires_state_features)
                 expected = 1.5 * features(
                     rho, data["grid_size"], data["grid_spacing"],
                     charges=readout.charges,
                 ).sum(dim=(-2, -1))
-                torch.testing.assert_close(readout.energy(data), expected)
+                # A fixed amplitude needs no state vector, so the context may
+                # omit the density scale entirely.
+                context = ReadoutContext.from_data(data, grid_spacing=.5)
+                self.assertIsNone(context.mean_density)
+                torch.testing.assert_close(readout.energy(context), expected)
                 expected_c1 = -torch.autograd.grad(expected.sum(), rho)[0] / .5**3
                 model = GridCACEModel(
                     None, None, [readout], grid_spacing=.5,
@@ -119,17 +157,37 @@ class TestLocalReadout(unittest.TestCase):
             hidden_sizes=(16, 8),
         )
         local_features = B.flatten(start_dim=-3)
+        readout.bind_input_size(local_features.shape[-1])
         return data, A, B, readout, readout(local_features)
 
     def test_batched_shapes(self):
         local_features = torch.randn(2, 5, 23)
-        readout = LocalReadout(
-            n_types=1,
-        )
+        readout = LocalReadout(n_types=1, n_features=23)
         output = readout(local_features)
 
         self.assertEqual(output.shape, (2, 5, 1))
         self.assertEqual(readout.mlp[0].in_features, 23)
+
+    def test_unbound_readout_is_bound_once(self):
+        readout = LocalReadout(n_types=2, hidden_sizes=(4,))
+        self.assertFalse(readout.is_bound)
+        self.assertIsNone(readout.to_config()["n_features"])
+        self.assertEqual(len(list(readout.parameters())), 0)
+        with self.assertRaisesRegex(RuntimeError, "no input width"):
+            readout(torch.zeros(3, 7))
+
+        readout.bind_input_size(7)
+
+        self.assertTrue(readout.is_bound)
+        self.assertEqual(readout.to_config()["n_features"], 7)
+        self.assertEqual(readout(torch.zeros(3, 7)).shape, (3, 2))
+        parameters = list(readout.parameters())
+        readout.bind_input_size(7)
+        self.assertEqual([id(p) for p in readout.parameters()], [id(p) for p in parameters])
+        with self.assertRaisesRegex(ValueError, "bound to 7 input features, not 9"):
+            readout.bind_input_size(9)
+        rebuilt = LocalReadout.from_config(readout.to_config())
+        rebuilt.load_state_dict(readout.state_dict(), strict=True)
 
     def test_readout_uses_local_features_directly(self):
         readout = LocalReadout(

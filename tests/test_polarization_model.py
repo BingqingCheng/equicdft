@@ -53,7 +53,7 @@ class TestPolarizationModel(unittest.TestCase):
             n_features=2 * b_features.n_features + 1, hidden_sizes=(5,),
         )]
         if with_scalar:
-            readouts.append(LDAReadout(mean_density=0.5, hidden_sizes=(4,)))
+            readouts.append(LDAReadout(hidden_sizes=(4,)))
         return GridCACEModel(
             a_features=a_features,
             b_features=b_features,
@@ -256,7 +256,7 @@ class TestPolarizationModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "orientational ideal"):
             self.model(compute_local_mu=True)
         scalar = GridCACEModel(
-            None, None, [LDAReadout(mean_density=0.5)], grid_spacing=0.5
+            None, None, [LDAReadout()], grid_spacing=0.5
         )
         self.assertFalse(scalar.requires_dipole_density)
         with self.assertRaisesRegex(ValueError, "requires a dipole-density readout"):

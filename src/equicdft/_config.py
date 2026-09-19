@@ -16,7 +16,6 @@ from typing import Any, Dict, Mapping, Optional, Type, TypeVar
 
 import torch
 from torch import nn
-from torch.nn.parameter import UninitializedParameter
 
 
 _REGISTRY: Dict[str, Type["Configurable"]] = {}
@@ -182,21 +181,15 @@ def mlp_hidden_sizes(mlp: nn.Sequential) -> list:
     widths = [
         layer.out_features
         for layer in mlp
-        if isinstance(layer, (nn.Linear, nn.LazyLinear))
+        if isinstance(layer, nn.Linear)
     ]
     return [int(width) for width in widths[:-1]]
 
 
-def mlp_input_size(mlp: nn.Sequential) -> Optional[int]:
-    """Return the input width of an MLP, or ``None`` while it is lazy."""
+def mlp_input_size(mlp: nn.Sequential) -> int:
+    """Return the input width of an MLP built by ``build_mlp``."""
 
-    first_layer = mlp[0]
-    if isinstance(first_layer, nn.LazyLinear) or isinstance(
-        first_layer.weight,
-        UninitializedParameter,
-    ):
-        return None
-    return int(first_layer.in_features)
+    return int(mlp[0].in_features)
 
 
 def optional_buffer_value(value: Optional[torch.Tensor]) -> Any:

@@ -11,6 +11,7 @@ from equicdft import (
     GridCACEModel,
     LDAReadout,
     Loss,
+    LossTerm,
     TensorLoss,
 )
 from equicdft._grid import voxel_volume
@@ -18,10 +19,20 @@ from equicdft._fourier import polarization_fourier_curvature
 from equicdft.stability import _feasible_wavevector_indices
 
 
-class _PredictionPenalty(nn.Module):
+class _PredictionPenalty(LossTerm):
     """Minimal specialized term used to test loss aggregation."""
 
-    name = "prediction_penalty"
+    def __init__(self):
+        super().__init__("prediction_penalty")
+
+    def evaluate(self, outputs, batch, model=None):
+        return {"loss": outputs["c1"].abs().mean(), "model_seen": model is not None}
+
+
+class _UnnamedTerm(nn.Module):
+    """A plain module is not a loss term, however loss-like it looks."""
+
+    name = "plain"
 
     def forward(self, outputs, batch):
         return outputs["c1"].abs().mean()
@@ -526,7 +537,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
     def test_polarization_stability_integrates_with_grid_model(self):
         batch = self._add_polarization(self._batch())
         readout = LDAReadout(
-            mean_density=0.5,
             dipole_density_scale=0.5,
             hidden_sizes=(),
         ).to(dtype=torch.float64)
@@ -542,6 +552,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             grid_spacing=1.0,
             mean_temperature=1.0,
             compute_c1=False,
+            mean_density=0.5,
         ).to(dtype=torch.float64)
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
@@ -762,7 +773,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             dim=-1,
         )
         readout = LDAReadout(
-            mean_density=1.0,
             n_types=2,
             hidden_sizes=(),
         ).to(dtype=torch.float64)
@@ -778,6 +788,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             grid_spacing=1.0,
             compute_c1=False,
             free_energy_mode="beta",
+            mean_density=1.0,
         ).to(dtype=torch.float64)
         outputs = model(batch, compute_c1=False)
         term = FourierStabilityLoss(
@@ -798,7 +809,6 @@ class TestFourierStabilityLoss(unittest.TestCase):
             dim=-1,
         )
         readout = LDAReadout(
-            mean_density=1.0,
             n_types=2,
             hidden_sizes=(),
         ).to(dtype=torch.float64)
@@ -814,6 +824,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             grid_spacing=1.0,
             compute_c1=False,
             free_energy_mode="beta",
+            mean_density=1.0,
         ).to(dtype=torch.float64)
         term = FourierStabilityLoss(
             wavevector_indices=((1, 0, 0),),
@@ -1681,12 +1692,32 @@ class TestLossAggregation(unittest.TestCase):
         self.assertIsNotNone(energy_prediction.grad)
 
     def test_accepts_specialized_term_with_same_interface(self):
-        values = Loss([_PredictionPenalty()])(
-            {"c1": torch.tensor([-2.0, 4.0])},
-            {},
-        )
+        loss = Loss([_PredictionPenalty()])
+        values = loss({"c1": torch.tensor([-2.0, 4.0])}, {})
         self.assertAlmostEqual(values["prediction_penalty"].item(), 3.0)
         self.assertAlmostEqual(values["total"].item(), 3.0)
+
+        values, details = loss.evaluate(
+            {"c1": torch.tensor([-2.0, 4.0])}, {}, model=nn.Identity(),
+        )
+        self.assertEqual(set(details), {"prediction_penalty"})
+        self.assertTrue(details["prediction_penalty"]["model_seen"])
+        self.assertAlmostEqual(details["prediction_penalty"]["loss"].item(), 3.0)
+
+    def test_plain_modules_are_rejected_and_terms_expose_details(self):
+        with self.assertRaisesRegex(TypeError, "LossTerm"):
+            Loss([_UnnamedTerm()])
+        term = TensorLoss("c1", "c1", "c1", weight=2.0)
+        self.assertIsInstance(term, LossTerm)
+        outputs = {"c1": torch.tensor([1.0, 3.0])}
+        batch = {"c1": torch.tensor([0.0, 1.0])}
+        details = term.evaluate(outputs, batch)
+        self.assertEqual(set(details), {"loss"})
+        torch.testing.assert_close(details["loss"], term(outputs, batch, model=None))
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            TensorLoss("", "c1", "c1")
+        with self.assertRaisesRegex(ValueError, "weight"):
+            TensorLoss("c1", "c1", "c1", weight=-1.0)
 
     def test_terms_must_be_nonempty_named_and_unique(self):
         with self.assertRaisesRegex(ValueError, "at least one"):

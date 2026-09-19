@@ -6,8 +6,8 @@ from .energy import EnergyReadout
 from .features import CartesianAFeatures
 from .interaction import BChiMessage
 from .loader import make_dataloaders
-from .loss import FourierResponseLoss, Loss, TensorLoss
-from .metrics import FourierResponseMetrics, Metrics
+from .loss import FourierResponseLoss, Loss, LossTerm, TensorLoss
+from .metrics import FourierResponseMetrics, MetricCollection, Metrics
 from .metalwall import MetalWall
 from .model import GridCACEModel
 from .pairwise import PairwiseReadout
@@ -50,8 +50,10 @@ __all__ = [
     "LDAReadout",
     "LongRangeReadout",
     "Loss",
+    "LossTerm",
     "MODEL_FORMAT",
     "MODEL_FORMAT_VERSION",
+    "MetricCollection",
     "Metrics",
     "MetalWall",
     "PairwiseReadout",

@@ -615,11 +615,16 @@ class CartesianAFeatures(nn.Module, Configurable):
             basis = self.radial_transform(basis, self.powers)
         return basis
 
-    def _bessel_stencil_basis(
+    def bessel_stencil_basis(
         self,
         n_radial_functions: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build a conditioned Bessel basis on this feature geometry."""
+        """Return a conditioned Bessel basis and Gram eigenvalues on this stencil.
+
+        Message layers with their own Bessel basis call this through
+        :meth:`equicdft.interaction.BChiMessage.bind_geometry` so that every
+        layer shares the exact integer stencil and center convention.
+        """
 
         return _conditioned_bessel_stencil_basis(
             self.squared_distances,
@@ -688,7 +693,7 @@ class CartesianAFeatures(nn.Module, Configurable):
             descriptor_density = self.transform_density(data["rho"])
             return self._convolve(descriptor_density, self.mean_density, stencil_basis, data)
 
-        fields, scales = self._polarization_fields(data)
+        fields, scales = self.polarization_fields(data)
         moments = self._convolve(fields, scales, stencil_basis, data)
         if self.separate_center:
             center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
@@ -698,7 +703,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         moments = moments.unflatten(-1, (4, self.n_output_channels))
         return moments.transpose(-3, -2).flatten(-3, -2)
 
-    def _polarization_fields(self, data):
+    def polarization_fields(self, data):
         """Pack original [rho, Px, Py, Pz] channels and their reference scales.
 
         Initial moments and joint messages use the same species mixing and

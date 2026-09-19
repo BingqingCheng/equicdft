@@ -2,14 +2,14 @@ import unittest
 
 import torch
 
-from equicdft import GGAReadout, LDAReadout
+from equicdft import GGAReadout, GridCACEModel, LDAReadout
+from equicdft.energy import ReadoutContext
 from equicdft.semilocal import periodic_gradient_energy_density
 
 
 class TestLDAReadout(unittest.TestCase):
     def test_linear_pointwise_state_mapping(self):
         readout = LDAReadout(
-            mean_density=2.0,
             n_types=2,
             hidden_sizes=(),
         )
@@ -30,11 +30,44 @@ class TestLDAReadout(unittest.TestCase):
         expected = torch.tensor([[[2.75], [-2.25]], [[3.25], [1.75]]])
         self.assertEqual(output.shape, (2, 2, 1))
         self.assertTrue(torch.equal(output, expected))
-        self.assertEqual(readout.mean_density.item(), 2.0)
+
+    def test_energy_normalizes_density_by_the_model_scale(self):
+        readout = LDAReadout(n_types=2, hidden_sizes=())
+        with torch.no_grad():
+            readout.mlp[-1].weight.copy_(torch.tensor([[2.0, -1.0, 0.5]]))
+            readout.mlp[-1].bias.fill_(0.25)
+        rho = torch.tensor([[[1.0, 0.5], [0.0, 3.0]], [[2.0, 1.0], [1.0, 1.0]]])
+        context = ReadoutContext(
+            rho=rho,
+            normalized_temperature=torch.tensor([2.0, 1.0]),
+            voxel_volume=0.5,
+            mean_density=2.0,
+        )
+
+        energy = readout.energy(context)
+
+        local_state = torch.cat(
+            (rho / 2.0, context.normalized_temperature[:, None, None].expand(2, 2, 1)),
+            dim=-1,
+        )
+        per_particle = readout(local_state)[..., 0]
+        expected = 0.5 * (rho.sum(-1) * per_particle).sum(-1)
+        torch.testing.assert_close(energy, expected)
+        with self.assertRaisesRegex(KeyError, "mean_density"):
+            readout.energy(
+                ReadoutContext(
+                    rho=rho,
+                    normalized_temperature=torch.tensor([2.0, 1.0]),
+                    voxel_volume=0.5,
+                )
+            )
+        with self.assertRaisesRegex(KeyError, "mean_density"):
+            GridCACEModel(None, None, [readout], grid_spacing=0.5)(
+                {"rho": rho, "temperature": torch.tensor([2.0, 1.0])}
+            )
 
     def test_zero_initialization_gives_zero_energy_per_particle(self):
         readout = LDAReadout(
-            mean_density=0.5,
             n_types=1,
             hidden_sizes=(4,),
             zero_init=True,
@@ -45,16 +78,12 @@ class TestLDAReadout(unittest.TestCase):
         self.assertTrue(torch.equal(output, torch.zeros_like(output)))
 
     def test_configuration_and_input_width_are_validated(self):
-        for mean_density in (0.0, -1.0, float("nan"), [1.0, 2.0]):
-            with self.subTest(mean_density=mean_density):
-                with self.assertRaisesRegex(ValueError, "mean_density"):
-                    LDAReadout(mean_density=mean_density)
         for n_types in (0, -1, 1.5, True):
             with self.subTest(n_types=n_types):
                 with self.assertRaises((TypeError, ValueError)):
-                    LDAReadout(mean_density=1.0, n_types=n_types)
+                    LDAReadout(n_types=n_types)
 
-        readout = LDAReadout(mean_density=1.0, n_types=2)
+        readout = LDAReadout(n_types=2)
         with self.assertRaisesRegex(ValueError, "local_state"):
             readout(torch.ones(4, 2))
 
@@ -95,9 +124,23 @@ class TestGGAReadout(unittest.TestCase):
 
         self.assertTrue(torch.all(coefficient >= 0.1))
 
+    def test_unbound_readout_is_bound_once_with_its_initial_coefficient(self):
+        readout = GGAReadout(hidden_sizes=(), initial_coefficient=0.05)
+        self.assertFalse(readout.is_bound)
+        self.assertIsNone(readout.to_config()["n_features"])
+        with self.assertRaisesRegex(RuntimeError, "no input width"):
+            readout(torch.ones(4, 2))
+        readout.bind_input_size(2)
+        self.assertTrue(readout.is_bound)
+        self.assertEqual(readout.to_config()["n_features"], 2)
+        torch.testing.assert_close(
+            readout(torch.randn(4, 2)), torch.full((4, 1), 0.05),
+        )
+        readout.bind_input_size(2)
+        with self.assertRaisesRegex(ValueError, "bound to 2 input features, not 3"):
+            readout.bind_input_size(3)
+
     def test_invalid_configuration_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "n_features"):
-            GGAReadout(hidden_sizes=())
         with self.assertRaisesRegex(ValueError, "initial_coefficient"):
             GGAReadout(
                 n_features=2,

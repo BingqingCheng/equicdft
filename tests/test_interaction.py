@@ -779,7 +779,7 @@ class TestBChiMessage(unittest.TestCase):
             message_layers=[message],
         )
 
-        basis = message._stencil_basis(
+        basis = message.stencil_basis(
             a_features,
             a_features.stencil_basis(),
         )
@@ -822,7 +822,7 @@ class TestBChiMessage(unittest.TestCase):
             grid_spacing=1.0,
             message_layers=[message],
         )
-        before = message._stencil_basis(
+        before = message.stencil_basis(
             a_features,
             a_features.stencil_basis(),
         ).detach().clone()
@@ -831,7 +831,7 @@ class TestBChiMessage(unittest.TestCase):
         with torch.no_grad():
             a_features.radial_transform.weight.add_(0.2)
 
-        after = message._stencil_basis(
+        after = message.stencil_basis(
             a_features,
             a_features.stencil_basis(),
         )
@@ -1530,10 +1530,10 @@ class TestMessagePassingModel(unittest.TestCase):
             radial_basis="bessel",
             n_radial_functions=2,
         )
-        message._bind_bessel_basis(first_features)
+        message.bind_geometry(first_features)
 
         with self.assertRaisesRegex(ValueError, "incompatible"):
-            message._bind_bessel_basis(second_features)
+            message.bind_geometry(second_features)
 
     def test_bessel_message_binding_respects_existing_double_dtype(self):
         a_features = CartesianAFeatures(
@@ -1585,11 +1585,11 @@ class TestMessagePassingModel(unittest.TestCase):
             radial_basis="bessel",
             n_radial_functions=2,
         )
-        message._bind_bessel_basis(a_features)
+        message.bind_geometry(a_features)
         message.double()
         a_features.double()
 
-        message._bind_bessel_basis(a_features)
+        message.bind_geometry(a_features)
 
         self.assertEqual(message.radial_transform.weight.dtype, torch.float64)
 

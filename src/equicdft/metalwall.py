@@ -10,13 +10,13 @@ from ._config import Configurable, build, constructor_arguments, make_config, re
 from ._fourier_sites import FourierSites
 from ._grid import common_grid_size, grid_spacing_tensor
 from ._metal_data import normalize_metal_site_mapping
-from .energy import EnergyReadout
+from .energy import EnergyReadout, ReadoutContext
 from .readout import LongRangeReadout
 from .reciprocal import _coulomb_values, _squared_wavevectors
 
 
 def _field_vector(value, name):
-    """Fixed Cartesian vector, shared or per field; retain input precision."""
+    """Fixed Cartesian vector, shared or per field, validated in float64."""
     raw = torch.as_tensor(value)
     if (
         raw.dtype == torch.bool
@@ -80,15 +80,25 @@ class MetalWall(EnergyReadout, Configurable):
     which returns the potential generated there by the liquid. MetalWall owns
     only the Gaussian metal-metal interaction, charge constraints, applied
     field, and induced-charge solve.
-    """
 
-    @property
-    def requires_state_features(self):
-        return self.liquid_coulomb.requires_state_features
+    Electrode geometry and charges are validated in double precision and then
+    stored in the default floating dtype active at construction, like every
+    other module buffer, so a model built under ``float32`` has one uniform
+    dtype and can be evaluated and saved as is. Construct the wall under a
+    ``float64`` default to keep double-precision electrode coordinates.
+
+    The wrapped ``liquid_coulomb`` readout is evaluated by the wall; listing
+    it again in the containing model's ``readout`` sequence would count the
+    liquid Coulomb energy twice, and :class:`equicdft.model.GridCACEModel`
+    rejects that.
+    """
 
     @property
     def requires_dipole_density(self):
         return self.liquid_coulomb.requires_dipole_density
+
+    def wrapped_readouts(self):
+        return (self.liquid_coulomb,)
 
     def __init__(
         self,
@@ -109,12 +119,16 @@ class MetalWall(EnergyReadout, Configurable):
         self.liquid_coulomb = liquid_coulomb
         self.n_types = liquid_coulomb.n_types
 
+        dtype = torch.get_default_dtype()
         sites = normalize_metal_site_mapping(metal_sites)
         for name in (
             "metal_positions", "metal_site_groups", "metal_group_ids",
             "metal_total_charge",
         ):
-            self.register_buffer(name, sites[name].detach().clone())
+            value = sites[name].detach().clone()
+            if value.is_floating_point():
+                value = value.to(dtype)
+            self.register_buffer(name, value)
         self.metal_sigma = positive_scalar(metal_sigma, "metal_sigma")
         self.tolerance = positive_scalar(tolerance, "tolerance")
         field = _field_vector(external_field, "external_field")
@@ -123,7 +137,7 @@ class MetalWall(EnergyReadout, Configurable):
                 "a nonzero external_field currently requires exactly one "
                 "electrode group"
             )
-        self.register_buffer("external_field", field)
+        self.register_buffer("external_field", field.to(dtype))
         self._cache_key = None
         self._cache = None
 
@@ -210,30 +224,29 @@ class MetalWall(EnergyReadout, Configurable):
         return self._cache
 
     @staticmethod
-    def _energy_scale(context, reference):
-        mode = context.get("free_energy_mode", "beta")
-        if mode == "physical":
-            scale = 1.0 / torch.as_tensor(context["reference_energy"]).to(reference)
-        elif mode == "beta":
-            scale = torch.as_tensor(context["beta"]).to(reference)
+    def _energy_scale(context: ReadoutContext, reference):
+        """Return the factor converting a physical energy to the model's unit."""
+
+        if context.free_energy_mode == "physical":
+            scale = 1.0 / context.require("reference_energy").to(reference)
         else:
-            raise ValueError("free_energy_mode must be 'beta' or 'physical'")
+            scale = context.require("beta").to(reference)
         if not torch.all(torch.isfinite(scale) & (scale > 0)).item():
             raise ValueError("energy scale must be finite and positive")
         return scale
 
-    def _prepare_fields(self, context, liquid_coulomb, energy_scale):
-        rho = context["rho"]
+    def _prepare_fields(self, context: ReadoutContext, liquid_coulomb, energy_scale):
+        rho = context.rho
         if not torch.all(torch.isfinite(rho)).item() or torch.any(rho < 0).item():
             raise ValueError("rho must be finite and nonnegative")
         leading, n_grid = rho.shape[:-2], rho.shape[-2]
-        shape = common_grid_size(context["grid_size"], leading)
+        shape = common_grid_size(context.require("grid_size"), leading)
         if math.prod(shape) != n_grid:
             raise ValueError("grid_size product does not match rho")
         spacing = grid_spacing_tensor(
-            context["grid_spacing"], device=rho.device, dtype=rho.dtype,
+            context.require("grid_spacing"), device=rho.device, dtype=rho.dtype,
         )
-        excluded = context.get("excluded_mask")
+        excluded = context.excluded_mask
         if excluded is not None:
             excluded = torch.as_tensor(excluded, device=rho.device)
             valid_shapes = ((n_grid,), (*leading, n_grid))
@@ -245,7 +258,9 @@ class MetalWall(EnergyReadout, Configurable):
             if torch.any(rho[excluded.expand(*leading, n_grid)] != 0.0).item():
                 raise ValueError("rho must be zero at excluded grid points")
             if self.requires_dipole_density and torch.any(
-                context["dipole_density"][excluded.expand(*leading, n_grid)] != 0.0
+                context.require("dipole_density")[
+                    excluded.expand(*leading, n_grid)
+                ] != 0.0
             ).item():
                 raise ValueError("dipole_density must be zero at excluded grid points")
 
@@ -346,7 +361,7 @@ class MetalWall(EnergyReadout, Configurable):
         reference = field.liquid_potential
         group_ids = self.metal_group_ids.to(device=reference.device)
         group_totals = self.metal_total_charge.to(reference)
-        positions = self.metal_positions.to(device=reference.device)
+        positions = self.metal_positions.to(reference)
         groups = self.metal_site_groups.to(device=reference.device)
         system = self._geometry(
             shape, spacing, reference, positions, groups, group_ids,
@@ -380,10 +395,10 @@ class MetalWall(EnergyReadout, Configurable):
             for key in outputs[0]
         }
 
-    def energy_and_outputs(self, context: Dict[str, Any]):
+    def energy_and_outputs(self, context: ReadoutContext):
         """Return the liquid LR plus electrode energy and electrode state."""
 
-        rho = context["rho"]
+        rho = context.rho
         if rho.dtype not in (torch.float32, torch.float64):
             raise TypeError("MetalWall requires float32 or float64 rho")
         liquid_coulomb = self.liquid_coulomb.coulomb_at(
@@ -399,9 +414,9 @@ class MetalWall(EnergyReadout, Configurable):
         )
         return liquid_coulomb.energy + scale * electrode_energy, metal
 
-    def energy(self, context: Dict[str, Any]):
+    def energy(self, context: ReadoutContext):
         return self.energy_and_outputs(context)[0]
 
-    def forward(self, context: Dict[str, Any]):
+    def forward(self, context: ReadoutContext):
         """Return electrode outputs for direct diagnostic evaluation."""
         return self.energy_and_outputs(context)[1]

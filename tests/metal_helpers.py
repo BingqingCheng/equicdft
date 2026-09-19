@@ -9,6 +9,7 @@ tests do not use it.
 import torch
 from equicdft import LongRangeReadout, MetalWall, ReciprocalFeatures
 from equicdft._metal_data import normalize_metal_sites
+from equicdft.energy import ReadoutContext
 from equicdft.metalwall import _field_vector
 
 
@@ -82,25 +83,40 @@ def _run(call, data, *args, **kwargs):
             wall.external_field = field
     clean = liquid_data(data)
     if isinstance(module, MetalWall):
-        rho = clean["rho"]
-        if rho.dtype not in (torch.float32, torch.float64):
-            return call(dict(clean, state_features=rho.new_empty(rho.shape[:-2] + (1 + rho.shape[-1],))))
-        temperature = torch.as_tensor(
-            clean.get("temperature", 1.0), dtype=rho.dtype, device=rho.device,
-        )
-        normalized = temperature / temperature.detach()
-        leading_temperature = (
-            normalized.expand(rho.shape[:-2])
-            if rho.shape[:-2] else normalized
-        )
-        clean = dict(clean)
-        clean.update(
-            state_features=torch.cat((
-                leading_temperature[..., None], rho.mean(-2),
-            ), dim=-1),
-            voxel_volume=torch.as_tensor(clean["grid_spacing"], dtype=rho.dtype, device=rho.device).prod(),
-            beta=torch.as_tensor(clean.get("beta", 1.), dtype=rho.dtype, device=rho.device),
-            reference_energy=torch.ones((), dtype=rho.dtype, device=rho.device),
-            free_energy_mode="beta",
-        )
+        return call(wall_context(clean), *args, **kwargs)
     return call(clean, *args, **kwargs)
+
+
+def wall_context(data):
+    """Build the readout context a model would hand to a standalone wall.
+
+    The unit contract is the reduced one of the oracle cases: ``beta`` from
+    the data (default one), unit reference energy, and ``T / T_ref = 1``
+    while keeping the temperature's differentiation graph.
+    """
+
+    rho = data["rho"]
+    scalar_dtype = rho.dtype if rho.is_floating_point() else torch.float64
+    temperature = torch.as_tensor(
+        data.get("temperature", 1.0), dtype=scalar_dtype, device=rho.device,
+    )
+    normalized = temperature / temperature.detach()
+    return ReadoutContext(
+        rho=rho,
+        normalized_temperature=normalized.expand(rho.shape[:-2]),
+        voxel_volume=torch.as_tensor(
+            data["grid_spacing"], dtype=scalar_dtype, device=rho.device,
+        ).prod(),
+        grid_spacing=torch.as_tensor(
+            data["grid_spacing"], dtype=scalar_dtype, device=rho.device,
+        ),
+        grid_size=data.get("grid_size"),
+        beta=torch.as_tensor(
+            data.get("beta", 1.), dtype=scalar_dtype, device=rho.device,
+        ),
+        reference_energy=torch.ones((), dtype=scalar_dtype, device=rho.device),
+        free_energy_mode="beta",
+        dipole_density=data.get("dipole_density"),
+        grid_center=data.get("grid_center"),
+        excluded_mask=data.get("excluded_mask"),
+    )

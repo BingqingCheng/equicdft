@@ -94,7 +94,62 @@ def compute_metric(
     )
 
 
-class Metrics(nn.Module):
+class MetricCollection(nn.Module):
+    """Base class of streaming metric accumulators used by the trainer.
+
+    A collection owns one accumulator per named subset. The trainer calls
+    :meth:`update_metrics` after every batch with the model outputs, the
+    batch, and the per-term details returned by :meth:`equicdft.Loss.evaluate`,
+    then :meth:`retrieve_metrics` once per epoch. Subclasses decide which of
+    those inputs they consume.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        subsets: Sequence[str] = ("train", "valid", "test"),
+    ) -> None:
+        super().__init__()
+
+        self.name = nonempty_string(name, "name")
+        self.subsets = unique_strings(subsets, "subsets")
+
+    def update_metrics(
+        self,
+        subset: str,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        details: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+    ) -> None:
+        """Accumulate one detached batch into a subset's statistics."""
+
+        raise NotImplementedError
+
+    def retrieve_metrics(
+        self,
+        subset: str,
+        clear: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Return metrics over all recorded batches for one subset."""
+
+        raise NotImplementedError
+
+    def clear_metrics(self, subset: str) -> None:
+        """Discard all batches recorded for one subset."""
+
+        raise NotImplementedError
+
+    def _require_subset(self, subset: str) -> None:
+        if subset not in self.subsets:
+            raise KeyError(
+                "unknown metric subset '{}'; choose from {}".format(
+                    subset,
+                    tuple(self.subsets),
+                )
+            )
+
+
+class Metrics(MetricCollection):
     """Stream predictions and targets into dataset-level metrics.
 
     Call :meth:`update_metrics` for every batch, then
@@ -144,22 +199,22 @@ class Metrics(nn.Module):
         subsets: Sequence[str] = ("train", "valid", "test"),
         selection_mask_key: Optional[str] = None,
     ) -> None:
-        super().__init__()
+        target_keys = normalize_target_keys(target_key)
+        default_target_name = target_keys[0]
+        super().__init__(
+            default_target_name if name is None else name,
+            subsets,
+        )
 
-        self.target_keys = normalize_target_keys(target_key)
+        self.target_keys = target_keys
         self.target_key = (
             self.target_keys[0]
             if len(self.target_keys) == 1
             else self.target_keys
         )
-        default_target_name = self.target_keys[0]
         self.prediction_key = nonempty_string(
             default_target_name if prediction_key is None else prediction_key,
             "prediction_key",
-        )
-        self.name = nonempty_string(
-            default_target_name if name is None else name,
-            "name",
         )
         self.selection_mask_key = (
             None
@@ -176,10 +231,9 @@ class Metrics(nn.Module):
                 "unsupported metrics: {}".format(sorted(unknown_metrics))
             )
 
-        subset_names = unique_strings(subsets, "subsets")
         self.logs = {
             subset: self._empty_statistics()
-            for subset in subset_names
+            for subset in self.subsets
         }
 
     def forward(
@@ -200,8 +254,9 @@ class Metrics(nn.Module):
         subset: str,
         outputs: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
+        details: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> None:
-        """Accumulate one detached batch into a subset's statistics."""
+        """Accumulate one detached batch; loss details are not needed."""
 
         self._require_subset(subset)
         prediction, target = self._select_tensors(outputs, batch)
@@ -502,42 +557,35 @@ class Metrics(nn.Module):
             values[metric] = value.to(dtype=statistics["result_dtype"])
         return values
 
-    def _require_subset(self, subset: str) -> None:
-        if subset not in self.logs:
-            raise KeyError(
-                "unknown metric subset '{}'; choose from {}".format(
-                    subset,
-                    tuple(self.logs),
-                )
-            )
 
-
-class FourierResponseMetrics(nn.Module):
+class FourierResponseMetrics(MetricCollection):
     """Accumulate projected-curvature and diagonal-response diagnostics.
 
-    The input to :meth:`update_metrics` is the dictionary returned by
-    :meth:`equicdft.FourierResponseLoss.evaluate`. Curvature metrics use the
-    supplied response weights. ``S`` diagnostics report ``1 / K`` separately
-    for each projected direction and therefore describe diagonal projected
-    responses, not an inversion of a full coupled response matrix.
+    The collection reads the details that the :class:`FourierResponseLoss`
+    term named ``loss_name`` (default: this collection's ``name``) returned
+    through :meth:`equicdft.Loss.evaluate`, so the expensive perturbed
+    evaluations are never repeated. Curvature metrics use the supplied
+    response weights. ``S`` diagnostics report ``1 / K`` separately for each
+    projected direction and therefore describe diagonal projected responses,
+    not an inversion of a full coupled response matrix.
     """
-
-    requires_loss_details = True
 
     def __init__(
         self,
         direction_names: Sequence[str],
         name: str = "fourier_response",
         subsets: Sequence[str] = ("train", "valid", "test"),
+        loss_name: Optional[str] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(name, subsets)
 
-        self.name = nonempty_string(name, "name")
         self.direction_names = unique_strings(
             direction_names,
             "direction_names",
         )
-        subset_names = unique_strings(subsets, "subsets")
+        self.loss_name = (
+            self.name if loss_name is None else nonempty_string(loss_name, "loss_name")
+        )
         self.logs = {
             subset: {
                 key: []
@@ -549,19 +597,29 @@ class FourierResponseMetrics(nn.Module):
                     "element_loss",
                 )
             }
-            for subset in subset_names
+            for subset in self.subsets
         }
 
     def update_metrics(
         self,
         subset: str,
-        details: Dict[str, torch.Tensor],
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+        details: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> None:
-        """Append one detached response-loss evaluation."""
+        """Append the response-loss evaluation recorded under ``loss_name``."""
 
         self._require_subset(subset)
+        if details is None or self.loss_name not in details:
+            raise KeyError(
+                "metric '{}' requires the details of loss term '{}'".format(
+                    self.name,
+                    self.loss_name,
+                )
+            )
+        response = details[self.loss_name]
         required = set(self.logs[subset])
-        missing = required - set(details)
+        missing = required - set(response)
         if missing:
             raise KeyError(
                 "response details are missing: {}".format(sorted(missing))
@@ -569,7 +627,7 @@ class FourierResponseMetrics(nn.Module):
         n_directions = len(self.direction_names)
         reference_shape = None
         for key in required:
-            value = details[key]
+            value = response[key]
             if not torch.is_tensor(value):
                 raise TypeError("response detail '{}' must be a tensor".format(key))
             if value.ndim < 1 or value.shape[-1] != n_directions:
@@ -674,12 +732,3 @@ class FourierResponseMetrics(nn.Module):
         self._require_subset(subset)
         for key in self.logs[subset]:
             self.logs[subset][key] = []
-
-    def _require_subset(self, subset: str) -> None:
-        if subset not in self.logs:
-            raise KeyError(
-                "unknown metric subset '{}'; choose from {}".format(
-                    subset,
-                    tuple(self.logs),
-                )
-            )
