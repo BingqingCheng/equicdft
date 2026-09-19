@@ -79,15 +79,6 @@ def inverse_langevin(p):
     return x
 
 
-def _positive_components(value, reference, name):
-    result = torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
-    if result.ndim > 1 or result.numel() not in (1, reference.shape[-1]):
-        raise ValueError(name + " must be scalar or one value per species")
-    if not torch.isfinite(result).all() or torch.any(result <= 0):
-        raise ValueError(name + " must be finite and positive")
-    return result.reshape(-1)
-
-
 def dipole_alignment(vector):
     """Return L(|a|)*a/|a| with smooth first and second derivatives at a=0."""
     square = vector.square().sum(dim=-1, keepdim=True)

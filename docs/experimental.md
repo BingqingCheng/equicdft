@@ -1,6 +1,6 @@
 # Experimental capabilities
 
-The top-level [`README.md`](README.md) documents the compact, established
+The top-level [`README.md`](../README.md) documents the compact, established
 workflow and model-file API. This file
 collects opt-in model and training capabilities developed for ongoing
 experiments. They are tested software interfaces, but their scientific value

@@ -10,12 +10,15 @@ model file format; this page covers the parts that need a decision from you.
 Model files are migrated in memory when they load, so nothing needs to be
 rewritten on disk:
 
-- Format 1 and 2 files load directly.
-- Format 3 moved the ideal reference into the model. An old **polarized**
-  model file does not record the physical molecular moment, and it is not
-  inferred from descriptor scales, so loading one requires the value from
-  the original run: `load_model(path, ideal=FixedDipoleIdeal(m, ...))`, or
-  `python -m equicdft.convert --dipole-magnitude m ...`.
+- Density-only format 1 and 2 files load directly. Polarized files from those
+  formats require an explicit ideal reference, as described below.
+- Format 3 moved the ideal reference into the model. **Polarized files older
+  than format 3** do not record the physical molecular moment, and it is not
+  inferred from descriptor scales. Loading one requires the value from the
+  original run: `load_model(path, ideal=FixedDipoleIdeal(m))`, where `m` is
+  the molecular dipole magnitude in the original run's dipole units, or
+  `python -m equicdft.convert --dipole-magnitude m ...`. Supply the original
+  thermal wavelength to `FixedDipoleIdeal` as well if it differs from 1.
 - Format 4 discards the retired `compute_local_mu` and `rho_min` settings.
   Fitted parameters and intrinsic thermodynamics are unchanged. If your fit
   relied on that density cutoff, set it explicitly in the application's loss

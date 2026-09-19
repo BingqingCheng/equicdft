@@ -5,8 +5,9 @@ what a checkpoint file contains, which of its entries older versions wrote
 under other names, and how its saved state is put back belong here, next to
 :mod:`equicdft.training.io`, which owns the history and log files.
 
-Every function takes the trainer it restores, so the phases stay explicit
-at the call site in ``Trainer.load_checkpoint``.
+Helpers take explicit checkpoint, model, loss or random-generator inputs
+rather than a trainer, keeping the restore phases explicit at the call site
+in ``Trainer.load_checkpoint``.
 """
 
 import copy

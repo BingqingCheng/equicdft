@@ -118,4 +118,3 @@ class IdealGas(IdealReference):
             "energy_per_particle": log_rho - 1,
             "ideal_density_derivative": log_rho,
         }
-
