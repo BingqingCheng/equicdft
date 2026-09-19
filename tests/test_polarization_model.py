@@ -10,7 +10,7 @@ from equicdft.representation.cartesian import CartesianAFeatures
 from equicdft.model import GridCACEModel
 from equicdft.functional.readout import LocalReadout
 from equicdft.functional.semilocal import LDAReadout
-from equicdft.solver import GridSolver
+from equicdft.solver.solver import GridSolver
 from equicdft.geometry.stencil import get_neighbor_indices
 from equicdft.representation.invariants import CartesianBFeatures
 

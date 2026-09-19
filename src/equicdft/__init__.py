@@ -26,7 +26,7 @@ from .serialization import (
     read_model_config,
     save_model,
 )
-from .solver import GridSolver
+from .solver.solver import GridSolver
 from .response.stability import FourierStabilityLoss
 from .representation.invariants import CartesianBFeatures
 from .training.trainer import Trainer, TrainingStream

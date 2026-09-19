@@ -4,7 +4,7 @@ from typing import Dict, Optional, Sequence, Union
 
 import torch
 
-from .functional.thermodynamics import (
+from ..functional.thermodynamics import (
     density_weighted_integral,
     local_chemical_potential as _local_chemical_potential,
     log_dimensionless_density,

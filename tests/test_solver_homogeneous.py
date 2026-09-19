@@ -8,7 +8,7 @@ from torch import nn
 
 from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
 from tests.metal_helpers import liquid_coulomb
-from equicdft._solver_symmetry import _HomogeneousDensityProjection
+from equicdft.solver.symmetry import _HomogeneousDensityProjection
 
 
 class IdealGas(nn.Module):

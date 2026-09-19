@@ -81,6 +81,8 @@ _MODULE_ALIASES: Dict[str, str] = {
     "equicdft.trainer": "equicdft.training.trainer",
     "equicdft._trainer_io": "equicdft.training.io",
     "equicdft._density_noise": "equicdft.training.noise",
+    "equicdft._solver_numerics": "equicdft.solver.numerics",
+    "equicdft._solver_symmetry": "equicdft.solver.symmetry",
 }
 _CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
     # classes that left their module for equicdft.response in step 5

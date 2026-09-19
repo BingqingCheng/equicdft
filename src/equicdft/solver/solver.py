@@ -5,16 +5,19 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from ._validation import (
+from .._validation import (
     boolean,
     finite_scalar,
     nonnegative_scalar,
     positive_integer,
     positive_scalar,
 )
-from .geometry.grid import voxel_volume
-from ._solver_symmetry import _HomogeneousDensityProjection, _normalize_homogeneous_axes
-from ._solver_numerics import (
+from ..geometry.grid import voxel_volume
+from .symmetry import (
+    _HomogeneousDensityProjection,
+    _normalize_homogeneous_axes,
+)
+from .numerics import (
     _anderson_log_density_candidate,
     _canonical_density_residual,
     _component_tensor,
@@ -28,13 +31,13 @@ from ._solver_numerics import (
     _residuals_converged,
     _thermodynamic_objective,
 )
-from .functional.thermodynamics import (
+from ..functional.thermodynamics import (
     density_weighted_integral,
     equilibrium_log_density,
     ideal_free_energy,
     local_chemical_potential,
 )
-from .functional.polarization_ideal import (
+from ..functional.polarization_ideal import (
     FixedDipoleIdeal,
     _positive_components,
     dipole_alignment,
