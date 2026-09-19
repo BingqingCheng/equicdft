@@ -532,8 +532,8 @@ def compare(
     """Raise AssertionError on the first difference between two case results.
 
     ``tolerance`` is ``None`` for an exact comparison, an ``(rtol, atol)``
-    pair, or a mapping from dtype to such pairs (integer and boolean tensors
-    are always compared exactly).
+    pair, or a mapping from dtype or output key to such pairs (a key takes
+    precedence; integer and boolean tensors are always compared exactly).
     """
 
     if set(recorded) != set(actual):
@@ -553,7 +553,7 @@ def compare(
             )
         pair = tolerance
         if isinstance(tolerance, dict):
-            pair = tolerance.get(expected.dtype)
+            pair = tolerance.get(key, tolerance.get(expected.dtype))
         if pair is None or not expected.is_floating_point():
             if not torch.equal(expected, value):
                 difference = (expected.double() - value.double()).abs().max().item()
@@ -562,6 +562,43 @@ def compare(
                 )
         else:
             torch.testing.assert_close(value, expected, rtol=pair[0], atol=pair[1], msg=key)
+
+
+def compare_trainer_cross_version(recorded, actual) -> None:
+    """Allow measured roundoff in the canonical trainer's unfixed gauge only.
+
+    Float32 cancellation leaves final-bias gradients of order 1e-8, which
+    Adam amplifies because its epsilon is also 1e-8. Across torch versions
+    the two unconstrained biases differ by 4.60e-4, whereas centered c1
+    differs by at most 1.13e-7 and the loss by 2.98e-8. Float64 reduces the
+    bias drift to 1.97e-12. Other fitted parameters/losses stay tightly tested.
+    """
+
+    recorded, actual = dict(recorded), dict(actual)
+    tolerance = dict(CROSS_VERSION_TOLERANCE)
+    for key in recorded:
+        if key in ("state/readout.0.mlp.2.bias", "state/readout.1.mlp.2.bias"):
+            tolerance[key] = (0.0, 5.0e-4)
+        elif "/train_metrics/mu/" in key and key.endswith(("/r2", "/rmse_percent")):
+            # The inferred target changes gauge between optimizer steps, so
+            # these ratios vary more than the unchanged canonical residual.
+            tolerance[key] = (3.0e-2, 1.0e-6)
+        elif "/valid_metrics/mu/" in key and key.endswith(("/r2", "/rmse_percent")):
+            # The single validation field has constant target, hence sigma=0.
+            # Roundoff can give either an enormous ratio or infinity. Compare
+            # its well-conditioned inverse, without accepting a wrong sign.
+            for values in (recorded, actual):
+                value = values[key]
+                if key.endswith("/r2"):
+                    if torch.any(value >= 0):
+                        raise AssertionError(key + ": expected negative R2 for this constant target")
+                    values[key] = 1.0 / (1.0 - value)
+                else:
+                    if torch.any(value <= 0):
+                        raise AssertionError(key + ": expected positive RMSE/sigma")
+                    values[key] = 100.0 / value
+            tolerance[key] = (0.0, 1.0e-7)
+    compare(recorded, actual, tolerance)
 
 
 if __name__ == "__main__":

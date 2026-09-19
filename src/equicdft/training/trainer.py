@@ -260,10 +260,22 @@ class Trainer:
         self._move_to_device()
 
     def to(self, device: Union[str, torch.device]) -> "Trainer":
-        """Move the model, losses and metrics to ``device`` and use it from now on."""
+        """Move modules and any optimizer state, preserving training progress."""
 
+        previous_parameters = self._optimization_parameters()
+        optimizer_state = (
+            None if self.optimizer is None else self.optimizer.state_dict()
+        )
         self.device = torch.device(device)
         self._move_to_device()
+        if self.optimizer is not None:
+            # Module.to may replace Parameter objects. Keep optimizer groups
+            # attached to the live parameters and let its loader apply the
+            # optimizer's device policy (e.g. Adam's CPU step counter).
+            replacements = dict(zip(previous_parameters, self._optimization_parameters()))
+            for group in self.optimizer.param_groups:
+                group["params"] = [replacements[p] for p in group["params"]]
+            self.optimizer.load_state_dict(optimizer_state)
         self._grid_geometry_device_cache.clear()
         return self
 
@@ -646,7 +658,6 @@ class Trainer:
                 "checkpoint has no stream-loss state for configured streams"
             )
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self._move_optimizer_state_to_device()
 
         scheduler_state = checkpoint["scheduler_state_dict"]
         if self.scheduler is None and scheduler_state is not None:
@@ -764,18 +775,8 @@ class Trainer:
         if self.optimizer is not None:
             return
 
-        # Loss modules may later contain trainable nuisance parameters, such
-        # as latent chemical-potential offsets, so optimize them with the model.
-        parameters = list(self.model.parameters()) + list(self.loss.parameters())
-        parameters.extend(self.stream_losses.parameters())
-        unique_parameters = []
-        seen = set()
-        for parameter in parameters:
-            if id(parameter) not in seen:
-                unique_parameters.append(parameter)
-                seen.add(id(parameter))
         self.optimizer = self.optimizer_cls(
-            unique_parameters,
+            self._optimization_parameters(),
             **self.optimizer_args,
         )
         if self.scheduler_cls is not None:
@@ -783,6 +784,13 @@ class Trainer:
                 self.optimizer,
                 **self.scheduler_args,
             )
+
+    def _optimization_parameters(self) -> List[nn.Parameter]:
+        """Model and loss parameters in stable order, without shared duplicates."""
+
+        parameters = list(self.model.parameters()) + list(self.loss.parameters())
+        parameters.extend(self.stream_losses.parameters())
+        return list(dict.fromkeys(parameters))
 
     @staticmethod
     def _validate_streams(
@@ -1172,14 +1180,6 @@ class Trainer:
             and self.epochs_without_improvement
             >= self.early_stopping_patience
         )
-
-    def _move_optimizer_state_to_device(self) -> None:
-        """Move restored optimizer tensors onto the configured device."""
-
-        for state in self.optimizer.state.values():
-            for key, value in state.items():
-                if torch.is_tensor(value):
-                    state[key] = value.to(self.device)
 
     def _write_history_csv(self) -> None:
         """Atomically write one flattened numerical row per completed epoch."""

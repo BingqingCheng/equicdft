@@ -161,6 +161,23 @@ class TestRemappingUnpickler(unittest.TestCase):
 
 
 class TestLegacyConversion(unittest.TestCase):
+    def test_loaded_lazy_weights_supply_the_missing_input_width(self):
+        torch.manual_seed(20)
+        model = example_model()
+        data = grid_data(cutoff_grid=1)
+        reference = copy.deepcopy(model)
+        readout = next(item for item in model.readout if isinstance(item, LocalReadout))
+        first = readout.mlp[0]
+        lazy = torch.nn.LazyLinear(first.out_features).to(first.weight)
+        lazy.load_state_dict(first.state_dict())
+        self.assertEqual(lazy.in_features, 0)
+        self.assertEqual(lazy.weight.shape, first.weight.shape)
+        readout.mlp[0] = lazy
+        readout.n_features = None
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_file = _whole_object_file(model, directory)
+            self.assert_converted_matches(reference, data, legacy_file)
+
     def assert_converted_matches(self, model, data, legacy_file):
         expected = model(copy.deepcopy(data))
         with tempfile.TemporaryDirectory() as directory:

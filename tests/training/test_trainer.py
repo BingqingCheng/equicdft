@@ -115,6 +115,58 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(trainer.device, torch.device("cpu"))
         self.assertIsInstance(trainer.metrics, tuple)
 
+    def test_to_rebinds_replaced_parameters_and_preserves_continuation(self):
+        loader = DataLoader(_dataset([1, 2]), batch_size=2)
+        reference = self._make_trainer(scheduler=True)
+        reference.optimizer_cls = torch.optim.Adam
+        reference.metrics = ()
+        reference.fit(loader, loader, epochs=2, verbose=False)
+        trainer = self._make_trainer(scheduler=True)
+        trainer.optimizer_cls = torch.optim.Adam
+        trainer.metrics = ()
+        trainer.fit(loader, loader, epochs=1, verbose=False)
+        optimizer, scheduler = trainer.optimizer, trainer.scheduler
+        old_parameter = next(trainer.model.parameters())
+        previous = torch.__future__.get_overwrite_module_params_on_conversion()
+        try:
+            torch.__future__.set_overwrite_module_params_on_conversion(True)
+            trainer.to("cpu")
+        finally:
+            torch.__future__.set_overwrite_module_params_on_conversion(previous)
+        parameter = next(trainer.model.parameters())
+        self.assertIsNot(parameter, old_parameter)
+        self.assertIs(trainer.optimizer, optimizer)
+        self.assertIs(trainer.scheduler, scheduler)
+        self.assertIs(optimizer.param_groups[0]["params"][0], parameter)
+        self.assertNotIn(old_parameter, optimizer.state)
+        trainer.fit(loader, loader, epochs=1, verbose=False)
+        self.assertTrue(torch.equal(parameter, next(reference.model.parameters())))
+        self.assertEqual(trainer.history, reference.history)
+
+    def test_to_moves_optimizer_moments_with_parameters(self):
+        # Meta exercises device transfer without requiring an accelerator.
+        loader = DataLoader(_dataset([1, 2]), batch_size=2)
+        trainer = self._make_trainer()
+        trainer.optimizer_cls = torch.optim.Adam
+        trainer.fit(loader, loader, epochs=1, verbose=False)
+        trainer.to("meta")
+        parameter = next(trainer.model.parameters())
+        self.assertIs(trainer.optimizer.param_groups[0]["params"][0], parameter)
+        for name in ("exp_avg", "exp_avg_sq"):
+            self.assertEqual(trainer.optimizer.state[parameter][name].device, parameter.device)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_to_cuda_and_back_continues_training(self):
+        loader = DataLoader(_dataset([1, 2]), batch_size=2)
+        trainer = self._make_trainer()
+        trainer.optimizer_cls = torch.optim.Adam
+        for device in ("cpu", "cuda", "cpu"):
+            trainer.to(device)
+            trainer.fit(loader, loader, epochs=1, verbose=False)
+            parameter = next(trainer.model.parameters())
+            self.assertEqual(trainer.optimizer.state[parameter]["exp_avg"].device, parameter.device)
+        self.assertEqual(len(trainer.history), 3)
+
     def test_shared_grid_geometry_device_copy_is_cached_but_not_serialized(self):
         geometry = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         dataset = _dataset([1, 2])

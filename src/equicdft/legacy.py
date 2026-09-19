@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ._config import Configurable, build, mlp_hidden_sizes, mlp_input_size
+from ._config import Configurable, build, mlp_hidden_sizes
 from .data.grid_data import GridData
 from .representation.cartesian import CartesianAFeatures, _DensityMixing
 from .representation.message import BChiMessage
@@ -391,10 +391,10 @@ def _upgrade_mlp_readout(module: nn.Module) -> None:
             _constructor_default(type(module), "zero_init"),
         )
     if isinstance(module, (LocalReadout, GGAReadout)):
-        # Lazily built input layers recorded no width; a pickled object is
-        # always materialized, so the width is that of its first layer.
+        # Loading fitted weights into LazyLinear can leave in_features at
+        # zero, even after its first forward. The fitted tensor is authoritative.
         if module.__dict__.get("n_features") is None:
-            module.n_features = mlp_input_size(mlp) if mlp is not None else None
+            module.n_features = int(mlp[0].weight.shape[1]) if mlp is not None else None
     if isinstance(module, LongRangeReadout):
         _set_default(module, "include_polarization", False)
         for name in ("charges", "pair_charge_products", "coulomb_amplitude"):
