@@ -30,7 +30,7 @@ import torch
 from torch import nn
 
 from ._config import Configurable, build, mlp_hidden_sizes, mlp_input_size
-from .data import GridData
+from .data.grid_data import GridData
 from .representation.cartesian import CartesianAFeatures, _DensityMixing
 from .representation.message import BChiMessage
 from .model import GridCACEModel
@@ -83,6 +83,9 @@ _MODULE_ALIASES: Dict[str, str] = {
     "equicdft._density_noise": "equicdft.training.noise",
     "equicdft._solver_numerics": "equicdft.solver.numerics",
     "equicdft._solver_symmetry": "equicdft.solver.symmetry",
+    "equicdft._data_helpers": "equicdft.data.extxyz",
+    "equicdft.loader": "equicdft.data.loaders",
+    "equicdft._metal_data": "equicdft.data.metal",
 }
 _CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
     # classes that left their module for equicdft.response in step 5

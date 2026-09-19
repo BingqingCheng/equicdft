@@ -6,13 +6,13 @@ import numpy as np
 import torch
 from ase import Atoms
 
-from ._validation import (
+from .._validation import (
     boolean as _strict_boolean,
     nonnegative_integer as _strict_nonnegative_integer,
     positive_integer as _strict_positive_integer,
     positive_scalar as _strict_positive_scalar,
 )
-from .geometry.stencil import (
+from ..geometry.stencil import (
     canonical_grid_order,
     coarsen_grid,
     get_neighbor_indices,
@@ -20,8 +20,8 @@ from .geometry.stencil import (
     grid_spacing_array,
     make_stencil,
 )
-from .geometry.grid import _grid_center_origin
-from .functional.thermodynamics import local_chemical_potential
+from ..geometry.grid import _grid_center_origin
+from ..functional.thermodynamics import local_chemical_potential
 
 
 GRID_INFO_KEYS = {

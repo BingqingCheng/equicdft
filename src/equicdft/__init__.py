@@ -2,11 +2,11 @@
 
 from ._version import __version__
 from .response.data import FourierResponseData
-from .data import GridData, default_data_key, read_metal_sites
+from .data.grid_data import GridData, default_data_key, read_metal_sites
 from .functional.base import EnergyReadout
 from .representation.cartesian import CartesianAFeatures
 from .representation.message import BChiMessage
-from .loader import make_dataloaders
+from .data.loaders import make_dataloaders
 from .response.loss import FourierResponseLoss
 from .training.loss import Loss, LossTerm, TensorLoss
 from .response.metrics import FourierResponseMetrics

@@ -21,13 +21,8 @@ class TestMeanDensityScript(unittest.TestCase):
                 frames.append(atoms)
             write(path, frames, format="extxyz")
 
-            script = (
-                Path(__file__).resolve().parents[1]
-                / "scripts"
-                / "mean_density.py"
-            )
             result = subprocess.run(
-                [sys.executable, str(script), str(path)],
+                [sys.executable, "-m", "equicdft.data.mean_density", str(path)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -40,7 +35,7 @@ class TestMeanDensityScript(unittest.TestCase):
                     "-c",
                     (
                         "import json; "
-                        "from scripts.mean_density import "
+                        "from equicdft.data.mean_density import "
                         "compute_mean_densities; "
                         "print(json.dumps(compute_mean_densities({!r})))"
                     ).format(str(path)),

@@ -189,7 +189,7 @@ class TestGridData(unittest.TestCase):
         default_dict = GridData.from_dict(values, cutoff_grid=1)
 
         with mock.patch(
-            "equicdft._data_helpers.get_neighbor_indices",
+            "equicdft.data.extxyz.get_neighbor_indices",
             side_effect=AssertionError("neighbor table was constructed"),
         ):
             omitted_xyz = GridData.from_xyz(

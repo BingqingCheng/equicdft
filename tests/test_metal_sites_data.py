@@ -10,7 +10,7 @@ from ase import Atoms
 from ase.io import write
 
 from equicdft import GridData, read_metal_sites
-from equicdft._metal_data import normalize_metal_sites
+from equicdft.data.metal import normalize_metal_sites
 
 
 def _metadata():

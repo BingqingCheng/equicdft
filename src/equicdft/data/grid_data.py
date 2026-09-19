@@ -7,8 +7,8 @@ import numpy as np
 from ase import Atoms
 from ase.io import read
 
-from ._validation import boolean, nonnegative_integer, positive_scalar
-from ._data_helpers import (
+from .._validation import boolean, nonnegative_integer, positive_scalar
+from .extxyz import (
     _metadata_positive_integer,
     _metadata_positive_scalar,
     build_grid_data,
@@ -17,8 +17,8 @@ from ._data_helpers import (
     process_atoms,
     validate_frame_grid_info,
 )
-from ._metal_data import normalize_metal_sites
-from .geometry.stencil import grid_size_array, grid_spacing_array
+from .metal import normalize_metal_sites
+from ..geometry.stencil import grid_size_array, grid_spacing_array
 
 __all__ = [
     "DEFAULT_BOLTZMANN_CONSTANT",
