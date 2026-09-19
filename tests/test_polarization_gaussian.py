@@ -7,7 +7,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, LDAReadout, LongRangeReadout, ReciprocalFeatures
-from equicdft.energy import ReadoutContext
+from equicdft.functional.base import ReadoutContext
 from equicdft.loss import TensorLoss
 
 

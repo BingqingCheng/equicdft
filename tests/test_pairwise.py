@@ -3,8 +3,8 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel, PairwiseReadout
-from equicdft.energy import ReadoutContext
-from equicdft.pairwise import _smooth_cutoff_envelope
+from equicdft.functional.base import ReadoutContext
+from equicdft.functional.pairwise import _smooth_cutoff_envelope
 
 
 def _context(rho, shape, temperature=1.1, voxel_volume=0.7, grid_size=True):

@@ -2,23 +2,20 @@
 
 from ._version import __version__
 from .data import FourierResponseData, GridData, default_data_key, read_metal_sites
-from .energy import EnergyReadout
+from .functional.base import EnergyReadout
 from .representation.cartesian import CartesianAFeatures
 from .representation.message import BChiMessage
 from .loader import make_dataloaders
 from .loss import FourierResponseLoss, Loss, LossTerm, TensorLoss
 from .metrics import FourierResponseMetrics, MetricCollection, Metrics
-from .metalwall import MetalWall
+from .functional.metalwall import MetalWall
 from .model import GridCACEModel
-from .pairwise import PairwiseReadout
-from .polarization_ideal import FixedDipoleIdeal
-from .readout import BulkReadout, LocalReadout, LongRangeReadout
-from .reciprocal import ReciprocalFeatures
+from .functional.pairwise import PairwiseReadout
+from .functional.polarization_ideal import FixedDipoleIdeal
+from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
+from .functional.reciprocal import ReciprocalFeatures
 from .response import FourierResponse
-from .semilocal import (
-    GGAReadout,
-    LDAReadout,
-)
+from .functional.semilocal import GGAReadout, LDAReadout
 from .serialization import (
     MODEL_FORMAT,
     MODEL_FORMAT_VERSION,

@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from equicdft import GridCACEModel
-from equicdft.energy import EnergyReadout, ReadoutContext
+from equicdft.functional.base import EnergyReadout, ReadoutContext
 
 
 class _QuadraticReadout(EnergyReadout):

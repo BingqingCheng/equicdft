@@ -7,7 +7,11 @@ import numpy as np
 import torch
 
 from equicdft import FixedDipoleIdeal, GridSolver
-from equicdft.polarization_ideal import inverse_langevin, langevin, log_sinhc
+from equicdft.functional.polarization_ideal import (
+    inverse_langevin,
+    langevin,
+    log_sinhc,
+)
 
 
 def exact_solution(data, numbers, moments):

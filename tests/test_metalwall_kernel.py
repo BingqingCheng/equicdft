@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import torch
 
-from equicdft._fourier_sites import FourierSites
-from equicdft.energy import ReadoutContext
-from equicdft.metalwall import MetalWall
+from equicdft.functional._sites import FourierSites
+from equicdft.functional.base import ReadoutContext
+from equicdft.functional.metalwall import MetalWall
 from tests.metal_helpers import _run, liquid_coulomb, metal_sites
 from tests.test_metalwall import _dense_kernels, _field, _site_rows
 

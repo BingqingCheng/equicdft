@@ -34,12 +34,12 @@ from .data import GridData
 from .representation.cartesian import CartesianAFeatures, _DensityMixing
 from .representation.message import BChiMessage
 from .model import GridCACEModel
-from .metalwall import MetalWall
-from .pairwise import PairwiseReadout
-from .readout import BulkReadout, LocalReadout, LongRangeReadout
-from .reciprocal import ReciprocalFeatures
+from .functional.metalwall import MetalWall
+from .functional.pairwise import PairwiseReadout
+from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
+from .functional.reciprocal import ReciprocalFeatures
 from .representation.invariants import CartesianBFeatures
-from .semilocal import GGAReadout, LDAReadout
+from .functional.semilocal import GGAReadout, LDAReadout
 from .serialization import _one_density_scale, default_dtype, model_dtype, save_model
 
 __all__ = [
@@ -64,6 +64,16 @@ _MODULE_ALIASES: Dict[str, str] = {
     "equicdft.symmetrize": "equicdft.representation.invariants",
     "equicdft.interaction": "equicdft.representation.message",
     "equicdft._radial": "equicdft.representation.radial",
+    "equicdft.energy": "equicdft.functional.base",
+    "equicdft.thermodynamics": "equicdft.functional.thermodynamics",
+    "equicdft.readout": "equicdft.functional.readout",
+    "equicdft.semilocal": "equicdft.functional.semilocal",
+    "equicdft.pairwise": "equicdft.functional.pairwise",
+    "equicdft.reciprocal": "equicdft.functional.reciprocal",
+    "equicdft.metalwall": "equicdft.functional.metalwall",
+    "equicdft.polarization_ideal": "equicdft.functional.polarization_ideal",
+    "equicdft._component_pairs": "equicdft.functional._pairs",
+    "equicdft._fourier_sites": "equicdft.functional._sites",
 }
 _CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {}
 

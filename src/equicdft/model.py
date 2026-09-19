@@ -29,11 +29,11 @@ from .geometry.grid import (
     voxel_volume as compute_voxel_volume,
 )
 from .derivatives import compute_grid_derivative
-from .energy import EnergyReadout, ReadoutContext
+from .functional.base import EnergyReadout, ReadoutContext
 from .representation.message import BChiMessage
 from ._metal_data import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
-from .thermodynamics import local_chemical_potential
+from .functional.thermodynamics import local_chemical_potential
 
 __all__ = [
     "GridCACEModel",

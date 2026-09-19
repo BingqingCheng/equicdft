@@ -2,7 +2,7 @@
 
 import torch
 
-from equicdft.thermodynamics import beta_external_potential
+from equicdft.functional.thermodynamics import beta_external_potential
 
 from .common import check_thresholds, load_case, print_metrics, r2, rmse
 

@@ -13,7 +13,7 @@ from equicdft import (
     ReciprocalFeatures,
 )
 from equicdft.derivatives import compute_grid_derivative
-from equicdft.energy import ReadoutContext
+from equicdft.functional.base import ReadoutContext
 from equicdft.geometry.stencil import get_neighbor_indices
 
 

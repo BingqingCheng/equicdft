@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from equicdft import LongRangeReadout, PairwiseReadout, ReciprocalFeatures
-from equicdft._component_pairs import symmetric_component_pairs
+from equicdft.functional._pairs import symmetric_component_pairs
 
 
 class TestSymmetricComponentPairs(unittest.TestCase):

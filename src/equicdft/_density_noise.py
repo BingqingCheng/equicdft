@@ -2,8 +2,11 @@
 
 import torch
 
-from .thermodynamics import local_chemical_potential
-from .polarization_ideal import FixedDipoleIdeal, _positive_components
+from .functional.thermodynamics import local_chemical_potential
+from .functional.polarization_ideal import (
+    FixedDipoleIdeal,
+    _positive_components,
+)
 
 
 _MAX_NOISE_ATTEMPTS = 1000

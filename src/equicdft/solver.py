@@ -28,13 +28,13 @@ from ._solver_numerics import (
     _residuals_converged,
     _thermodynamic_objective,
 )
-from .thermodynamics import (
+from .functional.thermodynamics import (
     density_weighted_integral,
     equilibrium_log_density,
     ideal_free_energy,
     local_chemical_potential,
 )
-from .polarization_ideal import (
+from .functional.polarization_ideal import (
     FixedDipoleIdeal,
     _positive_components,
     dipole_alignment,

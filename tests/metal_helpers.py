@@ -9,8 +9,8 @@ tests do not use it.
 import torch
 from equicdft import LongRangeReadout, MetalWall, ReciprocalFeatures
 from equicdft._metal_data import normalize_metal_sites
-from equicdft.energy import ReadoutContext
-from equicdft.metalwall import _field_vector
+from equicdft.functional.base import ReadoutContext
+from equicdft.functional.metalwall import _field_vector
 
 
 METAL_SITE_KEYS = (

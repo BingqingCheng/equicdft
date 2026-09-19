@@ -21,7 +21,7 @@ from .geometry.stencil import (
     make_stencil,
 )
 from .geometry.grid import _grid_center_origin
-from .thermodynamics import local_chemical_potential
+from .functional.thermodynamics import local_chemical_potential
 
 
 GRID_INFO_KEYS = {

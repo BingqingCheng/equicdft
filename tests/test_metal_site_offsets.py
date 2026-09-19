@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from equicdft._fourier_sites import FourierSites
+from equicdft.functional._sites import FourierSites
 
 
 SHAPE = (4, 3, 2)

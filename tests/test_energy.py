@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from equicdft.energy import EnergyReadout, ReadoutContext
-from equicdft.thermodynamics import (
+from equicdft.functional.base import EnergyReadout, ReadoutContext
+from equicdft.functional.thermodynamics import (
     beta_external_potential,
     density_weighted_integral,
     equilibrium_log_density,

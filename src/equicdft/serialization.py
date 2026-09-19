@@ -46,7 +46,7 @@ from torch import nn
 from ._version import __version__
 from ._config import TYPE_KEY, Configurable, build
 from ._trainer_io import atomic_torch_save
-from .energy import EnergyReadout
+from .functional.base import EnergyReadout
 
 __all__ = [
     "MODEL_FORMAT",

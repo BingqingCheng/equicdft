@@ -10,7 +10,7 @@ from equicdft import (
     FixedDipoleIdeal, GridCACEModel, LDAReadout, LongRangeReadout,
     GridSolver, ReciprocalFeatures,
 )
-from equicdft.energy import ReadoutContext
+from equicdft.functional.base import ReadoutContext
 
 
 def ctx(data):

@@ -8,7 +8,7 @@ from torch import nn
 
 from ._validation import finite_scalar
 from .geometry.grid import voxel_volume
-from .thermodynamics import ideal_free_energy
+from .functional.thermodynamics import ideal_free_energy
 
 
 def integer_wavevector_indices(
