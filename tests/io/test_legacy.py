@@ -134,9 +134,9 @@ def _strip_to_legacy_layout(model):
 class TestRemappingUnpickler(unittest.TestCase):
     def test_module_and_class_aliases_resolve_to_current_classes(self):
         unpickler = _RemappingUnpickler(io.BytesIO(b""))
-        _MODULE_ALIASES["equicdft.old_features"] = "equicdft.features"
+        _MODULE_ALIASES["equicdft.old_features"] = "equicdft.representation.cartesian"
         _CLASS_ALIASES[("equicdft.readout", "OldLocalReadout")] = (
-            "equicdft.readout",
+            "equicdft.functional.readout",
             "LocalReadout",
         )
         try:

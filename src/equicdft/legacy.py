@@ -57,7 +57,7 @@ PathLike = Union[str, Path]
 # these tables when a module or class moves; whole-object files then keep
 # loading without shims in the runtime modules.
 _MODULE_ALIASES: Dict[str, str] = {
-    # step 5 package layout (equicdft 0.1.0); the old paths are shims until 0.2.0
+    # Flat module paths of equicdft 0.0.x (before the package layout of 0.1.0).
     "equicdft.stencil": "equicdft.geometry.stencil",
     "equicdft._grid": "equicdft.geometry.grid",
     "equicdft.features": "equicdft.representation.cartesian",

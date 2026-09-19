@@ -1,105 +1,79 @@
-"""The step-5 package layout keeps every old import path working.
+"""The package layout: flat 0.0.x module paths are gone, pickles still convert.
 
-Each module that existed at the flat layout (equicdft 0.0.1) is either a
-package that re-exports the same names or a deprecated shim that does so
-with an ``EquicdftDeprecationWarning``. ``legacy._MODULE_ALIASES`` maps the
-old paths for whole-object pickles, so the shims can be deleted in 0.2.0
-without breaking those files.
+Whole-object model files written under the flat layout record module paths
+such as ``equicdft.features``; ``legacy._MODULE_ALIASES`` and
+``_CLASS_ALIASES`` map every one of them to the current home so
+``python -m equicdft.convert`` keeps working without shim modules.
 """
 
 import importlib
 import subprocess
 import sys
 import unittest
-import warnings
 
 import equicdft
-from equicdft._deprecation import EquicdftDeprecationWarning
-from equicdft.legacy import _CLASS_ALIASES, _MODULE_ALIASES
+from equicdft.legacy import _CLASS_ALIASES, _MODULE_ALIASES, _RemappingUnpickler
 
 
-# Public names each flat-layout module offered, recorded before the moves.
-OLD_MODULE_NAMES = {
-    "equicdft.data": [
-        "DEFAULT_BOLTZMANN_CONSTANT", "FourierResponseData", "GridData",
-        "default_data_key", "read_metal_sites",
-    ],
-    "equicdft.energy": ["EnergyReadout", "FREE_ENERGY_MODES", "ReadoutContext"],
+# Flat-layout module -> public classes it held (for the pickle remapping).
+OLD_MODULE_CLASSES = {
+    "equicdft.data": ["GridData", "FourierResponseData"],
+    "equicdft.energy": ["EnergyReadout", "ReadoutContext"],
     "equicdft.features": ["CartesianAFeatures"],
     "equicdft.interaction": ["BChiMessage"],
-    "equicdft.loader": ["LoaderResult", "make_dataloaders"],
-    "equicdft.loss": ["FourierResponseLoss", "Loss", "LossTerm", "TensorLoss"],
+    "equicdft.loss": ["LossTerm", "TensorLoss", "Loss", "FourierResponseLoss"],
     "equicdft.metalwall": ["MetalWall"],
-    "equicdft.metrics": [
-        "FourierResponseMetrics", "METRIC_LABELS", "MetricCollection", "Metrics",
-        "SUPPORTED_METRICS", "compute_metric", "format_metric_value", "metric_label",
-    ],
+    "equicdft.metrics": ["MetricCollection", "Metrics", "FourierResponseMetrics"],
     "equicdft.pairwise": ["PairwiseReadout"],
-    "equicdft.polarization_ideal": [
-        "FixedDipoleIdeal", "dipole_alignment", "inverse_langevin", "langevin", "log_sinhc",
-    ],
-    "equicdft.readout": ["BulkReadout", "LocalReadout", "LongRangeReadout"],
+    "equicdft.polarization_ideal": ["FixedDipoleIdeal"],
+    "equicdft.readout": ["LocalReadout", "BulkReadout", "LongRangeReadout"],
     "equicdft.reciprocal": ["ReciprocalFeatures"],
     "equicdft.response": ["FourierResponse"],
-    "equicdft.semilocal": ["GGAReadout", "LDAReadout", "periodic_gradient_energy_density"],
+    "equicdft.semilocal": ["LDAReadout", "GGAReadout"],
     "equicdft.solver": ["GridSolver"],
     "equicdft.stability": ["FourierStabilityLoss"],
-    "equicdft.stencil": [
-        "GridOrder", "canonical_grid_order", "coarsen_grid", "get_neighbor_indices",
-        "grid_size_array", "grid_spacing_array", "make_stencil",
-    ],
     "equicdft.symmetrize": ["CartesianBFeatures"],
-    "equicdft.thermodynamics": [
-        "beta_external_potential", "density_weighted_integral", "equilibrium_log_density",
-        "ideal_free_energy", "local_chemical_potential", "log_dimensionless_density",
-    ],
     "equicdft.trainer": ["Trainer", "TrainingStream"],
 }
 
-# Old paths that became packages keep working silently; the rest are shims.
+# Old paths that became packages and still import.
 PACKAGES = {"equicdft.data", "equicdft.response", "equicdft.solver"}
+
+REMOVED_MODULES = [
+    "equicdft.stencil", "equicdft.features", "equicdft.symmetrize",
+    "equicdft.interaction", "equicdft.energy", "equicdft.thermodynamics",
+    "equicdft.readout", "equicdft.semilocal", "equicdft.pairwise",
+    "equicdft.reciprocal", "equicdft.metalwall", "equicdft.polarization_ideal",
+    "equicdft.stability", "equicdft.loss", "equicdft.metrics", "equicdft.trainer",
+    "equicdft.loader", "equicdft._grid", "equicdft._fourier",
+    "equicdft._data_helpers", "equicdft._argument_checks",
+]
 
 
 class TestPackageLayout(unittest.TestCase):
-    def test_old_paths_offer_their_old_names(self):
-        for old, names in OLD_MODULE_NAMES.items():
-            with self.subTest(module=old):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", EquicdftDeprecationWarning)
-                    module = importlib.import_module(old)
-                missing = [name for name in names if not hasattr(module, name)]
-                self.assertEqual(missing, [], "{} lost {}".format(old, missing))
+    def test_flat_module_paths_are_gone(self):
+        for name in REMOVED_MODULES:
+            with self.subTest(module=name):
+                with self.assertRaises(ImportError):
+                    importlib.import_module(name)
 
-    def test_shims_warn_once_on_import_and_packages_do_not(self):
-        for old in OLD_MODULE_NAMES:
-            with self.subTest(module=old):
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    module = importlib.import_module(old)
-                    importlib.reload(module)  # a cached module would not warn again
-                ours = [w for w in caught if issubclass(w.category, EquicdftDeprecationWarning)]
-                if old in PACKAGES:
-                    self.assertEqual(ours, [])
-                else:
-                    self.assertEqual(len(ours), 1, old)
-                    self.assertIn("moved to", str(ours[0].message))
+    def test_packages_keep_their_public_names(self):
+        for name in PACKAGES:
+            module = importlib.import_module(name)
+            for attribute in OLD_MODULE_CLASSES[name]:
+                self.assertTrue(hasattr(module, attribute), "{} lacks {}".format(name, attribute))
 
-    def test_shim_targets_are_the_new_homes(self):
-        for old in OLD_MODULE_NAMES:
-            if old in PACKAGES:
-                continue
-            with self.subTest(module=old):
-                self.assertIn(old, _MODULE_ALIASES, "no pickle alias for {}".format(old))
-                new = importlib.import_module(_MODULE_ALIASES[old])
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", EquicdftDeprecationWarning)
-                    shim = importlib.import_module(old)
-                for name in shim.__all__:
-                    target, attribute = _CLASS_ALIASES.get((old, name), (_MODULE_ALIASES[old], name))
-                    home = importlib.import_module(target)
-                    self.assertIs(getattr(shim, name), getattr(home, attribute), name)
-                for name in getattr(new, "__all__", ()):
-                    self.assertTrue(hasattr(shim, name), "{} lacks {}".format(old, name))
+    def test_pickle_remapping_covers_every_flat_class(self):
+        unpickler = _RemappingUnpickler.__new__(_RemappingUnpickler)
+        for old, classes in OLD_MODULE_CLASSES.items():
+            for name in classes:
+                with self.subTest(reference="{}.{}".format(old, name)):
+                    resolved = unpickler.find_class(old, name)
+                    home = _MODULE_ALIASES.get(old, old)
+                    home, attribute = _CLASS_ALIASES.get((old, name), (home, name))
+                    self.assertIs(resolved, getattr(importlib.import_module(home), attribute))
+                    if hasattr(equicdft, name):
+                        self.assertIs(resolved, getattr(equicdft, name))
 
     def test_every_alias_target_exists(self):
         for old, new in _MODULE_ALIASES.items():
@@ -109,9 +83,7 @@ class TestPackageLayout(unittest.TestCase):
             with self.subTest(alias=old_module + "." + old_name):
                 self.assertTrue(hasattr(importlib.import_module(new_module), new_name))
 
-    def test_public_api_does_not_import_shims(self):
-        # `import equicdft` must be warning-free: the package imports its
-        # members from their new homes only.
+    def test_import_is_warning_free(self):
         code = (
             "import warnings; warnings.simplefilter('error');"
             " import equicdft; import equicdft.data, equicdft.response, equicdft.solver;"

@@ -2,7 +2,6 @@
 
 import math
 from typing import Any, Dict, Sequence
-from .._deprecation import keyword_only
 
 import torch
 
@@ -78,7 +77,6 @@ class PairwiseReadout(EnergyReadout, Configurable):
     ``cutoff_grid * h``.
     """
 
-    @keyword_only(2, ("cutoff_grid", "n_types", "hidden_sizes", "zero_init"))
     def __init__(
         self,
         cutoff_grid: int,

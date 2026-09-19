@@ -54,10 +54,8 @@ Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
 $\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. The model returns it as
 `beta_mu_local`, its weighted spatial mean as `beta_mu_average` and the hard
-weights as `beta_mu_weights`; the earlier keys `local_chemical_potential`,
-`average_chemical_potential` and `chemical_potential_weights` are still
-present as aliases until 0.2.0 and warn when read. If a reservoir chemical
-potential is known, the same tensor loss can instead target `beta_mu`.
+weights as `beta_mu_weights`. If a reservoir chemical potential is known, the
+same tensor loss can instead target `beta_mu`.
 
 One complete density field is one dataset item. Fields are never split into
 independent grid-point samples because the scalar functional and its derivative
@@ -293,11 +291,9 @@ reciprocal kernels with nonperiodic boundary conditions.
 - `serialization.py`, `legacy.py`, `convert.py`: versioned model files and
   conversion of whole-object pickles
 
-The flat module paths of equicdft 0.0.x (`equicdft.stencil`,
-`equicdft.features`, `equicdft.readout`, `equicdft.loss`, `equicdft.trainer`,
-...) still import and raise an `EquicdftDeprecationWarning`; they are removed
-in 0.2.0 (see `DEPRECATIONS.md`). The top-level names exported by `equicdft`
-itself are unchanged.
+Whole-object `torch.save(model)` files written under the flat 0.0.x layout
+still convert with `python -m equicdft.convert`: `equicdft.legacy` maps the
+old module paths to the current ones while unpickling.
 
 Run the test suite with:
 

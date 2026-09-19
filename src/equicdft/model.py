@@ -3,7 +3,6 @@
 from contextlib import nullcontext
 from numbers import Integral
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
-from ._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -36,15 +35,7 @@ from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .functional.thermodynamics import local_chemical_potential
 from .units import DEFAULT_BOLTZMANN_CONSTANT
-from ._deprecation import AliasedOutputs
 
-# Deprecated output keys (equicdft 0.0.x) -> canonical keys. The model still
-# emits the old names as aliases of the same tensors until 0.2.0.
-OUTPUT_KEY_ALIASES = {
-    "local_chemical_potential": "beta_mu_local",
-    "average_chemical_potential": "beta_mu_average",
-    "chemical_potential_weights": "beta_mu_weights",
-}
 
 __all__ = [
     "GridCACEModel",
@@ -130,10 +121,8 @@ class GridCACEModel(nn.Module, Configurable):
     also return the local and spatially averaged dimensionless chemical
     potentials ``beta_mu_local`` (``beta * mu_local`` at every grid point),
     ``beta_mu_average`` (its ``beta_mu_weights``-weighted spatial average)
-    and the hard weights ``beta_mu_weights`` themselves. The former names
-    ``local_chemical_potential``, ``average_chemical_potential`` and
-    ``chemical_potential_weights`` are emitted as aliases of the same
-    tensors and warn when read. Constructor response flags provide
+    and the hard weights ``beta_mu_weights`` themselves. Constructor
+    response flags provide
     defaults that individual forward calls may override. Readouts may also
     return named observables through ``energy_and_outputs``; these are passed
     through unchanged and are not additional energy contributions.
@@ -160,26 +149,6 @@ class GridCACEModel(nn.Module, Configurable):
     density-normalizing readouts must receive it explicitly.
     """
 
-    @keyword_only(
-        3,
-        (
-            "a_features",
-            "b_features",
-            "readout",
-            "grid_spacing",
-            "mean_temperature",
-            "boltzmann_constant",
-            "thermal_wavelength",
-            "compute_c1",
-            "compute_c2",
-            "compute_local_mu",
-            "rho_min",
-            "free_energy_mode",
-            "message_layers",
-            "compute_polarization_derivative",
-            "mean_density",
-        ),
-    )
     def __init__(
         self,
         a_features: Optional[nn.Module],
@@ -863,7 +832,6 @@ class GridCACEModel(nn.Module, Configurable):
                 "F_exc", "beta_F_exc", "c1", "c2",
                 "beta_mu_local", "beta_mu_average", "beta_mu_weights",
                 "polarization_derivative",
-                *OUTPUT_KEY_ALIASES,
             }
             for item in self.readout:
                 energy, extra_outputs = item.energy_and_outputs(context)
@@ -995,4 +963,4 @@ class GridCACEModel(nn.Module, Configurable):
                         )
                     )
 
-        return AliasedOutputs.with_aliases(outputs, OUTPUT_KEY_ALIASES)
+        return outputs

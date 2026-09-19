@@ -8,7 +8,6 @@ from .._validation import (
     unique_strings,
 )
 from ..training.metrics import MetricCollection
-from .._deprecation import keyword_only
 
 __all__ = [
     "FourierResponseMetrics",
@@ -27,7 +26,6 @@ class FourierResponseMetrics(MetricCollection):
     not an inversion of a full coupled response matrix.
     """
 
-    @keyword_only(1, ("direction_names", "name", "subsets", "loss_name"))
     def __init__(
         self,
         direction_names: Sequence[str],

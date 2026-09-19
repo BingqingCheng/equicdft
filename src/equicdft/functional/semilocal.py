@@ -2,7 +2,6 @@
 
 import math
 from typing import Any, Dict, Optional, Sequence, Union
-from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -82,7 +81,6 @@ class LDAReadout(EnergyReadout, Configurable):
         and species. Omit to preserve the density-only architecture.
     """
 
-    @keyword_only(1, ("n_types", "hidden_sizes", "zero_init", "dipole_density_scale"))
     def __init__(
         self,
         n_types: int = 1,
@@ -208,20 +206,10 @@ class GGAReadout(EnergyReadout, Configurable):
 
     requires_local_features = True
 
-    @keyword_only(
-        0,
-        (
-            "hidden_sizes",
-            "n_features",
-            "n_types",
-            "minimum_coefficient",
-            "initial_coefficient",
-        ),
-    )
     def __init__(
         self,
-        *,
         n_types: int = 1,
+        *,
         hidden_sizes: Sequence[int] = (32, 16),
         n_features: Optional[int] = None,
         minimum_coefficient: float = 0.0,

@@ -1,7 +1,6 @@
 """Composable objectives for training grid density-functional models."""
 
 from typing import Dict, Mapping, Optional, Sequence, Tuple
-from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -67,17 +66,6 @@ class TensorLoss(LossTerm):
     value per prediction and those values are reduced by a weighted mean.
     """
 
-    @keyword_only(
-        3,
-        (
-            "name",
-            "prediction_key",
-            "target_key",
-            "loss_fn",
-            "weights_key",
-            "weight",
-        ),
-    )
     def __init__(
         self,
         name: str,

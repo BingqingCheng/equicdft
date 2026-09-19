@@ -1,7 +1,6 @@
 """Training orchestration for grid density-functional models."""
 
 import math
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -36,55 +35,11 @@ from .._io import atomic_torch_save
 from .loss import Loss
 from .metrics import MetricCollection
 from ..serialization import migrate_model_state_dict
-from .._deprecation import (
-    REMOVAL_VERSION,
-    EquicdftDeprecationWarning,
-    keyword_only,
-)
 
 __all__ = [
     "TrainingStream",
     "Trainer",
 ]
-
-
-def _resolve_noise(
-    owner: str,
-    noise: Optional[NoiseOptions],
-    density_noise: Any,
-    density_noise_floor: Any,
-    polarization_noise: Any,
-    noise_dipole_magnitude: Any,
-) -> NoiseOptions:
-    """Return the NoiseOptions of ``owner`` from either spelling of them."""
-
-    legacy = {
-        "density_noise": density_noise,
-        "density_noise_floor": density_noise_floor,
-        "polarization_noise": polarization_noise,
-        "noise_dipole_magnitude": noise_dipole_magnitude,
-    }
-    given = {key: value for key, value in legacy.items() if value is not None}
-    if noise is not None and not isinstance(noise, NoiseOptions):
-        raise TypeError("noise must be a NoiseOptions")
-    if given:
-        if noise is not None:
-            raise TypeError(
-                "{} takes noise=NoiseOptions(...) or the keywords {}, not both".format(
-                    owner, ", ".join(sorted(given)),
-                )
-            )
-        warnings.warn(
-            "{}({}) is deprecated; pass noise=NoiseOptions(density=..., "
-            "density_floor=..., polarization=..., dipole_magnitude=...) "
-            "(the keywords are removed in equicdft {})".format(
-                owner, ", ".join(sorted(given)), REMOVAL_VERSION,
-            ),
-            EquicdftDeprecationWarning,
-            stacklevel=3,
-        )
-        return NoiseOptions.from_legacy(**given)
-    return noise if noise is not None else NoiseOptions()
 
 
 @dataclass
@@ -108,11 +63,6 @@ class TrainingStream:
     model_kwargs: Optional[Dict[str, Any]] = None
     cycle: bool = False
     noise: Optional[NoiseOptions] = None
-    # Deprecated spellings of ``noise`` (equicdft 0.0.x); removed in 0.2.0.
-    density_noise: Optional[bool] = None
-    density_noise_floor: Optional[float] = None
-    polarization_noise: Optional[bool] = None
-    noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None
 
     def __post_init__(self) -> None:
         self.name = nonempty_string(self.name, "stream name")
@@ -133,18 +83,10 @@ class TrainingStream:
         )
         self.model_kwargs = dict(self.model_kwargs or {})
         self.cycle = boolean(self.cycle, "cycle")
-        self.noise = _resolve_noise(
-            "TrainingStream",
-            self.noise,
-            self.density_noise,
-            self.density_noise_floor,
-            self.polarization_noise,
-            self.noise_dipole_magnitude,
-        )
-        self.density_noise = self.noise.density
-        self.density_noise_floor = self.noise.density_floor
-        self.polarization_noise = self.noise.polarization
-        self.noise_dipole_magnitude = self.noise.dipole_magnitude
+        if self.noise is None:
+            self.noise = NoiseOptions()
+        elif not isinstance(self.noise, NoiseOptions):
+            raise TypeError("noise must be a NoiseOptions")
 
 
 def _checkpoint_noise(checkpoint: Dict[str, Any]) -> NoiseOptions:
@@ -229,34 +171,9 @@ class Trainer:
         :class:`NoiseOptions` applied before each training forward of
         :meth:`fit`; validation and explicit evaluation stay clean. Joint
         training uses the per-stream ``noise`` of :class:`TrainingStream`
-        instead. The former keywords ``density_noise``,
-        ``density_noise_floor``, ``polarization_noise`` and
-        ``noise_dipole_magnitude`` are still accepted with a deprecation
-        warning.
+        instead.
     """
 
-    @keyword_only(
-        2,
-        (
-            "model",
-            "loss",
-            "metrics",
-            "optimizer_cls",
-            "optimizer_args",
-            "scheduler_cls",
-            "scheduler_args",
-            "device",
-            "checkpoint_dir",
-            "checkpoint_interval",
-            "save_best",
-            "early_stopping_patience",
-            "log_dir",
-            "density_noise",
-            "density_noise_floor",
-            "polarization_noise",
-            "noise_dipole_magnitude",
-        ),
-    )
     def __init__(
         self,
         model: nn.Module,
@@ -274,10 +191,6 @@ class Trainer:
         early_stopping_patience: Optional[int] = None,
         log_dir: Optional[Union[str, Path]] = None,
         noise: Optional[NoiseOptions] = None,
-        density_noise: Optional[bool] = None,
-        density_noise_floor: Optional[float] = None,
-        polarization_noise: Optional[bool] = None,
-        noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -313,14 +226,11 @@ class Trainer:
         self.checkpoint_interval = checkpoint_interval
         self.save_best = save_best
         self.early_stopping_patience = early_stopping_patience
-        self.noise = _resolve_noise(
-            "Trainer",
-            noise,
-            density_noise,
-            density_noise_floor,
-            polarization_noise,
-            noise_dipole_magnitude,
-        )
+        if noise is None:
+            noise = NoiseOptions()
+        elif not isinstance(noise, NoiseOptions):
+            raise TypeError("noise must be a NoiseOptions")
+        self.noise = noise
 
         self.checkpoint_dir = None
         if checkpoint_dir is not None:
@@ -603,33 +513,6 @@ class Trainer:
                 "Untrained validation baseline\n" + format_record(record)
             )
 
-    # Deprecated spellings of ``self.noise`` (equicdft 0.0.x); removed in 0.2.0.
-    def _legacy_noise_attribute(self, name: str, value: Any) -> Any:
-        warnings.warn(
-            "Trainer.{} is deprecated; read Trainer.noise (removed in equicdft {})".format(
-                name, REMOVAL_VERSION,
-            ),
-            EquicdftDeprecationWarning,
-            stacklevel=3,
-        )
-        return value
-
-    @property
-    def density_noise(self) -> bool:
-        return self._legacy_noise_attribute("density_noise", self.noise.density)
-
-    @property
-    def density_noise_floor(self) -> float:
-        return self._legacy_noise_attribute("density_noise_floor", self.noise.density_floor)
-
-    @property
-    def polarization_noise(self) -> bool:
-        return self._legacy_noise_attribute("polarization_noise", self.noise.polarization)
-
-    @property
-    def noise_dipole_magnitude(self) -> Any:
-        return self._legacy_noise_attribute("noise_dipole_magnitude", self.noise.dipole_magnitude)
-
     def save_checkpoint(
         self,
         path: Union[str, Path],
@@ -748,10 +631,6 @@ class Trainer:
         stream_noise = _checkpoint_stream_noise(checkpoint)
         for stream in self._streams:
             stream.noise = stream_noise.get(stream.name, NoiseOptions())
-            stream.density_noise = stream.noise.density
-            stream.density_noise_floor = stream.noise.density_floor
-            stream.polarization_noise = stream.noise.polarization
-            stream.noise_dipole_magnitude = stream.noise.dipole_magnitude
         self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:

@@ -7,7 +7,6 @@ from typing import (
     Sequence,
     Union,
 )
-from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -20,7 +19,6 @@ from .symmetry import (
 )
 from .dipoles import evaluate_fixed_dipoles, solve_fixed_dipoles
 from .euler import solve_euler
-from .results import aliased_result
 from .minimize import minimize_density
 from .options import (
     Constraints,
@@ -69,7 +67,6 @@ class GridSolver:
     entire inaccessible volume explicitly in ``excluded_mask``.
     """
 
-    @keyword_only(1, ("model", "device"))
     def __init__(
         self,
         model: Optional[nn.Module],
@@ -190,7 +187,7 @@ class GridSolver:
                     0.0,
                 )
 
-        return aliased_result(result)
+        return result
 
     def solve(
         self,
@@ -564,6 +561,6 @@ class GridSolver:
         result["anderson_accepted"] = state.get("anderson_accepted", 0)
         result["anderson_rejected"] = state.get("anderson_rejected", 0)
         result["anderson_resets"] = state.get("anderson_resets", 0)
-        return aliased_result(result)
+        return result
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return move_batch(data, self.device, self._geometry_cache)

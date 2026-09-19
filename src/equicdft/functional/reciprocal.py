@@ -2,7 +2,6 @@
 
 import math
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple, Union
-from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -225,7 +224,6 @@ class ReciprocalFeatures(nn.Module, Configurable):
         "coulomb",
     )
 
-    @keyword_only(1, ("radial_exponents", "screening", "kernel", "n_types"))
     def __init__(
         self,
         radial_exponents: Sequence[float] = (0.25, 0.5, 1.0, 2.0),

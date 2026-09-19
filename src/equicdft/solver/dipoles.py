@@ -28,7 +28,6 @@ from .numerics import (
     _project_vector_norm,
     _resolve_accessibility_masks,
 )
-from .results import aliased_result
 
 __all__ = ["evaluate_fixed_dipoles", "solve_fixed_dipoles"]
 
@@ -284,13 +283,14 @@ def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
             maximum_residual=maximum,
             rms_residual=rms,
         )
-    return aliased_result({
+    return {
         key: value.detach() if torch.is_tensor(value) else value
         for key, value in result.items()
-    })
+    }
 
 
-def fixed_dipole_converged(solver, result, tolerance_residual, tolerance_rms_residual
+def fixed_dipole_converged(
+    solver, result, tolerance_residual, tolerance_rms_residual
 ):
     return bool(
         result["maximum_residual"] <= tolerance_residual
@@ -317,7 +317,7 @@ def apply_fixed_dipole_bounds(solver,
         and maximum_polarization_fraction is None
         and fixed_field is None
     ):
-        return aliased_result(result)
+        return result
     if fixed_field == "dipole_density":
         residual, chemical_potential, maximum, rms = (
             _canonical_density_residual(
@@ -344,7 +344,7 @@ def apply_fixed_dipole_bounds(solver,
         )
         result["maximum_residual"] = result["rho"].new_tensor(maximum)
         result["rms_residual"] = result["rho"].new_tensor(rms)
-        return aliased_result(result)
+        return result
     unconstrained_polarization = result[
         "scaled_polarization_residual"
     ]
@@ -404,7 +404,7 @@ def apply_fixed_dipole_bounds(solver,
     else:
         result["maximum_residual"] = full_maximum
         result["rms_residual"] = full_rms
-    return aliased_result(result)
+    return result
 
 
 @torch.enable_grad()
@@ -726,7 +726,7 @@ def solve_fixed_dipoles(solver, data, method, options):
         anderson_resets=0,
     )
     result["particle_number_error"] = result["particle_numbers"] - numbers
-    return aliased_result(result)
+    return result
 
 
 def minimize_fixed_dipoles(
