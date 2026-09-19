@@ -6,8 +6,6 @@ import torch
 
 from ..functional.thermodynamics import (
     density_weighted_integral,
-    local_chemical_potential as _local_chemical_potential,
-    log_dimensionless_density,
 )
 
 
@@ -34,6 +32,7 @@ def _thermodynamic_objective(
     fixed_particle_numbers: bool,
     voxel_volume: torch.Tensor,
     thermal_wavelength: torch.Tensor,
+    ideal,
 ) -> torch.Tensor:
     """Return the objective with high-precision scalar accumulation."""
 
@@ -41,10 +40,10 @@ def _thermodynamic_objective(
     accumulation_dtype = _accumulation_dtype(rho.dtype)
     rho = rho.to(accumulation_dtype)
     wavelength = thermal_wavelength.to(accumulation_dtype)
-    log_density = log_dimensionless_density(rho, wavelength)
+    ideal_per_particle = ideal.per_particle(rho, wavelength)
     beta = evaluation["beta"].to(accumulation_dtype)
     per_particle = (
-        log_density - 1.0
+        ideal_per_particle
         + beta * evaluation["V_ext"].to(accumulation_dtype)
     )
     if not fixed_particle_numbers:
@@ -434,12 +433,26 @@ def _anderson_log_density_candidate(
     ).to(log_density_history[-1].dtype)
 
 
+def _stationarity_field(evaluation, projection=None):
+    """Add external fields to model derivatives, preserving scalar rounding.
+
+    On a homogeneous density the ideal response is already homogeneous.
+    Project only the excess response and external field: averaging the ideal
+    logarithm again changes last-bit rounding and can alter Armijo decisions.
+    """
+    if projection is None:
+        return evaluation["beta_mu_local"].detach()
+    return (
+        evaluation["ideal_density_derivative"].detach()
+        + evaluation["beta"] * projection.average(evaluation["V_ext"])
+        - projection.average(evaluation["c1"].detach())
+    )
+
+
 def _euler_residual(
     rho: torch.Tensor,
-    c1: torch.Tensor,
-    V_ext: torch.Tensor,
+    local_chemical_potential: torch.Tensor,
     beta: torch.Tensor,
-    thermal_wavelength: torch.Tensor,
     mu: Optional[torch.Tensor],
     density_threshold: float,
     maximum_density: Optional[torch.Tensor] = None,
@@ -453,13 +466,9 @@ def _euler_residual(
     """
 
     accessible = _accessible_density_mask(rho, accessible_mask)
-    local_chemical_potential = _local_chemical_potential(
-        rho,
-        V_ext,
-        beta,
-        c1,
-        thermal_wavelength,
-        mask=accessible,
+    local_chemical_potential = torch.where(
+        accessible, local_chemical_potential,
+        torch.zeros_like(local_chemical_potential),
     )
     if mu is None:
         return _canonical_density_residual(

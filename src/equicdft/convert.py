@@ -13,6 +13,7 @@ import sys
 from typing import Optional, Sequence
 
 from .legacy import convert_legacy_model
+from .functional.polarization_ideal import FixedDipoleIdeal
 from .serialization import read_model_config
 
 __all__ = [
@@ -49,6 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the converted model configuration as JSON",
     )
+    parser.add_argument("--dipole-magnitude", type=float, nargs="+",
+                        help="original molecular moment(s), required for old polarized models")
+    parser.add_argument("--thermal-wavelength", type=float, nargs="+", default=[1.0],
+                        help="ideal-reference wavelength(s) for polarization conversion")
     return parser
 
 
@@ -59,6 +64,8 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
         args.destination,
         verify=not args.no_verify,
         overwrite=args.overwrite,
+        ideal=(None if args.dipole_magnitude is None else FixedDipoleIdeal(
+            args.dipole_magnitude, thermal_wavelength=args.thermal_wavelength)),
     )
     print("wrote {}".format(destination))
     if args.show_config:

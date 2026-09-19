@@ -7,7 +7,7 @@ This checks the API and gradient path; it is not a polar-fluid training fit.
 import torch
 
 from equicdft import (
-    GridCACEModel, GridData, LocalReadout,
+    GridCACEModel, GridData, LocalReadout, FixedDipoleIdeal,
     CartesianAFeatures, CartesianBFeatures,
 )
 
@@ -32,6 +32,7 @@ def main():
         a_features=a_features,
         b_features=b_features,
         readout=[LocalReadout(n_features=b_features.n_features + 1, hidden_sizes=(16, 16))],
+        ideal=FixedDipoleIdeal(1.0),  # synthetic molecular moment, not water
         grid_spacing=0.5,
         boltzmann_constant=1.0,
         compute_c1=True,

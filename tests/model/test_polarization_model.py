@@ -253,15 +253,17 @@ class TestPolarizationModel(unittest.TestCase):
             model(data)
 
     def test_rejects_scalar_chemical_potential_and_unsupported_response(self):
-        with self.assertRaisesRegex(ValueError, "orientational ideal"):
-            self.model(compute_local_mu=True)
+        model = self.model(compute_local_mu=True)
+        from equicdft import FixedDipoleIdeal
+        model.ideal = FixedDipoleIdeal(1.)
+        self.assertIn("density_derivative", model(self.data()))
         scalar = GridCACEModel(
             None, None, [LDAReadout()], grid_spacing=0.5
         )
         self.assertFalse(scalar.requires_dipole_density)
         with self.assertRaisesRegex(ValueError, "requires a dipole-density readout"):
             scalar(self.data(), compute_polarization_derivative=True)
-        with self.assertRaisesRegex(ValueError, "dipole_magnitude"):
+        with self.assertRaisesRegex(TypeError, "ideal reference"):
             GridSolver(self.model())
 
     def test_zero_polarization_response_for_scalar_only_invariant_selection(self):

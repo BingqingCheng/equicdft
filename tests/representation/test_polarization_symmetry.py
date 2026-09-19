@@ -4,6 +4,7 @@ import itertools
 import unittest
 
 import numpy as np
+from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import (
@@ -76,6 +77,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         ]
         return GridCACEModel(
             a, b, readouts, grid_spacing=.7, mean_temperature=1.5,
+            ideal=FixedDipoleIdeal(1.0),
             compute_c1=True, compute_polarization_derivative=True,
             message_layers=[BChiMessage(
                 b.n_features, a.n_radial_channels, a.n_output_channels,
@@ -131,7 +133,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 for name in branches:
                     self.assertGreater(reference[name]["beta_F_exc"].abs().item(), 1e-8)
                     self.assertGreater(reference[name]["polarization_derivative"].abs().max().item(), 1e-8)
-                for key in reference["complete"]:
+                for key in ("beta_F_exc", "c1", "polarization_derivative"):
                     summed = sum(reference[name][key] for name in models if name != "complete")
                     torch.testing.assert_close(reference["complete"][key], summed,
                                                atol=1e-11, rtol=1e-10)
@@ -154,9 +156,9 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                             actual = self.evaluate(model, transformed)
                             for key, expected in reference[name].items():
                                 value = actual[key]
-                                if key != "beta_F_exc":
+                                if key not in ("beta_F_exc", "beta_F_id", "beta_F"):
                                     value = value[destination]
-                                if key == "polarization_derivative":
+                                if key in ("polarization_derivative", "ideal_polarization_derivative", "total_polarization_derivative"):
                                     expected = expected @ matrix.T
                                 torch.testing.assert_close(value, expected,
                                                            atol=1e-11, rtol=1e-10)

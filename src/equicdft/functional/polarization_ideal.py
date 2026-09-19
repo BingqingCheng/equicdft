@@ -6,10 +6,10 @@ alignment are boundary limits, not finite states accepted by this interface.
 """
 
 import torch
-from torch import nn
+from .._config import make_config, register
+from .ideal import IdealReference, _positive_parameter, _wavelength
 
 from .thermodynamics import (
-    density_weighted_integral,
     log_dimensionless_density,
 )
 
@@ -93,7 +93,8 @@ def dipole_alignment(vector):
     return coefficient * vector
 
 
-class FixedDipoleIdeal(nn.Module):
+@register
+class FixedDipoleIdeal(IdealReference):
     """Ideal beta free energy and derivatives at fixed independent rho and P.
 
     ``dipole_magnitude`` and ``thermal_wavelength`` are positive scalars or one
@@ -103,26 +104,17 @@ class FixedDipoleIdeal(nn.Module):
     derivative is positive, with units inverse dipole; both divide out Delta V.
     """
 
+    requires_dipole_density = True
+
     def __init__(self, dipole_magnitude, *, thermal_wavelength=1.0):
-        super().__init__()
-        for name, value in (
-            ("dipole_magnitude", dipole_magnitude),
-            ("thermal_wavelength", thermal_wavelength),
-        ):
-            # Preserve Python physical constants before casting to a field's
-            # dtype. Tensor inputs retain their explicitly selected precision.
-            if isinstance(value, torch.Tensor):
-                tensor = value
-            else:
-                tensor = torch.as_tensor(value, dtype=torch.float64)
-            if tensor.is_complex():
-                raise ValueError(name + " must be real")
-            if not tensor.is_floating_point():
-                tensor = tensor.to(torch.get_default_dtype())
-            if (tensor.ndim > 1 or not tensor.numel()
-                    or not torch.isfinite(tensor).all() or torch.any(tensor <= 0)):
-                raise ValueError(name + " must be a positive scalar or species vector")
-            self.register_buffer(name, tensor.detach().clone())
+        super().__init__(thermal_wavelength=thermal_wavelength)
+        self.register_buffer("dipole_magnitude", _positive_parameter(
+            dipole_magnitude, "dipole_magnitude",
+        ))
+
+    def to_config(self):
+        return make_config(self, dipole_magnitude=self.dipole_magnitude,
+                           thermal_wavelength=self.thermal_wavelength)
 
     def forward(
         self,
@@ -131,6 +123,14 @@ class FixedDipoleIdeal(nn.Module):
         voxel_volume,
         thermal_wavelength=None,
     ):
+        local = self.local(rho, dipole_density, thermal_wavelength)
+        return {
+            "beta_F_id": local["energy_density"].sum(dim=(-2, -1)) * voxel_volume,
+            "density_derivative": local["ideal_density_derivative"],
+            "polarization_derivative": local["ideal_polarization_derivative"],
+        }
+
+    def local(self, rho, dipole_density, thermal_wavelength=None):
         if (rho.ndim < 2 or min(rho.shape) < 1 or not rho.is_floating_point()
                 or not torch.isfinite(rho).all() or torch.any(rho <= 0)):
             raise ValueError("rho must be finite, positive, floating [..., grid, species]")
@@ -141,12 +141,11 @@ class FixedDipoleIdeal(nn.Module):
         if not torch.isfinite(dipole_density).all():
             raise ValueError("dipole_density must be finite")
         moment = _positive_components(self.dipole_magnitude, rho, "dipole_magnitude")
-        wavelength = _positive_components(
+        wavelength = _wavelength(
             self.thermal_wavelength
             if thermal_wavelength is None
             else thermal_wavelength,
             rho,
-            "thermal_wavelength",
         )
         reduced = dipole_density / (rho * moment)[..., None]
         square = reduced.square().sum(dim=-1)
@@ -170,9 +169,7 @@ class FixedDipoleIdeal(nn.Module):
         log_z = ratio * square - entropy
         log_rho = log_dimensionless_density(rho, wavelength)
         return {
-            "beta_F_id": density_weighted_integral(
-                rho, log_rho - 1 + entropy, voxel_volume
-            ),
-            "density_derivative": log_rho - log_z,
-            "polarization_derivative": ratio[..., None] * reduced / moment[..., None],
+            "energy_density": rho * (log_rho - 1 + entropy),
+            "ideal_density_derivative": log_rho - log_z,
+            "ideal_polarization_derivative": ratio[..., None] * reduced / moment[..., None],
         }

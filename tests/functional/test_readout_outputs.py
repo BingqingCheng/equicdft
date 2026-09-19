@@ -43,7 +43,7 @@ class TestReadoutOutputs(unittest.TestCase):
         energy, extra = readout.energy_and_outputs(context)
         torch.testing.assert_close(energy, readout.energy(context))
         self.assertEqual(extra, {})
-        result = self._model([readout])(data)
+        result = self._model([readout])(data, compute_ideal=False)
         self.assertEqual(set(result), {"beta_F_exc", "c1"})
 
     def test_observable_does_not_change_energy_or_derivatives(self):

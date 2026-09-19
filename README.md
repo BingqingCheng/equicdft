@@ -53,9 +53,17 @@ $$
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
 $\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. The model returns it as
-`beta_mu_local`, its weighted spatial mean as `beta_mu_average` and the hard
-weights as `beta_mu_weights`. If a reservoir chemical potential is known, the
-same tensor loss can instead target `beta_mu`.
+`beta_mu_local` for older configurations, with `beta_mu_average` and
+`beta_mu_weights`. New fits use the intrinsic `density_derivative` against
+`-beta * V_ext`, with explicit loss weights and `TensorLoss(center_axis=-2)`.
+`Metrics(center_axis=-2)` applies the same canonical gauge projection.
+
+The model owns its ideal reference (`IdealGas` by default for scalar models).
+It returns `beta_F_id`, `beta_F_exc`, their sum `beta_F`, and requested total
+intrinsic derivatives. `c1` and `c2` retain their excess-only definitions.
+`GridSolver(model)` adds external fields and ensemble constraints; it does not
+construct another ideal functional. `model(data, compute_ideal=False)` evaluates
+only the excess functional, for example for an excess-response probe.
 
 One complete density field is one dataset item. Fields are never split into
 independent grid-point samples because the scalar functional and its derivative

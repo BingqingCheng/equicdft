@@ -32,13 +32,13 @@ from .numerics import (
     _resolve_accessibility_masks,
     _component_tensor,
     _euler_residual,
+    _stationarity_field,
     _project_density_constraints,
     _residuals_converged,
 )
 from .._device import GeometryDeviceCache, module_device, move_batch
 from ..functional.thermodynamics import (
     density_weighted_integral,
-    ideal_free_energy,
 )
 from ..functional.polarization_ideal import FixedDipoleIdeal
 
@@ -50,10 +50,9 @@ __all__ = [
 class GridSolver:
     """Evaluate or minimize scalar-density and fixed-dipole functionals.
 
-    The wrapped model supplies the intrinsic excess functional. This class
-    adds the appropriate ideal, external-field, and chemical-potential terms.
-    Supplying ``dipole_magnitude`` explicitly enables the freely rotating,
-    fixed-dipole ideal reference and coupled ``(rho, dipole_density)`` solve.
+    The model supplies the complete intrinsic functional and its ideal reference.
+    This class adds external fields, ensemble constraints and numerical updates.
+    A model with ``FixedDipoleIdeal`` enables coupled rho/P solving.
 
     ``evaluate(data)`` requires ``rho`` and returns all quantities supported by
     the available fields. ``solve(data)`` requires ``V_ext`` and either ``mu``
@@ -69,43 +68,17 @@ class GridSolver:
 
     def __init__(
         self,
-        model: Optional[nn.Module],
+        model: nn.Module,
         *,
         device: Optional[Union[str, torch.device]] = None,
-        dipole_magnitude: Optional[
-            Union[float, Sequence[float], torch.Tensor]
-        ] = None,
     ) -> None:
-        if model is not None and not isinstance(model, nn.Module):
-            raise TypeError("model must be a torch.nn.Module or None")
-        if model is None and dipole_magnitude is None:
-            raise TypeError(
-                "model may be None only when dipole_magnitude is supplied"
-            )
-        if (
-            model is not None
-            and getattr(model, "requires_dipole_density", False)
-            and dipole_magnitude is None
-        ):
-            raise ValueError(
-                "dipole-density models require an explicit dipole_magnitude"
-            )
+        if not isinstance(model, nn.Module) or getattr(model, "ideal", None) is None:
+            raise TypeError("GridSolver requires a model with an explicit ideal reference")
         self.model = model
-        self.fixed_dipole_ideal = (
-            None
-            if dipole_magnitude is None
-            else FixedDipoleIdeal(dipole_magnitude)
-        )
-        self.device = (
-            (module_device(model) if model is not None else None)
-            if device is None
-            else torch.device(device)
-        )
+        self.device = module_device(model) if device is None else torch.device(device)
         self._geometry_cache = GeometryDeviceCache()
-        if self.model is not None and self.device is not None:
+        if self.device is not None:
             self.model.to(self.device)
-        if self.fixed_dipole_ideal is not None and self.device is not None:
-            self.fixed_dipole_ideal.to(self.device)
 
     def evaluate(
         self,
@@ -114,7 +87,7 @@ class GridSolver:
     ) -> Dict[str, Any]:
         """Evaluate a supplied density and its available thermodynamics."""
 
-        if self.fixed_dipole_ideal is not None:
+        if isinstance(self.model.ideal, FixedDipoleIdeal):
             return evaluate_fixed_dipoles(self, data, compute_c1)
 
         data = self._move_data(data)
@@ -141,23 +114,13 @@ class GridSolver:
             if key in data
         }
         result.update(outputs)
+        if compute_c1 and "V_ext" in data:
+            result["beta_mu_local"] = (
+                outputs["ideal_density_derivative"]
+                + data["beta"][..., None, None] * data["V_ext"] - outputs["c1"]
+            )
 
         volume_element = voxel_volume(data["grid_spacing"])
-        thermal_wavelength = data.get(
-            "thermal_wavelength",
-            torch.ones(
-                rho.shape[-1],
-                dtype=rho.dtype,
-                device=rho.device,
-            ),
-        )
-        result["beta_F_id"] = ideal_free_energy(
-            rho,
-            thermal_wavelength,
-            volume_element,
-        )
-        result["beta_F"] = result["beta_F_id"] + result["beta_F_exc"]
-
         if "V_ext" in data:
             beta = data["beta"][..., None, None]
             result["beta_V_ext"] = density_weighted_integral(
@@ -288,7 +251,7 @@ class GridSolver:
         ``full_*euler_lagrange_residual`` and ``full_converged`` results report
         unrestricted stationarity. Available only for density-only minimize.
 
-        With an explicit ``dipole_magnitude``, both methods optimize density
+        With ``model.ideal=FixedDipoleIdeal(...)``, both methods optimize density
         and dipole density. ``method="euler"`` uses the coupled orientational
         Euler expression with simultaneous adaptive mixing. The minimizer uses
         the fixed-dipole entropy mirror map and an Armijo line search, preserving
@@ -322,7 +285,7 @@ class GridSolver:
         if method is None:
             method = (
                 "minimize"
-                if self.fixed_dipole_ideal is not None
+                if isinstance(self.model.ideal, FixedDipoleIdeal)
                 else "euler"
             )
         if method not in ("minimize", "euler"):
@@ -330,20 +293,20 @@ class GridSolver:
         homogeneous_axes = _normalize_homogeneous_axes(constraints.homogeneous_axes)
         if homogeneous_axes and method != "minimize":
             raise ValueError("homogeneous_axes is currently available only with method='minimize'")
-        if self.fixed_dipole_ideal is not None:
+        if isinstance(self.model.ideal, FixedDipoleIdeal):
             if homogeneous_axes:
                 raise ValueError("homogeneous_axes is not supported with fixed dipoles")
             return solve_fixed_dipoles(self, data, method, options)
         if constraints.fixed_field is not None:
-            raise ValueError("fixed_field requires an explicit dipole_magnitude")
+            raise ValueError("fixed_field requires model.ideal=FixedDipoleIdeal(...)")
         if initial.polarization is not None:
             raise ValueError(
-                "initial_polarization requires an explicit dipole_magnitude"
+                "initial_polarization requires model.ideal=FixedDipoleIdeal(...)"
             )
         if constraints.maximum_polarization_fraction is not None:
             raise ValueError(
-                "maximum_polarization_fraction requires an explicit "
-                "dipole_magnitude"
+                "maximum_polarization_fraction requires "
+                "model.ideal=FixedDipoleIdeal(...)"
             )
 
         # Local names of the option fields the scalar path reads here; the
@@ -371,7 +334,7 @@ class GridSolver:
 
         n_types = V_ext.shape[-1]
         thermal_wavelength = _component_tensor(
-            data.get("thermal_wavelength", 1.0),
+            data.get("thermal_wavelength", self.model.ideal.thermal_wavelength),
             n_types,
             V_ext,
             "thermal_wavelength",
@@ -499,15 +462,8 @@ class GridSolver:
 
         residual, chemical_potential, max_residual, rms_residual = (
             _euler_residual(
-                result["rho"],
-                result["c1"],
-                V_ext,
-                data["beta"],
-                thermal_wavelength,
-                mu,
-                residual_density_threshold,
-                density_cap,
-                accessible_mask,
+                result["rho"], _stationarity_field(result), data["beta"], mu,
+                residual_density_threshold, density_cap, accessible_mask,
             )
         )
         if projection is not None:
@@ -518,9 +474,8 @@ class GridSolver:
                 max_residual, rms_residual, tolerance_residual, tolerance_rms_residual,
             )
             residual, chemical_potential, max_residual, rms_residual = _euler_residual(
-                result["rho"], projection.average(result["c1"]),
-                projection.average(V_ext), data["beta"], thermal_wavelength,
-                mu, residual_density_threshold, density_cap, accessible_mask,
+                result["rho"], _stationarity_field(result, projection), data["beta"], mu,
+                residual_density_threshold, density_cap, accessible_mask,
             )
             result["solver_homogeneous_axes"] = list(homogeneous_axes)
         result["euler_lagrange_residual"] = residual

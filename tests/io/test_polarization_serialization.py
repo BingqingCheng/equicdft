@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.ideal_helpers import with_ideal
+from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import GridSolver, MetalWall, load_model, save_model
@@ -25,6 +27,7 @@ class TestPolarizationSerialization(unittest.TestCase):
 
     def case(self, metal=False, messages=1, backend="fft"):
         model = fixtures.TestFullPolarizationSymmetry.model(backend, 0. if metal else .7, messages)
+        model.ideal = FixedDipoleIdeal(1.0)
         data = fixtures.TestFullPolarizationSymmetry.data()
         if metal:
             model.readout[2] = MetalWall(
@@ -118,7 +121,7 @@ class TestPolarizationSerialization(unittest.TestCase):
         for method, fixed in (("euler", None), ("minimize", None),
                               ("minimize", "rho"), ("minimize", "dipole_density")):
             with self.subTest(method=method, fixed=fixed):
-                results = [GridSolver(m, dipole_magnitude=1.).solve(
+                results = [GridSolver(with_ideal(m, FixedDipoleIdeal(1.))).solve(
                     data, method=method, fixed_field=fixed, **options,
                 ) for m in (model, restored)]
                 for key in ("rho", "dipole_density", "beta_A"):

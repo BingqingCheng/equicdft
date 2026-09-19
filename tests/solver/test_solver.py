@@ -52,19 +52,7 @@ class _DensityReadout(LocalReadout):
         return local_features[..., :1]
 
 
-class _IdealGasModel(nn.Module):
-    """Minimal zero-excess model for testing solver initialization."""
-
-    def __init__(self):
-        super().__init__()
-        self.register_buffer("zero", torch.tensor(0.0))
-
-    def forward(self, data, compute_c1=True):
-        rho = data["rho"]
-        outputs = {"beta_F_exc": self.zero.to(rho) * torch.sum(rho)}
-        if compute_c1:
-            outputs["c1"] = torch.zeros_like(rho)
-        return outputs
+from tests.ideal_helpers import IdealOnly as _IdealGasModel
 
 
 class TestGridSolver(unittest.TestCase):
@@ -698,15 +686,7 @@ class TestGridSolver(unittest.TestCase):
 
     def test_zero_density_is_included_in_default_physical_residual(self):
         rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
-        residual, _, max_residual, _ = _euler_residual(
-            rho=rho,
-            c1=torch.zeros_like(rho),
-            V_ext=torch.zeros_like(rho),
-            beta=torch.tensor(1.0, dtype=rho.dtype),
-            thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
-            mu=None,
-            density_threshold=0.0,
-        )
+        residual, _, max_residual, _ = _euler_residual(rho=rho, beta=torch.tensor(1.0, dtype=rho.dtype), mu=None, density_threshold=0.0, local_chemical_potential=torch.log(rho.clamp_min(torch.finfo(rho.dtype).tiny)))
 
         self.assertTrue(torch.isfinite(residual).all())
         self.assertGreater(max_residual, 100.0)
@@ -715,15 +695,7 @@ class TestGridSolver(unittest.TestCase):
         self,
     ):
         rho = torch.tensor([[1.0], [1.0e-8]], dtype=torch.float64)
-        _, _, max_residual, rms_residual = _euler_residual(
-            rho=rho,
-            c1=torch.zeros_like(rho),
-            V_ext=torch.zeros_like(rho),
-            beta=torch.tensor(1.0, dtype=rho.dtype),
-            thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
-            mu=None,
-            density_threshold=1.0e-3,
-        )
+        _, _, max_residual, rms_residual = _euler_residual(rho=rho, beta=torch.tensor(1.0, dtype=rho.dtype), mu=None, density_threshold=1.0e-3, local_chemical_potential=torch.log(rho.clamp_min(torch.finfo(rho.dtype).tiny)))
 
         self.assertLess(max_residual, 1.0e-5)
         self.assertLess(rms_residual, 1.0e-5)
@@ -731,16 +703,7 @@ class TestGridSolver(unittest.TestCase):
     def test_hard_wall_is_excluded_from_residual_diagnostics(self):
         rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
         residual, chemical_potential, max_residual, rms_residual = (
-            _euler_residual(
-                rho=rho,
-                c1=torch.zeros_like(rho),
-                V_ext=torch.zeros_like(rho),
-                beta=torch.tensor(1.0, dtype=rho.dtype),
-                thermal_wavelength=torch.tensor([1.0], dtype=rho.dtype),
-                mu=None,
-                density_threshold=0.0,
-                accessible_mask=torch.tensor([True, False]),
-            )
+            _euler_residual(rho=rho, beta=torch.tensor(1.0, dtype=rho.dtype), mu=None, density_threshold=0.0, accessible_mask=torch.tensor([True, False]), local_chemical_potential=torch.log(rho.clamp_min(torch.finfo(rho.dtype).tiny)))
         )
 
         self.assertTrue(torch.equal(residual, torch.zeros_like(rho)))

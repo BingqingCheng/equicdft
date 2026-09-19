@@ -11,12 +11,7 @@ from tests.metal_helpers import liquid_coulomb
 from equicdft.solver.symmetry import _HomogeneousDensityProjection
 
 
-class IdealGas(nn.Module):
-    def forward(self, data, compute_c1=True):
-        out = {"beta_F_exc": data["rho"].sum()*0}
-        if compute_c1:
-            out["c1"] = torch.zeros_like(data["rho"])
-        return out
+from tests.ideal_helpers import IdealOnly as IdealGas
 
 
 class TestHomogeneousSolver(unittest.TestCase):

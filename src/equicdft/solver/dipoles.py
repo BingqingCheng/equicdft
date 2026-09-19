@@ -102,12 +102,12 @@ def fixed_dipole_inputs(solver, data):
         raise ValueError("fixed-dipole solving requires cubic voxels")
     excluded, accessible = _resolve_accessibility_masks(data, potential)
     moment = _positive_components(
-        solver.fixed_dipole_ideal.dipole_magnitude,
+        solver.model.ideal.dipole_magnitude,
         potential,
         "dipole_magnitude",
     ).expand(potential.shape[-1])
     wavelength = _component_tensor(
-        data.get("thermal_wavelength", 1.0),
+        data.get("thermal_wavelength", solver.model.ideal.thermal_wavelength),
         potential.shape[-1],
         potential,
         "thermal_wavelength",
@@ -145,31 +145,19 @@ def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
     rho.requires_grad_(compute_derivatives)
     polarization.requires_grad_(compute_derivatives)
 
-    ideal = solver.fixed_dipole_ideal(
-        rho[accessible],
-        polarization[accessible],
-        volume,
-        thermal_wavelength=wavelength,
+    model_data = dict(data, rho=rho, dipole_density=polarization)
+    model_outputs = solver.model(
+        model_data, compute_c1=compute_derivatives, compute_c2=False,
+        compute_polarization_derivative=compute_derivatives,
     )
-    excess = rho.new_zeros(())
-    if solver.model is not None:
-        model_data = dict(data, rho=rho, dipole_density=polarization)
-        model_outputs = solver.model(
-            model_data,
-            compute_c1=False,
-            compute_c2=False,
-            compute_polarization_derivative=False,
-        )
-        excess = model_outputs["beta_F_exc"]
-        if excess.ndim:
-            raise ValueError(
-                "model must return scalar beta_F_exc for one field"
-            )
+    excess = model_outputs["beta_F_exc"]
+    if excess.ndim:
+        raise ValueError("model must return scalar beta_F_exc for one field")
     external = beta * volume * (
         (rho * potential).sum()
         - (polarization * data["E_ext"]).sum()
     )
-    beta_f = ideal["beta_F_id"] + excess
+    beta_f = model_outputs["beta_F"]
     beta_a = beta_f + external
     if not torch.isfinite(beta_a):
         raise FloatingPointError("nonfinite fixed-dipole objective")
@@ -187,10 +175,11 @@ def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
         )
         if key in data
     }
+    result.update(model_outputs)
     result.update(
         rho=rho,
         dipole_density=polarization,
-        beta_F_id=ideal["beta_F_id"],
+        beta_F_id=model_outputs["beta_F_id"],
         beta_F_exc=excess,
         beta_F=beta_f,
         beta_external=external,
@@ -202,33 +191,11 @@ def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
         ).max(),
     )
     if compute_derivatives:
-        if excess.requires_grad:
-            derivative_rho, derivative_p = torch.autograd.grad(
-                excess,
-                (rho, polarization),
-                allow_unused=True,
-            )
-        else:
-            derivative_rho = derivative_p = None
-        derivative_rho = (
-            torch.zeros_like(rho)
-            if derivative_rho is None
-            else derivative_rho
-        )
-        derivative_p = (
-            torch.zeros_like(polarization)
-            if derivative_p is None
-            else derivative_p
-        )
-        c1 = -derivative_rho / volume
-        polarization_derivative = derivative_p / volume
-        ideal_density = torch.zeros_like(rho)
-        ideal_polarization = torch.zeros_like(polarization)
-        ideal_density[accessible] = ideal["density_derivative"]
-        ideal_polarization[accessible] = ideal[
-            "polarization_derivative"
-        ]
-        local_mu = ideal_density - c1 + beta * potential
+        c1 = model_outputs["c1"]
+        polarization_derivative = model_outputs["polarization_derivative"]
+        ideal_density = model_outputs["ideal_density_derivative"]
+        ideal_polarization = model_outputs["ideal_polarization_derivative"]
+        local_mu = model_outputs["density_derivative"] + beta * potential
         weights = rho[accessible]
         chemical_potential = (
             weights * local_mu[accessible]
@@ -240,8 +207,7 @@ def evaluate_fixed_dipoles(solver, data, compute_derivatives=True):
         )
         polarization_residual = torch.where(
             accessible[:, None, None],
-            ideal_polarization
-            + polarization_derivative
+            model_outputs["total_polarization_derivative"]
             - beta * data["E_ext"],
             torch.zeros_like(polarization),
         )
@@ -625,7 +591,7 @@ def solve_fixed_dipoles(solver, data, method, options):
         polarization[accessible] = _project_vector_norm(
             polarization[accessible], allowed_norm
         )
-    initial_ideal = solver.fixed_dipole_ideal(
+    initial_ideal = solver.model.ideal(
         rho[accessible],
         polarization[accessible],
         volume,

@@ -31,13 +31,7 @@ def _grid_atoms():
     return atoms, excluded
 
 
-class _IdealGas(nn.Module):
-    def forward(self, data, compute_c1=True):
-        rho = data["rho"]
-        result = {"beta_F_exc": rho.sum(dim=(-2, -1)) * 0.}
-        if compute_c1:
-            result["c1"] = torch.zeros_like(rho)
-        return result
+from tests.ideal_helpers import IdealOnly as _IdealGas
 
 
 class TestGridExclusion(unittest.TestCase):

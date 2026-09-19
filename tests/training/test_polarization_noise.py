@@ -266,6 +266,7 @@ class TestPolarizationNoise(unittest.TestCase):
         from tests.representation.test_polarization_symmetry import TestFullPolarizationSymmetry
 
         model = TestFullPolarizationSymmetry.model("fft", 0.)
+        model.ideal = FixedDipoleIdeal(2.)
         data = TestFullPolarizationSymmetry.data()
         data["dipole_density_std"] = torch.full_like(data["dipole_density"], .01)
         # Moment 2 leaves all original/perturbed fixture values well inside.
@@ -273,7 +274,7 @@ class TestPolarizationNoise(unittest.TestCase):
         data["target_P_derivative"] = torch.zeros_like(data["dipole_density"])
         t = Trainer(model, Loss([TensorLoss("rho", "c1", "target_c1"),
                                 TensorLoss("P", "polarization_derivative", "target_P_derivative")]),
-                    noise=NoiseOptions(polarization=True, dipole_magnitude=2.), device="cpu")
+                    noise=NoiseOptions(polarization=True), device="cpu")
         dl = DataLoader([data])
         t.fit(dl, dl, epochs=1, verbose=False)
         self.assertTrue(torch.isfinite(torch.tensor(t.history[0]["train_losses"]["total"])))

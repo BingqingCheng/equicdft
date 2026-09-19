@@ -7,6 +7,7 @@ import torch
 from .numerics import (
     _anderson_log_density_candidate,
     _euler_residual,
+    _stationarity_field,
     _maximum_relative_change,
     _project_density_constraints,
     _residuals_converged,
@@ -81,6 +82,7 @@ def solve_euler(
         fixed_N is not None,
         voxel_volume,
         thermal_wavelength,
+                solver.model.ideal,
     )
     objective_history.append(objective.detach().item())
 
@@ -90,15 +92,8 @@ def solve_euler(
         trial_data["V_ext"] = V_ext
         trial_evaluation = evaluate(trial_data, compute_c1=True)
         _, _, trial_max_residual, trial_rms_residual = _euler_residual(
-            trial_rho,
-            trial_evaluation["c1"].detach(),
-            V_ext,
-            data["beta"],
-            thermal_wavelength,
-            mu,
-            residual_density_threshold,
-            maximum_density,
-            accessible_mask,
+            trial_rho, _stationarity_field(trial_evaluation), data["beta"], mu,
+            residual_density_threshold, maximum_density, accessible_mask,
         )
         return (
             trial_evaluation,
@@ -109,15 +104,8 @@ def solve_euler(
     for _ in range(max_iter):
         c1 = evaluation["c1"].detach()
         _, _, max_residual, rms_residual = _euler_residual(
-            rho,
-            c1,
-            V_ext,
-            data["beta"],
-            thermal_wavelength,
-            mu,
-            residual_density_threshold,
-            maximum_density,
-            accessible_mask,
+            rho, _stationarity_field(evaluation), data["beta"], mu,
+            residual_density_threshold, maximum_density, accessible_mask,
         )
         if _residuals_converged(
             max_residual,
@@ -261,6 +249,7 @@ def solve_euler(
                     fixed_N is not None,
                     voxel_volume,
                     thermal_wavelength,
+                solver.model.ideal,
                 )
                 accept_anderson = (
                     torch.all(torch.isfinite(candidate_rho)).item()
@@ -292,6 +281,7 @@ def solve_euler(
             fixed_N is not None,
             voxel_volume,
             thermal_wavelength,
+                solver.model.ideal,
         )
         objective_history.append(objective.detach().item())
 

@@ -34,6 +34,7 @@ from .data.grid_data import GridData
 from .representation.cartesian import CartesianAFeatures, _DensityMixing
 from .representation.message import BChiMessage
 from .model import GridCACEModel
+from .functional.ideal import IdealGas
 from .functional.metalwall import MetalWall
 from .functional.pairwise import PairwiseReadout
 from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
@@ -367,15 +368,16 @@ def _upgrade_model(module: GridCACEModel) -> None:
     _set_default(module, "compute_local_mu", False)
     _set_default(module, "compute_polarization_derivative", False)
     _set_default(module, "rho_min", 0.0)
-    if not _has_buffer(module, "thermal_wavelength"):
-        module.register_buffer(
-            "thermal_wavelength",
-            torch.ones(
-                module.n_types,
-                dtype=module.grid_spacing.dtype,
-                device=module.grid_spacing.device,
-            ),
-        )
+    if not _defines(module, "ideal"):
+        wavelength = module._buffers.pop("thermal_wavelength", None)
+        if wavelength is None:
+            wavelength = torch.ones(module.n_types, dtype=module.grid_spacing.dtype)
+        polarized = (
+            module.a_features is not None and getattr(module.a_features, "include_polarization", False)
+        ) or any(getattr(item, "requires_dipole_density", False) for item in module.readout)
+        module.ideal = None if polarized else IdealGas(thermal_wavelength=wavelength)
+    if "_n_types" not in module.__dict__:
+        module._n_types = module.n_types
 
 
 def _upgrade_mlp_readout(module: nn.Module) -> None:
@@ -474,6 +476,8 @@ def legacy_model_to_current(
     legacy: nn.Module,
     verify: bool = True,
     verification_data: Optional[Dict[str, Any]] = None,
+    *,
+    ideal=None,
 ) -> nn.Module:
     """Rebuild an upgraded legacy object as a fresh current-format model.
 
@@ -493,6 +497,12 @@ def legacy_model_to_current(
             )
         )
     legacy = upgrade_legacy_model(legacy)
+    if ideal is not None:
+        if legacy.ideal is not None:
+            raise ValueError("legacy model already has an ideal reference")
+        legacy.ideal = ideal
+    if legacy.ideal is None:
+        raise ValueError("provide ideal=FixedDipoleIdeal(...) from the original run metadata")
     config = legacy.to_config()
     with default_dtype(model_dtype(legacy)):
         model = build(config)
@@ -590,7 +600,8 @@ def verify_equivalent(
 
     field = _verification_field(candidate) if verification_data is None else verification_data
     options = dict(compute_c1=True,
-                   compute_polarization_derivative=candidate.requires_dipole_density)
+                   compute_polarization_derivative=candidate.requires_dipole_density,
+                   compute_ideal=False)
     expected = reference(dict(field), **options)
     actual = candidate(dict(field), **options)
     for key in ("beta_F_exc", "c1", "polarization_derivative", "metal_site_q",
@@ -612,6 +623,8 @@ def convert_legacy_model(
     verify: bool = True,
     overwrite: bool = False,
     verification_data: Optional[Dict[str, Any]] = None,
+    *,
+    ideal=None,
 ) -> Path:
     """Convert a whole-object model file into the current format.
 
@@ -636,5 +649,5 @@ def convert_legacy_model(
             )
         )
     legacy = load_legacy_model(source_path, map_location="cpu")
-    model = legacy_model_to_current(legacy, verify=verify, verification_data=verification_data)
+    model = legacy_model_to_current(legacy, verify=verify, verification_data=verification_data, ideal=ideal)
     return save_model(model, destination_path)

@@ -118,6 +118,9 @@ def main():
         boltzmann_constant=1.0,
         thermal_wavelength=1.0,
     )
+    for frame in dataset:
+        frame["negative_beta_V_ext"] = -frame["beta"] * frame["V_ext"]
+        frame["fit_weights"] = (frame["rho"] > args.rho_min).to(frame["rho"])
     loaders = make_dataloaders(
         train_dataset=dataset,
         valid_fraction=args.valid_fraction,
@@ -188,8 +191,6 @@ def main():
         boltzmann_constant=1.0,
         thermal_wavelength=1.0,
         compute_c1=True,
-        compute_local_mu=True,
-        rho_min=args.rho_min,
         # The selected protocol learns beta*F_exc directly. The model also
         # supports free_energy_mode="physical" for F_exc/(k_B*T_reference).
         free_energy_mode="beta",
@@ -197,25 +198,27 @@ def main():
     ).to(device)
 
     # NVT fields have no known reservoir mu. At equilibrium beta*mu_local is
-    # constant, so its masked spatial mean is used as a per-field latent
-    # target. Replacing target_key by "beta_mu" gives supervised GCMC fitting.
+    # constant. Center the intrinsic derivative and -beta*V independently
+    # on the same mask, removing one canonical constant per field/species.
     loss = Loss(
         terms=[
             TensorLoss(
                 name="beta_mu_local",
-                prediction_key="beta_mu_local",
-                target_key="beta_mu_average",
-                weights_key="beta_mu_weights",
+                prediction_key="density_derivative",
+                target_key="negative_beta_V_ext",
+                weights_key="fit_weights",
+                center_axis=-2,
             )
         ]
     )
     metrics = [
         Metrics(
             name="local chemical potential",
-            prediction_key="beta_mu_local",
-            target_key="beta_mu_average",
+            prediction_key="density_derivative",
+            target_key="negative_beta_V_ext",
+            center_axis=-2,
             metric_keys=("mae", "rmse", "rmse_percent"),
-            selection_mask_key="beta_mu_weights",
+            selection_mask_key="fit_weights",
         )
     ]
 

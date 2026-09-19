@@ -9,7 +9,7 @@ from .._validation import (
     nonempty_string,
     nonnegative_scalar,
 )
-from ._targets import TargetKeys, normalize_target_keys, resolve_target
+from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
 
 __all__ = [
     "LossTerm",
@@ -64,6 +64,12 @@ class TensorLoss(LossTerm):
     is used. A componentwise target without a grid axis is expanded over that
     axis. If ``weights_key`` is supplied, the loss function must return one
     value per prediction and those values are reduced by a weighted mean.
+
+    ``center_axis`` removes each tensor's weighted mean along that axis,
+    independently for all other indices (e.g. -2 for scalar grid/species
+    fields). ``target_scale`` multiplies the target before projection;
+    ``residual_scale`` multiplies both tensors before the criterion, hence
+    enters squared in MSE. ``weight`` multiplies the reduced loss afterward.
     """
 
     def __init__(
@@ -74,6 +80,9 @@ class TensorLoss(LossTerm):
         *,
         loss_fn: Optional[nn.Module] = None,
         weights_key: Optional[str] = None,
+        center_axis: Optional[int] = None,
+        residual_scale=1.0,
+        target_scale=1.0,
         weight: float = 1.0,
     ) -> None:
         super().__init__(name, weight)
@@ -82,6 +91,14 @@ class TensorLoss(LossTerm):
             prediction_key,
             "prediction_key",
         )
+        self.center_axis = center_axis
+        if center_axis is not None and (isinstance(center_axis, bool) or not isinstance(center_axis, int)):
+            raise TypeError("center_axis must be an integer axis or None")
+        for name, value in (("residual_scale", residual_scale), ("target_scale", target_scale)):
+            tensor = torch.as_tensor(value)
+            if tensor.is_complex() or not torch.isfinite(tensor).all():
+                raise ValueError(name + " must be finite and real")
+            self.register_buffer(name, tensor, persistent=False)
         self.target_keys = normalize_target_keys(target_key)
         self.target_key = (
             self.target_keys[0]
@@ -124,7 +141,26 @@ class TensorLoss(LossTerm):
             outputs=outputs,
             batch=batch,
         )
-        value = self.loss_fn(prediction, target)
+        if (self.center_axis is None and torch.all(self.target_scale == 1)
+                and torch.all(self.residual_scale == 1)):
+            value = self.loss_fn(prediction, target)
+        else:
+            value = self._transformed_loss(prediction, target, outputs, batch)
+        return self._reduce_loss(value, prediction, outputs, batch)
+
+    def _transformed_loss(self, prediction, target, outputs, batch):
+        target = target * self.target_scale.to(prediction)
+        if self.center_axis is not None:
+            weights = (None if self.weights_key is None else
+                       _resolve_weights(self.weights_key, outputs, batch))
+            prediction, target = center_fields(
+                prediction, target, weights, self.center_axis,
+            )
+        scale = self.residual_scale.to(prediction)
+        value = self.loss_fn(prediction * scale, target * scale)
+        return value
+
+    def _reduce_loss(self, value, prediction, outputs, batch):
         if self.weights_key is None:
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError("loss_fn must return one scalar tensor")

@@ -4,6 +4,7 @@ from ._version import __version__
 from .data.grid_data import GridData, GridDataset, default_data_key, read_metal_sites
 from .data.loaders import make_dataloaders
 from .functional.base import EnergyReadout
+from .functional.ideal import IdealGas, IdealReference
 from .functional.metalwall import MetalWall
 from .functional.pairwise import PairwiseReadout
 from .functional.polarization_ideal import FixedDipoleIdeal
@@ -44,6 +45,8 @@ __all__ = [
     "GridSolver",
     "GGAReadout",
     "EnergyReadout",
+    "IdealGas",
+    "IdealReference",
     "FourierResponseLoss",
     "FourierResponse",
     "FourierResponseData",

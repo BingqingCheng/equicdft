@@ -3,6 +3,8 @@
 import io
 import unittest
 
+from tests.ideal_helpers import with_ideal
+from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout
@@ -182,10 +184,10 @@ class TestPolarizationLDA(unittest.TestCase):
                 "temperature": torch.tensor(1.2),
                 "beta": 1. / (model.boltzmann_constant * 1.2),
                 "grid_spacing": torch.full((3,), .5)}
-        ideal = GridSolver(None, dipole_magnitude=.7).solve(
+        ideal = GridSolver(with_ideal(None, FixedDipoleIdeal(.7))).solve(
             data, particle_numbers=[.5], tolerance_residual=1e-10
         )
-        with_lda = GridSolver(model, dipole_magnitude=.7).solve(
+        with_lda = GridSolver(with_ideal(model, FixedDipoleIdeal(.7))).solve(
             data, particle_numbers=[.5], tolerance_residual=1e-10
         )
         self.assertEqual(ideal["status"], "converged")

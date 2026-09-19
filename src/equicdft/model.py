@@ -34,6 +34,7 @@ from .representation.message import BChiMessage
 from .data.metal import METAL_DATA_KEYS
 from ._nn import positive_scalar_tensor
 from .functional.thermodynamics import local_chemical_potential
+from .functional.ideal import IdealReference, IdealGas
 from .units import DEFAULT_BOLTZMANN_CONSTANT
 
 
@@ -108,6 +109,16 @@ def _validate_feature_modules(
 class GridCACEModel(nn.Module, Configurable):
     """Combine free-energy readouts and differentiate their scalar sum.
 
+    ``ideal`` owns the ideal reference, separate from the excess readouts.
+    Scalar models default to IdealGas; polarized models require an explicit
+    FixedDipoleIdeal to evaluate total thermodynamics or solve. Without one
+    they remain excess-only models. ``compute_ideal=False`` explicitly skips
+    ideal evaluation (including its physical-domain restrictions).
+    With an ideal reference, forward returns beta_F_id and beta_F, and adds
+    ideal derivatives to the requested excess derivatives under
+    density_derivative and total_polarization_derivative. Existing c1, c2
+    and polarization_derivative outputs remain excess-only.
+
     Every configured :class:`EnergyReadout` receives a shared context and
     returns one reduced free-energy contribution per field. With the default
     ``free_energy_mode="beta"``, the sum is interpreted directly as
@@ -156,13 +167,15 @@ class GridCACEModel(nn.Module, Configurable):
         readout: Sequence[EnergyReadout],
         *,
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
+        ideal: Optional[IdealReference] = None,
+        n_types: Optional[int] = None,
         mean_temperature: Union[float, torch.Tensor] = 1.0,
         boltzmann_constant: float = DEFAULT_BOLTZMANN_CONSTANT,
-        thermal_wavelength: Union[
+        thermal_wavelength: Optional[Union[
             float,
             Sequence[float],
             torch.Tensor,
-        ] = 1.0,
+        ]] = None,
         compute_c1: bool = True,
         compute_c2: bool = False,
         compute_local_mu: bool = False,
@@ -173,6 +186,11 @@ class GridCACEModel(nn.Module, Configurable):
         mean_density: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
+
+        if ideal is not None and thermal_wavelength is not None:
+            raise ValueError("set thermal_wavelength on ideal, not on both ideal and model")
+        if thermal_wavelength is None:
+            thermal_wavelength = 1.0
 
         compute_c1 = boolean(compute_c1, "compute_c1")
         compute_c2 = boolean(compute_c2, "compute_c2")
@@ -234,8 +252,6 @@ class GridCACEModel(nn.Module, Configurable):
             raise TypeError(
                 "readout must be a sequence of EnergyReadout modules"
             )
-        if not readouts:
-            raise ValueError("readout must contain at least one energy readout")
         if not all(isinstance(module, EnergyReadout) for module in readouts):
             raise TypeError("every readout must be an EnergyReadout module")
         if len({id(item) for item in readouts}) != len(readouts):
@@ -257,18 +273,17 @@ class GridCACEModel(nn.Module, Configurable):
                         type(wrapper).__name__, type(item).__name__,
                     )
                 )
-        has_polarization = (
+        if ideal is not None and not isinstance(ideal, IdealReference):
+            raise TypeError("ideal must be an IdealReference")
+        has_polarization = (ideal is not None and ideal.requires_dipole_density) or (
             a_features is not None and a_features.requires_dipole_density
         ) or any(item.requires_dipole_density for item in readouts)
+        if has_polarization and ideal is not None and not ideal.requires_dipole_density:
+            raise ValueError("polarization requires a polarization-capable ideal reference")
         if compute_polarization_derivative and not has_polarization:
             raise ValueError(
-                "compute_polarization_derivative requires a dipole-density readout "
-                "or feature module"
-            )
-        if compute_local_mu and has_polarization:
-            raise ValueError(
-                "compute_local_mu is unavailable for dipole-density models: "
-                "the orientational ideal free energy must first be specified"
+                "compute_polarization_derivative requires a dipole-density ideal, "
+                "readout or feature module"
             )
         # Neighborhood requirements are independent of which fields are read.
         cutoffs = [item.cutoff_grid for item in readouts
@@ -287,14 +302,21 @@ class GridCACEModel(nn.Module, Configurable):
                 "a_features and b_features are required by a configured readout"
             )
         if a_features is not None:
+            if n_types is not None and n_types != a_features.n_types:
+                raise ValueError("n_types must match a_features")
             n_types = a_features.n_types
         else:
             typed_readouts = [
                 item for item in readouts if item.n_types is not None
             ]
-            if not typed_readouts:
-                raise ValueError("n_types cannot be inferred from the readouts")
-            n_types = typed_readouts[0].n_types
+            if typed_readouts:
+                if n_types is not None and n_types != typed_readouts[0].n_types:
+                    raise ValueError("n_types must match readouts")
+                n_types = typed_readouts[0].n_types
+            elif n_types is None:
+                raise ValueError("provide n_types for an ideal-only model")
+        if isinstance(n_types, bool) or not isinstance(n_types, Integral) or n_types < 1:
+            raise ValueError("n_types must be a positive integer")
         for item in readouts:
             if item.n_types is not None and item.n_types != n_types:
                 raise ValueError("all readouts must use the same n_types")
@@ -331,6 +353,10 @@ class GridCACEModel(nn.Module, Configurable):
                 if freshly_built:
                     item.to(dtype=reference.dtype, device=reference.device)
 
+        self._n_types = int(n_types)
+        self.ideal = ideal if ideal is not None else (
+            None if has_polarization else IdealGas(thermal_wavelength=thermal_wavelength)
+        )
         self.a_features = a_features
         self.b_features = b_features
         self.message_layers = nn.ModuleList(messages)
@@ -403,10 +429,15 @@ class GridCACEModel(nn.Module, Configurable):
             "boltzmann_constant",
             boltzmann_constant_tensor,
         )
-        self.register_buffer(
-            "thermal_wavelength",
-            thermal_wavelength_tensor,
-        )
+        if ideal is None and self.ideal is not None:
+            self.ideal.thermal_wavelength = thermal_wavelength_tensor
+        # The ideal reference owns the physical wavelength; the property below
+        # remains a read-only convenience for grid metadata and conversion.
+        if self.ideal is not None:
+            for name in ("thermal_wavelength", "dipole_magnitude"):
+                value = getattr(self.ideal, name, None)
+                if value is not None and value.numel() not in (1, self.n_types):
+                    raise ValueError(name + " must be scalar or one value per type")
 
     def to_config(self) -> Dict[str, Any]:
         """Return the nested constructor arguments describing this model.
@@ -426,7 +457,8 @@ class GridCACEModel(nn.Module, Configurable):
             grid_spacing=self.grid_spacing,
             mean_temperature=scalar_value(self.mean_temperature),
             boltzmann_constant=scalar_value(self.boltzmann_constant),
-            thermal_wavelength=self.thermal_wavelength,
+            ideal=optional_config(self.ideal),
+            n_types=self.n_types,
             compute_c1=self.compute_c1,
             compute_c2=self.compute_c2,
             compute_local_mu=self.compute_local_mu,
@@ -447,6 +479,7 @@ class GridCACEModel(nn.Module, Configurable):
         """Rebuild the model and every configured submodule."""
 
         arguments = constructor_arguments(cls, config)
+        arguments["ideal"] = build_optional(arguments.get("ideal"))
         arguments["a_features"] = build_optional(arguments.get("a_features"))
         arguments["b_features"] = build_optional(arguments.get("b_features"))
         readouts = arguments.get("readout")
@@ -518,7 +551,7 @@ class GridCACEModel(nn.Module, Configurable):
         for item in self.readout:
             if item.n_types is not None:
                 return item.n_types
-        raise RuntimeError("n_types is unavailable")
+        return self._n_types
 
     @property
     def has_local_features(self) -> bool:
@@ -545,9 +578,16 @@ class GridCACEModel(nn.Module, Configurable):
     def requires_dipole_density(self) -> bool:
         """Whether configured features or readouts depend on polarization."""
 
-        return (
+        return (self.ideal is not None and self.ideal.requires_dipole_density) or (
             self.has_local_features and self.a_features.requires_dipole_density
         ) or any(item.requires_dipole_density for item in self.readout)
+
+    @property
+    def thermal_wavelength(self):
+        """The model-owned ideal reference wavelength."""
+        if self.ideal is None:
+            raise ValueError("attach an explicit ideal reference first")
+        return self.ideal.thermal_wavelength
 
     @property
     def voxel_volume(self) -> torch.Tensor:
@@ -574,6 +614,7 @@ class GridCACEModel(nn.Module, Configurable):
             ),
             "thermal_wavelength": (
                 self.thermal_wavelength.detach().cpu().tolist()
+                if self.ideal is not None else [1.0] * self.n_types
             ),
         }
 
@@ -735,6 +776,7 @@ class GridCACEModel(nn.Module, Configurable):
         compute_c2: Optional[bool] = None,
         c2_reference: Tuple[int, int] = (0, 0),
         compute_polarization_derivative: Optional[bool] = None,
+        compute_ideal: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
@@ -757,15 +799,17 @@ class GridCACEModel(nn.Module, Configurable):
         if compute_polarization_derivative is None:
             compute_polarization_derivative = self.compute_polarization_derivative
         has_polarization = self.requires_dipole_density
+        compute_ideal = optional_boolean(compute_ideal, "compute_ideal")
+        if compute_ideal is None:
+            compute_ideal = self.ideal is not None
         if compute_polarization_derivative and not has_polarization:
             raise ValueError(
                 "compute_polarization_derivative requires a dipole-density readout"
             )
-        if has_polarization and self.compute_local_mu:
-            raise ValueError(
-                "compute_local_mu is unavailable for dipole-density models: "
-                "the orientational ideal free energy must first be specified"
-            )
+        if compute_ideal and self.ideal is None:
+            raise ValueError("full evaluation requires an explicit ideal reference; "
+                             "use FixedDipoleIdeal with the physical dipole magnitude "
+                             "or compute_ideal=False for excess-only evaluation")
 
         # A requested functional derivative requires gradient tracking even
         # when surrounding evaluation code uses torch.no_grad(). Energy-only
@@ -831,7 +875,10 @@ class GridCACEModel(nn.Module, Configurable):
             reserved_outputs = {
                 "F_exc", "beta_F_exc", "c1", "c2",
                 "beta_mu_local", "beta_mu_average", "beta_mu_weights",
-                "polarization_derivative",
+                "polarization_derivative", "beta_F_id", "beta_F",
+                "ideal_density_derivative", "ideal_polarization_derivative",
+                "density_derivative", "total_polarization_derivative",
+                "ideal_derivative_mask",
             }
             for item in self.readout:
                 energy, extra_outputs = item.energy_and_outputs(context)
@@ -853,7 +900,8 @@ class GridCACEModel(nn.Module, Configurable):
             # Summing the scalar readouts before conversion and
             # differentiation makes every enabled contribution part of one
             # variational functional.
-            readout_energy = readout_energies[0]
+            readout_energy = (readout_energies[0] if readout_energies
+                               else 0.0 * rho.sum(dim=(-2, -1)))
             for energy in readout_energies[1:]:
                 readout_energy = readout_energy + energy
 
@@ -881,7 +929,7 @@ class GridCACEModel(nn.Module, Configurable):
                     beta_F_exc.sum(),
                     response_fields,
                     create_graph=(self.training or compute_c2),
-                    allow_unused=compute_polarization_derivative,
+                    allow_unused=True,
                 )
 
             if compute_polarization_derivative:
@@ -905,7 +953,10 @@ class GridCACEModel(nn.Module, Configurable):
                 # c1 has rho's shape [..., n_grid, n_types]. The minus sign
                 # and division by Delta V convert its discrete derivative
                 # into -delta(beta_F_exc)/delta(rho), holding P fixed.
-                outputs["c1"] = -derivatives[0] / volume_element
+                derivative_rho = derivatives[0]
+                if derivative_rho is None:
+                    derivative_rho = 0.0 * rho + 0.0 * beta_F_exc.sum()
+                outputs["c1"] = -derivative_rho / volume_element
 
                 if compute_c2:
                     reference_grid, reference_type = (
@@ -940,27 +991,30 @@ class GridCACEModel(nn.Module, Configurable):
                             outputs["polarization_derivative"] = outputs[
                                 "polarization_derivative"
                             ].detach()
-
-                # Chemical-potential response is controlled by one model flag.
-                # Both returned chemical-potential fields are dimensionless
-                # beta*mu quantities. V_ext remains optional for intrinsic-
-                # functional evaluation.
-                if (
-                    self.compute_local_mu
-                    and "V_ext" in data
-                ):
-                    beta_mu_local = self._compute_local_chemical_potential(
-                        data=data,
-                        c1=outputs["c1"],
+            if compute_ideal:
+                outputs.update(self.ideal.evaluate(data, volume_element))
+                outputs["beta_F"] = outputs["beta_F_id"] + outputs["beta_F_exc"]
+                if compute_c1:
+                    outputs["density_derivative"] = (
+                        outputs["ideal_density_derivative"] - outputs["c1"]
                     )
-                    outputs["beta_mu_local"] = beta_mu_local
-                    weights = self._weight_mask(data["rho"])
+                if compute_polarization_derivative:
+                    outputs["total_polarization_derivative"] = (
+                        outputs["ideal_polarization_derivative"]
+                        + outputs["polarization_derivative"]
+                    )
+                if self.compute_local_mu and compute_c1 and "V_ext" in data:
+                    # Legacy training observables retain their established
+                    # evaluation order/gauge; intrinsic derivatives above do not.
+                    outputs["beta_mu_local"] = (
+                        self._compute_local_chemical_potential(data, outputs["c1"])
+                        if not has_polarization else
+                        outputs["density_derivative"] + context.beta[..., None, None] * data["V_ext"]
+                    )
+                    weights = self._weight_mask(rho)
                     outputs["beta_mu_weights"] = weights
-                    outputs["beta_mu_average"] = (
-                        self.average_chemical_potential(
-                            beta_mu_local,
-                            weights,
-                        )
+                    outputs["beta_mu_average"] = self.average_chemical_potential(
+                        outputs["beta_mu_local"], weights,
                     )
 
         return outputs

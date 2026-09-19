@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 import numpy as np
+from tests.ideal_helpers import with_ideal, IdealOnly
+from equicdft import FixedDipoleIdeal
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -281,7 +283,7 @@ def _polar_coulomb():
 # --------------------------------------------------------------------- solver
 
 
-class _Quadratic(nn.Module):
+class _Quadratic(IdealOnly):
     """beta*F_exc = a*dV*sum(rho^2) with c1 = -2*a*rho: a convex test functional."""
 
     def __init__(self, a=0.5):
@@ -291,9 +293,12 @@ class _Quadratic(nn.Module):
     def forward(self, data, compute_c1=True):
         rho = data["rho"]
         volume = torch.prod(data["grid_spacing"].to(rho))
-        outputs = {"beta_F_exc": self.a.to(rho) * volume * torch.sum(rho ** 2)}
+        outputs = super().forward(data, compute_c1=compute_c1)
+        outputs["beta_F_exc"] = self.a.to(rho) * volume * torch.sum(rho ** 2)
+        outputs["beta_F"] = outputs["beta_F_id"] + outputs["beta_F_exc"]
         if compute_c1:
             outputs["c1"] = -2.0 * self.a.to(rho) * rho
+            outputs["density_derivative"] = outputs["ideal_density_derivative"] - outputs["c1"]
         return outputs
 
 
@@ -389,7 +394,7 @@ def _ideal_dipoles(method, **kwargs):
     def case():
         with default_dtype(torch.float64):
             torch.manual_seed(23)
-            solver = GridSolver(None, dipole_magnitude=[0.7, 1.9])
+            solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
             return _solver_result(solver.solve(
                 _ideal_dipoles_case(), particle_numbers=[3.0, 4.0],
                 method=method, max_iter=400, tolerance_residual=1e-6, **kwargs,
@@ -404,7 +409,7 @@ def _model_dipoles(method, fixed_field=None):
             torch.manual_seed(24)
             model = _polarization_model().eval()
             data = _polarization_data()
-            solver = GridSolver(model, dipole_magnitude=0.7)
+            solver = GridSolver(with_ideal(model, FixedDipoleIdeal(0.7)))
             external = {
                 key: data[key]
                 for key in ("grid_size", "grid_spacing", "temperature", "local_density_index")
@@ -536,6 +541,15 @@ def compare(
     precedence; integer and boolean tensors are always compared exactly).
     """
 
+    actual = dict(actual)
+    if "state/thermal_wavelength" in recorded and "state/ideal.thermal_wavelength" in actual:
+        actual["state/thermal_wavelength"] = actual.pop("state/ideal.thermal_wavelength")
+    added_outputs = {"beta_F_id", "beta_F", "ideal_derivative_mask",
+                     "ideal_density_derivative", "ideal_polarization_derivative",
+                     "density_derivative", "total_polarization_derivative", "beta_mu_local"}
+    for key in list(actual):
+        if key not in recorded and key.rsplit("/", 1)[-1] in added_outputs:
+            del actual[key]
     if set(recorded) != set(actual):
         raise AssertionError(
             "key sets differ: missing {} unexpected {}".format(

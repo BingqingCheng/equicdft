@@ -238,7 +238,7 @@ class TestGridLDABranch(unittest.TestCase):
         self.assertTrue(torch.allclose(outputs["c1"], -4.0 * data["rho"]))
 
     def test_at_least_one_local_energy_branch_is_required(self):
-        with self.assertRaisesRegex(ValueError, "at least one"):
+        with self.assertRaisesRegex(ValueError, "n_types"):
             GridCACEModel(
                 a_features=None,
                 b_features=None,
@@ -676,7 +676,7 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertIn("grid_spacing", state)
         self.assertIn("mean_temperature", state)
         self.assertIn("boltzmann_constant", state)
-        self.assertIn("thermal_wavelength", state)
+        self.assertIn("ideal.thermal_wavelength", state)
         self.assertEqual(
             model.grid_info,
             {
@@ -711,7 +711,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         outputs = model(data)
 
-        self.assertEqual(list(outputs), ["beta_F_exc", "c1"])
+        self.assertTrue({"beta_F_exc", "c1", "beta_F_id", "beta_F"}.issubset(outputs))
         self.assertTrue(data["rho"].requires_grad)
         self.assertEqual(outputs["beta_F_exc"].shape, ())
         self.assertEqual(outputs["c1"].shape, (27, 1))
@@ -827,7 +827,7 @@ class TestGridCACEModel(unittest.TestCase):
         self.assertEqual(model.free_energy_mode, "beta")
         outputs = model(self._make_data())
 
-        self.assertEqual(list(outputs), ["beta_F_exc", "c1"])
+        self.assertTrue({"beta_F_exc", "c1", "beta_F_id", "beta_F"}.issubset(outputs))
         self.assertTrue(torch.isfinite(outputs["beta_F_exc"]))
 
     def test_model_applies_c2_sign_and_voxel_volume_to_one_row(self):
@@ -1055,7 +1055,7 @@ class TestGridCACEModel(unittest.TestCase):
 
         self.assertEqual(
             list(outputs),
-            ["beta_F_exc"],
+            ["beta_F_exc", "beta_F_id", "ideal_derivative_mask", "ideal_density_derivative", "beta_F"],
         )
         self.assertFalse(data["rho"].requires_grad)
         self.assertFalse(outputs["beta_F_exc"].requires_grad)

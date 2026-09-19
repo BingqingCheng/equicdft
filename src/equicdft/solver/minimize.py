@@ -6,12 +6,12 @@ import torch
 
 from .numerics import (
     _euler_residual,
+    _stationarity_field,
     _maximum_relative_change,
     _mirror_descent_trial,
     _residuals_converged,
     _thermodynamic_objective,
 )
-from ..functional.thermodynamics import local_chemical_potential
 from .options import ConvergenceOptions, MinimizeOptions
 from .symmetry import _HomogeneousDensityProjection
 
@@ -57,7 +57,6 @@ def minimize_density(
     line_search_failures = 0
     final_relative_change = float("inf")
 
-    projected_V_ext = V_ext if projection is None else projection.average(V_ext)
     next_step_size = step_size
     for _ in range(max_iter):
         current_data = dict(data)
@@ -70,6 +69,7 @@ def minimize_density(
             fixed_N is not None,
             voxel_volume,
             thermal_wavelength,
+                solver.model.ideal,
         ).detach()
         if not torch.isfinite(objective).item():
             raise ValueError(
@@ -78,19 +78,9 @@ def minimize_density(
         if not objective_history:
             objective_history.append(objective.item())
 
-        projected_c1 = evaluation["c1"].detach()
-        if projection is not None:
-            projected_c1 = projection.average(projected_c1)
         residual, _, max_residual, rms_residual = _euler_residual(
-            rho,
-            projected_c1,
-            projected_V_ext,
-            data["beta"],
-            thermal_wavelength,
-            mu,
-            residual_density_threshold,
-            maximum_density,
-            accessible_mask,
+            rho, _stationarity_field(evaluation, projection), data["beta"], mu,
+            residual_density_threshold, maximum_density, accessible_mask,
         )
         if _residuals_converged(
             max_residual,
@@ -103,13 +93,10 @@ def minimize_density(
         # Armijo needs the true objective derivative, whereas the
         # update and convergence test use the projected KKT residual
         # when an upper density bound is active.
-        line_search_gradient = local_chemical_potential(
-            rho,
-            V_ext,
-            data["beta"],
-            evaluation["c1"].detach(),
-            thermal_wavelength,
-            mask=accessible_mask[:, None],
+        line_search_gradient = torch.where(
+            accessible_mask[:, None],
+            _stationarity_field(evaluation),
+            torch.zeros_like(rho),
         )
         if fixed_N is None:
             line_search_gradient = torch.where(
@@ -153,6 +140,7 @@ def minimize_density(
                 fixed_N is not None,
                 voxel_volume,
                 thermal_wavelength,
+                solver.model.ideal,
             ).detach()
 
             sufficient_decrease = (

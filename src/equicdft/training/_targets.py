@@ -100,3 +100,21 @@ def resolve_target(
             unresolved,
         )
     )
+
+
+def center_fields(prediction, target, weights, axis):
+    """Project independent spatial constants from each field/component pair."""
+    if not -prediction.ndim <= axis < prediction.ndim:
+        raise ValueError("center_axis is outside the field dimensions")
+    if weights is None:
+        weights = torch.ones_like(prediction)
+    weights = weights.detach().to(prediction)
+    if weights.shape != prediction.shape:
+        raise ValueError("weights and prediction must have same shape")
+    if not torch.isfinite(weights).all() or torch.any(weights < 0):
+        raise ValueError("projection weights must be finite and nonnegative")
+    denominator = weights.sum(dim=axis, keepdim=True)
+    if torch.any(denominator <= 0):
+        raise ValueError("each projected field must have positive weights")
+    return tuple(field - (weights * field).sum(dim=axis, keepdim=True) / denominator
+                 for field in (prediction, target))

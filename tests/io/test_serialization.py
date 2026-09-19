@@ -242,7 +242,7 @@ class TestSaveLoadModel(unittest.TestCase):
         model, data = _materialized_example()
         expected = model(copy.deepcopy(data))
         current = model_payload(model)
-        self.assertEqual(MODEL_FORMAT_VERSION, 2)
+        self.assertEqual(MODEL_FORMAT_VERSION, 3)
         legacy = copy.deepcopy(current)
         legacy["format_version"] = 1
         scale = legacy["config"].pop("mean_density")
@@ -252,7 +252,7 @@ class TestSaveLoadModel(unittest.TestCase):
 
         migrated = migrate_model_payload(legacy)
 
-        self.assertEqual(migrated["format_version"], 2)
+        self.assertEqual(migrated["format_version"], 3)
         self.assertEqual(migrated["config"], current["config"])
         self.assertEqual(set(migrated["state_dict"]), set(current["state_dict"]))
         self.assertEqual(migrated["state_dict"]["mean_density"].dtype, torch.float32)

@@ -5,7 +5,7 @@ holding a plain dictionary::
 
     {
         "format": "equicdft-model",
-        "format_version": 2,
+        "format_version": 3,
         "equicdft_version": "...",
         "torch_version": "...",
         "default_dtype": "float32",
@@ -31,6 +31,11 @@ Format history
 
 Whole-object ``torch.save(model)`` files predating this format are converted
 by :mod:`equicdft.legacy`.
+
+Format 3 stores the model-owned ideal reference. Older polarized files lack
+the physical molecular moment: load/conversion requires an explicit
+FixedDipoleIdeal supplied from the original run metadata, never inferred
+from descriptor scales. Original files are not modified by loading.
 """
 
 from contextlib import contextmanager
@@ -68,7 +73,7 @@ __all__ = [
 
 
 MODEL_FORMAT = "equicdft-model"
-MODEL_FORMAT_VERSION = 2
+MODEL_FORMAT_VERSION = 3
 
 _DTYPE_NAMES = {
     "float16": torch.float16,
@@ -120,7 +125,8 @@ def model_dtype(model: nn.Module) -> torch.dtype:
 
     dtypes = {
         tensor.dtype
-        for tensor in list(model.parameters()) + list(model.buffers())
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
+        if not name.startswith("ideal.")
         if tensor.is_floating_point()
     }
     if not dtypes:
@@ -303,6 +309,7 @@ def _one_density_scale(scales: Dict[str, Any], source: str) -> Any:
 def migrate_model_state_dict(
     state_dict: Dict[str, torch.Tensor],
     expects_model_scale: bool,
+    ideal=None,
 ) -> Dict[str, torch.Tensor]:
     """Return ``state_dict`` with the density scale where the model keeps it.
 
@@ -319,6 +326,19 @@ def migrate_model_state_dict(
     """
 
     state = dict(state_dict)
+    old_ideal = ("thermal_wavelength" in state
+                 or not any(key.startswith("ideal.") for key in state))
+    if "thermal_wavelength" in state:
+        state["ideal.thermal_wavelength"] = state.pop("thermal_wavelength")
+    if old_ideal and ideal is not None:
+        for name, value in ideal.state_dict().items():
+            key = "ideal." + name
+            if key in state and state[key].shape != value.shape:
+                stored = state[key]
+                if not torch.allclose(stored.to(value), value):
+                    raise ValueError("checkpoint ideal reference differs from configured model")
+                state[key] = value.detach().clone()
+            state.setdefault(key, value.detach().clone())
     scales = {}
     if "a_features.mean_density" in state:
         scales["a_features.mean_density"] = state["a_features.mean_density"]
@@ -371,7 +391,40 @@ def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-_MIGRATIONS = {1: _migrate_v1_to_v2}
+def _migrate_v2_to_v3(payload):
+    """Move the ideal reference into the model; never guess molecular moments."""
+    config = payload["config"]
+    if config.get("ideal") is not None:
+        return payload
+    wavelength = config.pop("thermal_wavelength", 1.0)
+
+    def polarized(value):
+        if isinstance(value, dict):
+            return (value.get("include_polarization", False)
+                    or value.get("variable") == "dipole_density"
+                    or (value.get(TYPE_KEY) == "LDAReadout"
+                        and value.get("dipole_density_scale") is not None)
+                    or any(polarized(v) for v in value.values()))
+        return isinstance(value, list) and any(polarized(v) for v in value)
+
+    if polarized(config):
+        config["ideal"] = None
+        # This field is migration metadata, consumed by build_model rather
+        # than passed to the constructor. An explicit ideal is required.
+        payload["missing_ideal_wavelength"] = wavelength
+        payload["state_dict"].pop("thermal_wavelength", None)
+        payload["state_dict"].pop("ideal.thermal_wavelength", None)
+    else:
+        config["ideal"] = {"type": "IdealGas", "thermal_wavelength": wavelength}
+        state = payload["state_dict"]
+        value = state.pop("thermal_wavelength", state.get("ideal.thermal_wavelength"))
+        if value is None:
+            value = torch.as_tensor(wavelength, dtype=dtype_from_name(payload["default_dtype"]))
+        state["ideal.thermal_wavelength"] = value
+    return payload
+
+
+_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
 
 
 def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -391,17 +444,37 @@ def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return upgraded
 
 
-def build_model(payload: Dict[str, Any]) -> nn.Module:
+def build_model(payload: Dict[str, Any], *, ideal=None) -> nn.Module:
     """Construct a model from a validated payload and load its state.
 
     Payloads written by earlier format versions are migrated in memory first.
     """
 
     payload = migrate_model_payload(payload)
+    if "missing_ideal_wavelength" in payload and ideal is None:
+        raise ValueError("old polarization model has no molecular dipole magnitude; "
+                         "pass ideal=FixedDipoleIdeal(...) using the original run metadata")
+    if ideal is not None:
+        payload = copy.deepcopy(payload)
+        if payload["config"].get("ideal") is not None:
+            raise ValueError("this model already records an ideal reference")
+        payload["config"]["ideal"] = ideal.to_config()
+        payload["state_dict"].update({
+            "ideal." + name: value for name, value in ideal.state_dict().items()
+        })
     with default_dtype(dtype_from_name(payload["default_dtype"])):
         model = build(payload["config"])
     if not isinstance(model, nn.Module):
         raise TypeError("model configuration did not build a torch module")
+    # Ideal physical constants may deliberately retain more precision than
+    # fitted parameters. Restore their recorded buffer dtypes, not a cast.
+    if getattr(model, "ideal", None) is not None:
+        for name in model.ideal._buffers:
+            key = "ideal." + name
+            if key in payload["state_dict"]:
+                model.ideal._buffers[name] = model.ideal._buffers[name].to(
+                    dtype=payload["state_dict"][key].dtype,
+                )
     model.load_state_dict(payload["state_dict"], strict=True)
     return model
 
@@ -410,6 +483,8 @@ def load_model(
     path: PathLike,
     map_location: Optional[Union[str, torch.device]] = None,
     eval_mode: bool = True,
+    *,
+    ideal=None,
 ) -> nn.Module:
     """Rebuild a model saved by :func:`save_model`.
 
@@ -420,7 +495,7 @@ def load_model(
     """
 
     payload = read_model_payload(path, map_location="cpu")
-    model = build_model(payload)
+    model = build_model(payload, ideal=ideal)
     if map_location is not None:
         model = model.to(torch.device(map_location))
     return model.eval() if eval_mode else model.train()

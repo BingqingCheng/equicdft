@@ -10,7 +10,7 @@ import json
 import numpy as np
 import torch
 
-from equicdft import GridSolver
+from equicdft import GridSolver, GridCACEModel, FixedDipoleIdeal
 
 
 def exact_solution(v, h_vector, number, volume, moment):
@@ -50,10 +50,13 @@ def main():
     cases = [("zero", zero_v, zero_h), ("scalar", v, zero_h),
              ("uniform-electric", zero_v, uniform), ("electric", zero_v, h),
              ("coupled", v, h), ("weak", v, 1e-5*h), ("strong", v, 20*h)]
+    model = GridCACEModel(None, None, [], ideal=FixedDipoleIdeal(moment),
+                          n_types=1, grid_spacing=spacing, boltzmann_constant=1.0)
     records = []
     for name, potential, field in cases:
         data = {"V_ext": potential/beta, "E_ext": field/(beta*moment),
-                "beta": torch.tensor(beta), "grid_spacing": torch.full((3,), spacing)}
+                "beta": torch.tensor(beta), "temperature": torch.tensor(1 / beta),
+                "grid_spacing": torch.full((3,), spacing)}
         reference_rho, reference_p = exact_solution(potential.numpy(), field.numpy(), number, spacing**3, moment)
         pair = []
         for start in ("uniform", "perturbed"):
@@ -64,7 +67,7 @@ def main():
                 fraction = 0.15*torch.randn_like(field)
                 fraction /= 1 + fraction.norm(dim=-1, keepdim=True)
                 initial = {"initial_rho": rho, "initial_polarization": moment*rho[..., None]*fraction}
-            result = GridSolver(None, dipole_magnitude=moment).solve(
+            result = GridSolver(model).solve(
                 data,
                 particle_numbers=number,
                 tolerance_residual=1e-8,

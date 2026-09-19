@@ -4,6 +4,8 @@ import io
 import math
 import unittest
 
+from tests.ideal_helpers import with_ideal
+from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import (
@@ -71,7 +73,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         torch.testing.assert_close(loaded.energy(ctx(data)), new.energy(ctx(data)))
         scalar = GridCACEModel(None, None, [loaded], grid_spacing=.8, boltzmann_constant=1.0).eval()
         polar = self.model(new).eval()
-        for key, value in scalar(self.clone(data)).items():
+        for key, value in scalar(self.clone(data), compute_ideal=False).items():
             torch.testing.assert_close(value, polar(self.clone(data))[key])
 
     def test_independent_les_style_positive_phase_sum_and_derivatives(self):
@@ -281,7 +283,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         external.update(beta=torch.tensor(1.), V_ext=(response["c1"]-ideal["density_derivative"]).detach(),
                         E_ext=(response["polarization_derivative"]+ideal["polarization_derivative"]).detach())
         numbers = data["rho"].sum(0)
-        solver = GridSolver(model, dipole_magnitude=.7)
+        solver = GridSolver(with_ideal(model, FixedDipoleIdeal(.7)))
         perturbed = data["rho"] * (1 + .03 * torch.randn_like(data["rho"]))
         perturbed *= numbers / perturbed.sum(0)
         for start in ({}, dict(initial_rho=perturbed, initial_polarization=.002*torch.randn_like(data["dipole_density"]))):

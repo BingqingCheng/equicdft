@@ -2,6 +2,8 @@
 
 import unittest
 
+from tests.ideal_helpers import with_ideal
+from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, LongRangeReadout, MetalWall, ReciprocalFeatures
@@ -26,7 +28,7 @@ class TestPolarizationConfinement(unittest.TestCase):
         active_data = dict(data, V_ext=data["V_ext"][~mask], E_ext=data["E_ext"][~mask])
         numbers, moments = torch.tensor([3., 4.]), torch.tensor([.7, 1.9])
         expected_rho, expected_p = ideal_reference.exact_solution(active_data, numbers, moments)
-        solver = GridSolver(None, dipole_magnitude=moments)
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal(moments)))
         for perturbed in (False, True):
             initial = {}
             if perturbed:
@@ -56,7 +58,7 @@ class TestPolarizationConfinement(unittest.TestCase):
 
     def test_invalid_masks_and_excluded_initial_fields(self):
         data = ideal_reference.TestGridSolverPolarization.case()
-        solver = GridSolver(None, dipole_magnitude=[.7, 1.9])
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal([.7, 1.9])))
         for mask, error in (
             (torch.ones(24, dtype=torch.bool), ValueError),
             (torch.zeros(24), TypeError),
@@ -121,7 +123,7 @@ class TestPolarizationConfinement(unittest.TestCase):
                 response.mlp[-1].bias.copy_(torch.tensor([.2, .1, .03, .02]))
             readouts.append(response)
         model = GridCACEModel(None, None, readouts, grid_spacing=.8, mean_density=.4, boltzmann_constant=1.0).eval()
-        solver = GridSolver(model, dipole_magnitude=.7)
+        solver = GridSolver(with_ideal(model, FixedDipoleIdeal(.7)))
         data["V_ext"] = torch.zeros_like(data["rho"])
         data["E_ext"] = torch.zeros_like(data["dipole_density"])
         target = solver.evaluate(data)
@@ -150,7 +152,7 @@ class TestPolarizationConfinement(unittest.TestCase):
         self.assertLess(endpoint["potential_residual"].item(), 1e-10)
 
     def test_homogeneous_axes_cannot_be_silently_ignored_for_dipoles(self):
-        solver = GridSolver(None, dipole_magnitude=[.7, 1.9])
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal([.7, 1.9])))
         with self.assertRaisesRegex(ValueError, "not supported with fixed dipoles"):
             solver.solve(ideal_reference.TestGridSolverPolarization.case(),
                          particle_numbers=[3., 4.], homogeneous_axes=["x", "y"])

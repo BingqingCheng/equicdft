@@ -637,6 +637,7 @@ class Trainer:
         model_state = migrate_model_state_dict(
             checkpoint["model_state_dict"],
             expects_model_scale="mean_density" in self.model.state_dict(),
+            ideal=getattr(self.model, "ideal", None),
         )
         self.model.load_state_dict(model_state, strict=True)
         self.noise = _checkpoint_noise(checkpoint)
@@ -1069,7 +1070,7 @@ class Trainer:
 
         batch = self._move_batch(batch)
         if noise is not None:
-            batch = noise.apply(batch)
+            batch = noise.apply(batch, ideal=getattr(self.model, "ideal", None))
         outputs = self.model(batch, **(model_kwargs or {}))
         losses, details = loss.evaluate(outputs, batch, model=self.model)
         return batch, outputs, losses, details

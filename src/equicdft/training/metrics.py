@@ -10,7 +10,7 @@ from .._validation import (
     nonempty_string,
     unique_strings,
 )
-from ._targets import TargetKeys, normalize_target_keys, resolve_target
+from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
 
 __all__ = [
     "SUPPORTED_METRICS",
@@ -209,6 +209,7 @@ class Metrics(MetricCollection):
         ),
         subsets: Sequence[str] = ("train", "valid", "test"),
         selection_mask_key: Optional[str] = None,
+        center_axis: Optional[int] = None,
     ) -> None:
         target_keys = normalize_target_keys(target_key)
         default_target_name = target_keys[0]
@@ -217,6 +218,9 @@ class Metrics(MetricCollection):
             subsets,
         )
 
+        self.center_axis = center_axis
+        if center_axis is not None and (isinstance(center_axis, bool) or not isinstance(center_axis, int)):
+            raise TypeError("center_axis must be an integer axis or None")
         self.target_keys = target_keys
         self.target_key = (
             self.target_keys[0]
@@ -372,12 +376,17 @@ class Metrics(MetricCollection):
                     "selection mask and prediction must have same shape"
                 )
             selection_mask = selection_mask.detach().to(dtype=torch.bool)
+            if self.center_axis is not None:
+                prediction, target = center_fields(prediction, target, selection_mask, self.center_axis)
             prediction = prediction[selection_mask]
             target = target[selection_mask]
             if prediction.numel() == 0:
                 raise ValueError(
                     "selection mask must retain at least one value"
                 )
+
+        elif self.center_axis is not None:
+            prediction, target = center_fields(prediction, target, None, self.center_axis)
 
         if prediction.ndim == 0:
             prediction = prediction.unsqueeze(0)

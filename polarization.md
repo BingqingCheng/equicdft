@@ -14,12 +14,14 @@ imports and explicit inputs. Defining a helper does not load data or start
 training. Call it with your application's physical parameters; no dataset,
 model, loss or units are assumed to exist in the Python session.
 
-The first helper constructs a one-species, short-range excess functional.
+The first helper constructs a one-species short-range excess functional plus
+its fixed-dipole ideal reference.
 Its required inputs are:
 
 - `density_reference`: a positive number-density scale, in inverse volume.
 - `dipole_density_reference`: a positive dipole-density scale, in dipole moment
   per volume. It is not the molecular dipole magnitude.
+- `dipole_magnitude`: the physical fixed molecular dipole moment, not a descriptor scale.
 - `grid_spacing`: voxel spacing, in your chosen length unit.
 - `temperature_reference`: a positive reference temperature.
 - `boltzmann_constant`: Boltzmann's constant in your energy/temperature units.
@@ -34,12 +36,14 @@ from equicdft import (
     CartesianBFeatures,
     GridCACEModel,
     LocalReadout,
+    FixedDipoleIdeal,
 )
 
 def build_short_range_model(
     *,
     density_reference,
     dipole_density_reference,
+    dipole_magnitude,
     grid_spacing,
     temperature_reference,
     boltzmann_constant,
@@ -66,6 +70,7 @@ def build_short_range_model(
         a_features=a_features,
         b_features=b_features,
         readout=[LocalReadout(hidden_sizes=(16, 8))],
+        ideal=FixedDipoleIdeal(dipole_magnitude),
         grid_spacing=grid_spacing,
         mean_temperature=temperature_reference,
         boltzmann_constant=boltzmann_constant,
@@ -76,8 +81,8 @@ def build_short_range_model(
 
 `GridCACEModel` binds `LocalReadout` to the width of the local feature vector
 at construction, so the model is complete (and can be optimized or saved)
-as soon as it is built. The model above contains only the short-range learned
-term, not a complete physical free-energy specification.
+as soon as it is built. The model includes ideal and short-range excess terms;
+Coulomb and other long-range contributions must be added when required by the system.
 
 The input fields are:
 
@@ -524,7 +529,7 @@ polarization and grid properties plus `density_sem` and `dipole_density_sem`,
 both on the final training grid. It returns a list of frames, not a data loader.
 
 The trainer helper takes that model, an application-defined `equicdft.Loss`,
-and an explicit physical `dipole_magnitude`. This is the fixed single-particle
+and obtains the physical `dipole_magnitude` from `model.ideal`. This is the fixed single-particle
 dipole moment in units of polarization density divided by number density
 (for example, e Å if density is in Å⁻³ and polarization density in e Å⁻²).
 It is **not** mass, a loss weight, or the descriptor normalization scale.
@@ -547,7 +552,7 @@ def load_sem_frames(path, model):
     )
 
 
-def build_sem_trainer(model, loss, *, dipole_magnitude, learning_rate):
+def build_sem_trainer(model, loss, *, learning_rate):
     return Trainer(
         model=model,
         loss=loss,
@@ -555,7 +560,6 @@ def build_sem_trainer(model, loss, *, dipole_magnitude, learning_rate):
         noise=NoiseOptions(
             density=True,
             polarization=True,
-            dipole_magnitude=dipole_magnitude,
         ),
     )
 ```
@@ -613,3 +617,154 @@ near the physical bound. SEM components are not a polar vector; general rotated
 covariances cannot be recovered from three diagonal values. The loader refuses
 uncertainty coarsening without covariance information. Noise augmentation alone
 does not guarantee a stable or more accurate learned free energy.
+
+## 9. Model-owned ideal energy, field fitting and solving
+
+`GridCACEModel` owns the full intrinsic functional. Its readouts still compute
+only excess contributions. Choose `ideal=IdealGas(...)` for scalar density or
+`ideal=FixedDipoleIdeal(dipole_magnitude, ...)` for density and fixed dipoles.
+The latter already includes translational entropy: do not add another ideal gas.
+Both accept `thermal_wavelength`, a positive scalar or per-species vector in
+the chosen length units, defaulting to one.
+
+For each species, define $u=|\mathbf{P}|/(m\rho)$ and
+$x=L^{-1}(u)$, where $L(x)=\coth x-1/x$. With normalized angular measure,
+
+$$
+\beta f_{\mathrm{id}}
+=\rho\left[\ln(\rho\Lambda^3)-1
++ux-\ln\left(\frac{\sinh x}{x}\right)\right].
+$$
+
+The orientational part vanishes at $\mathbf{P}=0$, recovering the scalar
+ideal gas. Its domain is $\rho>0$ and $|\mathbf{P}|<m\rho$.
+Exact vacuum with zero polarization has zero energy; returned ideal derivatives
+there are zero placeholders, marked by `ideal_derivative_mask=False`, not
+finite physical vacuum derivatives. `excluded_mask` requires zero fields;
+a statistical training mask does not change the free energy.
+
+For normal evaluation, the model returns:
+
+| Output | Meaning |
+| --- | --- |
+| `beta_F_id`, `beta_F_exc`, `beta_F` | Ideal, excess and total intrinsic beta free energies |
+| `ideal_density_derivative` | Ideal derivative with respect to density at fixed polarization |
+| `ideal_polarization_derivative` | Ideal derivative with respect to polarization at fixed density |
+| `density_derivative` | Total density derivative, `ideal_density_derivative - c1` |
+| `total_polarization_derivative` | Ideal plus excess polarization derivative |
+
+Total density derivatives require `compute_c1=True`; total polarization
+derivatives require `compute_polarization_derivative=True`. The existing `c1`,
+`c2` and `polarization_derivative` retain their **excess-only** definitions.
+Derivatives use continuum normalization, including division by voxel volume.
+External fields and chemical potentials are not part of the intrinsic model.
+
+`GridSolver(model)` obtains the same ideal reference and total derivatives
+from the model; there is no solver-side molecular-moment argument. It adds
+the external coupling $\int(\rho V_{\mathrm{ext}}-\mathbf{P}\cdot\mathbf{E}_{\mathrm{ext}})d\mathbf{r}$
+and applies ensemble constraints. For fixed particle numbers, equilibrium obeys
+
+$$
+\frac{\delta\beta F}{\delta\rho}+\beta V_{\mathrm{ext}}=\beta\mu,
+\qquad
+\frac{\delta\beta F}{\delta\mathbf{P}}=\beta\mathbf{E}_{\mathrm{ext}}.
+$$
+
+Canonical fitting can therefore use two ordinary `TensorLoss` terms, without
+a script-defined Euler loss. The following standalone helper uses a fixed
+density mask and independent mean removal for each density field/species.
+Polarization is not mean-centered. Pass **one unbatched frame** to the data
+helper before batching. `beta` is inverse energy; V is energy per particle,
+and E is energy per dipole moment.
+
+```python
+from equicdft import FixedDipoleIdeal, Loss, TensorLoss
+
+
+def prepare_field_targets(frame, *, rho_min):
+    result = dict(frame)
+    result["beta_V_target"] = frame["beta"] * frame["V_ext"]
+    result["beta_E_target"] = frame["beta"] * frame["E_ext"]
+    mask = (frame["rho"] > rho_min).to(frame["rho"])
+    result["density_weights"] = mask
+    result["polarization_weights"] = mask[..., None].expand_as(
+        frame["dipole_density"]
+    )
+    return result
+
+
+def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0):
+    if not isinstance(model.ideal, FixedDipoleIdeal):
+        raise TypeError("joint field fitting requires FixedDipoleIdeal")
+    moment = model.ideal.dipole_magnitude.reshape(-1, 1)
+    return Loss([
+        TensorLoss(
+            "density", "density_derivative", "beta_V_target",
+            target_scale=-1.0, center_axis=-2,
+            weights_key="density_weights", weight=density_weight,
+        ),
+        TensorLoss(
+            "polarization", "total_polarization_derivative", "beta_E_target",
+            residual_scale=moment, weights_key="polarization_weights",
+            weight=polarization_weight,
+        ),
+    ])
+```
+
+Explicitly, with binary mask $w$, $C_w$ subtracting the weighted spatial
+mean separately for each case/species, and $D_\rho,D_P$ denoting total
+intrinsic derivatives, this helper computes
+
+$$
+\mathcal{L}_\rho=\lambda_\rho
+\frac{\sum w\,[C_w(D_\rho+\beta V_{\mathrm{ext}})]^2}{\sum w},
+\qquad
+\mathcal{L}_P=\lambda_P
+\frac{\sum_{a=1}^3\sum w\,[m(D_{P,a}-\beta E_{\mathrm{ext},a})]^2}
+{3\sum w}.
+$$
+
+Sums include batch, voxel and species indices. Cases are weighted by their
+number of included entries, not independently normalized per case. The defaults
+are $\lambda_\rho=\lambda_P=1$. The physical per-species moment $m$ is inside
+the square to make both residuals dimensionless; it is not a statistical task
+weight. No sigma normalization or inverse-SEM weighting is applied.
+External targets stay fixed under SEM augmentation because ideal derivatives
+are reevaluated by the model on the perturbed fields. The separate legacy
+`compute_local_mu` outputs remain available for old configurations; new fitting
+code can keep masks and gauge projection entirely in the losses.
+
+### Excess-only evaluation and old models
+
+Use `model(data, compute_ideal=False)` when only the excess functional is
+needed. Fourier stability probes use this path so their intentionally relaxed
+polarization perturbations do not trigger the exact ideal-domain constraint;
+their separate quadratic ideal reference is unchanged. A polarization model
+built without an ideal reference remains excess-only and cannot be solved.
+
+New model files store the ideal configuration and parameters. Old scalar
+models migrate automatically. Old polarization files require an explicit
+`FixedDipoleIdeal` with the original physical moment and wavelength: descriptor
+normalization scales are not a reliable source of these parameters.
+
+```python
+from equicdft import FixedDipoleIdeal, load_model, save_model
+
+
+def migrate_polarization_model(source, destination, *, dipole_magnitude,
+                               thermal_wavelength=1.0):
+    model = load_model(
+        source,
+        ideal=FixedDipoleIdeal(
+            dipole_magnitude, thermal_wavelength=thermal_wavelength,
+        ),
+    )
+    save_model(model, destination)
+    return model
+```
+
+This helper accepts old **versioned** files; use a different destination to
+preserve the source. For a trusted whole-object pickle, use the existing
+conversion command with `--dipole-magnitude` and, if needed,
+`--thermal-wavelength`. Do not pass an ideal override when loading a file that
+already stores its ideal reference.
