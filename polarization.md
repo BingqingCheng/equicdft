@@ -532,7 +532,7 @@ It is **not** mass, a loss weight, or the descriptor normalization scale.
 objective, dataset split or training duration.
 
 ```python
-from equicdft import GridData, Trainer
+from equicdft import GridData, NoiseOptions, Trainer
 
 
 def load_sem_frames(path, model):
@@ -552,14 +552,16 @@ def build_sem_trainer(model, loss, *, dipole_magnitude, learning_rate):
         model=model,
         loss=loss,
         optimizer_args={"lr": learning_rate},
-        density_noise=True,
-        polarization_noise=True,
-        noise_dipole_magnitude=dipole_magnitude,
+        noise=NoiseOptions(
+            density=True,
+            polarization=True,
+            dipole_magnitude=dipole_magnitude,
+        ),
     )
 ```
 
 This example enables both density and polarization noise. For polarization
-noise alone, use `density_noise=False` and omit the density-SEM mapping if
+noise alone, use `NoiseOptions(polarization=True, ...)` and omit the density-SEM mapping if
 that property is absent. `dipole_magnitude` must be positive and may be a
 scalar or one value per species; it is the quantity denoted by $m$ in the
 equations. It must come from the physical particle model, not from fitting.
@@ -579,9 +581,9 @@ Each training visit proposes `P' = P + dipole_density_std * randn_like(P)`.
 Draws are independent over voxels, species and Cartesian components. Proposals
 violating `rho > 0` or `|P| < m*rho` are rejected and redrawn as whole vectors,
 not componentwise clipped. After 1,000 unsuccessful attempts the update fails
-explicitly. If density augmentation is also enabled with `density_noise=True`
+explicitly. If density augmentation is also enabled with `density=True`
 and `rho_std` (e.g. mapped to `density_sem`), the entire `(rho', P')` proposal
-is redrawn together; `density_noise_floor` defaults to zero. The scalar-fluid
+is redrawn together; `density_floor` defaults to zero. The scalar-fluid
 density-noise API retains its original Gaussian-plus-floor behavior.
 
 The optional original `valid` voxel mask is kept fixed, and its false cells

@@ -1,12 +1,120 @@
 """Training-only, diagonal-uncertainty perturbations in physical field units."""
 
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Union
+
 import torch
 
+from .._validation import boolean, nonnegative_scalar
 from ..functional.thermodynamics import local_chemical_potential
 from ..functional.polarization_ideal import (
     FixedDipoleIdeal,
     _positive_components,
 )
+
+__all__ = ["NoiseOptions", "add_density_noise", "add_field_noise"]
+
+
+def _noise_dipole_magnitude(value: Any) -> Optional[Union[float, List[float]]]:
+    """Normalize an optional fixed moment; species count is checked per batch."""
+
+    if value is None:
+        return None
+    magnitude = torch.as_tensor(value)
+    if magnitude.dtype == torch.bool or magnitude.is_complex():
+        raise ValueError("noise_dipole_magnitude must contain real numeric values")
+    # Preserve Python/NumPy double precision independently of torch's default.
+    magnitude = torch.as_tensor(value, dtype=torch.float64)
+    if (
+        magnitude.ndim > 1
+        or magnitude.numel() == 0
+        or not torch.all(torch.isfinite(magnitude)).item()
+        or torch.any(magnitude <= 0).item()
+    ):
+        raise ValueError(
+            "noise_dipole_magnitude must be a finite positive scalar or vector"
+        )
+    return magnitude.detach().cpu().tolist()
+
+
+@dataclass(frozen=True)
+class NoiseOptions:
+    """Training-time field noise of one trainer or training stream.
+
+    ``density`` and ``polarization`` add independent Gaussian draws scaled
+    by the batch ``rho_std`` and ``dipole_density_std`` before each training
+    forward; validation stays clean. ``density_floor`` is a nonnegative
+    lower density bound of the noisy field (excluded cells stay zero,
+    particle numbers are not renormalized). ``dipole_magnitude`` is the
+    positive fixed single-particle moment (scalar or per species) required
+    to perturb a polarized batch, including density-only perturbation of
+    such a batch, so the local physical bound and the coupled ideal targets
+    are preserved.
+    """
+
+    density: bool = False
+    density_floor: float = 0.0
+    polarization: bool = False
+    dipole_magnitude: Optional[Union[float, Sequence[float]]] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "density", boolean(self.density, "density_noise"))
+        object.__setattr__(
+            self, "density_floor",
+            nonnegative_scalar(self.density_floor, "density_noise_floor"),
+        )
+        object.__setattr__(
+            self, "polarization", boolean(self.polarization, "polarization_noise"),
+        )
+        object.__setattr__(
+            self, "dipole_magnitude", _noise_dipole_magnitude(self.dipole_magnitude),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.density or self.polarization
+
+    def apply(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Return ``batch`` with the configured noise (unchanged when disabled)."""
+
+        if not self.enabled:
+            return batch
+        return add_field_noise(
+            batch,
+            density_noise=self.density,
+            density_noise_floor=self.density_floor,
+            polarization_noise=self.polarization,
+            dipole_magnitude=self.dipole_magnitude,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "density": self.density,
+            "density_floor": self.density_floor,
+            "polarization": self.polarization,
+            "dipole_magnitude": self.dipole_magnitude,
+        }
+
+    @classmethod
+    def from_dict(cls, values: Dict[str, Any]) -> "NoiseOptions":
+        return cls(**values)
+
+    @classmethod
+    def from_legacy(
+        cls,
+        density_noise: Any = False,
+        density_noise_floor: Any = 0.0,
+        polarization_noise: Any = False,
+        noise_dipole_magnitude: Any = None,
+    ) -> "NoiseOptions":
+        """Build from the four keywords used before equicdft 0.1.0."""
+
+        return cls(
+            density=density_noise,
+            density_floor=density_noise_floor,
+            polarization=polarization_noise,
+            dipole_magnitude=noise_dipole_magnitude,
+        )
 
 
 _MAX_NOISE_ATTEMPTS = 1000

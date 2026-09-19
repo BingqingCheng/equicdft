@@ -56,6 +56,31 @@ class TestKeywordOnly(unittest.TestCase):
         self.assertEqual(rebuilt.to_config(), readout.to_config())
 
 
+class TestLegacyNoiseKeywords(unittest.TestCase):
+    def test_trainer_and_stream_keywords_map_onto_noise_options(self):
+        from torch import nn
+        from torch.utils.data import DataLoader
+
+        from equicdft import Loss, NoiseOptions, Trainer, TrainingStream
+
+        loss = Loss([TensorLoss("x", "prediction", "target")])
+        model = nn.Linear(1, 1)
+        with self.assertWarnsRegex(EquicdftDeprecationWarning, "noise=NoiseOptions"):
+            trainer = Trainer(model, loss, density_noise=True, density_noise_floor=0.1)
+        self.assertEqual(trainer.noise, NoiseOptions(density=True, density_floor=0.1))
+        with self.assertWarnsRegex(EquicdftDeprecationWarning, "Trainer.density_noise is deprecated"):
+            self.assertTrue(trainer.density_noise)
+        loader = DataLoader([{"x": torch.ones(1), "target": torch.ones(1)}])
+        with self.assertWarns(EquicdftDeprecationWarning):
+            stream = TrainingStream("s", loader, loader, loss, polarization_noise=True, noise_dipole_magnitude=2.0)
+        self.assertEqual(stream.noise, NoiseOptions(polarization=True, dipole_magnitude=2.0))
+        with self.assertRaisesRegex(TypeError, "not both"):
+            Trainer(model, loss, noise=NoiseOptions(), density_noise=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", EquicdftDeprecationWarning)
+            Trainer(model, loss, noise=NoiseOptions(density=True))
+
+
 class TestAliasedOutputs(unittest.TestCase):
     def setUp(self):
         self.outputs = AliasedOutputs.with_aliases(

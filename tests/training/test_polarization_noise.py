@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from equicdft import FixedDipoleIdeal, Loss, TensorLoss, Trainer, TrainingStream
-from equicdft.training.noise import add_field_noise
+from equicdft.training.noise import NoiseOptions, add_field_noise
 
 
 class RecordingPolarModel(nn.Module):
@@ -196,14 +196,14 @@ class TestPolarizationNoise(unittest.TestCase):
             add_field_noise(batch, polarization_noise=True, dipole_magnitude=1.)
 
     def test_train_only_clean_evaluation_and_joint_stream_opt_in(self):
-        t = trainer(polarization_noise=True, noise_dipole_magnitude=1.)
+        t = trainer(noise=NoiseOptions(polarization=True, dipole_magnitude=1.))
         with patch("torch.randn_like", side_effect=lambda x: torch.ones_like(x)):
             t.fit(loader(), loader(), epochs=1, verbose=False)
         for is_training, polar in t.model.seen:
             torch.testing.assert_close(polar, torch.full_like(polar, .35 if is_training else .2))
         t.model.seen.clear()
         t.evaluate_streams([TrainingStream("P", loader(), loader(), loss(),
-                            polarization_noise=True, noise_dipole_magnitude=1.)], subset="train")
+                            noise=NoiseOptions(polarization=True, dipole_magnitude=1.))], subset="train")
         for is_training, polar in t.model.seen:
             self.assertFalse(is_training)
             torch.testing.assert_close(polar, torch.full_like(polar, .2))
@@ -211,8 +211,8 @@ class TestPolarizationNoise(unittest.TestCase):
         with patch("torch.randn_like", side_effect=AssertionError("unexpected noise")):
             t.fit(loader(), loader(), epochs=1, verbose=False)
         t = trainer()
-        streams = [TrainingStream("P", loader(), loader(), loss(), polarization_noise=True,
-                                  noise_dipole_magnitude=1.),
+        streams = [TrainingStream("P", loader(), loader(), loss(),
+                                  noise=NoiseOptions(polarization=True, dipole_magnitude=1.)),
                    TrainingStream("clean", loader(), loader(), loss())]
         with patch("torch.randn_like", side_effect=lambda x: torch.ones_like(x)) as draws:
             t.fit_streams(streams, epochs=1, verbose=False)
@@ -222,11 +222,11 @@ class TestPolarizationNoise(unittest.TestCase):
         for joint in (False, True):
             with self.subTest(joint=joint), tempfile.TemporaryDirectory() as tmp:
                 def setup(path=None, enabled=True):
-                    t = trainer(checkpoint_dir=path, polarization_noise=enabled,
-                                noise_dipole_magnitude=.5 if enabled else None)
+                    t = trainer(checkpoint_dir=path, noise=NoiseOptions(
+                        polarization=enabled, dipole_magnitude=.5 if enabled else None))
                     streams = [TrainingStream("P", loader(), loader(), loss(),
-                               polarization_noise=enabled,
-                               noise_dipole_magnitude=.5 if enabled else None)]
+                               noise=NoiseOptions(polarization=enabled,
+                                                  dipole_magnitude=.5 if enabled else None))]
                     return t, streams
 
                 def fit(t, streams, epochs):
@@ -244,23 +244,23 @@ class TestPolarizationNoise(unittest.TestCase):
                 resumed, streams = setup(enabled=False)
                 if joint:
                     resumed.load_stream_checkpoint(Path(tmp)/"last.pt", streams)
-                    self.assertTrue(streams[0].polarization_noise)
+                    self.assertTrue(streams[0].noise.polarization)
                 else:
                     resumed.load_checkpoint(Path(tmp)/"last.pt", streams[0].train_loader)
-                    self.assertTrue(resumed.polarization_noise)
+                    self.assertTrue(resumed.noise.polarization)
                 fit(resumed, streams, 2)
                 self.assertTrue(torch.equal(full.model.weight, resumed.model.weight))
                 self.assertEqual(full.history, resumed.history)
                 checkpoint = torch.load(Path(tmp)/"last.pt", weights_only=False)
-                for key in ("polarization_noise", "noise_dipole_magnitude", "stream_polarization_noise"):
+                for key in ("noise", "stream_noise"):
                     checkpoint.pop(key)
                 torch.save(checkpoint, Path(tmp)/"legacy.pt")
                 if joint:
                     resumed.load_stream_checkpoint(Path(tmp)/"legacy.pt", streams)
-                    self.assertFalse(streams[0].polarization_noise)
+                    self.assertFalse(streams[0].noise.polarization)
                 else:
                     resumed.load_checkpoint(Path(tmp)/"legacy.pt", streams[0].train_loader)
-                    self.assertFalse(resumed.polarization_noise)
+                    self.assertFalse(resumed.noise.polarization)
 
     def test_complete_functional_training_has_finite_gradients(self):
         from tests.representation.test_polarization_symmetry import TestFullPolarizationSymmetry
@@ -273,7 +273,7 @@ class TestPolarizationNoise(unittest.TestCase):
         data["target_P_derivative"] = torch.zeros_like(data["dipole_density"])
         t = Trainer(model, Loss([TensorLoss("rho", "c1", "target_c1"),
                                 TensorLoss("P", "polarization_derivative", "target_P_derivative")]),
-                    polarization_noise=True, noise_dipole_magnitude=2., device="cpu")
+                    noise=NoiseOptions(polarization=True, dipole_magnitude=2.), device="cpu")
         dl = DataLoader([data])
         t.fit(dl, dl, epochs=1, verbose=False)
         self.assertTrue(torch.isfinite(torch.tensor(t.history[0]["train_losses"]["total"])))

@@ -78,3 +78,13 @@ listed first), `LongRangeReadout(n_kernels, n_types, ...)`,
 `GridSolver(model, ...)` and `Trainer(model, loss, ...)`. Calls that pass
 further arguments positionally still work in the 0.0.x order and warn; in
 0.2.0 they raise `TypeError`.
+
+## Trainer noise settings (0.1.0)
+
+`Trainer(noise=NoiseOptions(density=..., density_floor=..., polarization=...,
+dipole_magnitude=...))` and `TrainingStream(..., noise=NoiseOptions(...))`
+replace the four keywords `density_noise`, `density_noise_floor`,
+`polarization_noise` and `noise_dipole_magnitude`, which still work with a
+warning, as do the `Trainer.density_noise`-style attributes (read
+`Trainer.noise`). Checkpoints are written as version 3 (`noise`,
+`stream_noise`); version-2 checkpoints still load.

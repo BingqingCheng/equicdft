@@ -29,6 +29,7 @@ from .serialization import (
 from .solver.solver import GridSolver
 from .training.loss import Loss, LossTerm, TensorLoss
 from .training.metrics import MetricCollection, Metrics
+from .training.noise import NoiseOptions
 from .training.trainer import Trainer, TrainingStream
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     "MetricCollection",
     "Metrics",
     "MetalWall",
+    "NoiseOptions",
     "PairwiseReadout",
     "FixedDipoleIdeal",
     "ReciprocalFeatures",

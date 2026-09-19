@@ -696,7 +696,7 @@ class TestTrainer(unittest.TestCase):
             checkpoint = torch.load(directory / "last.pt")
 
         self.assertEqual(checkpoint["epoch"], 2)
-        self.assertEqual(checkpoint["checkpoint_version"], 2)
+        self.assertEqual(checkpoint["checkpoint_version"], 3)
         # Toy models carry no configuration; real models record theirs.
         self.assertIn("model_config", checkpoint)
         self.assertIsNone(checkpoint["model_config"])

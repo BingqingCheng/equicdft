@@ -14,7 +14,7 @@ from equicdft import (
     CartesianAFeatures, CartesianBFeatures, GridCACEModel, GridData,
     LDAReadout, LocalReadout, Loss, TensorLoss, Trainer, TrainingStream,
 )
-from equicdft.training.noise import add_density_noise
+from equicdft.training.noise import NoiseOptions, add_density_noise
 
 
 class RecordingModel(nn.Module):
@@ -99,10 +99,10 @@ class TestDensityNoise(unittest.TestCase):
                 add_density_noise({'rho': rho, 'rho_std': std}, 0.)
         for value in (-1., float('nan'), float('inf')):
             with self.assertRaises(ValueError):
-                trainer(density_noise_floor=value)
+                trainer(noise=NoiseOptions(density=True, density_floor=value))
 
     def test_train_only_and_clean_explicit_training_evaluation(self):
-        t = trainer(density_noise=True)
+        t = trainer(noise=NoiseOptions(density=True))
         train, valid = loader(), loader()
         with patch('torch.randn_like', side_effect=lambda x: torch.ones_like(x)):
             t.fit(train, valid, epochs=1, verbose=False)
@@ -111,7 +111,7 @@ class TestDensityNoise(unittest.TestCase):
             torch.testing.assert_close(rho, expected)
         t.model.seen.clear()
         t.evaluate_streams([TrainingStream('field', train, valid, t.loss,
-                                           density_noise=True)], subset='train')
+                                           noise=NoiseOptions(density=True))], subset='train')
         for is_training, rho in t.model.seen:
             self.assertFalse(is_training)
             torch.testing.assert_close(rho, rho.round())
@@ -123,7 +123,7 @@ class TestDensityNoise(unittest.TestCase):
         with patch('torch.randn_like', side_effect=AssertionError('unexpected noise')):
             t.fit(loader(), loader(), epochs=1, verbose=False)
         t = trainer()
-        streams = [TrainingStream('field', loader(), loader(), loss(), density_noise=True),
+        streams = [TrainingStream('field', loader(), loader(), loss(), noise=NoiseOptions(density=True)),
                    TrainingStream('response', loader(), loader(), loss())]
         with patch('torch.randn_like', side_effect=lambda x: torch.ones_like(x)) as draws:
             t.fit_streams(streams, epochs=1, verbose=False)
@@ -134,31 +134,42 @@ class TestDensityNoise(unittest.TestCase):
             restored = trainer()
             restored_streams = [TrainingStream(s.name, loader(), loader(), loss()) for s in streams]
             restored.load_stream_checkpoint(checkpoint, restored_streams)
-            self.assertTrue(restored_streams[0].density_noise)
-            self.assertFalse(restored_streams[1].density_noise)
+            self.assertTrue(restored_streams[0].noise.density)
+            self.assertFalse(restored_streams[1].noise.density)
 
     def test_checkpoint_resume_is_exact_and_legacy_disables_noise(self):
         torch.manual_seed(7)
-        full = trainer(density_noise=True)
+        full = trainer(noise=NoiseOptions(density=True))
         full.fit(loader(), loader(), epochs=3, verbose=False)
         with tempfile.TemporaryDirectory() as tmp:
             torch.manual_seed(7)
-            first = trainer(density_noise=True, checkpoint_dir=tmp)
+            first = trainer(noise=NoiseOptions(density=True), checkpoint_dir=tmp)
             first.fit(loader(), loader(), epochs=1, verbose=False)
             resumed = trainer()
             train, valid = loader(), loader()
             resumed.load_checkpoint(Path(tmp) / 'last.pt', train)
-            self.assertTrue(resumed.density_noise)
+            self.assertTrue(resumed.noise.density)
             resumed.fit(train, valid, epochs=2, verbose=False)
             self.assertTrue(torch.equal(full.model.weight, resumed.model.weight))
             self.assertEqual(full.history, resumed.history)
             checkpoint = torch.load(Path(tmp) / 'last.pt', weights_only=False)
+            self.assertEqual(checkpoint['checkpoint_version'], 3)
+            # A version-2 checkpoint spelled the settings out; it still loads.
+            version_two = dict(checkpoint)
+            version_two.pop('noise')
+            version_two.pop('stream_noise')
+            version_two.update(checkpoint_version=2, density_noise=True,
+                               density_noise_floor=0.25, stream_density_noise={})
+            torch.save(version_two, Path(tmp) / 'v2.pt')
+            resumed.load_checkpoint(Path(tmp) / 'v2.pt', train)
+            self.assertEqual(resumed.noise, NoiseOptions(density=True, density_floor=0.25))
+            # Without any noise keys, noise is off.
             for key in ('density_noise', 'density_noise_floor', 'stream_density_noise'):
-                checkpoint.pop(key)
+                version_two.pop(key)
             legacy = Path(tmp) / 'legacy.pt'
-            torch.save(checkpoint, legacy)
+            torch.save(version_two, legacy)
             resumed.load_checkpoint(legacy, train)
-            self.assertFalse(resumed.density_noise)
+            self.assertFalse(resumed.noise.density)
 
     def test_real_functional_gradients_and_clean_validation_forwards(self):
         atoms = TestDensityUncertaintyData.frame(n_types=2)
@@ -182,7 +193,7 @@ class TestDensityNoise(unittest.TestCase):
         t = Trainer(model, Loss([TensorLoss(
             'mu', 'beta_mu_local', 'beta_mu_average',
             weights_key='beta_mu_weights')]),
-            density_noise=True, optimizer_args={'lr': 1.e-4}, device='cpu')
+            noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4}, device='cpu')
         clean = fields[0]['rho'].clone()
         draws = torch.zeros_like(clean).unsqueeze(0)
         draws[:, :5] = -1000  # Force zeros at formerly positive cells.
