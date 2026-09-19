@@ -94,6 +94,13 @@ def _functional_dataset(n_fields=2):
 
 
 class TestTrainer(unittest.TestCase):
+    def test_trainer_is_a_plain_object_that_moves_its_modules(self):
+        trainer = self._make_trainer()
+        self.assertNotIsInstance(trainer, nn.Module)
+        self.assertIs(trainer.to("cpu"), trainer)
+        self.assertEqual(trainer.device, torch.device("cpu"))
+        self.assertIsInstance(trainer.metrics, tuple)
+
     def test_shared_grid_geometry_device_copy_is_cached_but_not_serialized(self):
         geometry = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         dataset = _dataset([1, 2])
@@ -116,8 +123,9 @@ class TestTrainer(unittest.TestCase):
             first["local_density_index"].data_ptr(),
             second["local_density_index"].data_ptr(),
         )
+        # The cache is trainer-local: nothing of it enters the model state.
         self.assertFalse(
-            any("geometry" in key for key in trainer.state_dict())
+            any("geometry" in key for key in trainer.model.state_dict())
         )
 
         cached_version = next(

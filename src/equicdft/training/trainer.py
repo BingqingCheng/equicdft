@@ -181,11 +181,12 @@ def _checkpoint_stream_noise(checkpoint: Dict[str, Any]) -> Dict[str, NoiseOptio
     }
 
 
-class Trainer(nn.Module):
+class Trainer:
     """Train a model with composable losses and dataset-level metrics.
 
-    The trainer owns optimization and epoch orchestration while the model,
-    loss, and metric modules retain their separate responsibilities. The
+    The trainer is a plain object that owns optimization and epoch
+    orchestration while the model, loss, and metric modules retain their
+    separate responsibilities; :meth:`to` moves all of them at once. The
     optimizer and scheduler are constructed on the first :meth:`fit`,
     :meth:`fit_streams` or :meth:`load_checkpoint` call from the parameters
     the model and loss modules already own.
@@ -278,8 +279,6 @@ class Trainer(nn.Module):
         polarization_noise: Optional[bool] = None,
         noise_dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
     ) -> None:
-        super().__init__()
-
         if not isinstance(model, nn.Module):
             raise TypeError("model must be a torch.nn.Module")
         if not isinstance(loss, Loss):
@@ -305,7 +304,7 @@ class Trainer(nn.Module):
 
         self.model = model
         self.loss = loss
-        self.metrics = nn.ModuleList(metrics)
+        self.metrics = tuple(metrics)
         self.optimizer_cls = optimizer_cls
         self.optimizer_args = dict(optimizer_args or {"lr": 1.0e-3})
         self.scheduler_cls = scheduler_cls
@@ -344,11 +343,29 @@ class Trainer(nn.Module):
         self.epochs_without_improvement = 0
         self._train_loader_generator = None
         self.stream_losses = nn.ModuleDict()
-        self.stream_metrics = nn.ModuleDict()
+        self.stream_metrics: Dict[str, Tuple[MetricCollection, ...]] = {}
         self._streams = ()
         self._stream_loader_generators = {}
         self._grid_geometry_device_cache = GeometryDeviceCache()
-        self.to(self.device)
+        self._move_to_device()
+
+    def to(self, device: Union[str, torch.device]) -> "Trainer":
+        """Move the model, losses and metrics to ``device`` and use it from now on."""
+
+        self.device = torch.device(device)
+        self._move_to_device()
+        self._grid_geometry_device_cache.clear()
+        return self
+
+    def _move_to_device(self) -> None:
+        self.model.to(self.device)
+        self.loss.to(self.device)
+        for metric in self.metrics:
+            metric.to(self.device)
+        self.stream_losses.to(self.device)
+        for metrics in self.stream_metrics.values():
+            for metric in metrics:
+                metric.to(self.device)
 
     def fit(
         self,
@@ -899,18 +916,15 @@ class Trainer(nn.Module):
             self.stream_losses = nn.ModuleDict(
                 {stream.name: stream.loss for stream in streams}
             )
-            self.stream_metrics = nn.ModuleDict(
-                {
-                    stream.name: nn.ModuleList(stream.metrics)
-                    for stream in streams
-                }
-            )
+            self.stream_metrics = {
+                stream.name: tuple(stream.metrics) for stream in streams
+            }
             self._streams = streams
             self._stream_loader_generators = {
                 stream.name: getattr(stream.train_loader, "generator", None)
                 for stream in streams
             }
-            self.to(self.device)
+            self._move_to_device()
         return self._streams
 
     @staticmethod
