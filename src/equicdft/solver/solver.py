@@ -6,17 +6,20 @@ from .._deprecation import keyword_only
 import torch
 from torch import nn
 
-from .._validation import (
-    boolean,
-    finite_scalar,
-    nonnegative_scalar,
-    positive_integer,
-    positive_scalar,
-)
+from .._validation import nonnegative_scalar
 from ..geometry.grid import voxel_volume
 from .symmetry import (
     _HomogeneousDensityProjection,
     _normalize_homogeneous_axes,
+)
+from .options import (
+    AndersonOptions,
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+    MinimizeOptions,
+    resolve_options,
 )
 from .numerics import (
     _anderson_log_density_candidate,
@@ -210,43 +213,28 @@ class GridSolver:
     def solve(
         self,
         data: Dict[str, Any],
-        initial_rho: Optional[torch.Tensor] = None,
-        particle_numbers: Optional[
-            Union[float, Sequence[float], torch.Tensor]
-        ] = None,
+        *,
         method: Optional[str] = None,
-        max_iter: int = 200,
-        tolerance_residual: float = 1.0e-4,
-        tolerance_rms_residual: Optional[float] = None,
-        tolerance_change: float = 1.0e-7,
-        step_size: float = 1.0,
-        minimum_step_size: float = 1.0e-8,
-        line_search_factor: float = 0.5,
-        armijo_factor: float = 1.0e-4,
-        mixing: float = 0.05,
-        adaptive_mixing: bool = True,
-        minimum_mixing: float = 0.005,
-        maximum_mixing: float = 0.2,
-        mixing_growth: float = 1.1,
-        mixing_backtrack_factor: float = 0.5,
-        anderson: bool = False,
-        anderson_history: int = 5,
-        anderson_regularization: float = 1.0e-8,
-        anderson_damping: float = 1.0,
-        max_log_density_change: float = 2.0,
-        residual_density_threshold: Optional[float] = None,
-        maximum_density: Optional[
-            Union[float, Sequence[float], torch.Tensor]
-        ] = None,
-        maximum_polarization_fraction: Optional[
-            Union[float, Sequence[float], torch.Tensor]
-        ] = None,
-        beta_multiplier: float = 0.0,
-        initial_polarization: Optional[torch.Tensor] = None,
-        fixed_field: Optional[str] = None,
-        homogeneous_axes: Optional[Union[str, Sequence[Union[int, str]]]] = None,
+        convergence: Optional[ConvergenceOptions] = None,
+        euler: Optional[EulerOptions] = None,
+        minimize: Optional[MinimizeOptions] = None,
+        constraints: Optional[Constraints] = None,
+        initial: Optional[Initialization] = None,
+        **flat_options: Any,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic functional to obtain equilibrium.
+
+        Options come in validated groups, ``convergence``
+        (:class:`ConvergenceOptions`), ``euler`` (:class:`EulerOptions`,
+        with ``anderson=AndersonOptions(...)`` for acceleration), ``minimize``
+        (:class:`MinimizeOptions`), ``constraints`` (:class:`Constraints`:
+        particle numbers, density and polarization caps, homogeneous axes,
+        fixed field) and ``initial`` (:class:`Initialization`: starting
+        fields and ``beta_multiplier``). Every field can equally be passed
+        as a flat keyword (``max_iter=``, ``mixing=``, ``anderson=True`` with
+        ``anderson_history=``, ``particle_numbers=``, ``initial_rho=``, ...);
+        a field set both ways is an error. The flat keywords are described
+        below by their field names.
 
         ``method="minimize"`` performs positivity-preserving mirror descent
         with an Armijo line search on the actual free energy (fixed particle
@@ -336,6 +324,22 @@ class GridSolver:
         available as ``full_maximum_residual`` and ``full_rms_residual``.
         """
 
+        options = resolve_options(
+            {
+                "convergence": convergence,
+                "euler": euler,
+                "minimize": minimize,
+                "constraints": constraints,
+                "initial": initial,
+            },
+            flat_options,
+        )
+        convergence = options.convergence
+        euler = options.euler
+        minimize = options.minimize
+        constraints = options.constraints
+        initial = options.initial
+
         if method is None:
             method = (
                 "minimize"
@@ -344,7 +348,7 @@ class GridSolver:
             )
         if method not in ("minimize", "euler"):
             raise ValueError("method must be 'minimize' or 'euler'")
-        homogeneous_axes = _normalize_homogeneous_axes(homogeneous_axes)
+        homogeneous_axes = _normalize_homogeneous_axes(constraints.homogeneous_axes)
         if homogeneous_axes and method != "minimize":
             raise ValueError("homogeneous_axes is currently available only with method='minimize'")
         if self.fixed_dipole_ideal is not None:
@@ -352,143 +356,51 @@ class GridSolver:
                 raise ValueError("homogeneous_axes is not supported with fixed dipoles")
             return self._solve_fixed_dipoles(
                 data=data,
-                initial_rho=initial_rho,
-                initial_polarization=initial_polarization,
-                particle_numbers=particle_numbers,
                 method=method,
-                max_iter=max_iter,
-                tolerance_residual=tolerance_residual,
-                tolerance_rms_residual=tolerance_rms_residual,
-                tolerance_change=tolerance_change,
-                step_size=step_size,
-                minimum_step_size=minimum_step_size,
-                line_search_factor=line_search_factor,
-                armijo_factor=armijo_factor,
-                mixing=mixing,
-                adaptive_mixing=adaptive_mixing,
-                minimum_mixing=minimum_mixing,
-                maximum_mixing=maximum_mixing,
-                mixing_growth=mixing_growth,
-                mixing_backtrack_factor=mixing_backtrack_factor,
-                anderson=anderson,
-                residual_density_threshold=residual_density_threshold,
-                maximum_density=maximum_density,
-                maximum_polarization_fraction=maximum_polarization_fraction,
-                beta_multiplier=beta_multiplier,
-                fixed_field=fixed_field,
+                options=options,
             )
-        if fixed_field is not None:
+        if constraints.fixed_field is not None:
             raise ValueError("fixed_field requires an explicit dipole_magnitude")
-        if initial_polarization is not None:
+        if initial.polarization is not None:
             raise ValueError(
                 "initial_polarization requires an explicit dipole_magnitude"
             )
-        if maximum_polarization_fraction is not None:
+        if constraints.maximum_polarization_fraction is not None:
             raise ValueError(
                 "maximum_polarization_fraction requires an explicit "
                 "dipole_magnitude"
             )
-        beta_multiplier = nonnegative_scalar(
-            beta_multiplier,
-            "beta_multiplier",
+
+        # Local names of the validated option fields.
+        initial_rho = initial.rho
+        particle_numbers = constraints.particle_numbers
+        beta_multiplier = initial.beta_multiplier
+        max_iter = convergence.max_iter
+        tolerance_residual = convergence.tolerance_residual
+        tolerance_rms_residual = convergence.tolerance_rms_residual
+        residual_density_threshold = convergence.residual_density_threshold
+        maximum_density = constraints.maximum_density
+        max_log_density_change = (
+            minimize.max_log_density_change
+            if method == "minimize"
+            else euler.max_log_density_change
         )
-        max_iter = positive_integer(max_iter, "max_iter")
-        tolerance_residual = positive_scalar(
-            tolerance_residual,
-            "tolerance_residual",
-        )
-        if tolerance_rms_residual is not None:
-            tolerance_rms_residual = positive_scalar(
-                tolerance_rms_residual,
-                "tolerance_rms_residual",
-            )
-        max_log_density_change = positive_scalar(
-            max_log_density_change,
-            "max_log_density_change",
-        )
-        if method == "minimize":
-            step_size = positive_scalar(step_size, "step_size")
-            minimum_step_size = positive_scalar(
-                minimum_step_size,
-                "minimum_step_size",
-            )
-            line_search_factor = finite_scalar(
-                line_search_factor,
-                "line_search_factor",
-            )
-            armijo_factor = finite_scalar(armijo_factor, "armijo_factor")
-            if minimum_step_size > step_size:
-                raise ValueError(
-                    "minimum_step_size must be no larger than step_size"
-                )
-            if not 0.0 < line_search_factor < 1.0:
-                raise ValueError(
-                    "line_search_factor must be in the interval (0, 1)"
-                )
-            if not 0.0 <= armijo_factor < 1.0:
-                raise ValueError(
-                    "armijo_factor must be in the interval [0, 1)"
-                )
-        else:
-            tolerance_change = positive_scalar(
-                tolerance_change,
-                "tolerance_change",
-            )
-            mixing = positive_scalar(mixing, "mixing")
-            minimum_mixing = positive_scalar(
-                minimum_mixing,
-                "minimum_mixing",
-            )
-            maximum_mixing = positive_scalar(
-                maximum_mixing,
-                "maximum_mixing",
-            )
-            mixing_growth = positive_scalar(
-                mixing_growth,
-                "mixing_growth",
-            )
-            mixing_backtrack_factor = positive_scalar(
-                mixing_backtrack_factor,
-                "mixing_backtrack_factor",
-            )
-            if mixing > 1.0:
-                raise ValueError("mixing must be in the interval (0, 1]")
-            adaptive_mixing = boolean(adaptive_mixing, "adaptive_mixing")
-            anderson = boolean(anderson, "anderson")
-            if adaptive_mixing:
-                if minimum_mixing > mixing:
-                    raise ValueError(
-                        "minimum_mixing must be no larger than mixing"
-                    )
-                if not mixing <= maximum_mixing <= 1.0:
-                    raise ValueError(
-                        "maximum_mixing must be at least mixing and no larger than one"
-                    )
-                if mixing_growth < 1.0:
-                    raise ValueError("mixing_growth must be at least one")
-                if not 0.0 < mixing_backtrack_factor < 1.0:
-                    raise ValueError(
-                        "mixing_backtrack_factor must lie in the interval (0, 1)"
-                    )
-            if anderson:
-                anderson_history = positive_integer(
-                    anderson_history,
-                    "anderson_history",
-                )
-                if anderson_history < 2:
-                    raise ValueError("anderson_history must be at least two")
-                anderson_regularization = nonnegative_scalar(
-                    anderson_regularization,
-                    "anderson_regularization",
-                )
-                anderson_damping = positive_scalar(
-                    anderson_damping,
-                    "anderson_damping",
-                )
-                if anderson_damping > 1.0:
-                    raise ValueError(
-                        "anderson_damping must be no larger than one"
-                    )
+        step_size = minimize.step_size
+        minimum_step_size = minimize.minimum_step_size
+        line_search_factor = minimize.line_search_factor
+        armijo_factor = minimize.armijo_factor
+        tolerance_change = euler.tolerance_change
+        mixing = euler.mixing
+        adaptive_mixing = euler.adaptive_mixing
+        minimum_mixing = euler.minimum_mixing
+        maximum_mixing = euler.maximum_mixing
+        mixing_growth = euler.mixing_growth
+        mixing_backtrack_factor = euler.mixing_backtrack_factor
+        anderson = euler.anderson is not None
+        anderson_options = euler.anderson or AndersonOptions()
+        anderson_history = anderson_options.history
+        anderson_regularization = anderson_options.regularization
+        anderson_damping = anderson_options.damping
 
         data = self._move_data(data)
         V_ext = data["V_ext"]
@@ -1553,106 +1465,49 @@ class GridSolver:
         return _aliased(result)
 
     @torch.enable_grad()
-    def _solve_fixed_dipoles(
-        self,
-        data,
-        initial_rho,
-        initial_polarization,
-        particle_numbers,
-        method,
-        max_iter,
-        tolerance_residual,
-        tolerance_rms_residual,
-        tolerance_change,
-        step_size,
-        minimum_step_size,
-        line_search_factor,
-        armijo_factor,
-        mixing,
-        adaptive_mixing,
-        minimum_mixing,
-        maximum_mixing,
-        mixing_growth,
-        mixing_backtrack_factor,
-        anderson,
-        residual_density_threshold,
-        maximum_density,
-        maximum_polarization_fraction,
-        beta_multiplier,
-        fixed_field,
-    ):
+    def _solve_fixed_dipoles(self, data, method, options):
         """Solve fixed-dipole Euler equations at fixed particle numbers."""
 
+        convergence = options.convergence
+        euler = options.euler
+        minimize = options.minimize
+        constraints = options.constraints
+        initial = options.initial
+        particle_numbers = constraints.particle_numbers
         if particle_numbers is None:
             raise ValueError(
                 "fixed-dipole solving currently requires particle_numbers"
             )
-        if anderson:
+        if euler.anderson is not None:
             raise ValueError(
                 "Anderson acceleration is not yet supported with fixed dipoles"
             )
-        if residual_density_threshold not in (None, 0, 0.0):
+        if convergence.residual_density_threshold not in (None, 0, 0.0):
             raise ValueError(
                 "residual_density_threshold is not supported with fixed dipoles"
             )
-        if fixed_field not in (None, "rho", "dipole_density"):
-            raise ValueError(
-                "fixed_field must be None, 'rho', or 'dipole_density'"
-            )
+        fixed_field = constraints.fixed_field
         if fixed_field is not None and method != "minimize":
             raise ValueError("fixed_field is supported only with method='minimize'")
-        max_iter = positive_integer(max_iter, "max_iter")
-        tolerance_residual = positive_scalar(
-            tolerance_residual, "tolerance_residual"
-        )
-        if tolerance_rms_residual is not None:
-            tolerance_rms_residual = positive_scalar(
-                tolerance_rms_residual, "tolerance_rms_residual"
-            )
-        beta_multiplier = nonnegative_scalar(beta_multiplier, "beta_multiplier")
-        if method == "minimize":
-            step_size = positive_scalar(step_size, "step_size")
-            minimum_step_size = positive_scalar(
-                minimum_step_size, "minimum_step_size"
-            )
-            line_search_factor = finite_scalar(
-                line_search_factor, "line_search_factor"
-            )
-            armijo_factor = finite_scalar(armijo_factor, "armijo_factor")
-            if minimum_step_size > step_size:
-                raise ValueError(
-                    "minimum_step_size must be no larger than step_size"
-                )
-            if not 0 < line_search_factor < 1:
-                raise ValueError("line_search_factor must lie in (0, 1)")
-            if not 0 <= armijo_factor < 1:
-                raise ValueError("armijo_factor must lie in [0, 1)")
-        else:
-            tolerance_change = positive_scalar(
-                tolerance_change, "tolerance_change"
-            )
-            mixing = positive_scalar(mixing, "mixing")
-            minimum_mixing = positive_scalar(
-                minimum_mixing, "minimum_mixing"
-            )
-            maximum_mixing = positive_scalar(
-                maximum_mixing, "maximum_mixing"
-            )
-            mixing_growth = positive_scalar(mixing_growth, "mixing_growth")
-            mixing_backtrack_factor = positive_scalar(
-                mixing_backtrack_factor, "mixing_backtrack_factor"
-            )
-            adaptive_mixing = boolean(adaptive_mixing, "adaptive_mixing")
-            if not 0 < mixing <= 1:
-                raise ValueError("mixing must lie in (0, 1]")
-            if not minimum_mixing <= mixing <= maximum_mixing <= 1:
-                raise ValueError(
-                    "require minimum_mixing <= mixing <= maximum_mixing <= 1"
-                )
-            if mixing_growth < 1:
-                raise ValueError("mixing_growth must be at least one")
-            if not 0 < mixing_backtrack_factor < 1:
-                raise ValueError("mixing_backtrack_factor must lie in (0, 1)")
+        initial_rho = initial.rho
+        initial_polarization = initial.polarization
+        beta_multiplier = initial.beta_multiplier
+        max_iter = convergence.max_iter
+        tolerance_residual = convergence.tolerance_residual
+        tolerance_rms_residual = convergence.tolerance_rms_residual
+        maximum_density = constraints.maximum_density
+        maximum_polarization_fraction = constraints.maximum_polarization_fraction
+        step_size = minimize.step_size
+        minimum_step_size = minimize.minimum_step_size
+        line_search_factor = minimize.line_search_factor
+        armijo_factor = minimize.armijo_factor
+        tolerance_change = euler.tolerance_change
+        mixing = euler.mixing
+        adaptive_mixing = euler.adaptive_mixing
+        minimum_mixing = euler.minimum_mixing
+        maximum_mixing = euler.maximum_mixing
+        mixing_growth = euler.mixing_growth
+        mixing_backtrack_factor = euler.mixing_backtrack_factor
 
         data = self._move_data(data)
         beta, volume, moment, wavelength, excluded, accessible = (

@@ -628,19 +628,58 @@ class TestGridSolver(unittest.TestCase):
                 method="unknown",
             )
 
-    def test_only_selected_method_options_are_validated(self):
-        GridSolver(self._make_model()).solve(
-            self._make_data(),
-            method="euler",
-            step_size="unused",
-            max_iter=1,
+    def test_every_option_is_validated_regardless_of_method(self):
+        # Options are validated once by their group, so an invalid value of
+        # the method that is not selected is still rejected.
+        with self.assertRaisesRegex((TypeError, ValueError), "step_size"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                method="euler",
+                step_size="unused",
+                max_iter=1,
+            )
+        with self.assertRaisesRegex((TypeError, ValueError), "mixing"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                method="minimize",
+                mixing="unused",
+                max_iter=1,
+            )
+
+    def test_option_groups_and_flat_keywords_are_equivalent(self):
+        from equicdft.solver.options import (
+            AndersonOptions,
+            Constraints,
+            ConvergenceOptions,
+            EulerOptions,
         )
-        GridSolver(self._make_model()).solve(
-            self._make_data(),
-            method="minimize",
-            mixing="unused",
-            max_iter=1,
+
+        data = self._make_data()
+        flat = GridSolver(self._make_model()).solve(
+            data,
+            particle_numbers=[1.0],
+            max_iter=30,
+            tolerance_residual=1.0e-6,
+            mixing=0.1,
+            anderson=True,
+            anderson_history=3,
         )
+        grouped = GridSolver(self._make_model()).solve(
+            self._make_data(),
+            constraints=Constraints(particle_numbers=[1.0]),
+            convergence=ConvergenceOptions(max_iter=30, tolerance_residual=1.0e-6),
+            euler=EulerOptions(mixing=0.1, anderson=AndersonOptions(history=3)),
+        )
+        self.assertTrue(torch.equal(flat["rho"], grouped["rho"]))
+        self.assertEqual(flat["n_iter"], grouped["n_iter"])
+        with self.assertRaisesRegex(TypeError, "set both"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                euler=EulerOptions(mixing=0.1),
+                mixing=0.2,
+            )
+        with self.assertRaisesRegex(TypeError, "unexpected keyword"):
+            GridSolver(self._make_model()).solve(self._make_data(), bogus=1)
 
     def test_zero_density_is_included_in_default_physical_residual(self):
         rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)

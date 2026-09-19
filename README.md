@@ -261,8 +261,14 @@ do not replace training-resume checkpoints with optimizer/scheduler state.
 - solve an equilibrium density at fixed particle number or fixed chemical
   potential using Euler iteration or direct free-energy minimization.
 
-The solver validates the grid against `model.grid_info`. See its docstring and
-the tests for the full option set. Both equilibrium algorithms keep excluded
+The solver validates the grid against `model.grid_info`. Its options come in
+validated groups from `equicdft.solver` (`ConvergenceOptions`, `EulerOptions`
+with `AndersonOptions`, `MinimizeOptions`, `Constraints`, `Initialization`),
+and every field can equally be passed as a flat keyword
+(`solver.solve(data, particle_numbers=[N], max_iter=300, mixing=0.1)` is
+`solver.solve(data, constraints=Constraints(particle_numbers=[N]),
+convergence=ConvergenceOptions(max_iter=300), euler=EulerOptions(mixing=0.1))`).
+See the docstring for the full set. Both equilibrium algorithms keep excluded
 densities exactly zero, normalize fixed particle numbers over accessible grid
 points only, and omit excluded points from Euler--Lagrange convergence
 diagnostics. This treats the exclusion mask as an infinite external potential
