@@ -241,15 +241,6 @@ fitted state, and verifies that old and new models evaluate identically.
 Use a distinct destination to preserve the original checkpoint. Only load
 trusted whole-object pickle files.
 
-The format also records polarization A/B flags and normalization, joint
-messages, polarization LDA, Gaussian vector/divergence kernels, and nested
-`MetalWall` geometry and charge constraints. Electrode FFT/LU caches are
-rebuilt, not serialized. For a whole-object electrode model, use the Python
-`convert_legacy_model` API with `verification_data` containing the original
-grid and fields; a guessed cell is not a valid verification geometry.
-Conversion checks polarization derivatives and electrode outputs as well as
-energy and density derivatives.
-
 Application checkpoints containing a configuration and `state_dict` are not
 whole-object files: rebuild them with their original application builder,
 load the state strictly, and then call `save_model`. Inference model files
@@ -261,20 +252,6 @@ do not replace training-resume checkpoints with optimizer/scheduler state.
   supplied equilibrium density;
 - solve an equilibrium density at fixed particle number or fixed chemical
   potential using Euler iteration or direct free-energy minimization.
-
-An explicit fixed dipole magnitude extends the same interface to coupled
-particle- and dipole-density equilibrium:
-
-```python
-solver = GridSolver(model, dipole_magnitude=m)
-result = solver.solve(data, particle_numbers=N)
-```
-
-Here `data` supplies `V_ext` and `E_ext`; the latter couples as
-$-\int \mathbf P\cdot\mathbf E_{\mathrm{ext}}$. Fixed-dipole solves use the
-orientational ideal entropy and preserve $|\mathbf P|<m\rho$. Both coupled
-Euler iteration and free-energy minimization are available. Polarization is
-enabled only by `dipole_magnitude`, never inferred from an optional data field.
 
 The solver validates the grid against `model.grid_info`. See its docstring and
 the tests for the full option set. Both equilibrium algorithms keep excluded
