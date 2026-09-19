@@ -17,7 +17,7 @@ import itertools
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Tuple
 
 import numpy as np
 import torch
@@ -53,8 +53,16 @@ from tests.model_fixtures import (
 GOLDEN_PATH = Path(__file__).with_name("goldens.pt")
 
 # name -> (rtol, atol) for cases whose numbers may legitimately move at the
-# floating-point level; every other case must match exactly.
+# floating-point level; every other case must match exactly when the running
+# torch version is the one that recorded the file.
 TOLERANCES: Dict[str, Tuple[float, float]] = {}
+
+# Under another torch release kernels differ at rounding level (FFT, matmul
+# accumulation order), so every case is compared with this tolerance instead.
+CROSS_VERSION_TOLERANCE: Dict[torch.dtype, Tuple[float, float]] = {
+    torch.float32: (1.0e-5, 1.0e-6),
+    torch.float64: (1.0e-6, 1.0e-9),
+}
 
 
 @contextmanager
@@ -512,9 +520,14 @@ def record(path: Path = GOLDEN_PATH) -> None:
 def compare(
     recorded: Dict[str, torch.Tensor],
     actual: Dict[str, torch.Tensor],
-    tolerance: Optional[Tuple[float, float]] = None,
+    tolerance=None,
 ) -> None:
-    """Raise AssertionError on the first difference between two case results."""
+    """Raise AssertionError on the first difference between two case results.
+
+    ``tolerance`` is ``None`` for an exact comparison, an ``(rtol, atol)``
+    pair, or a mapping from dtype to such pairs (integer and boolean tensors
+    are always compared exactly).
+    """
 
     if set(recorded) != set(actual):
         raise AssertionError(
@@ -531,14 +544,17 @@ def compare(
                     key, expected.dtype, tuple(expected.shape), value.dtype, tuple(value.shape),
                 )
             )
-        if tolerance is None:
+        pair = tolerance
+        if isinstance(tolerance, dict):
+            pair = tolerance.get(expected.dtype)
+        if pair is None or not expected.is_floating_point():
             if not torch.equal(expected, value):
                 difference = (expected.double() - value.double()).abs().max().item()
                 raise AssertionError(
                     "{}: not identical (max abs difference {:.3e})".format(key, difference)
                 )
         else:
-            torch.testing.assert_close(value, expected, rtol=tolerance[0], atol=tolerance[1], msg=key)
+            torch.testing.assert_close(value, expected, rtol=pair[0], atol=pair[1], msg=key)
 
 
 if __name__ == "__main__":
