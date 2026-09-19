@@ -35,12 +35,12 @@ from tests.model_fixtures import (
 )
 
 
-REPOSITORY = Path(__file__).resolve().parents[1]
+REPOSITORY = Path(__file__).resolve().parents[2]
 FROZEN_WHOLE_OBJECT_MODEL = (
     REPOSITORY / "tests" / "fixtures" / "lj_paper_v1_whole_object_model.pt"
 )
 FROZEN_CONVERTED_MODEL = (
-    REPOSITORY / "examples" / "lj_paper_v1_regression" / "model.pt"
+    REPOSITORY / "tests" / "regression" / "lj_paper_v1" / "model.pt"
 )
 
 

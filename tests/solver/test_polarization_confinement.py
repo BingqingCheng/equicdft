@@ -6,8 +6,8 @@ import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, LongRangeReadout, MetalWall, ReciprocalFeatures
 from tests.metal_helpers import wall_context as ctx
-from tests.test_metalwall_polarization import _case, _liquid, _oracle
-from tests import test_polarization_ideal as ideal_reference
+from tests.functional.test_metalwall_polarization import _case, _liquid, _oracle
+from tests.solver import test_polarization_ideal as ideal_reference
 
 
 class TestPolarizationConfinement(unittest.TestCase):

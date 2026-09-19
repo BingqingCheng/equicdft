@@ -263,32 +263,42 @@ reciprocal kernels with nonperiodic boundary conditions.
 
 ## Package map
 
-- `data.py`, `stencil.py`: complete fields and periodic neighborhoods
-- `features.py`, `symmetrize.py`: Cartesian moments and cubic invariants
-- `readout.py`, `semilocal.py`: local and state-dependent contributions
-- `pairwise.py`: finite-range distance-dependent pair contribution
+- `equicdft.geometry`: stencils, grid index arithmetic, periodic convolutions
+- `equicdft.data`: `GridData` fields, EXTXYZ parsing, loaders, metal sites,
+  the `equicdft-mean-density` console script
+- `equicdft.representation`: Cartesian moments (`CartesianAFeatures`), cubic
+  invariants (`CartesianBFeatures`), message passing (`BChiMessage`)
+- `equicdft.functional`: the readout interface and thermodynamics, local,
+  state-dependent, pairwise, reciprocal-space and metal-wall readouts, the
+  fixed-dipole ideal gas
 - `model.py`, `derivatives.py`: scalar functional and automatic derivatives
-- `loss.py`: composable training objectives
-- `metrics.py`, `trainer.py`: fitting, reporting, and restart state
-- `solver.py`: forward thermodynamics and equilibrium density solution
-- `reciprocal.py`: optional reciprocal-space features and readout support
-- `serialization.py`, `legacy.py`: versioned model files and conversion of
-  whole-object pickles
+- `equicdft.response`: Fourier probe modes, curvature, stability and response
+  losses, metrics and data
+- `equicdft.training`: loss terms, streaming metrics, the trainer, noise
+- `equicdft.solver`: forward thermodynamics and equilibrium density solution
+- `serialization.py`, `legacy.py`, `convert.py`: versioned model files and
+  conversion of whole-object pickles
+
+The flat module paths of equicdft 0.0.x (`equicdft.stencil`,
+`equicdft.features`, `equicdft.readout`, `equicdft.loss`, `equicdft.trainer`,
+...) still import and raise an `EquicdftDeprecationWarning`; they are removed
+in 0.2.0 (see `DEPRECATIONS.md`). The top-level names exported by `equicdft`
+itself are unchanged.
 
 Run the test suite with:
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m unittest discover -s tests -t . -p "test_*.py"
 ```
 
-The `lj_paper_v1_regression` example freezes one held-out `T=1.5` field and
+The `tests/regression/lj_paper_v1` harness freezes one held-out `T=1.5` field and
 the released model. It doubles as a regression test for gauge-aligned
 density-to-external-potential inference and the fixed-particle-number reverse
 solve:
 
 ```bash
-python -m examples.lj_paper_v1_regression.forward
-python -m examples.lj_paper_v1_regression.solve
+python -m tests.regression.lj_paper_v1.forward
+python -m tests.regression.lj_paper_v1.solve
 ```
 
 ## Scope

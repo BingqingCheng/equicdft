@@ -7,8 +7,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from equicdft import FourierStabilityLoss, Loss, Trainer
-from tests.test_fourier_amplitudes import batch
-from tests import test_loss as fixtures
+from tests.response.test_fourier_amplitudes import batch
+from tests.training import test_loss as fixtures
 
 
 class TestFourierModeCounts(unittest.TestCase):

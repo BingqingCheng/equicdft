@@ -12,8 +12,8 @@ from ase.io import write
 from torch.utils.data import DataLoader
 
 from equicdft import GridData, GridSolver, MetalWall, read_metal_sites
-from tests.test_metal_sites_data import _atoms, _grid_values
-from tests.test_metalwall_sites import (
+from tests.data.test_metal_sites_data import _atoms, _grid_values
+from tests.functional.test_metalwall_sites import (
     _data, _inverse_fixture, _one_electrode, _reference, _wall,
 )
 

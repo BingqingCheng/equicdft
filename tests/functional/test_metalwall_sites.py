@@ -125,7 +125,7 @@ def _correction(result):
 def _model_fixture(mode="beta"):
     # Import locally to reuse the established weak-coupling fixture without
     # collecting its TestCase a second time through this module.
-    from tests.test_metal_model import TestMetalModel
+    from tests.functional.test_metal_model import TestMetalModel
 
     model = TestMetalModel._model(mode=mode).eval()
     data = TestMetalModel._data()

@@ -28,7 +28,7 @@ class TestMeanDensityScript(unittest.TestCase):
                 text=True,
             )
 
-            repository = Path(__file__).resolve().parents[1]
+            repository = Path(__file__).resolve().parents[2]
             imported = subprocess.run(
                 [
                     sys.executable,

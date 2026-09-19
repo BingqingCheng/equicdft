@@ -11,7 +11,7 @@ from equicdft.functional._sites import FourierSites
 from equicdft.functional.base import ReadoutContext
 from equicdft.functional.metalwall import MetalWall
 from tests.metal_helpers import _run, liquid_coulomb, metal_sites
-from tests.test_metalwall import _dense_kernels, _field, _site_rows
+from tests.functional.test_metalwall import _dense_kernels, _field, _site_rows
 
 
 def _grid_potential(charge, kernel, spacing, shape):

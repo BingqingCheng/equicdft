@@ -8,7 +8,7 @@ import torch
 from equicdft import GridCACEModel, LongRangeReadout, MetalWall, ReciprocalFeatures
 from equicdft.serialization import build_model, model_payload
 from tests.metal_helpers import _run, liquid_coulomb, metal_sites
-from tests.test_metalwall_sites import _data, _reference
+from tests.functional.test_metalwall_sites import _data, _reference
 
 
 def _one_electrode(data):

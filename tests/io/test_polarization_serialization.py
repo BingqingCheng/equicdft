@@ -9,7 +9,7 @@ import torch
 
 from equicdft import GridSolver, MetalWall, load_model, save_model
 from equicdft.legacy import convert_legacy_model, legacy_model_to_current, verify_equivalent
-from tests import test_polarization_symmetry as fixtures
+from tests.representation import test_polarization_symmetry as fixtures
 
 
 class TestPolarizationSerialization(unittest.TestCase):
