@@ -646,6 +646,21 @@ class TestGridSolver(unittest.TestCase):
                 max_iter=1,
             )
 
+    def test_scalar_results_report_status_and_coupled_residual_names(self):
+        data = self._make_data()
+        result = GridSolver(self._make_model()).solve(
+            data, max_iter=200, tolerance_residual=1.0e-6, tolerance_change=1.0e-14,
+        )
+        self.assertEqual(result["status"], "converged")
+        self.assertEqual(result["maximum_residual"], result["max_euler_lagrange_residual"])
+        self.assertEqual(result["rms_residual"], result["rms_euler_lagrange_residual"])
+        short = GridSolver(self._make_model()).solve(data, max_iter=1, tolerance_residual=1.0e-12)
+        self.assertEqual(short["status"], "max_iter")
+        stalled = GridSolver(self._make_model()).solve(
+            data, max_iter=200, tolerance_residual=1.0e-12, tolerance_change=1.0,
+        )
+        self.assertEqual(stalled["status"], "stalled")
+
     def test_option_groups_and_flat_keywords_are_equivalent(self):
         from equicdft.solver.options import (
             AndersonOptions,

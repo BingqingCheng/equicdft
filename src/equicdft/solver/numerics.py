@@ -1,6 +1,6 @@
 """Private numerical kernels used by the equilibrium grid solver."""
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -644,3 +644,35 @@ def _accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
     if dtype in (torch.float16, torch.bfloat16, torch.float32):
         return torch.float64
     return dtype
+
+
+def _resolve_accessibility_masks(
+    data: Dict[str, Any],
+    field: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return validated excluded and accessible masks for a grid field."""
+
+    expected_shape = field.shape[:-1]
+    excluded_mask = data.get("excluded_mask")
+    if excluded_mask is None:
+        excluded = torch.zeros(
+            expected_shape,
+            dtype=torch.bool,
+            device=field.device,
+        )
+    else:
+        if (
+            not torch.is_tensor(excluded_mask)
+            or excluded_mask.dtype != torch.bool
+        ):
+            raise TypeError("excluded_mask must be a Boolean tensor")
+        if excluded_mask.shape != expected_shape:
+            raise ValueError(
+                "excluded_mask must have shape field.shape[:-1]"
+            )
+        excluded = excluded_mask.to(device=field.device)
+    if torch.any(torch.all(excluded, dim=-1)).item():
+        raise ValueError(
+            "exclusion masks must leave at least one accessible grid point"
+        )
+    return excluded, ~excluded

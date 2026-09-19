@@ -62,6 +62,7 @@ def solve_euler(
     n_iter = 0
     n_evaluations = 0
     mixing_backtracks = 0
+    stalled = False
     anderson_attempts = 0
     anderson_accepted = 0
     anderson_rejected = 0
@@ -302,6 +303,7 @@ def solve_euler(
         else:
             current_mixing = mixing
         if relative_change <= tolerance_change:
+            stalled = True
             break
 
     return {
@@ -311,6 +313,7 @@ def solve_euler(
         "objective_history": objective_history,
         "final_relative_density_change": final_relative_change,
         "line_search_failures": 0,
+        "stalled": stalled,
         "mixing_backtracks": mixing_backtracks,
         "final_mixing": current_mixing,
         "solver_anderson": anderson,
