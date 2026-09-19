@@ -10,7 +10,7 @@ from .._validation import (
     nonempty_string,
     unique_strings,
 )
-from .._targets import TargetKeys, normalize_target_keys, resolve_target
+from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 __all__ = [
     "SUPPORTED_METRICS",

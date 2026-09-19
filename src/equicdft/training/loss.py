@@ -9,7 +9,7 @@ from .._validation import (
     nonempty_string,
     nonnegative_scalar,
 )
-from .._targets import TargetKeys, normalize_target_keys, resolve_target
+from ._targets import TargetKeys, normalize_target_keys, resolve_target
 
 __all__ = [
     "LossTerm",
