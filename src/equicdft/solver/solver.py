@@ -1,6 +1,7 @@
 """Evaluate learned grid functionals and minimize thermodynamic objectives."""
 
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -84,11 +85,12 @@ class GridSolver:
     entire inaccessible volume explicitly in ``excluded_mask``.
     """
 
+    @keyword_only(1, ("model", "device"))
     def __init__(
         self,
         model: Optional[nn.Module],
-        device: Optional[Union[str, torch.device]] = None,
         *,
+        device: Optional[Union[str, torch.device]] = None,
         dipole_magnitude: Optional[
             Union[float, Sequence[float], torch.Tensor]
         ] = None,

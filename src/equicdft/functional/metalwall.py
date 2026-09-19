@@ -2,6 +2,7 @@
 
 import math
 from typing import Any, Dict, Mapping, NamedTuple
+from .._deprecation import keyword_only
 
 import torch
 
@@ -104,13 +105,14 @@ class MetalWall(EnergyReadout, Configurable):
     def wrapped_readouts(self):
         return (self.liquid_coulomb,)
 
+    @keyword_only(3, ("liquid_coulomb", "metal_sites", "metal_sigma", "tolerance"))
     def __init__(
         self,
         liquid_coulomb: LongRangeReadout,
         metal_sites: Mapping[str, Any],
         metal_sigma: float,
-        tolerance: float = 1.0e-6,
         *,
+        tolerance: float = 1.0e-6,
         external_field=(0.0, 0.0, 0.0),
     ) -> None:
         super().__init__()

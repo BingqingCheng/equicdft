@@ -59,3 +59,22 @@ constructor argument.
   `boltzmann_constant=1.0` to both `GridData` and `GridCACEModel`.
 - `BulkReadout`, `LongRangeReadout` and `GGAReadout` default to
   `hidden_sizes=(32, 16)` like every other readout, instead of `(16, 16)`.
+
+## Keyword-only constructor arguments (0.1.0)
+
+Constructors take only their structural arguments positionally and every
+option by keyword: `LocalReadout(n_types, ...)`, `BulkReadout(n_types, ...)`,
+`LDAReadout(n_types, ...)`, `GGAReadout(...)` (all keyword; `n_types` is
+listed first), `LongRangeReadout(n_kernels, n_types, ...)`,
+`PairwiseReadout(cutoff_grid, n_types, ...)`,
+`MetalWall(liquid_coulomb, metal_sites, metal_sigma, ...)`,
+`ReciprocalFeatures(radial_exponents, ...)`, `FixedDipoleIdeal(dipole_magnitude, ...)`,
+`CartesianAFeatures(max_power, mean_density, ...)`,
+`CartesianBFeatures(max_power, max_product_order, ...)`,
+`BChiMessage(n_invariant_features, n_radial_channels, n_channels, ...)`,
+`GridCACEModel(a_features, b_features, readout, ...)`,
+`TensorLoss(name, prediction_key, target_key, ...)`, `Metrics(target_key, ...)`,
+`FourierResponseLoss(directions, ...)`, `FourierResponseMetrics(direction_names, ...)`,
+`GridSolver(model, ...)` and `Trainer(model, loss, ...)`. Calls that pass
+further arguments positionally still work in the 0.0.x order and warn; in
+0.2.0 they raise `TypeError`.

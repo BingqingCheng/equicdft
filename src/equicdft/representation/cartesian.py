@@ -1,6 +1,7 @@
 """Cartesian moment features for density fields on fixed integer grids."""
 
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -191,10 +192,35 @@ class CartesianAFeatures(nn.Module, Configurable):
     buffers, so they follow the module across devices without being optimized.
     """
 
+    @keyword_only(
+        2,
+        (
+            "max_power",
+            "mean_density",
+            "cutoff_grid",
+            "radial_basis",
+            "radial_exponents",
+            "n_radial_channels",
+            "trainable_radial_exponents",
+            "coordinate_scaling",
+            "separate_center",
+            "n_types",
+            "n_channels",
+            "radial_centers",
+            "trainable_radial_centers",
+            "density_transform",
+            "trainable_density_transform",
+            "n_radial_functions",
+            "convolution_backend",
+            "include_polarization",
+            "dipole_density_scale",
+        ),
+    )
     def __init__(
         self,
         max_power: int,
         mean_density: Union[float, torch.Tensor],
+        *,
         cutoff_grid: int = 3,
         radial_basis: str = "none",
         radial_exponents: Optional[

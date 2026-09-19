@@ -1,6 +1,7 @@
 """Accumulate and evaluate prediction metrics across complete grid fields."""
 
 from typing import Dict, Optional, Sequence, Tuple
+from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -195,9 +196,21 @@ class Metrics(MetricCollection):
         same shape as the prediction.
     """
 
+    @keyword_only(
+        1,
+        (
+            "target_key",
+            "prediction_key",
+            "name",
+            "metric_keys",
+            "subsets",
+            "selection_mask_key",
+        ),
+    )
     def __init__(
         self,
         target_key: TargetKeys,
+        *,
         prediction_key: Optional[str] = None,
         name: Optional[str] = None,
         metric_keys: Sequence[str] = (

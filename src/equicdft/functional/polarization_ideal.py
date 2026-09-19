@@ -7,6 +7,7 @@ alignment are boundary limits, not finite states accepted by this interface.
 
 import torch
 from torch import nn
+from .._deprecation import keyword_only
 
 from .thermodynamics import (
     density_weighted_integral,
@@ -103,7 +104,8 @@ class FixedDipoleIdeal(nn.Module):
     derivative is positive, with units inverse dipole; both divide out Delta V.
     """
 
-    def __init__(self, dipole_magnitude, thermal_wavelength=1.0):
+    @keyword_only(1, ("dipole_magnitude", "thermal_wavelength"))
+    def __init__(self, dipole_magnitude, *, thermal_wavelength=1.0):
         super().__init__()
         for name, value in (
             ("dipole_magnitude", dipole_magnitude),

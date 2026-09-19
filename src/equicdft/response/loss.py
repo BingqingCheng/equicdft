@@ -7,6 +7,7 @@ from .._validation import nonempty_string
 from .modes import average_fourier_phases, normalized_directions
 from .response import FourierResponse
 from ..training.loss import LossTerm
+from .._deprecation import keyword_only
 
 __all__ = [
     "FourierResponseLoss",
@@ -25,9 +26,25 @@ class FourierResponseLoss(LossTerm):
     inverse response matrix using the same direction convention.
     """
 
+    @keyword_only(
+        1,
+        (
+            "directions",
+            "wavevector_indices_key",
+            "target_key",
+            "scale_key",
+            "weights_key",
+            "relative_amplitude",
+            "perturbations_per_forward",
+            "loss_fn",
+            "weight",
+            "name",
+        ),
+    )
     def __init__(
         self,
         directions: Sequence[Sequence[float]],
+        *,
         wavevector_indices_key: str = "fourier_wavevector_indices",
         target_key: str = "fourier_curvature",
         scale_key: Optional[str] = None,

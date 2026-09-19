@@ -57,7 +57,7 @@ class TestFixedDipoleIdeal(unittest.TestCase):
         torch.testing.assert_close(inverse_langevin(torch.from_numpy(mean)), h, rtol=1e-10, atol=2e-12)
 
     def test_independent_derivatives_and_mixed_hessian(self):
-        ideal = FixedDipoleIdeal([0.7, 1.9], [1.2, 0.8])
+        ideal = FixedDipoleIdeal([0.7, 1.9], thermal_wavelength=[1.2, 0.8])
         for volume in (0.125, 8.0):
             rho = (0.5 + torch.rand(3, 2)).requires_grad_()
             polar = (0.03*torch.randn(3, 2, 3)).requires_grad_()
@@ -73,7 +73,7 @@ class TestFixedDipoleIdeal(unittest.TestCase):
     def test_zero_polarization_hessian_and_scalar_limit(self):
         rho = torch.tensor([[0.4]], requires_grad=True)
         polar = torch.zeros(1, 1, 3, requires_grad=True)
-        ideal = FixedDipoleIdeal(1.7, 1.3)
+        ideal = FixedDipoleIdeal(1.7, thermal_wavelength=1.3)
         result = ideal(rho, polar, 8.)
         expected = 8*rho.sum()*(torch.log(rho[0, 0]*1.3**3) - 1)
         torch.testing.assert_close(result["beta_F_id"], expected)

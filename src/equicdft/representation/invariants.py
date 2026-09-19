@@ -7,6 +7,7 @@ integer spherical stencil constructed by :func:`equicdft.stencil.make_stencil`.
 
 from itertools import combinations_with_replacement, permutations, product
 from typing import Any, Dict, List, Sequence, Tuple
+from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -186,8 +187,18 @@ class CartesianBFeatures(nn.Module, Configurable):
     ``B: [..., n_grid, n_radial_channels, n_B, n_channels]``.
     """
 
+    @keyword_only(
+        2,
+        (
+            "max_power",
+            "max_product_order",
+            "include_polarization",
+            "separate_center",
+        ),
+    )
     def __init__(
         self, max_power: int, max_product_order: int = 3,
+        *,
         include_polarization: bool = False, separate_center: bool = True,
     ) -> None:
         super().__init__()

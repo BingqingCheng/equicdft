@@ -35,6 +35,7 @@ from .._io import atomic_torch_save
 from .loss import Loss
 from .metrics import MetricCollection
 from ..serialization import migrate_model_state_dict
+from .._deprecation import keyword_only
 
 __all__ = [
     "TrainingStream",
@@ -183,10 +184,33 @@ class Trainer(nn.Module):
         moment in the units of P/rho, not a statistical loss weight.
     """
 
+    @keyword_only(
+        2,
+        (
+            "model",
+            "loss",
+            "metrics",
+            "optimizer_cls",
+            "optimizer_args",
+            "scheduler_cls",
+            "scheduler_args",
+            "device",
+            "checkpoint_dir",
+            "checkpoint_interval",
+            "save_best",
+            "early_stopping_patience",
+            "log_dir",
+            "density_noise",
+            "density_noise_floor",
+            "polarization_noise",
+            "noise_dipole_magnitude",
+        ),
+    )
     def __init__(
         self,
         model: nn.Module,
         loss: Loss,
+        *,
         metrics: Sequence[MetricCollection] = (),
         optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_args: Optional[Dict[str, Any]] = None,

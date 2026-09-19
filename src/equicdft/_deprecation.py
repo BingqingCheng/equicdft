@@ -7,6 +7,7 @@ users can silence or escalate them separately from other libraries'
 deprecations (``warnings.simplefilter("error", EquicdftDeprecationWarning)``).
 """
 
+import functools
 import warnings
 
 
@@ -91,3 +92,53 @@ def _rebuild_aliased_outputs(values, aliases):
     outputs = AliasedOutputs(values)
     outputs._aliases = aliases
     return outputs
+
+
+def keyword_only(n_positional, legacy_order):
+    """Accept the 0.0.x positional call form of a now keyword-only signature.
+
+    Decorates ``__init__`` (or any method): calls that pass more than
+    ``n_positional`` arguments after ``self`` are mapped onto the parameter
+    names in ``legacy_order``, the positional order the signature had before
+    it became keyword-only, and warn once per call site. The decorated
+    signature itself is free to order its keyword-only parameters as it
+    likes. Removed in :data:`REMOVAL_VERSION`, after which the extra
+    positionals raise ``TypeError`` from the signature itself.
+    """
+
+    legacy_order = tuple(legacy_order)
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if len(args) > n_positional:
+                extra = args[n_positional:]
+                names = legacy_order[n_positional:n_positional + len(extra)]
+                owner = type(self).__name__
+                if len(names) < len(extra):
+                    raise TypeError(
+                        "{}() takes at most {} positional arguments ({} given)".format(
+                            owner, len(legacy_order), len(args),
+                        )
+                    )
+                for name in names:
+                    if name in kwargs:
+                        raise TypeError(
+                            "{}() got multiple values for argument '{}'".format(owner, name)
+                        )
+                warnings.warn(
+                    "{}() takes {} positional argument{}; pass {} by keyword "
+                    "(positional use is removed in equicdft {})".format(
+                        owner, n_positional, "" if n_positional == 1 else "s",
+                        ", ".join(names), REMOVAL_VERSION,
+                    ),
+                    EquicdftDeprecationWarning,
+                    stacklevel=2,
+                )
+                kwargs = dict(kwargs, **dict(zip(names, extra)))
+                args = args[:n_positional]
+            return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorate

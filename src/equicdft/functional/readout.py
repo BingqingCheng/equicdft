@@ -1,6 +1,7 @@
 """Energy readouts for grid features."""
 
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence
+from .._deprecation import keyword_only
 
 import torch
 
@@ -75,9 +76,11 @@ class LocalReadout(EnergyReadout, Configurable):
 
     requires_local_features = True
 
+    @keyword_only(1, ("n_types", "hidden_sizes", "n_features"))
     def __init__(
         self,
         n_types: int = 1,
+        *,
         hidden_sizes: Sequence[int] = (32, 16),
         n_features: Optional[int] = None,
     ) -> None:
@@ -181,9 +184,11 @@ class BulkReadout(EnergyReadout, Configurable):
         leaves a pretrained local model unchanged before fine-tuning.
     """
 
+    @keyword_only(1, ("n_types", "hidden_sizes", "zero_init"))
     def __init__(
         self,
         n_types: int = 1,
+        *,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = True,
     ) -> None:
@@ -304,10 +309,24 @@ class LongRangeReadout(EnergyReadout, Configurable):
             or (features is not None and features.requires_dipole_density)
         )
 
+    @keyword_only(
+        2,
+        (
+            "n_kernels",
+            "n_types",
+            "hidden_sizes",
+            "zero_init",
+            "charges",
+            "coulomb_amplitude",
+            "features",
+            "include_polarization",
+        ),
+    )
     def __init__(
         self,
         n_kernels: Optional[int] = None,
         n_types: Optional[int] = None,
+        *,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = True,
         charges: Optional[Sequence[float]] = None,

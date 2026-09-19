@@ -1,6 +1,7 @@
 """Finite-range message passing between invariant grid environments."""
 
 from typing import Any, Dict, Optional, Sequence, Union
+from .._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -102,11 +103,29 @@ class BChiMessage(nn.Module, Configurable):
         scalar gate-only operation, parameter shapes and checkpoint keys.
     """
 
+    @keyword_only(
+        3,
+        (
+            "n_invariant_features",
+            "n_radial_channels",
+            "n_channels",
+            "hidden_sizes",
+            "radial_exponents",
+            "trainable_radial_exponents",
+            "radial_centers",
+            "trainable_radial_centers",
+            "radial_basis",
+            "n_radial_functions",
+            "convolution_backend",
+            "include_polarization",
+        ),
+    )
     def __init__(
         self,
         n_invariant_features: int,
         n_radial_channels: int,
         n_channels: int,
+        *,
         hidden_sizes: Sequence[int] = (32, 16),
         radial_exponents: Optional[
             Union[Sequence[float], torch.Tensor]

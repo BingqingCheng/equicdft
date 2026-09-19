@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from numbers import Integral
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from ._deprecation import keyword_only
 
 import torch
 from torch import nn
@@ -159,11 +160,32 @@ class GridCACEModel(nn.Module, Configurable):
     density-normalizing readouts must receive it explicitly.
     """
 
+    @keyword_only(
+        3,
+        (
+            "a_features",
+            "b_features",
+            "readout",
+            "grid_spacing",
+            "mean_temperature",
+            "boltzmann_constant",
+            "thermal_wavelength",
+            "compute_c1",
+            "compute_c2",
+            "compute_local_mu",
+            "rho_min",
+            "free_energy_mode",
+            "message_layers",
+            "compute_polarization_derivative",
+            "mean_density",
+        ),
+    )
     def __init__(
         self,
         a_features: Optional[nn.Module],
         b_features: Optional[nn.Module],
         readout: Sequence[EnergyReadout],
+        *,
         grid_spacing: Union[float, Sequence[float], torch.Tensor],
         mean_temperature: Union[float, torch.Tensor] = 1.0,
         boltzmann_constant: float = DEFAULT_BOLTZMANN_CONSTANT,
