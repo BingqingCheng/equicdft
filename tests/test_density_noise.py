@@ -14,7 +14,7 @@ from equicdft import (
     CartesianAFeatures, CartesianBFeatures, GridCACEModel, GridData,
     LDAReadout, LocalReadout, Loss, TensorLoss, Trainer, TrainingStream,
 )
-from equicdft._density_noise import add_density_noise
+from equicdft.training.noise import add_density_noise
 
 
 class RecordingModel(nn.Module):

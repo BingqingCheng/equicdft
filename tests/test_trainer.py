@@ -22,7 +22,7 @@ from equicdft import (
     make_dataloaders,
 )
 from equicdft.geometry.grid import voxel_volume
-from equicdft._trainer_io import format_record
+from equicdft.training.io import format_record
 from equicdft.geometry.stencil import get_neighbor_indices
 
 

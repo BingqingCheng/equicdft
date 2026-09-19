@@ -20,7 +20,7 @@ from .modes import (
     wavevector_magnitude as _wavevector_magnitude,
 )
 from .curvature import polarization_fourier_curvature
-from ..loss import LossTerm
+from ..training.loss import LossTerm
 from .response import FourierResponse
 
 __all__ = [

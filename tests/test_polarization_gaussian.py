@@ -8,7 +8,7 @@ import torch
 
 from equicdft import GridCACEModel, LDAReadout, LongRangeReadout, ReciprocalFeatures
 from equicdft.functional.base import ReadoutContext
-from equicdft.loss import TensorLoss
+from equicdft.training.loss import TensorLoss
 
 
 class TestPolarizationGaussian(unittest.TestCase):

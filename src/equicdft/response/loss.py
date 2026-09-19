@@ -6,7 +6,7 @@ from torch import nn
 from .._validation import nonempty_string
 from .modes import average_fourier_phases, normalized_directions
 from .response import FourierResponse
-from ..loss import LossTerm
+from ..training.loss import LossTerm
 
 __all__ = [
     "FourierResponseLoss",

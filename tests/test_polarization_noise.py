@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from equicdft import FixedDipoleIdeal, Loss, TensorLoss, Trainer, TrainingStream
-from equicdft._density_noise import add_field_noise
+from equicdft.training.noise import add_field_noise
 
 
 class RecordingPolarModel(nn.Module):
@@ -121,7 +121,7 @@ class TestPolarizationNoise(unittest.TestCase):
                      dipole_density_std=std)
         draws = [torch.tensor([[.1, .2, .3], [2., 0., 0.]]),
                  torch.tensor([[.2, .3, .4]])]
-        with patch("equicdft._density_noise._MAX_NOISE_ATTEMPTS", 2):
+        with patch("equicdft.training.noise._MAX_NOISE_ATTEMPTS", 2):
             with patch("torch.randn_like", side_effect=draws) as random:
                 out = add_field_noise(batch, polarization_noise=True, dipole_magnitude=1.)
         self.assertEqual([call.args[0].shape for call in random.call_args_list],

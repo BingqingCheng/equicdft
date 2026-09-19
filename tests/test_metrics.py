@@ -4,8 +4,8 @@ import unittest
 import torch
 
 from equicdft import FourierResponseMetrics, MetricCollection, Metrics
-from equicdft.metrics import compute_metric
-from equicdft.metrics import format_metric_value, metric_label
+from equicdft.training.metrics import compute_metric
+from equicdft.training.metrics import format_metric_value, metric_label
 
 
 class TestComputeMetric(unittest.TestCase):

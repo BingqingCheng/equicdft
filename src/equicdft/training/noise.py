@@ -2,8 +2,8 @@
 
 import torch
 
-from .functional.thermodynamics import local_chemical_potential
-from .functional.polarization_ideal import (
+from ..functional.thermodynamics import local_chemical_potential
+from ..functional.polarization_ideal import (
     FixedDipoleIdeal,
     _positive_components,
 )

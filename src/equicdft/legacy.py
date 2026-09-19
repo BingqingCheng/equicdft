@@ -76,8 +76,18 @@ _MODULE_ALIASES: Dict[str, str] = {
     "equicdft._fourier_sites": "equicdft.functional._sites",
     "equicdft._fourier": "equicdft.response.modes",
     "equicdft.stability": "equicdft.response.stability",
+    "equicdft.loss": "equicdft.training.loss",
+    "equicdft.metrics": "equicdft.training.metrics",
+    "equicdft.trainer": "equicdft.training.trainer",
+    "equicdft._trainer_io": "equicdft.training.io",
+    "equicdft._density_noise": "equicdft.training.noise",
 }
-_CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {}
+_CLASS_ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
+    # classes that left their module for equicdft.response in step 5
+    ("equicdft.loss", "FourierResponseLoss"): ("equicdft.response.loss", "FourierResponseLoss"),
+    ("equicdft.metrics", "FourierResponseMetrics"): ("equicdft.response.metrics", "FourierResponseMetrics"),
+    ("equicdft.data", "FourierResponseData"): ("equicdft.response.data", "FourierResponseData"),
+}
 
 
 class _RemappingUnpickler(pickle.Unpickler):

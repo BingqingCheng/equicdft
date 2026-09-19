@@ -8,9 +8,9 @@ from .representation.cartesian import CartesianAFeatures
 from .representation.message import BChiMessage
 from .loader import make_dataloaders
 from .response.loss import FourierResponseLoss
-from .loss import Loss, LossTerm, TensorLoss
+from .training.loss import Loss, LossTerm, TensorLoss
 from .response.metrics import FourierResponseMetrics
-from .metrics import MetricCollection, Metrics
+from .training.metrics import MetricCollection, Metrics
 from .functional.metalwall import MetalWall
 from .model import GridCACEModel
 from .functional.pairwise import PairwiseReadout
@@ -29,7 +29,7 @@ from .serialization import (
 from .solver import GridSolver
 from .response.stability import FourierStabilityLoss
 from .representation.invariants import CartesianBFeatures
-from .trainer import Trainer, TrainingStream
+from .training.trainer import Trainer, TrainingStream
 
 __all__ = [
     "__version__",

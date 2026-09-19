@@ -6,23 +6,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-import torch
 
-from ._validation import boolean
+from .._validation import boolean
 from .metrics import format_metric_value, metric_label
-
-
-def atomic_torch_save(value: object, path: Path) -> None:
-    """Write a Torch object atomically through a sibling temporary file."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(".{}.tmp".format(path.name))
-    try:
-        torch.save(value, str(temporary_path))
-        os.replace(str(temporary_path), str(path))
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
 
 
 def append_log_message(
