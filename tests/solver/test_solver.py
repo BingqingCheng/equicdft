@@ -4,13 +4,13 @@ import torch
 from torch import nn
 
 from equicdft import GridCACEModel, GridData, GridSolver, LocalReadout
+from equicdft.solver.euler import (
+    _anderson_log_density_candidate as solver_anderson_candidate,
+)
 from equicdft.solver.numerics import (
     _anderson_log_density_candidate as numerical_anderson_candidate,
-    _project_density_constraints,
-)
-from equicdft.solver.solver import (
-    _anderson_log_density_candidate as solver_anderson_candidate,
     _euler_residual,
+    _project_density_constraints,
     _residuals_converged,
 )
 

@@ -12,8 +12,9 @@ from .symmetry import (
     _HomogeneousDensityProjection,
     _normalize_homogeneous_axes,
 )
+from .euler import solve_euler
+from .minimize import minimize_density
 from .options import (
-    AndersonOptions,
     Constraints,
     ConvergenceOptions,
     EulerOptions,
@@ -22,26 +23,21 @@ from .options import (
     resolve_options,
 )
 from .numerics import (
-    _anderson_log_density_candidate,
     _canonical_density_residual,
     _component_tensor,
     _euler_residual,
     _fixed_dipole_bound_kkt,
     _maximum_relative_change,
-    _mirror_descent_trial,
     _polarization_residual_norms,
     _project_density_constraints,
     _project_vector_norm,
     _residuals_converged,
-    _thermodynamic_objective,
 )
 from .._deprecation import AliasedOutputs
 from ..model import OUTPUT_KEY_ALIASES
 from ..functional.thermodynamics import (
     density_weighted_integral,
-    equilibrium_log_density,
     ideal_free_energy,
-    local_chemical_potential,
 )
 from ..functional.polarization_ideal import (
     FixedDipoleIdeal,
@@ -371,36 +367,15 @@ class GridSolver:
                 "dipole_magnitude"
             )
 
-        # Local names of the validated option fields.
+        # Local names of the option fields the scalar path reads here; the
+        # drivers read their own groups.
         initial_rho = initial.rho
         particle_numbers = constraints.particle_numbers
         beta_multiplier = initial.beta_multiplier
-        max_iter = convergence.max_iter
         tolerance_residual = convergence.tolerance_residual
         tolerance_rms_residual = convergence.tolerance_rms_residual
         residual_density_threshold = convergence.residual_density_threshold
         maximum_density = constraints.maximum_density
-        max_log_density_change = (
-            minimize.max_log_density_change
-            if method == "minimize"
-            else euler.max_log_density_change
-        )
-        step_size = minimize.step_size
-        minimum_step_size = minimize.minimum_step_size
-        line_search_factor = minimize.line_search_factor
-        armijo_factor = minimize.armijo_factor
-        tolerance_change = euler.tolerance_change
-        mixing = euler.mixing
-        adaptive_mixing = euler.adaptive_mixing
-        minimum_mixing = euler.minimum_mixing
-        maximum_mixing = euler.maximum_mixing
-        mixing_growth = euler.mixing_growth
-        mixing_backtrack_factor = euler.mixing_backtrack_factor
-        anderson = euler.anderson is not None
-        anderson_options = euler.anderson or AndersonOptions()
-        anderson_history = anderson_options.history
-        anderson_regularization = anderson_options.regularization
-        anderson_damping = anderson_options.damping
 
         data = self._move_data(data)
         V_ext = data["V_ext"]
@@ -525,54 +500,16 @@ class GridSolver:
         self.model.eval()
         try:
             if method == "minimize":
-                state = self._minimize(
-                    data=data,
-                    rho=rho,
-                    V_ext=V_ext,
-                    thermal_wavelength=thermal_wavelength,
-                    mu=mu,
-                    fixed_N=fixed_N,
-                    voxel_volume=volume_element,
-                    max_iter=max_iter,
-                    tolerance_residual=tolerance_residual,
-                    tolerance_rms_residual=tolerance_rms_residual,
-                    step_size=step_size,
-                    minimum_step_size=minimum_step_size,
-                    line_search_factor=line_search_factor,
-                    armijo_factor=armijo_factor,
-                    max_log_density_change=max_log_density_change,
-                    residual_density_threshold=residual_density_threshold,
-                    maximum_density=density_cap,
-                    accessible_mask=accessible_mask,
-                    projection=projection,
+                state = minimize_density(
+                    self, data, rho, V_ext, thermal_wavelength, mu, fixed_N,
+                    volume_element, density_cap, accessible_mask, projection,
+                    convergence, minimize,
                 )
             else:
-                state = self._solve_euler(
-                    data=data,
-                    rho=rho,
-                    V_ext=V_ext,
-                    thermal_wavelength=thermal_wavelength,
-                    mu=mu,
-                    fixed_N=fixed_N,
-                    voxel_volume=volume_element,
-                    max_iter=max_iter,
-                    tolerance_residual=tolerance_residual,
-                    tolerance_rms_residual=tolerance_rms_residual,
-                    tolerance_change=tolerance_change,
-                    mixing=mixing,
-                    adaptive_mixing=adaptive_mixing,
-                    minimum_mixing=minimum_mixing,
-                    maximum_mixing=maximum_mixing,
-                    mixing_growth=mixing_growth,
-                    mixing_backtrack_factor=mixing_backtrack_factor,
-                    anderson=anderson,
-                    anderson_history=anderson_history,
-                    anderson_regularization=anderson_regularization,
-                    anderson_damping=anderson_damping,
-                    max_log_density_change=max_log_density_change,
-                    residual_density_threshold=residual_density_threshold,
-                    maximum_density=density_cap,
-                    accessible_mask=accessible_mask,
+                state = solve_euler(
+                    self, data, rho, V_ext, thermal_wavelength, mu, fixed_N,
+                    volume_element, density_cap, accessible_mask,
+                    convergence, euler,
                 )
 
             final_data = dict(data)
@@ -635,461 +572,7 @@ class GridSolver:
         result["anderson_resets"] = state.get("anderson_resets", 0)
         return _aliased(result)
 
-    def _minimize(
-        self,
-        data: Dict[str, Any],
-        rho: torch.Tensor,
-        V_ext: torch.Tensor,
-        thermal_wavelength: torch.Tensor,
-        mu: Optional[torch.Tensor],
-        fixed_N: Optional[torch.Tensor],
-        voxel_volume: torch.Tensor,
-        max_iter: int,
-        tolerance_residual: float,
-        tolerance_rms_residual: Optional[float],
-        step_size: float,
-        minimum_step_size: float,
-        line_search_factor: float,
-        armijo_factor: float,
-        max_log_density_change: float,
-        residual_density_threshold: float,
-        maximum_density: Optional[torch.Tensor],
-        accessible_mask: torch.Tensor,
-        projection: Optional[_HomogeneousDensityProjection] = None,
-    ) -> Dict[str, Any]:
-        """Minimize the thermodynamic objective by mirror descent."""
 
-        objective_history = []
-        n_iter = 0
-        n_evaluations = 0
-        line_search_failures = 0
-        final_relative_change = float("inf")
-
-        projected_V_ext = V_ext if projection is None else projection.average(V_ext)
-        next_step_size = step_size
-        for _ in range(max_iter):
-            current_data = dict(data)
-            current_data["rho"] = rho.detach().clone()
-            current_data["V_ext"] = V_ext
-            evaluation = self.evaluate(current_data, compute_c1=True)
-            n_evaluations += 1
-            objective = _thermodynamic_objective(
-                evaluation,
-                fixed_N is not None,
-                voxel_volume,
-                thermal_wavelength,
-            ).detach()
-            if not torch.isfinite(objective).item():
-                raise ValueError(
-                    "the thermodynamic objective became non-finite"
-                )
-            if not objective_history:
-                objective_history.append(objective.item())
-
-            projected_c1 = evaluation["c1"].detach()
-            if projection is not None:
-                projected_c1 = projection.average(projected_c1)
-            residual, _, max_residual, rms_residual = _euler_residual(
-                rho,
-                projected_c1,
-                projected_V_ext,
-                data["beta"],
-                thermal_wavelength,
-                mu,
-                residual_density_threshold,
-                maximum_density,
-                accessible_mask,
-            )
-            if _residuals_converged(
-                max_residual,
-                rms_residual,
-                tolerance_residual,
-                tolerance_rms_residual,
-            ):
-                break
-
-            # Armijo needs the true objective derivative, whereas the
-            # update and convergence test use the projected KKT residual
-            # when an upper density bound is active.
-            line_search_gradient = local_chemical_potential(
-                rho,
-                V_ext,
-                data["beta"],
-                evaluation["c1"].detach(),
-                thermal_wavelength,
-                mask=accessible_mask[:, None],
-            )
-            if fixed_N is None:
-                line_search_gradient = torch.where(
-                    accessible_mask[:, None],
-                    line_search_gradient - data["beta"] * mu[None, :],
-                    torch.zeros_like(line_search_gradient),
-                )
-
-            accepted = False
-            trial_step_size = next_step_size
-            while trial_step_size >= minimum_step_size:
-                trial_rho = _mirror_descent_trial(
-                    rho,
-                    residual,
-                    trial_step_size,
-                    fixed_N,
-                    voxel_volume,
-                    max_log_density_change,
-                    maximum_density,
-                    accessible_mask,
-                )
-                displacement = trial_rho - rho
-                objective_dtype = objective.dtype
-                directional_derivative = voxel_volume.to(
-                    objective_dtype
-                ) * torch.sum(
-                    line_search_gradient.to(objective_dtype)
-                    * displacement.to(objective_dtype)
-                )
-
-                trial_data = dict(data)
-                trial_data["rho"] = trial_rho.detach().clone()
-                trial_data["V_ext"] = V_ext
-                trial_evaluation = self.evaluate(
-                    trial_data,
-                    compute_c1=False,
-                )
-                n_evaluations += 1
-                trial_objective = _thermodynamic_objective(
-                    trial_evaluation,
-                    fixed_N is not None,
-                    voxel_volume,
-                    thermal_wavelength,
-                ).detach()
-
-                sufficient_decrease = (
-                    objective + armijo_factor * directional_derivative
-                )
-                if (
-                    torch.isfinite(trial_objective).item()
-                    and directional_derivative.item() < 0.0
-                    and trial_objective.item()
-                    <= sufficient_decrease.item()
-                ):
-                    accepted = True
-                    break
-                trial_step_size *= line_search_factor
-
-            if not accepted:
-                line_search_failures += 1
-                break
-
-            relative_change = _maximum_relative_change(rho, trial_rho)
-            rho = trial_rho.detach()
-            n_iter += 1
-            final_relative_change = relative_change
-            objective_history.append(trial_objective.item())
-            next_step_size = min(
-                step_size,
-                trial_step_size / line_search_factor,
-            )
-
-        return {
-            "rho": rho,
-            "n_iter": n_iter,
-            "n_evaluations": n_evaluations,
-            "objective_history": objective_history,
-            "final_relative_density_change": final_relative_change,
-            "line_search_failures": line_search_failures,
-        }
-
-    def _solve_euler(
-        self,
-        data: Dict[str, Any],
-        rho: torch.Tensor,
-        V_ext: torch.Tensor,
-        thermal_wavelength: torch.Tensor,
-        mu: Optional[torch.Tensor],
-        fixed_N: Optional[torch.Tensor],
-        voxel_volume: torch.Tensor,
-        max_iter: int,
-        tolerance_residual: float,
-        tolerance_rms_residual: Optional[float],
-        tolerance_change: float,
-        mixing: float,
-        adaptive_mixing: bool,
-        minimum_mixing: float,
-        maximum_mixing: float,
-        mixing_growth: float,
-        mixing_backtrack_factor: float,
-        anderson: bool,
-        anderson_history: int,
-        anderson_regularization: float,
-        anderson_damping: float,
-        max_log_density_change: float,
-        residual_density_threshold: float,
-        maximum_density: Optional[torch.Tensor],
-        accessible_mask: torch.Tensor,
-    ) -> Dict[str, Any]:
-        """Solve the Euler fixed point with optional residual backtracking."""
-
-        objective_history = []
-        n_iter = 0
-        n_evaluations = 0
-        mixing_backtracks = 0
-        anderson_attempts = 0
-        anderson_accepted = 0
-        anderson_rejected = 0
-        anderson_resets = 0
-        anderson_log_history = []
-        anderson_residual_history = []
-        final_relative_change = float("inf")
-        current_mixing = mixing
-        current_data = dict(data)
-        current_data["rho"] = rho.detach().clone()
-        current_data["V_ext"] = V_ext
-        evaluation = self.evaluate(current_data, compute_c1=True)
-        n_evaluations += 1
-        objective = _thermodynamic_objective(
-            evaluation,
-            fixed_N is not None,
-            voxel_volume,
-            thermal_wavelength,
-        )
-        objective_history.append(objective.detach().item())
-
-        def evaluate_trial(trial_rho: torch.Tensor):
-            trial_data = dict(data)
-            trial_data["rho"] = trial_rho.detach().clone()
-            trial_data["V_ext"] = V_ext
-            trial_evaluation = self.evaluate(trial_data, compute_c1=True)
-            _, _, trial_max_residual, trial_rms_residual = _euler_residual(
-                trial_rho,
-                trial_evaluation["c1"].detach(),
-                V_ext,
-                data["beta"],
-                thermal_wavelength,
-                mu,
-                residual_density_threshold,
-                maximum_density,
-                accessible_mask,
-            )
-            return (
-                trial_evaluation,
-                trial_max_residual,
-                trial_rms_residual,
-            )
-
-        for _ in range(max_iter):
-            c1 = evaluation["c1"].detach()
-            _, _, max_residual, rms_residual = _euler_residual(
-                rho,
-                c1,
-                V_ext,
-                data["beta"],
-                thermal_wavelength,
-                mu,
-                residual_density_threshold,
-                maximum_density,
-                accessible_mask,
-            )
-            if _residuals_converged(
-                max_residual,
-                rms_residual,
-                tolerance_residual,
-                tolerance_rms_residual,
-            ):
-                break
-
-            current_log_density = torch.log(
-                torch.clamp(rho, min=torch.finfo(rho.dtype).tiny)
-            )
-            if fixed_N is None:
-                target_log_density = equilibrium_log_density(
-                    V_ext, data["beta"], mu, c1, thermal_wavelength,
-                )
-                log_change = torch.clamp(
-                    target_log_density - current_log_density,
-                    min=-max_log_density_change,
-                    max=max_log_density_change,
-                )
-                target_rho = torch.exp(current_log_density + log_change)
-                if maximum_density is not None:
-                    target_rho = torch.minimum(
-                        target_rho,
-                        maximum_density[None, :],
-                    )
-                target_rho = target_rho.masked_fill(
-                    ~accessible_mask[:, None],
-                    0.0,
-                )
-            else:
-                logits = (-data["beta"] * V_ext + c1).masked_fill(
-                    ~accessible_mask[:, None],
-                    -torch.inf,
-                )
-                target_rho = (
-                    fixed_N[None, :]
-                    * torch.softmax(logits, dim=0)
-                    / voxel_volume
-                )
-
-            if anderson:
-                target_log_density = torch.log(
-                    torch.clamp(
-                        target_rho,
-                        min=torch.finfo(target_rho.dtype).tiny,
-                    )
-                )
-                fixed_point_residual = (
-                    target_log_density - current_log_density
-                ).masked_fill(~accessible_mask[:, None], 0.0)
-                anderson_log_history.append(current_log_density.detach())
-                anderson_residual_history.append(
-                    fixed_point_residual.detach()
-                )
-                anderson_log_history = anderson_log_history[
-                    -anderson_history:
-                ]
-                anderson_residual_history = anderson_residual_history[
-                    -anderson_history:
-                ]
-
-            trial_mixing = current_mixing
-            while True:
-                next_rho = (
-                    (1.0 - trial_mixing) * rho
-                    + trial_mixing * target_rho
-                )
-                next_rho = _project_density_constraints(
-                    next_rho,
-                    fixed_N,
-                    voxel_volume,
-                    maximum_density,
-                    accessible_mask,
-                )
-
-                (
-                    trial_evaluation,
-                    trial_max_residual,
-                    trial_rms_residual,
-                ) = evaluate_trial(next_rho)
-                n_evaluations += 1
-
-                if (
-                    not adaptive_mixing
-                    or trial_rms_residual <= rms_residual
-                    or trial_mixing <= minimum_mixing
-                ):
-                    break
-                trial_mixing = max(
-                    minimum_mixing,
-                    trial_mixing * mixing_backtrack_factor,
-                )
-                mixing_backtracks += 1
-
-            if (
-                anderson
-                and len(anderson_log_history) == anderson_history
-                and (n_iter + 1) % anderson_history == 0
-            ):
-                anderson_attempts += 1
-                try:
-                    weights = torch.where(
-                        accessible_mask[:, None],
-                        rho,
-                        torch.zeros_like(rho),
-                    )
-                    weights = weights / torch.sum(weights)
-                    candidate_log_density = _anderson_log_density_candidate(
-                        anderson_log_history,
-                        anderson_residual_history,
-                        weights,
-                        anderson_regularization,
-                        anderson_damping,
-                    )
-                    log_change = torch.clamp(
-                        candidate_log_density - current_log_density,
-                        min=-max_log_density_change,
-                        max=max_log_density_change,
-                    )
-                    candidate_rho = torch.exp(
-                        current_log_density + log_change
-                    ).masked_fill(~accessible_mask[:, None], 0.0)
-                    candidate_rho = _project_density_constraints(
-                        candidate_rho,
-                        fixed_N,
-                        voxel_volume,
-                        maximum_density,
-                        accessible_mask,
-                    )
-
-                    (
-                        candidate_evaluation,
-                        candidate_max_residual,
-                        candidate_rms_residual,
-                    ) = evaluate_trial(candidate_rho)
-                    n_evaluations += 1
-                    candidate_objective = _thermodynamic_objective(
-                        candidate_evaluation,
-                        fixed_N is not None,
-                        voxel_volume,
-                        thermal_wavelength,
-                    )
-                    accept_anderson = (
-                        torch.all(torch.isfinite(candidate_rho)).item()
-                        and torch.isfinite(candidate_objective).item()
-                        and candidate_max_residual <= trial_max_residual
-                        and candidate_rms_residual <= trial_rms_residual
-                    )
-                except (RuntimeError, ValueError):
-                    accept_anderson = False
-
-                if accept_anderson:
-                    next_rho = candidate_rho
-                    trial_evaluation = candidate_evaluation
-                    trial_rms_residual = candidate_rms_residual
-                    anderson_accepted += 1
-                else:
-                    anderson_rejected += 1
-                    anderson_resets += 1
-                    anderson_log_history = anderson_log_history[-1:]
-                    anderson_residual_history = anderson_residual_history[-1:]
-
-            relative_change = _maximum_relative_change(rho, next_rho)
-            rho = next_rho.detach()
-            evaluation = trial_evaluation
-            n_iter += 1
-            final_relative_change = relative_change
-            objective = _thermodynamic_objective(
-                evaluation,
-                fixed_N is not None,
-                voxel_volume,
-                thermal_wavelength,
-            )
-            objective_history.append(objective.detach().item())
-
-            if adaptive_mixing:
-                current_mixing = min(
-                    maximum_mixing,
-                    trial_mixing * mixing_growth,
-                )
-            else:
-                current_mixing = mixing
-            if relative_change <= tolerance_change:
-                break
-
-        return {
-            "rho": rho,
-            "n_iter": n_iter,
-            "n_evaluations": n_evaluations,
-            "objective_history": objective_history,
-            "final_relative_density_change": final_relative_change,
-            "line_search_failures": 0,
-            "mixing_backtracks": mixing_backtracks,
-            "final_mixing": current_mixing,
-            "solver_anderson": anderson,
-            "anderson_attempts": anderson_attempts,
-            "anderson_accepted": anderson_accepted,
-            "anderson_rejected": anderson_rejected,
-            "anderson_resets": anderson_resets,
-        }
 
     def _fixed_dipole_inputs(self, data):
         """Validate one coupled fixed-dipole field."""
