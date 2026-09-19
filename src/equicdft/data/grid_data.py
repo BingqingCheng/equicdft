@@ -422,5 +422,3 @@ class GridData(dict):
                 include_local_density_index=include_local_density_index,
             )
         )
-
-

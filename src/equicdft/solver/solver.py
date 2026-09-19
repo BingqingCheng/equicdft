@@ -567,5 +567,3 @@ class GridSolver:
         return aliased_result(result)
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return move_batch(data, self.device, self._geometry_cache)
-
-

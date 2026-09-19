@@ -653,5 +653,3 @@ def canonical_wavevector_indices(
         dtype=torch.long,
         device=wavevector_indices.device,
     )
-
-

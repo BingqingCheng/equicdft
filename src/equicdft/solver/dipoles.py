@@ -642,7 +642,7 @@ def solve_fixed_dipoles(solver, data, method, options):
         result = solver.evaluate(
             dict(data, rho=rho, dipole_density=polarization)
         )
-        result = apply_fixed_dipole_bounds(solver, 
+        result = apply_fixed_dipole_bounds(solver,
             result,
             density_cap,
             polarization_fraction_cap,
@@ -652,7 +652,7 @@ def solve_fixed_dipoles(solver, data, method, options):
             minimum_density=minimum_density,
         )
         if method == "minimize":
-            state = minimize_fixed_dipoles(solver, 
+            state = minimize_fixed_dipoles(solver,
                 data,
                 result,
                 alignment,
@@ -673,7 +673,7 @@ def solve_fixed_dipoles(solver, data, method, options):
                 minimum_density,
             )
         else:
-            state = solve_fixed_dipole_euler(solver, 
+            state = solve_fixed_dipole_euler(solver,
                 data,
                 result,
                 numbers,
@@ -769,7 +769,7 @@ def minimize_fixed_dipoles(
                 "maximum_residual": float(result["maximum_residual"]),
             }
         )
-        converged = fixed_dipole_converged(solver, 
+        converged = fixed_dipole_converged(solver,
             result, tolerance_residual, tolerance_rms_residual
         )
         if converged or iteration == max_iter:
@@ -846,7 +846,7 @@ def minimize_fixed_dipoles(
                 trial = solver.evaluate(
                     dict(data, rho=trial_rho, dipole_density=trial_p)
                 )
-                trial = apply_fixed_dipole_bounds(solver, 
+                trial = apply_fixed_dipole_bounds(solver,
                     trial,
                     maximum_density,
                     maximum_polarization_fraction,
@@ -968,7 +968,7 @@ def solve_fixed_dipole_euler(
                 "maximum_residual": float(result["maximum_residual"]),
             }
         )
-        converged = fixed_dipole_converged(solver, 
+        converged = fixed_dipole_converged(solver,
             result, tolerance_residual, tolerance_rms_residual
         )
         if converged or iteration == max_iter:
@@ -1017,7 +1017,7 @@ def solve_fixed_dipole_euler(
             trial = solver.evaluate(
                 dict(data, rho=trial_rho, dipole_density=trial_p)
             )
-            trial = apply_fixed_dipole_bounds(solver, 
+            trial = apply_fixed_dipole_bounds(solver,
                 trial,
                 maximum_density,
                 maximum_polarization_fraction,
@@ -1052,7 +1052,7 @@ def solve_fixed_dipole_euler(
             else mixing
         )
         if max(density_change, polarization_change) <= tolerance_change:
-            converged = fixed_dipole_converged(solver, 
+            converged = fixed_dipole_converged(solver,
                 result, tolerance_residual, tolerance_rms_residual
             )
             status = "converged" if converged else "max_iter"

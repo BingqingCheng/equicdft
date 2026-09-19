@@ -579,5 +579,3 @@ class Metrics(MetricCollection):
                 value = 1.0 - squared_error_sum / target_m2
             values[metric] = value.to(dtype=statistics["result_dtype"])
         return values
-
-
