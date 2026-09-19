@@ -12,7 +12,7 @@ from ._validation import (
     positive_integer as _strict_positive_integer,
     positive_scalar as _strict_positive_scalar,
 )
-from .stencil import (
+from .geometry.stencil import (
     canonical_grid_order,
     coarsen_grid,
     get_neighbor_indices,
@@ -20,7 +20,7 @@ from .stencil import (
     grid_spacing_array,
     make_stencil,
 )
-from ._grid import _grid_center_origin
+from .geometry.grid import _grid_center_origin
 from .thermodynamics import local_chemical_potential
 
 

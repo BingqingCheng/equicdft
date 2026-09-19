@@ -15,7 +15,7 @@ from equicdft import (
     LocalReadout,
 )
 from equicdft.legacy import upgrade_legacy_model
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 def _load_whole_model(serialized):
@@ -149,7 +149,7 @@ class TestCartesianAFeatures(unittest.TestCase):
         )
         rfftn = torch.fft.rfftn
         with mock.patch(
-            "equicdft._grid.torch.fft.rfftn",
+            "equicdft.geometry.convolution.torch.fft.rfftn",
             wraps=rfftn,
         ) as transform:
             actual = fft(

@@ -26,7 +26,7 @@ from ._data_helpers import (
 )
 from ._metal_data import normalize_metal_sites
 from ._fourier import canonical_wavevector_indices, integer_wavevector_indices
-from .stencil import grid_size_array, grid_spacing_array
+from .geometry.stencil import grid_size_array, grid_spacing_array
 
 __all__ = [
     "DEFAULT_BOLTZMANN_CONSTANT",

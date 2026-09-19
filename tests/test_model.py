@@ -16,7 +16,7 @@ from equicdft import (
     LongRangeReadout,
     ReciprocalFeatures,
 )
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class _DensityFeatures(nn.Module):

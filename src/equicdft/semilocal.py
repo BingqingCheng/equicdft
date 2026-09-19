@@ -19,7 +19,7 @@ from ._config import (
     optional_buffer_value,
     register,
 )
-from ._grid import grid_spacing_tensor
+from .geometry.grid import grid_spacing_tensor
 from ._nn import (
     build_mlp,
     positive_scalar_tensor,

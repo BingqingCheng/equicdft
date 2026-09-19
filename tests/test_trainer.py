@@ -21,9 +21,9 @@ from equicdft import (
     TrainingStream,
     make_dataloaders,
 )
-from equicdft._grid import voxel_volume
+from equicdft.geometry.grid import voxel_volume
 from equicdft._trainer_io import format_record
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class _LinearDictionaryModel(nn.Module):
@@ -719,7 +719,7 @@ class TestTrainer(unittest.TestCase):
             Loss,
             TensorLoss,
         )
-        from equicdft.stencil import get_neighbor_indices
+        from equicdft.geometry.stencil import get_neighbor_indices
         import numpy as np
 
         shape = (4, 4, 4)

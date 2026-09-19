@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from ._validation import finite_scalar
-from ._grid import voxel_volume
+from .geometry.grid import voxel_volume
 from .thermodynamics import ideal_free_energy
 
 

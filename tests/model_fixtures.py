@@ -21,7 +21,7 @@ from equicdft import (
     PairwiseReadout,
     ReciprocalFeatures,
 )
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 def grid_data(

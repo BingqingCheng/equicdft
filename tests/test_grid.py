@@ -3,15 +3,17 @@ import unittest
 import numpy as np
 import torch
 
-from equicdft._grid import (
+from equicdft.geometry.convolution import (
     gather_neighbors,
-    grid_spacing_tensor,
     periodic_density_convolution,
     periodic_stencil_convolution,
+)
+from equicdft.geometry.grid import (
+    grid_spacing_tensor,
     require_matching_grid_spacing,
     voxel_volume,
 )
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class TestGridGeometry(unittest.TestCase):

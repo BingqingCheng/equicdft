@@ -8,7 +8,7 @@ import torch
 from ._validation import positive_scalar
 from ._config import Configurable, build, constructor_arguments, make_config, register
 from ._fourier_sites import FourierSites
-from ._grid import common_grid_size, grid_spacing_tensor
+from .geometry.grid import common_grid_size, grid_spacing_tensor
 from ._metal_data import normalize_metal_site_mapping
 from .energy import EnergyReadout, ReadoutContext
 from .readout import LongRangeReadout

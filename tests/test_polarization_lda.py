@@ -7,7 +7,7 @@ import torch
 
 from equicdft import GridCACEModel, GridSolver, LDAReadout, CartesianAFeatures, CartesianBFeatures, LocalReadout
 from equicdft.energy import ReadoutContext
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 import numpy as np
 
 

@@ -12,7 +12,7 @@ from ._validation import (
     positive_integer,
     positive_scalar,
 )
-from ._grid import voxel_volume
+from .geometry.grid import voxel_volume
 from ._solver_symmetry import _HomogeneousDensityProjection, _normalize_homogeneous_axes
 from ._solver_numerics import (
     _anderson_log_density_candidate,

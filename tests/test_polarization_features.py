@@ -10,7 +10,7 @@ import torch
 from equicdft import (
     BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LocalReadout,
 )
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 def periodic_field(size=3, cutoff=1, n_types=1):

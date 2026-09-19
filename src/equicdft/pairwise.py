@@ -8,10 +8,10 @@ import torch
 from ._validation import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
 from ._config import Configurable, make_config, register
-from ._grid import common_grid_size
+from .geometry.grid import common_grid_size
 from ._nn import build_mlp, validate_hidden_sizes
 from .energy import EnergyReadout, ReadoutContext
-from .stencil import make_stencil
+from .geometry.stencil import make_stencil
 
 __all__ = [
     "PairwiseReadout",

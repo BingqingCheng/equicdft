@@ -13,7 +13,7 @@ from equicdft import (
     LocalReadout,
 )
 from equicdft.legacy import upgrade_legacy_model
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 def _grid_data(shape=(5, 5, 5), cutoff_grid=1):

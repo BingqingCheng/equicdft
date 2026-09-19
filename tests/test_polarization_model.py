@@ -11,7 +11,7 @@ from equicdft.model import GridCACEModel
 from equicdft.readout import LocalReadout
 from equicdft.semilocal import LDAReadout
 from equicdft.solver import GridSolver
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 from equicdft.symmetrize import CartesianBFeatures
 
 

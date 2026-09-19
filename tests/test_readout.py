@@ -14,7 +14,7 @@ from equicdft import (
 )
 from equicdft.derivatives import compute_grid_derivative
 from equicdft.energy import ReadoutContext
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class TestBulkReadout(unittest.TestCase):

@@ -14,7 +14,7 @@ from equicdft import (
     LossTerm,
     TensorLoss,
 )
-from equicdft._grid import voxel_volume
+from equicdft.geometry.grid import voxel_volume
 from equicdft._fourier import polarization_fourier_curvature
 from equicdft.stability import _feasible_wavevector_indices
 

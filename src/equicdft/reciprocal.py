@@ -10,7 +10,7 @@ from ._validation import boolean, positive_integer
 from ._component_pairs import symmetric_component_pairs
 from ._config import Configurable, make_config, register
 from ._fourier_sites import FourierSites
-from ._grid import (
+from .geometry.grid import (
     _grid_center_origin,
     common_grid_size,
     grid_spacing_tensor,

@@ -10,7 +10,7 @@ from equicdft._radial import (
     whiten_radial_cartesian_basis,
 )
 from equicdft.features import _make_powers
-from equicdft.stencil import make_stencil
+from equicdft.geometry.stencil import make_stencil
 
 
 class TestRadialValues(unittest.TestCase):

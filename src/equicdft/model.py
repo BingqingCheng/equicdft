@@ -23,7 +23,7 @@ from ._config import (
     register,
     scalar_value,
 )
-from ._grid import (
+from .geometry.grid import (
     grid_spacing_tensor,
     require_matching_grid_spacing,
     voxel_volume as compute_voxel_volume,

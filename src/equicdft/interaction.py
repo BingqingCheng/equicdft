@@ -7,7 +7,10 @@ from torch import nn
 
 from ._validation import boolean, positive_integer
 from ._config import Configurable, make_config, register
-from ._grid import gather_neighbors, periodic_stencil_convolution
+from .geometry.convolution import (
+    gather_neighbors,
+    periodic_stencil_convolution,
+)
 from ._nn import build_mlp, validate_hidden_sizes
 from ._radial import (
     _RadialTransform,

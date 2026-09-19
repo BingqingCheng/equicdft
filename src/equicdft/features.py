@@ -12,7 +12,10 @@ from ._validation import (
     positive_integer,
 )
 from ._config import Configurable, make_config, optional_buffer_value, register, scalar_value
-from ._grid import gather_neighbors, periodic_density_convolution
+from .geometry.convolution import (
+    gather_neighbors,
+    periodic_density_convolution,
+)
 from ._nn import positive_scalar_tensor
 from ._radial import (
     _RadialTransform,
@@ -21,7 +24,7 @@ from ._radial import (
     prepare_radial_centers,
     prepare_radial_exponents,
 )
-from .stencil import make_stencil
+from .geometry.stencil import make_stencil
 
 __all__ = [
     "CartesianAFeatures",

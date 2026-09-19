@@ -10,7 +10,7 @@ from equicdft import (
     BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
     LocalReadout, LongRangeReadout, ReciprocalFeatures,
 )
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class TestFullPolarizationSymmetry(unittest.TestCase):

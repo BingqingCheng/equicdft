@@ -14,7 +14,10 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from torch import nn
 
-from ._grid import grid_spacing_tensor, voxel_volume as compute_voxel_volume
+from .geometry.grid import (
+    grid_spacing_tensor,
+    voxel_volume as compute_voxel_volume,
+)
 
 __all__ = [
     "FREE_ENERGY_MODES",

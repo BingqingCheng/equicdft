@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from equicdft import BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LocalReadout
-from equicdft.stencil import get_neighbor_indices
+from equicdft.geometry.stencil import get_neighbor_indices
 
 
 class TestPolarizationMessage(unittest.TestCase):

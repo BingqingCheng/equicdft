@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from equicdft.stencil import (
+from equicdft.geometry.stencil import (
     canonical_grid_order,
     coarsen_grid,
     get_neighbor_indices,

@@ -191,7 +191,7 @@ def _metal(mode):
 
 def _polarization_data(batched=False):
     positions = np.indices((3, 3, 3)).reshape(3, -1).T
-    from equicdft.stencil import get_neighbor_indices  # noqa: E402 (moves in step 5)
+    from equicdft.geometry.stencil import get_neighbor_indices
 
     indices, _ = get_neighbor_indices(positions, cutoff_grid=1)
     shape = (2, 27, 1) if batched else (27, 1)
