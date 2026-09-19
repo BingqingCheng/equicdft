@@ -34,6 +34,7 @@ from .numerics import (
     _residuals_converged,
 )
 from .._deprecation import AliasedOutputs
+from .._device import GeometryDeviceCache, module_device, move_batch
 from ..model import OUTPUT_KEY_ALIASES
 from ..functional.thermodynamics import (
     density_weighted_integral,
@@ -115,10 +116,11 @@ class GridSolver:
             else FixedDipoleIdeal(dipole_magnitude)
         )
         self.device = (
-            (_module_device(model) if model is not None else None)
+            (module_device(model) if model is not None else None)
             if device is None
             else torch.device(device)
         )
+        self._geometry_cache = GeometryDeviceCache()
         if self.model is not None and self.device is not None:
             self.model.to(self.device)
         if self.fixed_dipole_ideal is not None and self.device is not None:
@@ -1619,20 +1621,7 @@ class GridSolver:
         }
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        if self.device is None:
-            return dict(data)
-        return {
-            key: value.to(self.device) if torch.is_tensor(value) else value
-            for key, value in data.items()
-        }
-
-
-def _module_device(module: nn.Module) -> torch.device:
-    parameter = next(module.parameters(), None)
-    if parameter is not None:
-        return parameter.device
-    buffer = next(module.buffers(), None)
-    return torch.device("cpu") if buffer is None else buffer.device
+        return move_batch(data, self.device, self._geometry_cache)
 
 
 def _resolve_accessibility_masks(

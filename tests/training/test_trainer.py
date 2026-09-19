@@ -121,12 +121,12 @@ class TestTrainer(unittest.TestCase):
         )
 
         cached_version = next(
-            iter(trainer._grid_geometry_device_cache.values())
+            iter(trainer._grid_geometry_device_cache._entries.values())
         )[1]
         geometry.add_(1)
         trainer._move_batch(batches[0])
         refreshed_version = next(
-            iter(trainer._grid_geometry_device_cache.values())
+            iter(trainer._grid_geometry_device_cache._entries.values())
         )[1]
         self.assertEqual(refreshed_version, cached_version + 1)
 
