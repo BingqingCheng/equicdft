@@ -80,7 +80,7 @@ class TestPolarizationLDA(unittest.TestCase):
         data["rho"][0] = 0.
         data["dipole_density"].zero_()
         output = model(data)
-        response = output["polarization_derivative"]
+        response = output["polarization_derivative_excess"]
         self.assertTrue(torch.equal(response, torch.zeros_like(response)))
         hessian_row = torch.autograd.grad(response[2, 0, 1], data["dipole_density"], retain_graph=True)[0]
         expected = torch.zeros_like(response)
@@ -96,7 +96,7 @@ class TestPolarizationLDA(unittest.TestCase):
                 data = self.data()
                 output = model(data)
                 for field, index, key, sign in (("rho", (3, 0), "c1", -1),
-                                                ("dipole_density", (3, 0, 2), "polarization_derivative", 1)):
+                                                ("dipole_density", (3, 0, 2), "polarization_derivative_excess", 1)):
                     plus, minus = self.clone(data), self.clone(data)
                     plus[field][index] += 1e-5
                     minus[field][index] -= 1e-5
@@ -111,7 +111,7 @@ class TestPolarizationLDA(unittest.TestCase):
         data = self.data()
         output = model(data)
         left = torch.autograd.grad(output["c1"][2, 0], data["dipole_density"], retain_graph=True)[0]
-        right = torch.autograd.grad(output["polarization_derivative"][2, 0, 1], data["rho"], retain_graph=True)[0]
+        right = torch.autograd.grad(output["polarization_derivative_excess"][2, 0, 1], data["rho"], retain_graph=True)[0]
         torch.testing.assert_close(left[2, 0, 1], -right[2, 0], atol=1e-12, rtol=1e-10)
         self.assertGreater(abs(float(left[2, 0, 1])), 1e-8)
         left[2] = 0
@@ -130,19 +130,19 @@ class TestPolarizationLDA(unittest.TestCase):
             actual = model(changed)
             torch.testing.assert_close(actual["beta_F_exc"], output["beta_F_exc"])
             torch.testing.assert_close(actual["c1"], output["c1"])
-            torch.testing.assert_close(actual["polarization_derivative"], output["polarization_derivative"] @ transform.T)
+            torch.testing.assert_close(actual["polarization_derivative_excess"], output["polarization_derivative_excess"] @ transform.T)
 
     def test_batch_shapes_and_response_loss_gradients(self):
         model = self.model([self.readout(3)]).train()
         data = self.data(3, batched=True)
         output = model(data)
         self.assertEqual(output["c1"].shape, (2, 8, 3))
-        self.assertEqual(output["polarization_derivative"].shape, (2, 8, 3, 3))
+        self.assertEqual(output["polarization_derivative_excess"].shape, (2, 8, 3, 3))
         for index in range(2):
             single = model({k: v[index].detach().clone() for k, v in data.items()})
             for key in output:
                 torch.testing.assert_close(single[key], output[key][index])
-        (output["c1"].square().mean() + output["polarization_derivative"].square().mean()).backward()
+        (output["c1"].square().mean() + output["polarization_derivative_excess"].square().mean()).backward()
         self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
         self.assertGreater(float(model.readout[0].mlp[0].weight.grad.abs().max()), 0.)
 
@@ -175,7 +175,7 @@ class TestPolarizationLDA(unittest.TestCase):
         actual = model(data)
         for value in actual.values():
             self.assertTrue(torch.equal(value, torch.zeros_like(value)))
-        actual["polarization_derivative"].square().mean().backward()
+        actual["polarization_derivative_excess"].square().mean().backward()
 
     def test_zero_lda_preserves_ideal_density_and_orientation_equilibrium(self):
         model = self.model([self.readout(zero_init=True)]).eval()

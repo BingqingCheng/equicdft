@@ -81,7 +81,7 @@ class TestPolarizationGaussian(unittest.TestCase):
             expected = .5 * volume * .9 * data["dipole_density"][0].square().sum()
             torch.testing.assert_close(output["beta_F_exc"], expected, atol=1e-13, rtol=1e-12)
             torch.testing.assert_close(
-                output["polarization_derivative"], .9 * data["dipole_density"],
+                output["polarization_derivative_excess"], .9 * data["dipole_density"],
                 atol=1e-13, rtol=1e-12,
             )
             torch.testing.assert_close(output["c1"], torch.zeros_like(data["rho"]), atol=0., rtol=0.)
@@ -102,7 +102,7 @@ class TestPolarizationGaussian(unittest.TestCase):
                         result = self.model(self.readout(), spacing).eval()(self.clone(data))
                         torch.testing.assert_close(result["beta_F_exc"], torch.tensor(expected_energy), atol=1e-13, rtol=1e-12)
                         torch.testing.assert_close(
-                            result["polarization_derivative"], factor * data["dipole_density"],
+                            result["polarization_derivative_excess"], factor * data["dipole_density"],
                             atol=1e-13, rtol=1e-12,
                         )
 
@@ -116,7 +116,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         factor = 1.7 * math.exp(-alpha * math.pi**2)
         expected = .5 * math.prod(shape) * .03**2 * factor
         torch.testing.assert_close(result["beta_F_exc"], torch.tensor(expected), atol=1e-13, rtol=1e-12)
-        torch.testing.assert_close(result["polarization_derivative"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
+        torch.testing.assert_close(result["polarization_derivative_excess"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
 
     def test_independent_gaussian_and_coulomb_uniform_l_t_response(self):
         shape, spacing, alpha = (8, 3, 3), .8, .3
@@ -146,7 +146,7 @@ class TestPolarizationGaussian(unittest.TestCase):
                 output = model(self.clone(data))
                 expected_energy = .5 * spacing**3 * factor * data["dipole_density"].square().sum()
                 torch.testing.assert_close(output["beta_F_exc"], expected_energy, atol=1e-13, rtol=1e-12)
-                torch.testing.assert_close(output["polarization_derivative"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
+                torch.testing.assert_close(output["polarization_derivative_excess"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
                 torch.testing.assert_close(
                     output["beta_F_exc"],
                     gaussian.energy(self.context(data)) + coulomb.energy(self.context(data)),
@@ -172,7 +172,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         result = self.model(readout).eval()(self.clone(data))
         matrix = torch.tensor([[1.2, -.4], [-.4, .7]])
         torch.testing.assert_close(result["beta_F_exc"], (expected * torch.tensor([1.2, -.4, .7])).sum(), atol=1e-13, rtol=1e-12)
-        torch.testing.assert_close(result["polarization_derivative"], (matrix @ vectors).expand_as(data["dipole_density"]), atol=1e-13, rtol=1e-12)
+        torch.testing.assert_close(result["polarization_derivative_excess"], (matrix @ vectors).expand_as(data["dipole_density"]), atol=1e-13, rtol=1e-12)
 
     def test_explicit_fourier_sum_batched_anisotropic_grid(self):
         # Independent DFT reference, including k=0, without reusing FFT helpers.
@@ -242,7 +242,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         data = self.data()
         data["dipole_density"] += torch.tensor([.02, -.01, .03])
         output = self.model(readout).train()(data)
-        loss = TensorLoss("polarization", "polarization_derivative", "target")
+        loss = TensorLoss("polarization", "polarization_derivative_excess", "target")
         loss(output, {"target": data["dipole_density"].detach()}).backward()
         self.assertGreater(float(readout.mlp[-1].bias.grad.abs().max()), 1e-8)
         self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in readout.parameters()))
@@ -260,7 +260,7 @@ class TestPolarizationGaussian(unittest.TestCase):
             output = model(data)
             for field, index, key, sign in (
                 ("rho", (4, 0), "c1", -1),
-                ("dipole_density", (4, 0, 2), "polarization_derivative", 1),
+                ("dipole_density", (4, 0, 2), "polarization_derivative_excess", 1),
             ):
                 plus, minus = self.clone(data), self.clone(data)
                 plus[field][index] += 1e-6
@@ -269,7 +269,7 @@ class TestPolarizationGaussian(unittest.TestCase):
                 torch.testing.assert_close(fd, sign * output[key][index], atol=2e-9, rtol=2e-7)
             self.assertGreater(float(output["c1"].abs().max()), 1e-8)
             left = torch.autograd.grad(output["c1"][4, 0], data["dipole_density"], retain_graph=True)[0][5, 0, 2]
-            right = torch.autograd.grad(output["polarization_derivative"][5, 0, 2], data["rho"], retain_graph=True)[0][4, 0]
+            right = torch.autograd.grad(output["polarization_derivative_excess"][5, 0, 2], data["rho"], retain_graph=True)[0][4, 0]
             torch.testing.assert_close(left, -right, atol=1e-12, rtol=1e-12)
 
     def test_model_batch_and_additivity_with_lda_and_coulomb(self):
@@ -293,7 +293,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         batch = {key: torch.stack((data[key], other[key])) for key in ("rho", "dipole_density", "temperature")}
         batch.update(grid_size=data["grid_size"], grid_spacing=data["grid_spacing"])
         batched = model(batch)
-        self.assertEqual(batched["polarization_derivative"].shape, (2, 45, 1, 3))
+        self.assertEqual(batched["polarization_derivative_excess"].shape, (2, 45, 1, 3))
         for index, single in enumerate((data, other)):
             for key, value in model(self.clone(single)).items():
                 torch.testing.assert_close(value, batched[key][index], atol=2e-12, rtol=2e-12)

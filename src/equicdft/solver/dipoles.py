@@ -360,14 +360,13 @@ def solve_fixed_dipoles(solver, data, method, options):
         polarization[accessible] = _project_vector_norm(
             polarization[accessible], allowed_norm
         )
-    initial_ideal = solver.model.ideal(
+    initial_ideal = solver.model.ideal.local(
         rho[accessible],
         polarization[accessible],
-        volume,
         thermal_wavelength=wavelength,
     )
     alignment = (
-        initial_ideal["polarization_derivative"] * moment[..., None]
+        initial_ideal["ideal_polarization_derivative"] * moment[..., None]
     ).detach()
 
     was_training = solver.model.training if solver.model is not None else None
@@ -713,7 +712,7 @@ def solve_fixed_dipole_euler(
         polarization = result["dipole_density"]
         target_alignment = moment[..., None] * (
             beta * data["E_ext"]
-            - result["polarization_derivative"]
+            - result["polarization_derivative_excess"]
         )
         target_alignment = _project_vector_norm(
             target_alignment, maximum_alignment

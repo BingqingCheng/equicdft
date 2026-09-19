@@ -137,23 +137,23 @@ class TestPolarizationNoise(unittest.TestCase):
                     batch["valid"][:, 0] = False
                     moment = [.5, .8]
                     ideal = FixedDipoleIdeal(moment, thermal_wavelength=[2., 3.])
-                    before = ideal(batch["rho"], batch["dipole_density"], 1.)
-                    scalar = before["density_derivative"] + .7
-                    vector = .3 - before["polarization_derivative"]
+                    before = ideal.local(batch["rho"], batch["dipole_density"])
+                    scalar = before["ideal_density_derivative"] + .7
+                    vector = .3 - before["ideal_polarization_derivative"]
                     batch["c1_plus_beta_mu"] = scalar.clone()
                     batch["c1"] = scalar - .2
-                    batch["polarization_derivative"] = vector.clone()
+                    batch["polarization_derivative_excess"] = vector.clone()
                     batch["target_c1"] = scalar[:, 1:].clone() if packed else scalar.clone()
                     batch["target_P_derivative"] = vector[:, 1:].clone() if packed else vector.clone()
                     with patch("torch.randn_like", side_effect=lambda x: torch.ones_like(x)):
                         out = add_field_noise(batch, density_noise=density_noise,
                                               polarization_noise=True, dipole_magnitude=moment)
-                    after = ideal(out["rho"], out["dipole_density"], 1.)
-                    expected_scalar = after["density_derivative"] + .7
-                    expected_vector = .3 - after["polarization_derivative"]
+                    after = ideal.local(out["rho"], out["dipole_density"])
+                    expected_scalar = after["ideal_density_derivative"] + .7
+                    expected_vector = .3 - after["ideal_polarization_derivative"]
                     torch.testing.assert_close(out["c1_plus_beta_mu"], expected_scalar)
                     torch.testing.assert_close(out["c1"], expected_scalar - .2)
-                    torch.testing.assert_close(out["polarization_derivative"], expected_vector)
+                    torch.testing.assert_close(out["polarization_derivative_excess"], expected_vector)
                     torch.testing.assert_close(out["target_c1"], expected_scalar[:, 1:] if packed else expected_scalar)
                     torch.testing.assert_close(out["target_P_derivative"], expected_vector[:, 1:] if packed else expected_vector)
                     self.assertFalse(torch.equal(out["target_c1"], batch["target_c1"]))
@@ -273,7 +273,7 @@ class TestPolarizationNoise(unittest.TestCase):
         data["target_c1"] = torch.zeros_like(data["rho"])
         data["target_P_derivative"] = torch.zeros_like(data["dipole_density"])
         t = Trainer(model, Loss([TensorLoss("rho", "c1", "target_c1"),
-                                TensorLoss("P", "polarization_derivative", "target_P_derivative")]),
+                                TensorLoss("P", "polarization_derivative_excess", "target_P_derivative")]),
                     noise=NoiseOptions(polarization=True), device="cpu")
         dl = DataLoader([data])
         t.fit(dl, dl, epochs=1, verbose=False)

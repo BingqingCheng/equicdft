@@ -112,13 +112,15 @@ def _set_density_residuals(result, residual, chemical_potential, maximum, rms):
     )
 
 
-@torch.enable_grad()
+@torch.no_grad()
 def evaluate(solver, data, compute_derivatives=True):
     """Add external coupling and stationarity diagnostics to model outputs.
 
     Scalar evaluation supports batches and either canonical or prescribed-mu
     residuals. Fixed-dipole evaluation retains its single-field canonical
     contract. Bounds/projections are applied by the solve drivers, not here.
+    Inputs are copied before the model enables differentiation; all returned
+    tensors are detached. Use the model directly for differentiable outputs.
     """
 
     data = solver._move_data(data)
@@ -142,7 +144,8 @@ def evaluate(solver, data, compute_derivatives=True):
         polarization.requires_grad_(compute_derivatives)
         data = dict(data, rho=rho, dipole_density=polarization)
     else:
-        rho = data["rho"]
+        rho = data["rho"].detach().clone()
+        data = dict(data, rho=rho)
         volume = voxel_volume(data["grid_spacing"])
         excluded, accessible = _resolve_accessibility_masks(data, rho)
 
@@ -237,7 +240,7 @@ def evaluate(solver, data, compute_derivatives=True):
             if polarized:
                 p_residual = torch.where(
                     accessible[:, None, None],
-                    outputs["total_polarization_derivative"] - beta_value * data["E_ext"],
+                    outputs["polarization_derivative"] - beta_value * data["E_ext"],
                     torch.zeros_like(polarization),
                 )
                 scaled = p_residual * moment[..., None]
@@ -252,11 +255,7 @@ def evaluate(solver, data, compute_derivatives=True):
                 maximum, rms = torch.maximum(maximum, p_max), torch.maximum(rms, p_rms)
             result.update(maximum_residual=maximum, rms_residual=rms)
 
-    # Preserve the existing graph contract: coupled evaluation is numerical,
-    # while scalar prescribed-density evaluation can retain autograd tensors.
-    if polarized:
-        return {
-            key: value.detach() if torch.is_tensor(value) else value
-            for key, value in result.items()
-        }
-    return result
+    return {
+        key: value.detach() if torch.is_tensor(value) else value
+        for key, value in result.items()
+    }

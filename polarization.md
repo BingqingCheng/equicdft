@@ -597,10 +597,13 @@ No particle-number normalization or subtraction of mean polarization is applied.
 
 Both ideal-derived targets change when either field changes. The trainer
 refreshes recognized scalar targets `c1_plus_beta_mu`, `c1`, and `target_c1`
-by adding the change in `FixedDipoleIdeal.density_derivative`; it refreshes
-`polarization_derivative` and `target_P_derivative` by subtracting the change
+by adding the change in the local `ideal_density_derivative`; it refreshes
+`polarization_derivative_excess` and `target_P_derivative` by subtracting the change
 in the ideal polarization derivative. The latter names must denote **excess**
 derivative targets `beta*E_ext - ideal_P`, not electric-field values themselves.
+The unsuffixed `polarization_derivative` now denotes a total-derivative target
+and is not adjusted by noise augmentation. Rename old excess-target fields
+explicitly; the code cannot infer their meaning from their numerical values.
 This preserves external fields, chemical-potential/gauge offsets and thermal-
 wavelength conventions. Targets may be full-grid tensors or packed using the
 original `valid` mask. Custom target names are untouched and must be computed
@@ -651,13 +654,30 @@ For normal evaluation, the model returns:
 | `ideal_density_derivative` | Ideal derivative with respect to density at fixed polarization |
 | `ideal_polarization_derivative` | Ideal derivative with respect to polarization at fixed density |
 | `density_derivative` | Total density derivative, `ideal_density_derivative - c1` |
-| `total_polarization_derivative` | Ideal plus excess polarization derivative |
+| `density_derivative_excess` | Excess density derivative, `-c1` |
+| `polarization_derivative` | Ideal plus excess polarization derivative |
+| `polarization_derivative_excess` | Excess polarization derivative |
 
 Total density derivatives require `compute_c1=True`; total polarization
-derivatives require `compute_polarization_derivative=True`. The existing `c1`,
-`c2` and `polarization_derivative` retain their **excess-only** definitions.
+derivatives require `compute_polarization_derivative=True`. The existing `c1`
+and `c2` retain their **excess-only** definitions. When `compute_ideal=False`,
+the total derivative keys are absent; only excess responses are returned.
 Derivatives use continuum normalization, including division by voxel volume.
 External fields and chemical potentials are not part of the intrinsic model.
+
+Migration: the former excess-only `polarization_derivative` is now
+`polarization_derivative_excess`; the former `total_polarization_derivative`
+is now `polarization_derivative`. Update loss prediction keys, target names
+and analysis scripts explicitly. Coupled Euler updates use the excess response;
+stationarity residuals use the total response. Fitted tensors are unchanged.
+
+Both ideal references expose `local(rho, dipole_density=None,
+thermal_wavelength=None)` for `energy_per_particle` (beta units) and the
+`ideal_*_derivative` values. Their shared `evaluate(data, voxel_volume)`
+handles vacuum/exclusions and integrates rho times the local per-particle
+energy. The dipole-only callable interface and scalar-only `per_particle`
+method have been removed. Scalar minimization retains higher-precision
+accumulation using this common local interface.
 
 `GridSolver(model)` obtains the same ideal reference and total derivatives
 from the model; there is no solver-side molecular-moment argument. It adds
@@ -691,8 +711,11 @@ those belong to `solve`. Scalar evaluation supports batches and either a
 prescribed chemical potential or canonical mean removal. Fixed-dipole
 evaluation remains canonical, unbatched, and requires both `V_ext` and
 `E_ext`. The scalar and coupled numerical update kernels remain separate.
-For differentiable coupled observables use the model directly: coupled
-solver evaluation returns detached tensors, as before.
+Solver evaluation returns detached numerical tensors for both systems, without
+marking caller fields for gradients. `compute_derivatives=True` still computes
+the requested derivatives internally; it does not retain their autograd graph.
+For training and differentiable observables, including higher derivatives, use
+the model directly. Solves do not retain a graph through their iterations.
 
 Canonical fitting can therefore use two ordinary `TensorLoss` terms, without
 a script-defined Euler loss. The following standalone helper uses a fixed
@@ -728,7 +751,7 @@ def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0
             weights_key="density_weights", weight=density_weight,
         ),
         TensorLoss(
-            "polarization", "total_polarization_derivative", "beta_E_target",
+            "polarization", "polarization_derivative", "beta_E_target",
             residual_scale=moment, weights_key="polarization_weights",
             weight=polarization_weight,
         ),

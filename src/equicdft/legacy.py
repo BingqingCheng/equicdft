@@ -604,7 +604,7 @@ def verify_equivalent(
                    compute_ideal=False)
     expected = reference(dict(field), **options)
     actual = candidate(dict(field), **options)
-    for key in ("beta_F_exc", "c1", "polarization_derivative", "metal_site_q",
+    for key in ("beta_F_exc", "c1", "polarization_derivative_excess", "metal_site_q",
                 "charge_residual", "potential_residual"):
         if key not in expected and key not in actual:
             continue

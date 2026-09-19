@@ -194,7 +194,7 @@ def _target_delta(target, delta, valid, name):
 def _refresh_polarized_targets(batch, result, active, ideal):
     """Change only the known ideal parts; external fields and gauges stay fixed."""
     scalar_keys = ("c1_plus_beta_mu", "c1", "target_c1")
-    vector_keys = ("polarization_derivative", "target_P_derivative")
+    vector_keys = ("polarization_derivative_excess", "target_P_derivative")
     if not any(key in batch for key in scalar_keys + vector_keys):
         return
 
@@ -203,15 +203,15 @@ def _refresh_polarized_targets(batch, result, active, ideal):
         # ideal formula. The thermal wavelength cancels in the differences.
         rho = torch.where(active, fields["rho"], torch.ones_like(fields["rho"]))
         polar = torch.where(active[..., None], fields["dipole_density"], 0.0)
-        return ideal(rho, polar, 1.0)
+        return ideal.local(rho, polar)
 
     before, after = response(batch), response(result)
     valid = batch.get("valid")
     if valid is not None:
         valid = valid.bool()
     for keys, derivative, sign in (
-        (scalar_keys, "density_derivative", 1),
-        (vector_keys, "polarization_derivative", -1),
+        (scalar_keys, "ideal_density_derivative", 1),
+        (vector_keys, "ideal_polarization_derivative", -1),
     ):
         delta = sign * (after[derivative] - before[derivative])
         for key in keys:

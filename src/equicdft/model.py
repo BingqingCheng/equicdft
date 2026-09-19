@@ -114,8 +114,9 @@ class GridCACEModel(nn.Module, Configurable):
     ideal evaluation (including its physical-domain restrictions).
     With an ideal reference, forward returns beta_F_id and beta_F, and adds
     ideal derivatives to the requested excess derivatives under
-    density_derivative and total_polarization_derivative. Existing c1, c2
-    and polarization_derivative outputs remain excess-only.
+    density_derivative and polarization_derivative. The corresponding
+    *_derivative_excess outputs and c1/c2 remain excess-only. Total outputs
+    are absent when ideal evaluation is disabled; their meaning never changes.
 
     Every configured :class:`EnergyReadout` receives a shared context and
     returns one reduced free-energy contribution per field. With the default
@@ -133,7 +134,7 @@ class GridCACEModel(nn.Module, Configurable):
 
     With polarization features or readouts, ``dipole_density`` is an independent polar
     vector field. Density derivatives hold that field fixed. The optional
-    ``polarization_derivative`` output is the positive functional derivative
+    ``polarization_derivative_excess`` output is the positive functional derivative
     ``delta(beta_F_exc)/delta(dipole_density)``, not an external electric
     field or a complete orientational chemical potential. Polarization
     descriptors require cubic voxels; the box dimensions may differ.
@@ -809,9 +810,9 @@ class GridCACEModel(nn.Module, Configurable):
             reserved_outputs = {
                 "F_exc", "beta_F_exc", "c1", "c2",
                 "beta_mu_local", "beta_mu_average", "beta_mu_weights",
-                "polarization_derivative", "beta_F_id", "beta_F",
+                "polarization_derivative_excess", "beta_F_id", "beta_F",
                 "ideal_density_derivative", "ideal_polarization_derivative",
-                "density_derivative", "total_polarization_derivative",
+                "density_derivative", "density_derivative_excess", "polarization_derivative",
                 "ideal_derivative_mask",
             }
             for item in self.readout:
@@ -880,7 +881,7 @@ class GridCACEModel(nn.Module, Configurable):
                         polarization_derivative = (
                             0.0 * data["dipole_density"] + 0.0 * beta_F_exc.sum()
                         )
-                outputs["polarization_derivative"] = (
+                outputs["polarization_derivative_excess"] = (
                     polarization_derivative / volume_element
                 )
             if compute_c1:
@@ -891,6 +892,7 @@ class GridCACEModel(nn.Module, Configurable):
                 if derivative_rho is None:
                     derivative_rho = 0.0 * rho + 0.0 * beta_F_exc.sum()
                 outputs["c1"] = -derivative_rho / volume_element
+                outputs["density_derivative_excess"] = -outputs["c1"]
 
                 if compute_c2:
                     reference_grid, reference_type = (
@@ -921,9 +923,10 @@ class GridCACEModel(nn.Module, Configurable):
                         # c2. Match the graph-free evaluation semantics of a
                         # c1-only forward call before returning it.
                         outputs["c1"] = outputs["c1"].detach()
+                        outputs["density_derivative_excess"] = outputs["density_derivative_excess"].detach()
                         if compute_polarization_derivative:
-                            outputs["polarization_derivative"] = outputs[
-                                "polarization_derivative"
+                            outputs["polarization_derivative_excess"] = outputs[
+                                "polarization_derivative_excess"
                             ].detach()
             if compute_ideal:
                 outputs.update(self.ideal.evaluate(data, volume_element))
@@ -933,9 +936,9 @@ class GridCACEModel(nn.Module, Configurable):
                         outputs["ideal_density_derivative"] - outputs["c1"]
                     )
                 if compute_polarization_derivative:
-                    outputs["total_polarization_derivative"] = (
+                    outputs["polarization_derivative"] = (
                         outputs["ideal_polarization_derivative"]
-                        + outputs["polarization_derivative"]
+                        + outputs["polarization_derivative_excess"]
                     )
 
         return outputs

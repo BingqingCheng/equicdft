@@ -279,6 +279,12 @@ Analytic ideal-reference diagnostics may still be returned; `c2` is never
 requested by solver evaluation. Direct model calls retain their `compute_c1`
 keyword.
 
+Solver evaluation returns detached numerical tensors and does not mark caller
+fields for gradients. Use the model directly for training or higher derivatives.
+The model reports `density_derivative` for the total intrinsic response and
+`density_derivative_excess = -c1` for its excess part. With `compute_ideal=False`,
+only excess responses are returned; total-response names are never reused.
+
 `beta_external` is the external coupling (`beta_V_ext` for density-only data),
 `beta_A = beta_F + beta_external`, and `beta_Omega` subtracts `beta_mu_N` when
 a chemical potential is supplied. `density_residual`, `max_density_residual`

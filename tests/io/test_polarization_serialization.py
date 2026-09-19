@@ -98,10 +98,10 @@ class TestPolarizationSerialization(unittest.TestCase):
         altered = copy.deepcopy(model)
         # A derivative-only defect must not escape energy/density checking.
         def wrong_derivative(module, args, output):
-            output["polarization_derivative"] = output["polarization_derivative"] + .01
+            output["polarization_derivative_excess"] = output["polarization_derivative_excess"] + .01
             return output
         handle = altered.register_forward_hook(wrong_derivative)
-        with self.assertRaisesRegex(ValueError, "polarization_derivative"):
+        with self.assertRaisesRegex(ValueError, "polarization_derivative_excess"):
             verify_equivalent(model, altered, data)
         handle.remove()
 

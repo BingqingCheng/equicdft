@@ -40,7 +40,7 @@ class TestModelIdealReference(unittest.TestCase):
         polar = self.model(True)(self.data(True))
         for key in ("beta_F_id", "beta_F", "density_derivative"):
             torch.testing.assert_close(scalar[key], polar[key], rtol=0, atol=0)
-        self.assertEqual(polar["total_polarization_derivative"].abs().max(), 0)
+        self.assertEqual(polar["polarization_derivative"].abs().max(), 0)
 
     def test_total_derivatives_match_autograd(self):
         for polarized in (False, True):
@@ -53,7 +53,7 @@ class TestModelIdealReference(unittest.TestCase):
             gradients = torch.autograd.grad(outputs["beta_F"], fields)
             torch.testing.assert_close(gradients[0], outputs["density_derivative"])
             if polarized:
-                torch.testing.assert_close(gradients[1], outputs["total_polarization_derivative"])
+                torch.testing.assert_close(gradients[1], outputs["polarization_derivative"])
 
     def test_masked_vacuum_and_batches(self):
         data = self.data(True)

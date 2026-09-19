@@ -90,7 +90,7 @@ class TestPolarizationModel(unittest.TestCase):
                 output = model(data)
                 for name, index, response, sign in (
                     ("rho", (7, 0), "c1", -1),
-                    ("dipole_density", (9, 0, 1), "polarization_derivative", 1),
+                    ("dipole_density", (9, 0, 1), "polarization_derivative_excess", 1),
                 ):
                     plus, minus = self.cloned(data), self.cloned(data)
                     plus[name][index] += epsilon
@@ -115,7 +115,7 @@ class TestPolarizationModel(unittest.TestCase):
         output = model(data)
         self.assertEqual(output["beta_F_exc"].shape, (2,))
         self.assertEqual(output["c1"].shape, (2, 27, 1))
-        self.assertEqual(output["polarization_derivative"].shape, (2, 27, 1, 3))
+        self.assertEqual(output["polarization_derivative_excess"].shape, (2, 27, 1, 3))
         for field in range(2):
             single = self.cloned(data)
             for name in (
@@ -137,7 +137,7 @@ class TestPolarizationModel(unittest.TestCase):
             output["c1"][rho_index], data["dipole_density"], retain_graph=True
         )[0][polar_index]
         mixed_from_polarization = torch.autograd.grad(
-            output["polarization_derivative"][polar_index], data["rho"]
+            output["polarization_derivative_excess"][polar_index], data["rho"]
         )[0][rho_index]
         torch.testing.assert_close(
             mixed_from_c1, -mixed_from_polarization, atol=1e-12, rtol=1e-10
@@ -158,7 +158,7 @@ class TestPolarizationModel(unittest.TestCase):
             finite_difference, output["c2"][7, 0], atol=1e-8, rtol=2e-6
         )
         self.assertFalse(output["c1"].requires_grad)
-        self.assertFalse(output["polarization_derivative"].requires_grad)
+        self.assertFalse(output["polarization_derivative_excess"].requires_grad)
 
     def test_optional_derivatives_under_no_grad(self):
         model = self.model().eval()
@@ -173,14 +173,14 @@ class TestPolarizationModel(unittest.TestCase):
             )
         self.assertEqual(set(energy), {"beta_F_exc"})
         self.assertFalse(energy["beta_F_exc"].requires_grad)
-        self.assertEqual(set(polar_only), {"beta_F_exc", "polarization_derivative"})
-        self.assertEqual(set(density_only), {"beta_F_exc", "c1"})
+        self.assertEqual(set(polar_only), {"beta_F_exc", "polarization_derivative_excess"})
+        self.assertEqual(set(density_only), {"beta_F_exc", "c1", "density_derivative_excess"})
 
     def test_response_loss_trains_radials_and_readout(self):
         model = self.model().train()
         output = model(self.data())
         loss = output["c1"].square().mean()
-        loss = loss + output["polarization_derivative"].square().mean()
+        loss = loss + output["polarization_derivative_excess"].square().mean()
         loss.backward()
         feature_gradients = [
             parameter.grad for parameter in model.a_features.parameters()
@@ -223,8 +223,8 @@ class TestPolarizationModel(unittest.TestCase):
                 atol=1e-11, rtol=1e-10,
             )
             torch.testing.assert_close(
-                actual["polarization_derivative"][destination],
-                output["polarization_derivative"] @ rotation.T,
+                actual["polarization_derivative_excess"][destination],
+                output["polarization_derivative_excess"] @ rotation.T,
                 atol=1e-11, rtol=1e-10,
             )
 
@@ -280,7 +280,7 @@ class TestPolarizationModel(unittest.TestCase):
             model.train(training)
             data = self.data()
             output = model(data)
-            response = output["polarization_derivative"]
+            response = output["polarization_derivative_excess"]
             self.assertEqual(response.shape, (27, 1, 3))
             self.assertTrue(torch.equal(response, torch.zeros_like(response)))
             self.assertEqual(response.requires_grad, training)

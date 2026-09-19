@@ -132,8 +132,8 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 # silently disabled (in particular, the LDA final layer).
                 for name in branches:
                     self.assertGreater(reference[name]["beta_F_exc"].abs().item(), 1e-8)
-                    self.assertGreater(reference[name]["polarization_derivative"].abs().max().item(), 1e-8)
-                for key in ("beta_F_exc", "c1", "polarization_derivative"):
+                    self.assertGreater(reference[name]["polarization_derivative_excess"].abs().max().item(), 1e-8)
+                for key in ("beta_F_exc", "c1", "polarization_derivative_excess"):
                     summed = sum(reference[name][key] for name in models if name != "complete")
                     torch.testing.assert_close(reference["complete"][key], summed,
                                                atol=1e-11, rtol=1e-10)
@@ -158,7 +158,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                                 value = actual[key]
                                 if key not in ("beta_F_exc", "beta_F_id", "beta_F"):
                                     value = value[destination]
-                                if key in ("polarization_derivative", "ideal_polarization_derivative", "total_polarization_derivative"):
+                                if key in ("polarization_derivative_excess", "ideal_polarization_derivative", "polarization_derivative"):
                                     expected = expected @ matrix.T
                                 torch.testing.assert_close(value, expected,
                                                            atol=1e-11, rtol=1e-10)

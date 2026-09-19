@@ -40,7 +40,9 @@ def _thermodynamic_objective(
     accumulation_dtype = _accumulation_dtype(rho.dtype)
     rho = rho.to(accumulation_dtype)
     wavelength = thermal_wavelength.to(accumulation_dtype)
-    ideal_per_particle = ideal.per_particle(rho, wavelength)
+    ideal_per_particle = ideal.local(
+        rho, thermal_wavelength=wavelength,
+    )["energy_per_particle"]
     beta = evaluation["beta"].to(accumulation_dtype)
     per_particle = (
         ideal_per_particle

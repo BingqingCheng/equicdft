@@ -20,10 +20,11 @@ class IdealOnly(nn.Module):
         outputs["beta_F"] = outputs["beta_F_id"]
         if compute_c1:
             outputs["c1"] = torch.zeros_like(rho)
+            outputs["density_derivative_excess"] = -outputs["c1"]
             outputs["density_derivative"] = outputs["ideal_density_derivative"]
         if compute_polarization_derivative:
-            outputs["polarization_derivative"] = torch.zeros_like(data["dipole_density"])
-            outputs["total_polarization_derivative"] = outputs["ideal_polarization_derivative"]
+            outputs["polarization_derivative_excess"] = torch.zeros_like(data["dipole_density"])
+            outputs["polarization_derivative"] = outputs["ideal_polarization_derivative"]
         return outputs
 
 

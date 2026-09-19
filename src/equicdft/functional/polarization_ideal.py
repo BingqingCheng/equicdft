@@ -1,8 +1,8 @@
 """Ideal entropy of freely rotating, fixed-magnitude electric point dipoles.
 
 Angular measure is dOmega/(4*pi). rho is number/volume and P is dipole/volume.
-The finite differentiable domain is rho > 0 and |P| < m*rho. Vacuum and perfect
-alignment are boundary limits, not finite states accepted by this interface.
+The local finite differentiable domain is rho > 0 and |P| < m*rho. The shared
+grid evaluator handles exact vacuum; perfect alignment remains a boundary limit.
 """
 
 import torch
@@ -116,25 +116,11 @@ class FixedDipoleIdeal(IdealReference):
         return make_config(self, dipole_magnitude=self.dipole_magnitude,
                            thermal_wavelength=self.thermal_wavelength)
 
-    def forward(
-        self,
-        rho,
-        dipole_density,
-        voxel_volume,
-        thermal_wavelength=None,
-    ):
-        local = self.local(rho, dipole_density, thermal_wavelength)
-        return {
-            "beta_F_id": local["energy_density"].sum(dim=(-2, -1)) * voxel_volume,
-            "density_derivative": local["ideal_density_derivative"],
-            "polarization_derivative": local["ideal_polarization_derivative"],
-        }
-
-    def local(self, rho, dipole_density, thermal_wavelength=None):
+    def local(self, rho, dipole_density=None, thermal_wavelength=None):
         if (rho.ndim < 2 or min(rho.shape) < 1 or not rho.is_floating_point()
                 or not torch.isfinite(rho).all() or torch.any(rho <= 0)):
             raise ValueError("rho must be finite, positive, floating [..., grid, species]")
-        if dipole_density.shape != (*rho.shape, 3):
+        if dipole_density is None or dipole_density.shape != (*rho.shape, 3):
             raise ValueError("dipole_density must have shape [..., grid, species, 3]")
         if dipole_density.dtype != rho.dtype or dipole_density.device != rho.device:
             raise ValueError("rho and dipole_density must share dtype and device")
@@ -169,7 +155,7 @@ class FixedDipoleIdeal(IdealReference):
         log_z = ratio * square - entropy
         log_rho = log_dimensionless_density(rho, wavelength)
         return {
-            "energy_density": rho * (log_rho - 1 + entropy),
+            "energy_per_particle": log_rho - 1 + entropy,
             "ideal_density_derivative": log_rho - log_z,
             "ideal_polarization_derivative": ratio[..., None] * reduced / moment[..., None],
         }

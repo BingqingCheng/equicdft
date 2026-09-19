@@ -123,7 +123,7 @@ class TestPolarizationMessage(unittest.TestCase):
                     expected = reference(data)
                     expected_features = reference._local_invariant_features(data)
                     self.assertEqual(expected_features.shape[-1], 3*2*reference.b_features.n_features)
-                    loss = expected["c1"].square().mean() + expected["polarization_derivative"].square().mean()
+                    loss = expected["c1"].square().mean() + expected["polarization_derivative_excess"].square().mean()
                     loss.backward()
                     for backend in ("conv3d", "fft"):
                         actual_model = self.model(backend, center=center, layers=2, radial=radial)
@@ -135,7 +135,7 @@ class TestPolarizationMessage(unittest.TestCase):
                         actual = actual_model(inputs)
                         for key in expected:
                             torch.testing.assert_close(actual[key], expected[key], atol=2e-11, rtol=2e-11)
-                        (actual["c1"].square().mean() + actual["polarization_derivative"].square().mean()).backward()
+                        (actual["c1"].square().mean() + actual["polarization_derivative_excess"].square().mean()).backward()
                         for p, q in zip(reference.parameters(), actual_model.parameters()):
                             self.assertIsNotNone(p.grad)
                             self.assertTrue(torch.isfinite(p.grad).all())
@@ -148,7 +148,7 @@ class TestPolarizationMessage(unittest.TestCase):
         drho = torch.randn_like(data["rho"])
         dp = torch.randn_like(data["dipole_density"])
         volume = .7**3
-        analytic = volume*((-out["c1"]*drho).sum() + (out["polarization_derivative"]*dp).sum())
+        analytic = volume*((-out["c1"]*drho).sum() + (out["polarization_derivative_excess"]*dp).sum())
         eps = 1e-5
         energies = []
         for sign in (-1, 1):
@@ -157,7 +157,7 @@ class TestPolarizationMessage(unittest.TestCase):
             energies.append(model(shifted, compute_c1=False, compute_polarization_derivative=False)["beta_F_exc"])
         torch.testing.assert_close((energies[1]-energies[0])/(2*eps), analytic, atol=2e-8, rtol=2e-7)
         rho_then_p = torch.autograd.grad((-out["c1"]*drho).sum(), data["dipole_density"], retain_graph=True)[0]
-        p_then_rho = torch.autograd.grad((out["polarization_derivative"]*dp).sum(), data["rho"])[0]
+        p_then_rho = torch.autograd.grad((out["polarization_derivative_excess"]*dp).sum(), data["rho"])[0]
         torch.testing.assert_close((rho_then_p*dp).sum(), (p_then_rho*drho).sum(), atol=1e-11, rtol=1e-10)
 
     def test_message_has_two_hop_polarization_dependence(self):
@@ -182,7 +182,7 @@ class TestPolarizationMessage(unittest.TestCase):
         data["dipole_density"].zero_()
         model = self.model(layers=2)
         outputs = model(data)
-        (outputs["c1"].square().mean() + outputs["polarization_derivative"].square().mean()).backward()
+        (outputs["c1"].square().mean() + outputs["polarization_derivative_excess"].square().mean()).backward()
         for p in model.parameters():
             self.assertIsNotNone(p.grad)
             self.assertTrue(torch.isfinite(p.grad).all())

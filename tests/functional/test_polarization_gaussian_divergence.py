@@ -79,7 +79,7 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
             torch.testing.assert_close(actual, expected, atol=1e-13, rtol=1e-12)
             output = self.model(self.readout(), spacing).eval()(self.clone(data))
             torch.testing.assert_close(output["beta_F_exc"], .9 * volume * norm / 2, atol=1e-13, rtol=1e-12)
-            torch.testing.assert_close(output["polarization_derivative"], .9 * data["dipole_density"], atol=1e-13, rtol=1e-12)
+            torch.testing.assert_close(output["polarization_derivative_excess"], .9 * data["dipole_density"], atol=1e-13, rtol=1e-12)
 
     def test_mixed_wavevector_longitudinal_and_two_transverse_modes(self):
         shape, amplitude = (7, 5, 3), .03
@@ -111,7 +111,7 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
                     output = self.model(self.readout(), spacing).eval()(self.clone(data))
                     response = a * direction + b * k * torch.dot(k, direction)
                     expected_derivative = amplitude * wave[:, None, None] * response
-                    torch.testing.assert_close(output["polarization_derivative"], expected_derivative, atol=1e-13, rtol=1e-12)
+                    torch.testing.assert_close(output["polarization_derivative_excess"], expected_derivative, atol=1e-13, rtol=1e-12)
                     expected_energy = prefactor * (a + b * torch.dot(k, direction).square())
                     torch.testing.assert_close(output["beta_F_exc"], expected_energy, atol=1e-13, rtol=1e-12)
 
@@ -194,12 +194,12 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
         data = self.data()
         inputs = [self.clone(data), self.clone(data)]
         outputs = [self.model(readout).train()(item) for readout, item in zip((baseline, extended), inputs)]
-        for key in ("beta_F_exc", "c1", "polarization_derivative"):
+        for key in ("beta_F_exc", "c1", "polarization_derivative_excess"):
             torch.testing.assert_close(outputs[0][key], outputs[1][key], atol=1e-13, rtol=1e-12)
         rho_probe, p_probe = torch.randn_like(data["rho"]), torch.randn_like(data["dipole_density"])
         second_derivatives = []
         for output, item in zip(outputs, inputs):
-            probe = (output["c1"] * rho_probe).sum() + (output["polarization_derivative"] * p_probe).sum()
+            probe = (output["c1"] * rho_probe).sum() + (output["polarization_derivative_excess"] * p_probe).sum()
             second_derivatives.append(torch.autograd.grad(probe, (item["rho"], item["dipole_density"])))
         for left, right in zip(*second_derivatives):
             torch.testing.assert_close(left, right, atol=1e-13, rtol=1e-12)
@@ -223,7 +223,7 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
         model = self.model(readout).train()
         output = model(data)
         target = data["dipole_density"].detach()
-        loss = output["c1"].square().mean() + (output["polarization_derivative"] - target).square().mean()
+        loss = output["c1"].square().mean() + (output["polarization_derivative_excess"] - target).square().mean()
         loss.backward()
         for parameter in readout.parameters():
             self.assertTrue(parameter.grad is not None and torch.isfinite(parameter.grad).all())
@@ -238,7 +238,7 @@ class TestPolarizationGaussianDivergence(unittest.TestCase):
         finite_difference = (model(plus)["beta_F_exc"] - model(minus)["beta_F_exc"]) / (2e-6 * .8**3)
         torch.testing.assert_close(finite_difference, -output["c1"][4, 0], atol=2e-9, rtol=2e-7)
         left = torch.autograd.grad(output["c1"][4, 0], data["dipole_density"], retain_graph=True)[0][5, 0, 2]
-        right = torch.autograd.grad(output["polarization_derivative"][5, 0, 2], data["rho"])[0][4, 0]
+        right = torch.autograd.grad(output["polarization_derivative_excess"][5, 0, 2], data["rho"])[0][4, 0]
         self.assertGreater(float(left.abs()), 1e-8)
         torch.testing.assert_close(left, -right, atol=1e-12, rtol=1e-12)
 

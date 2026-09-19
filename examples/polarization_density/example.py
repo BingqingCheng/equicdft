@@ -48,13 +48,13 @@ def main():
     data["dipole_density"] = 0.01 * torch.randn(n_grid, 1, 3)
 
     outputs = model(data)
-    for name in ("beta_F_exc", "c1", "polarization_derivative"):
+    for name in ("beta_F_exc", "c1", "polarization_derivative_excess"):
         assert torch.isfinite(outputs[name]).all()
         print("{}: shape {}".format(name, tuple(outputs[name].shape)))
     # Both responses remain differentiable with respect to model parameters
     # in training mode. Physical targets/losses require an ideal orientational
     # functional and the external electric-field convention first.
-    outputs["polarization_derivative"].square().sum().backward()
+    outputs["polarization_derivative_excess"].square().sum().backward()
     # A constant per-particle offset disappears from the P derivative, so
     # parameters controlling only that offset need not receive a gradient.
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)

@@ -555,6 +555,13 @@ def compare(
     """
 
     actual = dict(actual)
+    # Historical unsuffixed P responses were excess-only. Rename the reference
+    # keys, not their tensors, so the same physical quantities are compared.
+    recorded = {
+        (key.rsplit("/", 1)[0] + "/polarization_derivative_excess"
+         if key.endswith("/polarization_derivative") else key): value
+        for key, value in recorded.items()
+    }
     # Model training-policy outputs were retired; preserve all energy,
     # derivative, solver and historical trainer comparisons.
     retired = {"out/beta_mu_local", "out/beta_mu_average", "out/beta_mu_weights",
@@ -565,7 +572,8 @@ def compare(
         actual["state/thermal_wavelength"] = actual.pop("state/ideal.thermal_wavelength")
     added_outputs = {"beta_F_id", "beta_F", "ideal_derivative_mask",
                      "ideal_density_derivative", "ideal_polarization_derivative",
-                     "density_derivative", "total_polarization_derivative", "beta_mu_local"}
+                     "density_derivative", "density_derivative_excess",
+                     "polarization_derivative", "beta_mu_local"}
     for key in list(actual):
         if key not in recorded and key.rsplit("/", 1)[-1] in added_outputs:
             del actual[key]

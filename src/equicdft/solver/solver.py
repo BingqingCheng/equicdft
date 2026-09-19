@@ -93,6 +93,8 @@ class GridSolver:
         for scalar fields, otherwise the canonical weighted mean.
         Fixed-dipole evaluation remains canonical and requires V_ext and E_ext.
         Bounds and homogeneous projections are applied only by solve.
+        All returned tensors are detached and caller field tensors are not
+        marked for gradients. Use the model for differentiable calculations.
         """
 
         return evaluate(self, data, compute_derivatives)

@@ -41,7 +41,7 @@ class TestSolverEvaluation(unittest.TestCase):
                 rho, beta, volume = data["rho"], data["beta"], data["grid_spacing"].prod()
                 external = volume * (rho * beta[..., None, None] * data["V_ext"]).sum((-2, -1))
                 torch.testing.assert_close(result["beta_external"], external)
-                self.assertIs(result["beta_external"], result["beta_V_ext"])
+                torch.testing.assert_close(result["beta_external"], result["beta_V_ext"], rtol=0, atol=0)
                 torch.testing.assert_close(result["beta_A"], result["beta_F"] + external)
                 torch.testing.assert_close(result["particle_numbers"], volume * rho.sum(-2))
                 torch.testing.assert_close((rho * result["density_residual"]).sum(-2),
@@ -66,7 +66,7 @@ class TestSolverEvaluation(unittest.TestCase):
         torch.testing.assert_close(result["beta_external"], external, rtol=0, atol=0)
         torch.testing.assert_close(result["beta_external"], result["beta_V_ext"] + result["beta_P_ext"])
         torch.testing.assert_close(result["polarization_residual"],
-                                   result["total_polarization_derivative"] - beta * data["E_ext"])
+                                   result["polarization_derivative"] - beta * data["E_ext"])
         torch.testing.assert_close(result["maximum_residual"],
                                    torch.maximum(result["max_density_residual"], result["max_polarization_residual"]))
         self.assert_density_aliases(result)

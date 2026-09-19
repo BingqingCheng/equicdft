@@ -23,6 +23,15 @@ class IdealReference(nn.Module, Configurable):
             thermal_wavelength, "thermal_wavelength",
         ))
 
+    def local(self, rho, dipole_density=None, thermal_wavelength=None):
+        """Return beta energy per particle and local ideal derivatives.
+
+        This is the finite-interior physics interface. The common evaluate
+        wrapper handles vacuum/exclusions and integrates over the grid.
+        Derivatives are continuum derivatives (no voxel-volume factor).
+        """
+        raise NotImplementedError
+
     def evaluate(self, data, voxel_volume):
         """Evaluate full grids, preserving batches and zero-density boundaries."""
         rho = data["rho"]
@@ -47,7 +56,7 @@ class IdealReference(nn.Module, Configurable):
         safe_rho = torch.where(active, rho, torch.ones_like(rho))
         wavelength = data.get("thermal_wavelength", self.thermal_wavelength)
         local = self.local(safe_rho, data.get("dipole_density"), wavelength)
-        density_energy = local.pop("energy_density")
+        density_energy = safe_rho * local.pop("energy_per_particle")
         volume = torch.as_tensor(voxel_volume, dtype=rho.dtype, device=rho.device)
         result = {
             "beta_F_id": (density_energy * active).sum(dim=(-2, -1)) * volume,
@@ -79,15 +88,14 @@ class IdealGas(IdealReference):
     def to_config(self):
         return make_config(self, thermal_wavelength=self.thermal_wavelength)
 
-    def per_particle(self, rho, thermal_wavelength):
-        """Scalar ideal contribution for stable objective accumulation."""
-        return log_dimensionless_density(rho, thermal_wavelength) - 1.0
-
-    def local(self, rho, polarization, thermal_wavelength):
-        wavelength = _wavelength(thermal_wavelength, rho)
+    def local(self, rho, dipole_density=None, thermal_wavelength=None):
+        wavelength = _wavelength(
+            self.thermal_wavelength if thermal_wavelength is None else thermal_wavelength,
+            rho,
+        )
         log_rho = log_dimensionless_density(rho, wavelength)
         return {
-            "energy_density": rho * (log_rho - 1),
+            "energy_per_particle": log_rho - 1,
             "ideal_density_derivative": log_rho,
         }
 

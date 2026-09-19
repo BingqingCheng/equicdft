@@ -117,7 +117,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
             factor = 1.7 * 4 * math.pi * math.exp(-.3 * k*k)
             expected = factor * math.prod(shape) * spacing**3 * .03**2 / 4
             torch.testing.assert_close(result["beta_F_exc"], torch.tensor(expected), atol=1e-13, rtol=1e-12)
-            torch.testing.assert_close(result["polarization_derivative"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
+            torch.testing.assert_close(result["polarization_derivative_excess"], factor * data["dipole_density"], atol=1e-13, rtol=1e-12)
             torch.testing.assert_close(result["c1"], torch.zeros_like(data["rho"]), atol=0., rtol=0.)
             data["dipole_density"] = data["dipole_density"].roll(1, -1)
             transverse = self.readout().energy(ctx(data))
@@ -169,7 +169,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         torch.testing.assert_close(readout.energy(ctx(batch)), torch.stack((readout.energy(ctx(data)), readout.energy(ctx(other)))))
         model = self.model(readout).eval()
         output = model(batch)
-        self.assertEqual(output["polarization_derivative"].shape, (2, 45, 3, 3))
+        self.assertEqual(output["polarization_derivative_excess"].shape, (2, 45, 3, 3))
         for i, single in enumerate((data, other)):
             for key, value in model(self.clone(single)).items():
                 torch.testing.assert_close(value, output[key][i])
@@ -186,14 +186,14 @@ class TestPolarizationCoulomb(unittest.TestCase):
                                    mean_temperature=1.4, boltzmann_constant=.8).train()
                 output = model(data)
                 for field, index, key, sign in (("rho", (4, 1), "c1", -1),
-                                               ("dipole_density", (4, 1, 2), "polarization_derivative", 1)):
+                                               ("dipole_density", (4, 1, 2), "polarization_derivative_excess", 1)):
                     plus, minus = self.clone(data), self.clone(data)
                     plus[field][index] += 1e-6
                     minus[field][index] -= 1e-6
                     fd = (model(plus)["beta_F_exc"] - model(minus)["beta_F_exc"]) / 2e-6 / spacing**3
                     torch.testing.assert_close(fd, sign * output[key][index], atol=2e-9, rtol=2e-7)
                 left = torch.autograd.grad(output["c1"][4, 1], data["dipole_density"], retain_graph=True)[0][5, 0, 2]
-                right = torch.autograd.grad(output["polarization_derivative"][5, 0, 2], data["rho"], retain_graph=True)[0][4, 1]
+                right = torch.autograd.grad(output["polarization_derivative_excess"][5, 0, 2], data["rho"], retain_graph=True)[0][4, 1]
                 self.assertGreater(abs(float(left)), 1e-8)
                 torch.testing.assert_close(left, -right, atol=1e-12, rtol=1e-12)
 
@@ -249,7 +249,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         changed["dipole_density"] = transform(data["dipole_density"], True)
         result = model(changed)
         torch.testing.assert_close(result["beta_F_exc"], reference["beta_F_exc"], atol=1e-12, rtol=1e-12)
-        torch.testing.assert_close(result["polarization_derivative"], transform(reference["polarization_derivative"], True), atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(result["polarization_derivative_excess"], transform(reference["polarization_derivative_excess"], True), atol=1e-12, rtol=1e-12)
         shifted, tiled = self.clone(data), self.clone(data)
         for key in ("rho", "dipole_density"):
             grid = data[key].reshape(*shape, *data[key].shape[1:])
@@ -268,7 +268,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         # A spatially varying target tests response-loss training even from
         # zero amplitude; a constant target is orthogonal to these modes.
         output = model(self.data(n_types=2))
-        (output["polarization_derivative"] - torch.randn_like(output["polarization_derivative"])).square().mean().backward()
+        (output["polarization_derivative_excess"] - torch.randn_like(output["polarization_derivative_excess"])).square().mean().backward()
         self.assertGreater(float(readout.mlp[-1].bias.grad.abs().max()), 1e-8)
         self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in readout.parameters()))
 
@@ -278,10 +278,10 @@ class TestPolarizationCoulomb(unittest.TestCase):
         data["dipole_density"] *= .25
         model = self.model(self.readout((.4,), amplitude=.2), spacing=1.).eval()
         response = model(self.clone(data))
-        ideal = FixedDipoleIdeal(.7)(data["rho"], data["dipole_density"], 1.)
+        ideal = FixedDipoleIdeal(.7).local(data["rho"], data["dipole_density"])
         external = {k: data[k] for k in ("grid_size", "grid_spacing", "temperature")}
-        external.update(beta=torch.tensor(1.), V_ext=(response["c1"]-ideal["density_derivative"]).detach(),
-                        E_ext=(response["polarization_derivative"]+ideal["polarization_derivative"]).detach())
+        external.update(beta=torch.tensor(1.), V_ext=(response["c1"]-ideal["ideal_density_derivative"]).detach(),
+                        E_ext=(response["polarization_derivative_excess"]+ideal["ideal_polarization_derivative"]).detach())
         numbers = data["rho"].sum(0)
         solver = GridSolver(with_ideal(model, FixedDipoleIdeal(.7)))
         perturbed = data["rho"] * (1 + .03 * torch.randn_like(data["rho"]))

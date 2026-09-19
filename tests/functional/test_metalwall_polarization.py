@@ -265,7 +265,7 @@ class TestMetalWallPolarization(unittest.TestCase):
         result = model(_copy(data))
         torch.testing.assert_close(result["beta_F_exc"], energy, atol=2e-13, rtol=2e-12)
         torch.testing.assert_close(result["c1"], -actual_gradients[0] / data["grid_spacing"].prod(), atol=2e-12, rtol=2e-12)
-        torch.testing.assert_close(result["polarization_derivative"], actual_gradients[1] / data["grid_spacing"].prod(), atol=2e-12, rtol=2e-12)
+        torch.testing.assert_close(result["polarization_derivative_excess"], actual_gradients[1] / data["grid_spacing"].prod(), atol=2e-12, rtol=2e-12)
         for field, index in (("rho", (4, 1)), ("dipole_density", (5, 2, 0))):
             direction = torch.zeros_like(data[field])
             direction[index] = 1.

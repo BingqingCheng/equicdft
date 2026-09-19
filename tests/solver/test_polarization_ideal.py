@@ -63,11 +63,11 @@ class TestFixedDipoleIdeal(unittest.TestCase):
         for volume in (0.125, 8.0):
             rho = (0.5 + torch.rand(3, 2)).requires_grad_()
             polar = (0.03*torch.randn(3, 2, 3)).requires_grad_()
-            result = ideal(rho, polar, volume)
+            result = ideal.evaluate(dict(rho=rho, dipole_density=polar), volume)
             dr, dp = torch.autograd.grad(result["beta_F_id"], (rho, polar), create_graph=True)
-            torch.testing.assert_close(dr/volume, result["density_derivative"], atol=2e-12, rtol=2e-11)
-            torch.testing.assert_close(dp/volume, result["polarization_derivative"], atol=2e-12, rtol=2e-11)
-            self.assertTrue(torch.autograd.gradcheck(lambda r, p: ideal(r, p, volume)["beta_F_id"], (rho, polar), eps=1e-6, atol=2e-8, rtol=2e-6))
+            torch.testing.assert_close(dr/volume, result["ideal_density_derivative"], atol=2e-12, rtol=2e-11)
+            torch.testing.assert_close(dp/volume, result["ideal_polarization_derivative"], atol=2e-12, rtol=2e-11)
+            self.assertTrue(torch.autograd.gradcheck(lambda r, p: ideal.evaluate(dict(rho=r, dipole_density=p), volume)["beta_F_id"], (rho, polar), eps=1e-6, atol=2e-8, rtol=2e-6))
             mixed_r = torch.autograd.grad(dr[0, 0], polar, retain_graph=True)[0][0, 0, 1]
             mixed_p = torch.autograd.grad(dp[0, 0, 1], rho)[0][0, 0]
             torch.testing.assert_close(mixed_r, mixed_p, atol=1e-12, rtol=1e-10)
@@ -76,12 +76,12 @@ class TestFixedDipoleIdeal(unittest.TestCase):
         rho = torch.tensor([[0.4]], requires_grad=True)
         polar = torch.zeros(1, 1, 3, requires_grad=True)
         ideal = FixedDipoleIdeal(1.7, thermal_wavelength=1.3)
-        result = ideal(rho, polar, 8.)
+        result = ideal.evaluate(dict(rho=rho, dipole_density=polar), 8.)
         expected = 8*rho.sum()*(torch.log(rho[0, 0]*1.3**3) - 1)
         torch.testing.assert_close(result["beta_F_id"], expected)
-        hessian = torch.autograd.functional.hessian(lambda p: ideal(rho, p, 8.)["beta_F_id"], polar).reshape(3, 3)
+        hessian = torch.autograd.functional.hessian(lambda p: ideal.evaluate(dict(rho=rho, dipole_density=p), 8.)["beta_F_id"], polar).reshape(3, 3)
         torch.testing.assert_close(hessian, 8*3/(1.7**2*0.4)*torch.eye(3), atol=1e-12, rtol=1e-12)
-        self.assertTrue(torch.autograd.gradgradcheck(lambda r, p: ideal(r, p, 8.)["beta_F_id"], (rho, polar), atol=2e-7))
+        self.assertTrue(torch.autograd.gradgradcheck(lambda r, p: ideal.evaluate(dict(rho=r, dipole_density=p), 8.)["beta_F_id"], (rho, polar), atol=2e-7))
 
     def test_near_saturation_and_inverse_derivative(self):
         p = torch.tensor([0., 1e-8, 1e-3, 0.2, 0.8, 0.99, 0.9999], requires_grad=True)
@@ -90,19 +90,19 @@ class TestFixedDipoleIdeal(unittest.TestCase):
         self.assertTrue(torch.autograd.gradcheck(inverse_langevin, (p[:-1],), eps=1e-7, atol=1e-5, rtol=1e-5))
         polar = torch.zeros(1, 1, 3)
         polar[..., 0] = 0.9999
-        self.assertTrue(torch.isfinite(FixedDipoleIdeal(1.)(torch.ones(1, 1), polar, 1.)["beta_F_id"]))
+        self.assertTrue(torch.isfinite(FixedDipoleIdeal(1.).evaluate(dict(rho=torch.ones(1, 1), dipole_density=polar), 1.)["beta_F_id"]))
 
     def test_batch_and_rotation(self):
         ideal = FixedDipoleIdeal([1., 2.])
         rho = 0.5 + torch.rand(2, 5, 2)
         polar = 0.05*torch.randn(2, 5, 2, 3)
         rotation, _ = torch.linalg.qr(torch.randn(3, 3))
-        original = ideal(rho, polar, torch.tensor([0.125, 8.]))
-        rotated = ideal(rho, polar @ rotation.T, torch.tensor([0.125, 8.]))
+        original = ideal.evaluate(dict(rho=rho, dipole_density=polar), torch.tensor([0.125, 8.]))
+        rotated = ideal.evaluate(dict(rho=rho, dipole_density=polar @ rotation.T), torch.tensor([0.125, 8.]))
         torch.testing.assert_close(original["beta_F_id"], rotated["beta_F_id"], rtol=1e-12, atol=1e-12)
-        torch.testing.assert_close(original["polarization_derivative"] @ rotation.T, rotated["polarization_derivative"], rtol=1e-11, atol=1e-12)
+        torch.testing.assert_close(original["ideal_polarization_derivative"] @ rotation.T, rotated["ideal_polarization_derivative"], rtol=1e-11, atol=1e-12)
         for batch, volume in enumerate((0.125, 8.)):
-            torch.testing.assert_close(original["beta_F_id"][batch], ideal(rho[batch], polar[batch], volume)["beta_F_id"])
+            torch.testing.assert_close(original["beta_F_id"][batch], ideal.evaluate(dict(rho=rho[batch], dipole_density=polar[batch]), volume)["beta_F_id"])
 
     def test_invalid_states(self):
         torch.set_default_dtype(torch.float32)
@@ -115,9 +115,9 @@ class TestFixedDipoleIdeal(unittest.TestCase):
             polar = torch.zeros(2, 1, 3)
             polar[0, 0, 0] = value
             with self.assertRaises(ValueError):
-                ideal(rho, polar, 1.)
+                ideal.local(rho, polar)
         with self.assertRaises(ValueError):
-            ideal(torch.zeros_like(rho), torch.zeros(2, 1, 3), 1.)
+            ideal.local(torch.zeros_like(rho), torch.zeros(2, 1, 3))
         with self.assertRaises(ValueError):
             FixedDipoleIdeal(-1.)
         with self.assertRaisesRegex(ValueError, "must be real"):
@@ -406,8 +406,8 @@ class TestGridSolverPolarization(unittest.TestCase):
                     out["c1"] = -self.strength * data["rho"]
                     out["density_derivative"] = out["ideal_density_derivative"]-out["c1"]
                 if kwargs.get("compute_polarization_derivative", False):
-                    out["polarization_derivative"] = self.strength * data["dipole_density"]
-                    out["total_polarization_derivative"] = out["ideal_polarization_derivative"]+out["polarization_derivative"]
+                    out["polarization_derivative_excess"] = self.strength * data["dipole_density"]
+                    out["polarization_derivative"] = out["ideal_polarization_derivative"]+out["polarization_derivative_excess"]
                 return out
 
         data = self.case()
@@ -416,9 +416,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         target_rho = 0.4 + 0.1*torch.rand_like(data["V_ext"])
         target_p = 0.04*torch.randn(*target_rho.shape, 3)
         moments = [0.7, 1.9]
-        ideal = FixedDipoleIdeal(moments)(target_rho, target_p, data["grid_spacing"].prod())
-        data["V_ext"] = -(ideal["density_derivative"] + model.strength.detach()*target_rho)/data["beta"]
-        data["E_ext"] = (ideal["polarization_derivative"] + model.strength.detach()*target_p)/data["beta"]
+        ideal = FixedDipoleIdeal(moments).local(target_rho, target_p)
+        data["V_ext"] = -(ideal["ideal_density_derivative"] + model.strength.detach()*target_rho)/data["beta"]
+        data["E_ext"] = (ideal["ideal_polarization_derivative"] + model.strength.detach()*target_p)/data["beta"]
         numbers = target_rho.sum(0)*data["grid_spacing"].prod()
         result = GridSolver(with_ideal(model, FixedDipoleIdeal(moments))).solve(
             data, particle_numbers=numbers, tolerance_residual=1.0e-7
@@ -448,17 +448,13 @@ class TestGridSolverPolarization(unittest.TestCase):
             0.5 * target_rho * moments
             / target_p.norm(dim=-1).clamp_min(1.0e-12)
         )[..., None]
-        ideal = FixedDipoleIdeal(moments)(
-            target_rho,
-            target_p,
-            data["grid_spacing"].prod(),
-        )
+        ideal = FixedDipoleIdeal(moments).local(target_rho, target_p)
         numbers = target_rho.sum(0) * data["grid_spacing"].prod()
         solver = GridSolver(with_ideal(None, FixedDipoleIdeal(moments)))
 
         fixed_p_data = dict(
             data,
-            V_ext=-ideal["density_derivative"] / data["beta"],
+            V_ext=-ideal["ideal_density_derivative"] / data["beta"],
             E_ext=torch.full_like(data["E_ext"], 30.0),
         )
         initial_rho = target_rho.roll(1, dims=0)
@@ -483,7 +479,7 @@ class TestGridSolverPolarization(unittest.TestCase):
         fixed_rho_data = dict(
             data,
             V_ext=30.0 * data["V_ext"],
-            E_ext=ideal["polarization_derivative"] / data["beta"],
+            E_ext=ideal["ideal_polarization_derivative"] / data["beta"],
         )
         fixed_rho = solver.solve(
             fixed_rho_data,
