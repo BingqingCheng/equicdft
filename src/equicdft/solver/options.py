@@ -2,9 +2,21 @@
 
 Each group is a frozen dataclass that validates itself once, so the solver
 paths (scalar and fixed-dipole, Euler and minimize) share one definition of
-every option and its admissible range. ``solve`` accepts the groups as
-keyword arguments and, equivalently, the flat keyword names listed in
-:data:`FLAT_KEYWORDS`; :func:`resolve_options` merges the two forms.
+every option and its admissible range.
+
+The groups are ``convergence`` (:class:`ConvergenceOptions`), ``euler``
+(:class:`EulerOptions`, with ``anderson=AndersonOptions(...)`` for
+acceleration), ``minimize`` (:class:`MinimizeOptions`), ``constraints``
+(:class:`Constraints`: particle numbers, density and polarization caps,
+homogeneous axes, fixed field) and ``initial`` (:class:`Initialization`:
+starting fields and ``beta_multiplier``).
+
+``solve`` accepts them as keyword arguments and, equivalently, every field
+as a flat keyword (``max_iter=``, ``mixing=``, ``anderson=True`` with
+``anderson_history=``, ``particle_numbers=``, ``initial_rho=``, ...), named
+after the field itself and listed in :data:`FLAT_KEYWORDS`;
+:func:`resolve_options` merges the two forms and rejects a field set both
+ways. Each field is documented on its group below.
 """
 
 from dataclasses import dataclass, fields, replace

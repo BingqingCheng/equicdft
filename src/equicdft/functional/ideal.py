@@ -8,6 +8,29 @@ from .._species import broadcast_species_field, species_parameter
 from .thermodynamics import log_dimensionless_density
 
 
+def validate_density_field(rho, excluded_mask=None, exclusion_message=None):
+    """Check a density grid and its exclusions once, for every consumer.
+
+    The ideal reference cannot evaluate a negative or nonfinite density, and
+    an excluded voxel is an exact hard wall, so both rules are enforced here
+    rather than separately by every caller that hands a field to a model.
+    ``exclusion_message`` lets a caller that also carries a polarization say
+    so, since the two fields are excluded together.
+    """
+
+    if (rho.ndim < 2 or not rho.is_floating_point()
+            or not torch.isfinite(rho).all() or torch.any(rho < 0)):
+        raise ValueError("rho must be finite nonnegative [..., grid, species]")
+    if excluded_mask is None:
+        return
+    if excluded_mask.dtype != torch.bool or excluded_mask.shape != rho.shape[:-1]:
+        raise ValueError("excluded_mask must be Boolean [..., grid]")
+    if torch.any(rho.masked_select(excluded_mask[..., None]) != 0):
+        raise ValueError(
+            exclusion_message or "rho must be zero at excluded grid points"
+        )
+
+
 class IdealReference(nn.Module, Configurable):
     """Intrinsic ideal beta energy and continuum derivatives on a grid.
 
@@ -45,16 +68,8 @@ class IdealReference(nn.Module, Configurable):
     def evaluate(self, data, voxel_volume):
         """Evaluate full grids, preserving batches and zero-density boundaries."""
         rho = data["rho"]
-        if (rho.ndim < 2 or not rho.is_floating_point()
-                or not torch.isfinite(rho).all() or torch.any(rho < 0)):
-            raise ValueError("rho must be finite nonnegative [..., grid, species]")
+        validate_density_field(rho, data.get("excluded_mask"))
         active = rho > 0
-        excluded = data.get("excluded_mask")
-        if excluded is not None:
-            if excluded.dtype != torch.bool or excluded.shape != rho.shape[:-1]:
-                raise ValueError("excluded_mask must be Boolean [..., grid]")
-            if torch.any(rho.masked_select(excluded[..., None]) != 0):
-                raise ValueError("rho must be zero at excluded grid points")
         if self.requires_dipole_density:
             p = data["dipole_density"]
             if p.shape != (*rho.shape, 3):

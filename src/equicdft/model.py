@@ -129,6 +129,124 @@ def _validate_feature_modules(
     b_features.validate_a_features(a_features)
 
 
+def _normalize_readouts(readout: Sequence[EnergyReadout]) -> list:
+    """Return the readouts as a list, rejecting anything counted twice.
+
+    A readout that wraps another evaluates it already, so listing both the
+    wrapper and its inner readout would add that energy to the functional
+    twice.
+    """
+
+    if isinstance(readout, EnergyReadout):
+        raise TypeError(
+            "readout must be a sequence of EnergyReadout modules"
+        )
+    try:
+        readouts = list(readout)
+    except TypeError:
+        raise TypeError(
+            "readout must be a sequence of EnergyReadout modules"
+        )
+    if not all(isinstance(module, EnergyReadout) for module in readouts):
+        raise TypeError("every readout must be an EnergyReadout module")
+    if len({id(item) for item in readouts}) != len(readouts):
+        raise ValueError(
+            "readout lists the same module twice; its energy would be "
+            "counted twice"
+        )
+    wrapped = {
+        id(inner): (item, inner)
+        for item in readouts
+        for inner in item.wrapped_readouts()
+    }
+    for item in readouts:
+        if id(item) in wrapped:
+            wrapper, _ = wrapped[id(item)]
+            raise ValueError(
+                "{} already evaluates its wrapped {}; listing both counts "
+                "that energy twice".format(
+                    type(wrapper).__name__, type(item).__name__,
+                )
+            )
+    return readouts
+
+
+def _resolve_polarization(
+    ideal: Optional["IdealReference"],
+    a_features: Optional[nn.Module],
+    readouts: Sequence[EnergyReadout],
+    compute_polarization_derivative: bool,
+) -> bool:
+    """Return whether dipole density is an independent field of this model."""
+
+    if ideal is not None and not isinstance(ideal, IdealReference):
+        raise TypeError("ideal must be an IdealReference")
+    has_polarization = (ideal is not None and ideal.requires_dipole_density) or (
+        a_features is not None and a_features.requires_dipole_density
+    ) or any(item.requires_dipole_density for item in readouts)
+    if has_polarization and ideal is not None and not ideal.requires_dipole_density:
+        raise ValueError("polarization requires a polarization-capable ideal reference")
+    if compute_polarization_derivative and not has_polarization:
+        raise ValueError(
+            "compute_polarization_derivative requires a dipole-density ideal, "
+            "readout or feature module"
+        )
+    return has_polarization
+
+
+def _check_cutoff_and_feature_requirements(
+    a_features: Optional[nn.Module],
+    readouts: Sequence[EnergyReadout],
+) -> None:
+    """Reject disagreeing neighborhoods and missing feature modules."""
+
+    # Neighborhood requirements are independent of which fields are read.
+    cutoffs = [item.cutoff_grid for item in readouts
+               if item.requires_local_density_index]
+    if a_features is not None:
+        cutoffs.append(a_features.cutoff_grid)
+    if cutoffs and any(value != cutoffs[0] for value in cutoffs):
+        raise ValueError(
+            "local and polarization features must use the same cutoff_grid"
+        )
+    if (
+        any(item.requires_local_features for item in readouts)
+        and a_features is None
+    ):
+        raise ValueError(
+            "a_features and b_features are required by a configured readout"
+        )
+
+
+def _resolve_n_types(
+    a_features: Optional[nn.Module],
+    readouts: Sequence[EnergyReadout],
+    n_types: Optional[int],
+) -> int:
+    """Return the one component count the features and readouts agree on."""
+
+    if a_features is not None:
+        if n_types is not None and n_types != a_features.n_types:
+            raise ValueError("n_types must match a_features")
+        n_types = a_features.n_types
+    else:
+        typed_readouts = [
+            item for item in readouts if item.n_types is not None
+        ]
+        if typed_readouts:
+            if n_types is not None and n_types != typed_readouts[0].n_types:
+                raise ValueError("n_types must match readouts")
+            n_types = typed_readouts[0].n_types
+        elif n_types is None:
+            raise ValueError("provide n_types for an ideal-only model")
+    if isinstance(n_types, bool) or not isinstance(n_types, Integral) or n_types < 1:
+        raise ValueError("n_types must be a positive integer")
+    for item in readouts:
+        if item.n_types is not None and item.n_types != n_types:
+            raise ValueError("all readouts must use the same n_types")
+    return n_types
+
+
 @register
 class GridCACEModel(nn.Module, Configurable):
     """Combine free-energy readouts and differentiate their scalar sum.
@@ -263,85 +381,12 @@ class GridCACEModel(nn.Module, Configurable):
                     "dimensions {}".format(actual, expected)
                 )
             module.bind_geometry(a_features)
-        if isinstance(readout, EnergyReadout):
-            raise TypeError(
-                "readout must be a sequence of EnergyReadout modules"
-            )
-        try:
-            readouts = list(readout)
-        except TypeError:
-            raise TypeError(
-                "readout must be a sequence of EnergyReadout modules"
-            )
-        if not all(isinstance(module, EnergyReadout) for module in readouts):
-            raise TypeError("every readout must be an EnergyReadout module")
-        if len({id(item) for item in readouts}) != len(readouts):
-            raise ValueError(
-                "readout lists the same module twice; its energy would be "
-                "counted twice"
-            )
-        wrapped = {
-            id(inner): (item, inner)
-            for item in readouts
-            for inner in item.wrapped_readouts()
-        }
-        for item in readouts:
-            if id(item) in wrapped:
-                wrapper, _ = wrapped[id(item)]
-                raise ValueError(
-                    "{} already evaluates its wrapped {}; listing both counts "
-                    "that energy twice".format(
-                        type(wrapper).__name__, type(item).__name__,
-                    )
-                )
-        if ideal is not None and not isinstance(ideal, IdealReference):
-            raise TypeError("ideal must be an IdealReference")
-        has_polarization = (ideal is not None and ideal.requires_dipole_density) or (
-            a_features is not None and a_features.requires_dipole_density
-        ) or any(item.requires_dipole_density for item in readouts)
-        if has_polarization and ideal is not None and not ideal.requires_dipole_density:
-            raise ValueError("polarization requires a polarization-capable ideal reference")
-        if compute_polarization_derivative and not has_polarization:
-            raise ValueError(
-                "compute_polarization_derivative requires a dipole-density ideal, "
-                "readout or feature module"
-            )
-        # Neighborhood requirements are independent of which fields are read.
-        cutoffs = [item.cutoff_grid for item in readouts
-                   if item.requires_local_density_index]
-        if a_features is not None:
-            cutoffs.append(a_features.cutoff_grid)
-        if cutoffs and any(value != cutoffs[0] for value in cutoffs):
-            raise ValueError(
-                "local and polarization features must use the same cutoff_grid"
-            )
-        if (
-            any(item.requires_local_features for item in readouts)
-            and a_features is None
-        ):
-            raise ValueError(
-                "a_features and b_features are required by a configured readout"
-            )
-        if a_features is not None:
-            if n_types is not None and n_types != a_features.n_types:
-                raise ValueError("n_types must match a_features")
-            n_types = a_features.n_types
-        else:
-            typed_readouts = [
-                item for item in readouts if item.n_types is not None
-            ]
-            if typed_readouts:
-                if n_types is not None and n_types != typed_readouts[0].n_types:
-                    raise ValueError("n_types must match readouts")
-                n_types = typed_readouts[0].n_types
-            elif n_types is None:
-                raise ValueError("provide n_types for an ideal-only model")
-        if isinstance(n_types, bool) or not isinstance(n_types, Integral) or n_types < 1:
-            raise ValueError("n_types must be a positive integer")
-        for item in readouts:
-            if item.n_types is not None and item.n_types != n_types:
-                raise ValueError("all readouts must use the same n_types")
-
+        readouts = _normalize_readouts(readout)
+        has_polarization = _resolve_polarization(
+            ideal, a_features, readouts, compute_polarization_derivative,
+        )
+        _check_cutoff_and_feature_requirements(a_features, readouts)
+        n_types = _resolve_n_types(a_features, readouts, n_types)
         density_scale = None
         if mean_density is not None:
             density_scale = positive_scalar_tensor(mean_density, "mean_density")
