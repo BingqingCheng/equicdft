@@ -318,3 +318,13 @@ latent chemical-potential training, and fixed $N$/fixed $\mu$ equilibrium
 solves. The compact example uses the validated short-range LDA +
 Cartesian-invariant model and does not enable GGA, pairwise, reciprocal-space,
 or direct $c^{(2)}$ supervision.
+
+Readout constructors share one convention: the structural arguments
+(`n_types`, and `cutoff_grid` for `PairwiseReadout`) are positional, every
+option is a keyword, and `hidden_sizes` defaults to `(32, 16)` everywhere.
+`zero_init` defaults encode the readout's role and are deliberately not
+uniform: the additive corrections `BulkReadout`, `LongRangeReadout` and
+`PairwiseReadout` start at zero contribution (`zero_init=True`), so a model
+initially equals its local part, while the primary `LDAReadout` starts from
+random weights (`zero_init=False`); `LocalReadout` and `GGAReadout` have no
+such option (`GGAReadout` controls its start through `initial_coefficient`).
