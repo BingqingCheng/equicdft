@@ -88,3 +88,21 @@ replace the four keywords `density_noise`, `density_noise_floor`,
 warning, as do the `Trainer.density_noise`-style attributes (read
 `Trainer.noise`). Checkpoints are written as version 3 (`noise`,
 `stream_noise`); version-2 checkpoints still load.
+
+## Solver options (0.1.0, no deprecation)
+
+`GridSolver.solve` takes its options as validated groups
+(`equicdft.solver.ConvergenceOptions`, `EulerOptions` with `AndersonOptions`,
+`MinimizeOptions`, `Constraints`, `Initialization`). The flat keywords of
+0.0.x (`max_iter=`, `mixing=`, `anderson=True` with `anderson_history=`,
+`particle_numbers=`, `initial_rho=`, ...) remain a supported spelling of
+the same fields, not a deprecated one; a field given both ways raises
+`TypeError`. Options of the method that is not selected are now validated
+too. Scalar results additionally carry `status`, `maximum_residual` and
+`rms_residual` like the fixed-dipole results.
+
+## Trainer (0.1.0, no deprecation)
+
+`Trainer` is a plain object rather than an `nn.Module`; `Trainer.to(device)`
+still moves the model, losses and metrics together. `fit` accepts
+`record_initial_validation` like `fit_streams`.
