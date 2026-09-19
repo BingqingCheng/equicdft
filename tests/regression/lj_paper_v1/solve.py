@@ -30,7 +30,7 @@ def evaluate_solve():
         "converged": bool(result["converged"]),
         "iterations": int(result["n_iter"]),
         "evaluations": int(result["n_evaluations"]),
-        "max_residual": float(result["max_euler_lagrange_residual"]),
+        "max_residual": float(result["max_density_residual"]),
         "particle_number": float(particle_numbers.item()),
         "particle_error": float(
             torch.max(torch.abs(predicted_particles - particle_numbers))

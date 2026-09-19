@@ -328,7 +328,7 @@ class TestMetalModel(unittest.TestCase):
                 result["rho"].sum(dim=0) * model.voxel_volume, numbers, atol=1e-12,
             ))
             self.assertTrue(torch.allclose(result["rho"], target, atol=1e-9, rtol=0.0))
-            self.assertLess(result["max_euler_lagrange_residual"], 1e-9)
+            self.assertLess(result["max_density_residual"], 1e-9)
             electrode = _run(model.readout[1], dict(data, rho=result["rho"]))
             for key, expected in electrode.items():
                 torch.testing.assert_close(result[key], expected)

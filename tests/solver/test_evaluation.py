@@ -26,12 +26,15 @@ class TestSolverEvaluation(unittest.TestCase):
     def solver(self, polarized=False):
         return GridSolver(IdealOnly(FixedDipoleIdeal([.7, 1.2]) if polarized else None))
 
-    def assert_density_aliases(self, result):
-        for new, old in (("density_residual", "euler_lagrange_residual"),
-                         ("max_density_residual", "max_euler_lagrange_residual"),
-                         ("rms_density_residual", "rms_euler_lagrange_residual")):
-            torch.testing.assert_close(torch.as_tensor(result[new]), torch.as_tensor(result[old]),
-                                       rtol=0, atol=0)
+    def assert_canonical_residual_names(self, result):
+        """One name per residual: the Euler-Lagrange spellings are retired."""
+
+        for name in ("density_residual", "max_density_residual", "rms_density_residual"):
+            self.assertIn(name, result)
+        for retired in ("euler_lagrange_residual", "max_euler_lagrange_residual",
+                        "rms_euler_lagrange_residual",
+                        "polarization_euler_lagrange_residual"):
+            self.assertNotIn(retired, result)
 
     def test_scalar_energies_and_canonical_residuals_single_and_batch(self):
         for batch in (False, True):
@@ -46,7 +49,7 @@ class TestSolverEvaluation(unittest.TestCase):
                 torch.testing.assert_close(result["particle_numbers"], volume * rho.sum(-2))
                 torch.testing.assert_close((rho * result["density_residual"]).sum(-2),
                                            torch.zeros_like(rho.sum(-2)), atol=1e-15, rtol=0)
-                self.assert_density_aliases(result)
+                self.assert_canonical_residual_names(result)
 
     def test_prescribed_mu_batch(self):
         data = self.data(batch=True)
@@ -55,7 +58,7 @@ class TestSolverEvaluation(unittest.TestCase):
         expected = result["beta_mu_local"] - (data["beta"][:, None] * data["mu"])[:, None, :]
         torch.testing.assert_close(result["density_residual"], expected)
         torch.testing.assert_close(result["beta_Omega"], result["beta_A"] - result["beta_mu_N"])
-        self.assert_density_aliases(result)
+        self.assert_canonical_residual_names(result)
 
     def test_polarization_coupling_and_derivatives(self):
         data = self.data(polarized=True)
@@ -69,7 +72,7 @@ class TestSolverEvaluation(unittest.TestCase):
                                    result["polarization_derivative"] - beta * data["E_ext"])
         torch.testing.assert_close(result["maximum_residual"],
                                    torch.maximum(result["max_density_residual"], result["max_polarization_residual"]))
-        self.assert_density_aliases(result)
+        self.assert_canonical_residual_names(result)
 
     def test_zero_polarization_matches_scalar_ideal(self):
         data = self.data(polarized=True)
@@ -137,5 +140,5 @@ class TestSolverEvaluation(unittest.TestCase):
                                 rho = data["rho"].clone()
                                 options.update(initial_rho=rho, initial_polarization=torch.zeros_like(data["dipole_density"]))
                         result = self.solver(polarized).solve(data, method=method, **options)
-                        self.assert_density_aliases(result)
+                        self.assert_canonical_residual_names(result)
                         self.assertIn("beta_A", result)

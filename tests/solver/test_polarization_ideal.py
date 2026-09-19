@@ -427,7 +427,7 @@ class TestGridSolverPolarization(unittest.TestCase):
         torch.testing.assert_close(result["rho"], target_rho, rtol=0, atol=3e-8)
         torch.testing.assert_close(result["dipole_density"], target_p, rtol=0, atol=3e-8)
         self.assertTrue(any(item.get("accepted_step", 1.) < 1. for item in result["history"]))
-        self.assertGreater(result["iterations"], 1)
+        self.assertGreater(result["n_iter"], 1)
         self.assertEqual(float(model.strength.grad), 7.)
         self.assertTrue(model.training)
         failure = GridSolver(with_ideal(model, FixedDipoleIdeal(moments))).solve(

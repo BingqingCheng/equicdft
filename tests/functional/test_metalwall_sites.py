@@ -412,7 +412,7 @@ class TestExplicitMetalSites(unittest.TestCase):
             "metal_group_ids", "metal_total_charge",
         ):
             self.assertNotIn(key, result)
-        torch.testing.assert_close(result["euler_lagrange_residual"], torch.zeros_like(data["rho"]),
+        torch.testing.assert_close(result["density_residual"], torch.zeros_like(data["rho"]),
                                    atol=3e-11, rtol=0)
         expected_external = data["beta"] * model.voxel_volume * (data["rho"] * data["V_ext"]).sum()
         torch.testing.assert_close(result["beta_V_ext"], expected_external)
@@ -445,7 +445,7 @@ class TestExplicitMetalSites(unittest.TestCase):
             self.assertTrue(torch.all(result["rho"][~excluded] > 0))
             torch.testing.assert_close(model.voxel_volume * result["rho"].sum(0), numbers, atol=1e-12, rtol=0)
             torch.testing.assert_close(result["rho"], target, atol=1e-9, rtol=0)
-            self.assertLess(result["max_euler_lagrange_residual"], 1e-9)
+            self.assertLess(result["max_density_residual"], 1e-9)
             self.assert_outputs_close(result, _model_reference(dict(data, rho=result["rho"])))
             solutions.append(result["rho"])
         torch.testing.assert_close(solutions[0], solutions[1], atol=1e-9, rtol=0)

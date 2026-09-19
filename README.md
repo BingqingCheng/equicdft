@@ -287,9 +287,11 @@ only excess responses are returned; total-response names are never reused.
 
 `beta_external` is the external coupling (`beta_V_ext` for density-only data),
 `beta_A = beta_F + beta_external`, and `beta_Omega` subtracts `beta_mu_N` when
-a chemical potential is supplied. `density_residual`, `max_density_residual`
-and `rms_density_residual` share the historical `euler_lagrange_residual`,
-`max_euler_lagrange_residual` and `rms_euler_lagrange_residual` values.
+a chemical potential is supplied. The density stationarity residual and its
+norms are `density_residual`, `max_density_residual` and
+`rms_density_residual`, with `polarization_residual` the coupled counterpart;
+these replace the `euler_lagrange_residual` spellings, which carried the same
+values and are no longer returned.
 Prescribed-density evaluation reports unconstrained stationarity; a solve
 reports the residuals after its bounds and homogeneous projections.
 

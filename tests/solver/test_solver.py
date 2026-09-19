@@ -158,7 +158,7 @@ class TestGridSolver(unittest.TestCase):
         self.assertTrue(torch.allclose(result["beta_F_id"], expected_F_id))
         self.assertTrue(
             torch.allclose(
-                result["euler_lagrange_residual"],
+                result["density_residual"],
                 torch.zeros_like(rho),
                 atol=1.0e-12,
             )
@@ -181,10 +181,10 @@ class TestGridSolver(unittest.TestCase):
             torch.allclose(result["rho"], target_rho, atol=2.0e-6, rtol=0.0)
         )
         self.assertLess(
-            torch.max(torch.abs(result["euler_lagrange_residual"])).item(),
+            torch.max(torch.abs(result["density_residual"])).item(),
             1.0e-7,
         )
-        self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
+        self.assertLess(result["max_density_residual"], 1.0e-7)
         self.assertEqual(result["solver_method"], "minimize")
         self.assertLessEqual(result["line_search_failures"], 1)
         self.assert_objective_history_nonincreasing(
@@ -209,7 +209,7 @@ class TestGridSolver(unittest.TestCase):
         self.assertTrue(torch.allclose(result["rho"], expected_rho))
         self.assertAlmostEqual(result["rho"].sum().item(), 2.0)
         self.assertLess(
-            torch.max(torch.abs(result["euler_lagrange_residual"])).item(),
+            torch.max(torch.abs(result["density_residual"])).item(),
             1.0e-12,
         )
         self.assertTrue(result["converged"])
@@ -248,7 +248,7 @@ class TestGridSolver(unittest.TestCase):
                 self.assertAlmostEqual(result["rho"].sum().item(), 1.0)
                 self.assertTrue(
                     torch.all(
-                        result["euler_lagrange_residual"][
+                        result["density_residual"][
                             data["excluded_mask"]
                         ]
                         == 0.0
@@ -408,7 +408,7 @@ class TestGridSolver(unittest.TestCase):
             torch.allclose(result["rho"], expected_rho, atol=1.0e-7)
         )
         self.assertTrue(result["converged"])
-        self.assertLess(result["max_euler_lagrange_residual"], 1.0e-7)
+        self.assertLess(result["max_density_residual"], 1.0e-7)
         self.assertLess(
             result["objective_history"][-1],
             result["objective_history"][0],
@@ -639,8 +639,8 @@ class TestGridSolver(unittest.TestCase):
             data, max_iter=200, tolerance_residual=1.0e-6, tolerance_change=1.0e-14,
         )
         self.assertEqual(result["status"], "converged")
-        self.assertEqual(result["maximum_residual"], result["max_euler_lagrange_residual"])
-        self.assertEqual(result["rms_residual"], result["rms_euler_lagrange_residual"])
+        self.assertEqual(result["maximum_residual"], result["max_density_residual"])
+        self.assertEqual(result["rms_residual"], result["rms_density_residual"])
         short = GridSolver(self._make_model()).solve(data, max_iter=1, tolerance_residual=1.0e-12)
         self.assertEqual(short["status"], "max_iter")
         stalled = GridSolver(self._make_model()).solve(

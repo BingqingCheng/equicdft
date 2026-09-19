@@ -90,13 +90,12 @@ class TestSolveReporting(unittest.TestCase):
                     self.assertEqual(result["solver_method"], method)
                     self.assertEqual(result["n_iter"], len(result["objective_history"]) - 1)
                     self.assertGreaterEqual(result["n_evaluations"], result["n_iter"] + 1)
+                    self.assertNotIn("iterations", result)
                     if polarized:
-                        self.assertEqual(result["iterations"], result["n_iter"])
                         self.assertEqual(result["objective_history"],
                                          [entry["beta_A"] for entry in result["history"]])
                         self.assertIn("final_relative_polarization_change", result)
                     else:
-                        self.assertNotIn("iterations", result)
                         self.assertNotIn("history", result)
 
     def test_model_training_mode_is_restored_on_evaluation_failure(self):

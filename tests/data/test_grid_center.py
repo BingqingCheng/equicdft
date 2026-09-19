@@ -202,7 +202,7 @@ class TestGridCenter(unittest.TestCase):
                         metal_positions=legacy["metal_positions"] + origin)
         solver = GridSolver(model)
         old, new = _run(solver.evaluate, legacy), _run(solver.evaluate, physical)
-        for key in ("beta_F_exc", "c1", "metal_site_q", "euler_lagrange_residual"):
+        for key in ("beta_F_exc", "c1", "metal_site_q", "density_residual"):
             torch.testing.assert_close(new[key], old[key], atol=3e-11, rtol=3e-11)
         torch.testing.assert_close(new["grid_center"], physical["grid_center"])
         wall = next(module for module in model.modules() if isinstance(module, MetalWall))

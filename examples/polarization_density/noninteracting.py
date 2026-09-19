@@ -76,7 +76,7 @@ def main():
             density_error = float((result["rho"]-reference_rho).abs().max()/reference_rho.mean())
             polar_error = float((result["dipole_density"]-reference_p).abs().max()/(moment*reference_rho.mean()))
             record = {"case": name, "start": start, "converged": result["converged"],
-                      "iterations": result["iterations"],
+                      "iterations": result["n_iter"],
                       "maximum_residual": float(result["maximum_residual"]),
                       "scaled_density_error": density_error,
                       "scaled_polarization_error": polar_error,

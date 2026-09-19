@@ -195,7 +195,7 @@ class GridSolver:
         The full model (including metal response) and energy are unchanged;
         the gradient is averaged before each update. Standard residual and
         convergence keys then describe the constrained problem. Additional
-        ``full_*euler_lagrange_residual`` and ``full_converged`` results report
+        ``full_*density_residual`` and ``full_converged`` results report
         unrestricted stationarity. Available only for density-only minimize.
 
         With ``model.ideal=FixedDipoleIdeal(...)``, both methods optimize density
@@ -414,9 +414,9 @@ class GridSolver:
             )
         )
         if projection is not None:
-            result["full_euler_lagrange_residual"] = residual
-            result["full_max_euler_lagrange_residual"] = max_residual
-            result["full_rms_euler_lagrange_residual"] = rms_residual
+            result["full_density_residual"] = residual
+            result["full_max_density_residual"] = max_residual
+            result["full_rms_density_residual"] = rms_residual
             result["full_converged"] = _residuals_converged(
                 max_residual, rms_residual, tolerance_residual, tolerance_rms_residual,
             )

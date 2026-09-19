@@ -427,7 +427,6 @@ def solve_fixed_dipoles(solver, data, method, options):
             else polarization_fraction_cap.detach()
         ),
         solver_fixed_field=fixed_field,
-        iterations=state["n_iter"],
         particle_number_error=result["particle_numbers"] - numbers,
     )
     state["objective_history"] = [item["beta_A"] for item in state["history"]]

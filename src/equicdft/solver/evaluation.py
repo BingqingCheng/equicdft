@@ -100,16 +100,13 @@ def fixed_dipole_inputs(solver, data):
 
 
 def _set_density_residuals(result, residual, chemical_potential, maximum, rms):
-    """Keep common density diagnostics and the historical Euler names in sync."""
+    """Record the density stationarity residual and its two norms."""
 
     result.update(
         beta_mu=chemical_potential,
         density_residual=residual,
         max_density_residual=maximum,
         rms_density_residual=rms,
-        euler_lagrange_residual=residual,
-        max_euler_lagrange_residual=maximum,
-        rms_euler_lagrange_residual=rms,
     )
 
 
@@ -248,7 +245,6 @@ def evaluate(solver, data, compute_derivatives=True):
                 p_max, p_rms = _polarization_residual_norms(rho, scaled, accessible)
                 result.update(
                     polarization_residual=p_residual,
-                    polarization_euler_lagrange_residual=p_residual,
                     scaled_polarization_residual=scaled,
                     max_polarization_residual=p_max,
                     rms_polarization_residual=p_rms,

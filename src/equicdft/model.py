@@ -144,6 +144,12 @@ class GridCACEModel(nn.Module, Configurable):
     *_derivative_excess outputs and c1/c2 remain excess-only. Total outputs
     are absent when ideal evaluation is disabled; their meaning never changes.
 
+    ``density_derivative_excess`` is exactly ``-c1``, the same tensor under
+    the systematic name that pairs with ``density_derivative``. Both are
+    returned because ``c1`` is the direct-correlation name the literature
+    and the fitted models use; new code that handles total and excess
+    responses together should prefer the ``*_derivative*`` names.
+
     Every configured :class:`EnergyReadout` receives a shared context and
     returns one reduced free-energy contribution per field. With the default
     ``free_energy_mode="beta"``, the sum is interpreted directly as

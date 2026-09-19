@@ -542,6 +542,31 @@ def record(path: Path = GOLDEN_PATH) -> None:
     print("recorded {} cases ({} tensors) to {}".format(len(results), total, path))
 
 
+def _rename_recorded(
+    recorded: Dict[str, torch.Tensor],
+    renames: Dict[str, str],
+) -> Dict[str, torch.Tensor]:
+    """Return ``recorded`` under current output names, dropping duplicates.
+
+    A record that already carries the new name kept the two as aliases of
+    one tensor, so the retired entry is discarded; otherwise it is renamed
+    and its recorded value is still compared.
+    """
+
+    result = {}
+    for key, value in recorded.items():
+        prefix, _, name = key.rpartition("/")
+        new_name = renames.get(name)
+        if new_name is None:
+            result[key] = value
+            continue
+        renamed = "{}/{}".format(prefix, new_name) if prefix else new_name
+        if renamed in recorded:
+            continue
+        result[renamed] = value
+    return result
+
+
 def compare(
     recorded: Dict[str, torch.Tensor],
     actual: Dict[str, torch.Tensor],
@@ -557,11 +582,28 @@ def compare(
     actual = dict(actual)
     # Historical unsuffixed P responses were excess-only. Rename the reference
     # keys, not their tensors, so the same physical quantities are compared.
+    # (``_rename_recorded`` below does the same for the retired residual
+    # spellings; both keep the original recorded values in play.)
     recorded = {
         (key.rsplit("/", 1)[0] + "/polarization_derivative_excess"
          if key.endswith("/polarization_derivative") else key): value
         for key, value in recorded.items()
     }
+    # The Euler-Lagrange spellings of the residuals, and the coupled
+    # solver's ``iterations``, were retired in favour of one name each. Where a record carries both --
+    # the fixed-dipole results always did -- they held the same tensor, so
+    # the duplicate is dropped rather than renamed, and the recorded values
+    # are still compared against what the solver produces today.
+    recorded = _rename_recorded(recorded, {
+        "euler_lagrange_residual": "density_residual",
+        "max_euler_lagrange_residual": "max_density_residual",
+        "rms_euler_lagrange_residual": "rms_density_residual",
+        "full_euler_lagrange_residual": "full_density_residual",
+        "full_max_euler_lagrange_residual": "full_max_density_residual",
+        "full_rms_euler_lagrange_residual": "full_rms_density_residual",
+        "polarization_euler_lagrange_residual": "polarization_residual",
+        "iterations": "n_iter",
+    })
     # Model training-policy outputs were retired; preserve all energy,
     # derivative, solver and historical trainer comparisons.
     retired = {"out/beta_mu_local", "out/beta_mu_average", "out/beta_mu_weights",
