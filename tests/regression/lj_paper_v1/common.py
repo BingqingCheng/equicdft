@@ -7,7 +7,8 @@ from pathlib import Path
 
 import torch
 
-from equicdft import GridData, GridSolver, load_model
+from equicdft import GridData, GridSolver
+from equicdft.conversion import load_converted_model
 
 
 DIRECTORY = Path(__file__).resolve().parent
@@ -52,7 +53,8 @@ def load_case():
     # model.pt is the published LJ-paper-v1 model in the versioned
     # configuration-plus-state format; the original whole-object pickle it
     # was converted from is kept under tests/fixtures.
-    model = load_model(MODEL_PATH, map_location=device)
+    # Keep this frozen older-format artifact unchanged and convert in memory.
+    model = load_converted_model(MODEL_PATH).to(device)
     frames = GridData.from_xyz(FIELD_PATH, grid_info=model.grid_info)
     if len(frames) != 1:
         raise RuntimeError("expected exactly one regression field")

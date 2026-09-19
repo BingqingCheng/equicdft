@@ -3,6 +3,7 @@
 import unittest
 
 from tests.ideal_helpers import with_ideal
+from equicdft.solver import Constraints, ConvergenceOptions, Initialization
 from equicdft import FixedDipoleIdeal
 import torch
 
@@ -36,8 +37,13 @@ class TestPolarizationConfinement(unittest.TestCase):
                 rho[~mask] = torch.exp(.3 * torch.randn(16, 2))
                 rho *= numbers / (data["grid_spacing"].prod() * rho.sum(0))
                 p = .02 * (rho * moments)[..., None] * torch.randn(24, 2, 3)
-                initial = dict(initial_rho=rho, initial_polarization=p)
-            result = solver.solve(data, particle_numbers=numbers, tolerance_residual=1e-9, **initial)
+                initial = dict(initial=Initialization(rho=rho, polarization=p))
+            result = solver.solve(
+                data,
+                **initial,
+                convergence=ConvergenceOptions(tolerance_residual=1e-9),
+                constraints=Constraints(particle_numbers=numbers),
+            )
             self.assertTrue(result["converged"])
             self.assertLess(result["maximum_residual"].item(), 1e-9)
             torch.testing.assert_close(result["rho"][~mask], expected_rho, atol=1e-9, rtol=0)
@@ -51,7 +57,11 @@ class TestPolarizationConfinement(unittest.TestCase):
         changed["V_ext"][mask] = 1000.
         changed["E_ext"][mask] = -3000.
         changed["V_ext"][~mask] += torch.tensor([2., -3.])
-        shifted = solver.solve(changed, particle_numbers=numbers, tolerance_residual=1e-9)
+        shifted = solver.solve(
+            changed,
+            convergence=ConvergenceOptions(tolerance_residual=1e-9),
+            constraints=Constraints(particle_numbers=numbers),
+        )
         torch.testing.assert_close(shifted["rho"], result["rho"], atol=1e-9, rtol=0)
         torch.testing.assert_close(shifted["dipole_density"], result["dipole_density"], atol=1e-9, rtol=0)
         torch.testing.assert_close(shifted["beta_mu"] - result["beta_mu"], data["beta"] * torch.tensor([2., -3.]), atol=1e-9, rtol=0)
@@ -65,9 +75,15 @@ class TestPolarizationConfinement(unittest.TestCase):
             (torch.zeros(24, 2, dtype=torch.bool), ValueError),
         ):
             with self.assertRaises(error):
-                solver.solve(dict(data, excluded_mask=mask), particle_numbers=[3., 4.])
+                solver.solve(
+                    dict(data, excluded_mask=mask),
+                    constraints=Constraints(particle_numbers=[3., 4.]),
+                )
         data["excluded_mask"] = torch.arange(24) == 0
-        result = solver.solve(data, particle_numbers=[3., 4.])
+        result = solver.solve(
+            data,
+            constraints=Constraints(particle_numbers=[3., 4.]),
+        )
         for name in ("rho", "dipole_density"):
             bad = result[name].clone()
             bad[0] = .01
@@ -141,9 +157,12 @@ class TestPolarizationConfinement(unittest.TestCase):
                 torch.testing.assert_close(numeric, analytic, rtol=1.e-6, atol=1.e-9)
         data["V_ext"] = -target["density_residual"] / data["beta"]
         data["E_ext"] = target["polarization_residual"] / data["beta"]
-        result = solver.solve(data, particle_numbers=target["particle_numbers"],
-                              initial_rho=torch.where(mask[:, None], 0., target["particle_numbers"] / ((~mask).sum() * .8**3)),
-                              initial_polarization=torch.zeros_like(data["dipole_density"]), tolerance_residual=1e-8)
+        result = solver.solve(
+            data,
+            convergence=ConvergenceOptions(tolerance_residual=1e-8),
+            constraints=Constraints(particle_numbers=target["particle_numbers"]),
+            initial=Initialization(rho=torch.where(mask[:, None], 0., target["particle_numbers"] / ((~mask).sum() * .8**3)), polarization=torch.zeros_like(data["dipole_density"])),
+        )
         self.assertTrue(result["converged"], result["status"])
         torch.testing.assert_close(result["rho"], data["rho"], atol=1e-8, rtol=0)
         torch.testing.assert_close(result["dipole_density"], data["dipole_density"], atol=1e-8, rtol=0)
@@ -154,8 +173,10 @@ class TestPolarizationConfinement(unittest.TestCase):
     def test_homogeneous_axes_cannot_be_silently_ignored_for_dipoles(self):
         solver = GridSolver(with_ideal(None, FixedDipoleIdeal([.7, 1.9])))
         with self.assertRaisesRegex(ValueError, "not supported with fixed dipoles"):
-            solver.solve(ideal_reference.TestGridSolverPolarization.case(),
-                         particle_numbers=[3., 4.], homogeneous_axes=["x", "y"])
+            solver.solve(
+                ideal_reference.TestGridSolverPolarization.case(),
+                constraints=Constraints(particle_numbers=[3., 4.], homogeneous_axes=["x", "y"]),
+            )
 
 
 if __name__ == "__main__":

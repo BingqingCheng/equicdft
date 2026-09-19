@@ -7,6 +7,12 @@ from unittest.mock import patch
 import torch
 from tests.metal_helpers import _run, liquid_coulomb, liquid_data, metal_sites
 
+from equicdft.solver import (
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+)
 from equicdft import (
     GridCACEModel,
     GridSolver,
@@ -309,15 +315,14 @@ class TestMetalModel(unittest.TestCase):
         data.pop("rho")
         solutions = []
         for initialization in (None, torch.flip(target, dims=(0,)) + 0.05):
-            result = _run(GridSolver(model).solve,
+            result = _run(
+                GridSolver(model).solve,
                 data,
-                initial_rho=initialization,
-                particle_numbers=numbers,
                 method="euler",
-                max_iter=250,
-                tolerance_residual=1e-9,
-                tolerance_change=1e-12,
-                mixing=0.2,
+                convergence=ConvergenceOptions(max_iter=250, tolerance_residual=1e-9),
+                euler=EulerOptions(tolerance_change=1e-12, mixing=0.2),
+                constraints=Constraints(particle_numbers=numbers),
+                initial=Initialization(rho=initialization),
             )
             self.assertTrue(result["converged"])
             self.assertTrue(torch.equal(

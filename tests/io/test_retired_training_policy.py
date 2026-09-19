@@ -3,8 +3,9 @@
 import unittest
 import torch
 from equicdft import GridCACEModel
-from equicdft.legacy import upgrade_legacy_model
-from equicdft.serialization import build_model, model_payload, migrate_model_payload
+from equicdft.conversion.legacy import upgrade_legacy_model
+from equicdft.serialization import model_payload
+from equicdft.conversion import build_converted_model, migrate_model_payload
 from tests.model_fixtures import example_model, grid_data
 
 
@@ -14,7 +15,7 @@ class TestRetiredTrainingPolicy(unittest.TestCase):
         payload = model_payload(model)
         payload["format_version"] = 3
         payload["config"].update(compute_local_mu=True, rho_min=.123)
-        restored = build_model(payload).eval()
+        restored = build_converted_model(payload).eval()
         self.assertIn("rho_min", payload["config"])
         migrated = migrate_model_payload(payload)
         self.assertNotIn("rho_min", migrated["config"])

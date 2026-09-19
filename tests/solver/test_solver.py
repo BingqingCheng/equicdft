@@ -3,6 +3,14 @@ import unittest
 import torch
 from torch import nn
 
+from equicdft.solver import (
+    AndersonOptions,
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+    MinimizeOptions,
+)
 from equicdft import GridCACEModel, GridData, GridSolver, LocalReadout
 from equicdft.solver.euler import (
     _anderson_log_density_candidate as solver_anderson_candidate,
@@ -173,8 +181,7 @@ class TestGridSolver(unittest.TestCase):
         result = GridSolver(self._make_model()).solve(
             self._make_data(target_rho),
             method="minimize",
-            max_iter=200,
-            tolerance_residual=1.0e-8,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-8),
         )
 
         self.assertTrue(
@@ -197,8 +204,8 @@ class TestGridSolver(unittest.TestCase):
 
         result = GridSolver(self._make_model()).solve(
             data,
-            particle_numbers=[2.0],
             method="minimize",
+            constraints=Constraints(particle_numbers=[2.0]),
         )
 
         expected_rho = torch.full(
@@ -231,11 +238,10 @@ class TestGridSolver(unittest.TestCase):
                 )
                 result = GridSolver(self._make_model()).solve(
                     data,
-                    initial_rho=torch.ones_like(data["V_ext"]),
-                    particle_numbers=[1.0],
                     method=method,
-                    max_iter=200,
-                    tolerance_residual=1.0e-8,
+                    convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-8),
+                    constraints=Constraints(particle_numbers=[1.0]),
+                    initial=Initialization(rho=torch.ones_like(data["V_ext"])),
                 )
 
                 self.assertTrue(
@@ -271,8 +277,7 @@ class TestGridSolver(unittest.TestCase):
                 result = GridSolver(_IdealGasModel()).solve(
                     data,
                     method=method,
-                    max_iter=20,
-                    tolerance_residual=1.0e-10,
+                    convergence=ConvergenceOptions(max_iter=20, tolerance_residual=1.0e-10),
                 )
 
                 self.assertTrue(torch.allclose(result["rho"], expected))
@@ -300,17 +305,15 @@ class TestGridSolver(unittest.TestCase):
 
         ideal = GridSolver(_IdealGasModel()).solve(
             data,
-            particle_numbers=[2.0],
-            beta_multiplier=1.0,
-            max_iter=1,
-            tolerance_residual=1.0e-10,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(beta_multiplier=1.0),
         )
         uniform = GridSolver(_IdealGasModel()).solve(
             data,
-            particle_numbers=[2.0],
-            max_iter=1,
-            tolerance_residual=1.0e-10,
-            adaptive_mixing=False,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1.0e-10),
+            euler=EulerOptions(adaptive_mixing=False),
+            constraints=Constraints(particle_numbers=[2.0]),
         )
 
         self.assertEqual(ideal["solver_beta_multiplier"], 1.0)
@@ -325,10 +328,9 @@ class TestGridSolver(unittest.TestCase):
         )
         tempered = GridSolver(_IdealGasModel()).solve(
             data,
-            particle_numbers=[2.0],
-            beta_multiplier=0.5,
-            max_iter=1,
-            tolerance_residual=10.0,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=10.0),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(beta_multiplier=0.5),
         )
         self.assertEqual(tempered["solver_beta_multiplier"], 0.5)
         self.assertTrue(torch.allclose(tempered["rho"], tempered_expected))
@@ -339,18 +341,16 @@ class TestGridSolver(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "beta_multiplier"):
                     GridSolver(self._make_model()).solve(
                         self._make_data(),
-                        beta_multiplier=invalid_value,
+                        initial=Initialization(beta_multiplier=invalid_value),
                     )
 
     def test_explicit_density_overrides_beta_profile(self):
         initial_rho = torch.full((4, 1), 0.5, dtype=torch.float64)
         result = GridSolver(self._make_model()).solve(
             self._make_data(include_mu=False),
-            initial_rho=initial_rho,
-            particle_numbers=[2.0],
-            beta_multiplier=1.0,
-            max_iter=1,
-            tolerance_residual=10.0,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=10.0),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(rho=initial_rho, beta_multiplier=1.0),
         )
         self.assertTrue(torch.allclose(result["rho"], initial_rho))
 
@@ -363,17 +363,15 @@ class TestGridSolver(unittest.TestCase):
         )
         result = GridSolver(_IdealGasModel()).solve(
             data,
-            beta_multiplier=0.5,
-            max_iter=1,
-            tolerance_residual=100.0,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=100.0),
+            initial=Initialization(beta_multiplier=0.5),
         )
         self.assertTrue(torch.allclose(result["rho"], expected))
 
         uniform = GridSolver(_IdealGasModel()).solve(
             data,
-            beta_multiplier=0.0,
-            max_iter=1,
-            tolerance_residual=100.0,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=100.0),
+            initial=Initialization(beta_multiplier=0.0),
         )
         old_uniform = torch.exp(
             data["beta"] * data["mu"]
@@ -392,11 +390,10 @@ class TestGridSolver(unittest.TestCase):
 
         result = GridSolver(self._make_model()).solve(
             data,
-            initial_rho=initial_rho,
-            particle_numbers=[2.0],
             method="minimize",
-            max_iter=200,
-            tolerance_residual=1.0e-7,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-7),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(rho=initial_rho),
         )
 
         expected_rho = torch.full(
@@ -425,11 +422,8 @@ class TestGridSolver(unittest.TestCase):
 
         result = GridSolver(self._make_model()).solve(
             self._make_data(target_rho),
-            max_iter=200,
-            mixing=0.2,
-            adaptive_mixing=False,
-            tolerance_residual=1.0e-9,
-            tolerance_change=1.0e-12,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-9),
+            euler=EulerOptions(mixing=0.2, adaptive_mixing=False, tolerance_change=1.0e-12),
         )
 
         self.assertEqual(result["solver_method"], "euler")
@@ -447,14 +441,8 @@ class TestGridSolver(unittest.TestCase):
         result = GridSolver(self._make_model()).solve(
             self._make_data(target_rho),
             method="euler",
-            max_iter=200,
-            mixing=0.05,
-            minimum_mixing=0.01,
-            maximum_mixing=0.4,
-            mixing_growth=1.2,
-            tolerance_residual=1.0e-8,
-            tolerance_rms_residual=1.0e-8,
-            tolerance_change=1.0e-12,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-8, tolerance_rms_residual=1.0e-8),
+            euler=EulerOptions(mixing=0.05, minimum_mixing=0.01, maximum_mixing=0.4, mixing_growth=1.2, tolerance_change=1.0e-12),
         )
 
         self.assertTrue(result["converged"])
@@ -472,24 +460,24 @@ class TestGridSolver(unittest.TestCase):
         )
         data = self._make_data(target_rho, include_mu=False)
         particle_numbers = [target_rho.sum().item()]
-        options = {
-            "particle_numbers": particle_numbers,
-            "method": "euler",
-            "max_iter": 200,
-            "mixing": 0.05,
-            "minimum_mixing": 0.01,
-            "maximum_mixing": 0.4,
-            "mixing_growth": 1.2,
-            "tolerance_residual": 1.0e-8,
-            "tolerance_rms_residual": 1.0e-8,
-            "tolerance_change": 1.0e-12,
-        }
-
-        scalar = GridSolver(self._make_model()).solve(data, **options)
+        from dataclasses import replace
+        options = dict(
+            method="euler",
+            constraints=Constraints(particle_numbers=particle_numbers),
+            convergence=ConvergenceOptions(
+                max_iter=200, tolerance_residual=1.0e-8,
+                tolerance_rms_residual=1.0e-8,
+            ),
+        )
+        euler = EulerOptions(
+            mixing=0.05, minimum_mixing=0.01, maximum_mixing=0.4,
+            mixing_growth=1.2, tolerance_change=1.0e-12,
+        )
+        scalar = GridSolver(self._make_model()).solve(data, euler=euler, **options)
         accelerated = GridSolver(self._make_model()).solve(
             data,
-            anderson=True,
             **options,
+            euler=replace(euler, anderson=AndersonOptions()),
         )
 
         self.assertTrue(scalar["converged"])
@@ -529,18 +517,14 @@ class TestGridSolver(unittest.TestCase):
 
         result = GridSolver(self._make_model()).solve(
             data,
-            initial_rho=torch.tensor(
+            method="euler",
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-8, tolerance_rms_residual=1.0e-8),
+            euler=EulerOptions(tolerance_change=1.0e-12, anderson=AndersonOptions()),
+            constraints=Constraints(particle_numbers=[1.0], maximum_density=0.6),
+            initial=Initialization(rho=torch.tensor(
                 [[0.0], [0.2], [0.5], [0.3]],
                 dtype=torch.float64,
-            ),
-            particle_numbers=[1.0],
-            method="euler",
-            anderson=True,
-            maximum_density=0.6,
-            max_iter=200,
-            tolerance_residual=1.0e-8,
-            tolerance_rms_residual=1.0e-8,
-            tolerance_change=1.0e-12,
+            )),
         )
 
         self.assertEqual(result["rho"][0, 0].item(), 0.0)
@@ -550,18 +534,17 @@ class TestGridSolver(unittest.TestCase):
 
     def test_anderson_options_are_validated_when_enabled(self):
         invalid_options = (
-            {"anderson_history": 1},
-            {"anderson_regularization": -1.0},
-            {"anderson_damping": 0.0},
-            {"anderson_damping": 1.1},
+            {"history": 1},
+            {"regularization": -1.0},
+            {"damping": 0.0},
+            {"damping": 1.1},
         )
         for options in invalid_options:
             with self.subTest(options=options):
                 with self.assertRaises(ValueError):
                     GridSolver(self._make_model()).solve(
                         self._make_data(),
-                        anderson=True,
-                        **options,
+                        euler=EulerOptions(anderson=AndersonOptions(**options)),
                     )
 
     def test_fixed_particle_number_density_cap_is_enforced(self):
@@ -573,11 +556,9 @@ class TestGridSolver(unittest.TestCase):
 
         result = GridSolver(self._make_model()).solve(
             data,
-            particle_numbers=[2.0],
             method="minimize",
-            maximum_density=0.6,
-            max_iter=500,
-            tolerance_residual=1.0e-7,
+            convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-7),
+            constraints=Constraints(particle_numbers=[2.0], maximum_density=0.6),
         )
 
         self.assertLessEqual(result["rho"].max().item(), 0.6 + 1.0e-12)
@@ -591,8 +572,7 @@ class TestGridSolver(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "infeasible"):
             GridSolver(self._make_model()).solve(
                 data,
-                particle_numbers=[2.0],
-                maximum_density=0.4,
+                constraints=Constraints(particle_numbers=[2.0], maximum_density=0.4),
             )
 
     def test_density_cap_feasibility_uses_accessible_volume(self):
@@ -604,8 +584,7 @@ class TestGridSolver(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "infeasible"):
             GridSolver(self._make_model()).solve(
                 data,
-                particle_numbers=[1.0],
-                maximum_density=0.4,
+                constraints=Constraints(particle_numbers=[1.0], maximum_density=0.4),
             )
 
     def test_solver_method_is_validated(self):
@@ -622,66 +601,49 @@ class TestGridSolver(unittest.TestCase):
             GridSolver(self._make_model()).solve(
                 self._make_data(),
                 method="euler",
-                step_size="unused",
-                max_iter=1,
+                minimize=MinimizeOptions(step_size=-1.),
+                convergence=ConvergenceOptions(max_iter=1),
             )
         with self.assertRaisesRegex((TypeError, ValueError), "mixing"):
             GridSolver(self._make_model()).solve(
                 self._make_data(),
                 method="minimize",
-                mixing="unused",
-                max_iter=1,
+                euler=EulerOptions(mixing=-1.),
+                convergence=ConvergenceOptions(max_iter=1),
             )
 
     def test_scalar_results_report_status_and_coupled_residual_names(self):
         data = self._make_data()
         result = GridSolver(self._make_model()).solve(
-            data, max_iter=200, tolerance_residual=1.0e-6, tolerance_change=1.0e-14,
+            data,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-6),
+            euler=EulerOptions(tolerance_change=1.0e-14),
         )
         self.assertEqual(result["status"], "converged")
         self.assertEqual(result["maximum_residual"], result["max_density_residual"])
         self.assertEqual(result["rms_residual"], result["rms_density_residual"])
-        short = GridSolver(self._make_model()).solve(data, max_iter=1, tolerance_residual=1.0e-12)
+        short = GridSolver(self._make_model()).solve(
+            data,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1.0e-12),
+        )
         self.assertEqual(short["status"], "max_iter")
         stalled = GridSolver(self._make_model()).solve(
-            data, max_iter=200, tolerance_residual=1.0e-12, tolerance_change=1.0,
+            data,
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-12),
+            euler=EulerOptions(tolerance_change=1.0),
         )
         self.assertEqual(stalled["status"], "stalled")
 
-    def test_option_groups_and_flat_keywords_are_equivalent(self):
-        from equicdft.solver.options import (
-            AndersonOptions,
-            Constraints,
-            ConvergenceOptions,
-            EulerOptions,
-        )
-
-        data = self._make_data()
-        flat = GridSolver(self._make_model()).solve(
-            data,
-            particle_numbers=[1.0],
-            max_iter=30,
-            tolerance_residual=1.0e-6,
-            mixing=0.1,
-            anderson=True,
-            anderson_history=3,
-        )
-        grouped = GridSolver(self._make_model()).solve(
-            self._make_data(),
-            constraints=Constraints(particle_numbers=[1.0]),
-            convergence=ConvergenceOptions(max_iter=30, tolerance_residual=1.0e-6),
-            euler=EulerOptions(mixing=0.1, anderson=AndersonOptions(history=3)),
-        )
-        self.assertTrue(torch.equal(flat["rho"], grouped["rho"]))
-        self.assertEqual(flat["n_iter"], grouped["n_iter"])
-        with self.assertRaisesRegex(TypeError, "set both"):
-            GridSolver(self._make_model()).solve(
-                self._make_data(),
-                euler=EulerOptions(mixing=0.1),
-                mixing=0.2,
-            )
+    def test_only_grouped_options_are_accepted(self):
+        solver = GridSolver(self._make_model())
         with self.assertRaisesRegex(TypeError, "unexpected keyword"):
-            GridSolver(self._make_model()).solve(self._make_data(), bogus=1)
+            solver.solve(self._make_data(), max_iter=1)
+        with self.assertRaisesRegex(TypeError, "convergence must be"):
+            solver.solve(self._make_data(), convergence={})
+        with self.assertRaisesRegex(ValueError, "minimize options require"):
+            solver.solve(self._make_data(), method="euler", minimize=MinimizeOptions())
+        with self.assertRaisesRegex(ValueError, "euler options require"):
+            solver.solve(self._make_data(), method="minimize", euler=EulerOptions())
 
     def test_zero_density_is_included_in_default_physical_residual(self):
         rho = torch.tensor([[1.0], [0.0]], dtype=torch.float64)

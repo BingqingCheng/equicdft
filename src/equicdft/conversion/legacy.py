@@ -14,7 +14,7 @@ history to one place:
 * :func:`legacy_model_to_current` describes the upgraded object with
   ``to_config()``, rebuilds a fresh model from that configuration, transfers
   the fitted state, and checks that both evaluate identically;
-* :func:`convert_legacy_model` writes the result with
+* :func:`equicdft.conversion.convert_model` writes the result with
   :func:`equicdft.serialization.save_model`.
 
 The runtime classes themselves carry no legacy fallbacks.
@@ -29,26 +29,26 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ._config import Configurable, build, mlp_hidden_sizes
-from .data.grid_data import GridData
-from .representation.cartesian import CartesianAFeatures, _DensityMixing
-from .representation.message import BChiMessage
-from .model import GridCACEModel
-from .functional.ideal import IdealGas
-from .functional.metalwall import MetalWall
-from .functional.pairwise import PairwiseReadout
-from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
-from .functional.reciprocal import ReciprocalFeatures
-from .representation.invariants import CartesianBFeatures
-from .functional.semilocal import GGAReadout, LDAReadout
-from .serialization import _one_density_scale, default_dtype, model_dtype, save_model
+from .._config import Configurable, build, mlp_hidden_sizes
+from ..data.grid_data import GridData
+from ..representation.cartesian import CartesianAFeatures, _DensityMixing
+from ..representation.message import BChiMessage
+from ..model import GridCACEModel
+from ..functional.ideal import IdealGas
+from ..functional.metalwall import MetalWall
+from ..functional.pairwise import PairwiseReadout
+from ..functional.readout import BulkReadout, LocalReadout, LongRangeReadout
+from ..functional.reciprocal import ReciprocalFeatures
+from ..representation.invariants import CartesianBFeatures
+from ..functional.semilocal import GGAReadout, LDAReadout
+from ..serialization import default_dtype, model_dtype
+from .formats import _one_density_scale
 
 __all__ = [
     "load_legacy_model",
     "upgrade_legacy_model",
     "legacy_model_to_current",
     "verify_equivalent",
-    "convert_legacy_model",
 ]
 
 
@@ -108,7 +108,7 @@ class _RemappingUnpickler(pickle.Unpickler):
 def _remapping_pickle_module() -> types.ModuleType:
     """Return the ``pickle_module`` object ``torch.load`` expects."""
 
-    module = types.ModuleType("equicdft.legacy._pickle")
+    module = types.ModuleType("equicdft.conversion.legacy._pickle")
     module.Unpickler = _RemappingUnpickler
 
     def load(file: Any, **arguments: Any) -> Any:
@@ -615,39 +615,3 @@ def verify_equivalent(
                 "converted model output '{}' differs from the legacy "
                 "object".format(key)
             )
-
-
-def convert_legacy_model(
-    source: PathLike,
-    destination: Optional[PathLike] = None,
-    verify: bool = True,
-    overwrite: bool = False,
-    verification_data: Optional[Dict[str, Any]] = None,
-    *,
-    ideal=None,
-) -> Path:
-    """Convert a whole-object model file into the current format.
-
-    ``destination`` defaults to the source path, replacing the legacy file.
-    An existing distinct destination is only replaced with ``overwrite``.
-    Supply ``verification_data`` for models containing fixed electrode sites.
-    To preserve the original, always pass a distinct destination path.
-    """
-
-    source_path = Path(source).expanduser()
-    destination_path = (
-        source_path if destination is None else Path(destination).expanduser()
-    )
-    if (
-        destination_path.exists()
-        and destination_path.resolve() != source_path.resolve()
-        and not overwrite
-    ):
-        raise FileExistsError(
-            "{} exists; pass overwrite=True to replace it".format(
-                destination_path
-            )
-        )
-    legacy = load_legacy_model(source_path, map_location="cpu")
-    model = legacy_model_to_current(legacy, verify=verify, verification_data=verification_data, ideal=ideal)
-    return save_model(model, destination_path)

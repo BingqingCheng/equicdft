@@ -15,7 +15,7 @@ target.
 - Omitting every option described here retains the existing model paths.
 - Models saved with `save_model` record every option in their configuration
   and load unchanged; whole-object `torch.save(model)` files from before that
-  format are converted once with `python -m equicdft.convert`, which fills
+  format are converted once with `python -m equicdft.conversion`, which fills
   in the defaults such files implied and verifies the result.
 - Optional energies are summed before functional differentiation.
 - Radial transforms act before invariant products; density transforms act
@@ -706,13 +706,14 @@ The fixed-particle-number Euler solver can optionally propose Anderson-mixed
 updates in log-density space:
 
 ```python
+from equicdft.solver import AndersonOptions, EulerOptions
+
 result = solver.solve(
     field,
     method="euler",
-    anderson=True,
-    anderson_history=5,
-    anderson_regularization=1.0e-8,
-    anderson_damping=1.0,
+    euler=EulerOptions(anderson=AndersonOptions(
+        history=5, regularization=1.0e-8, damping=1.0,
+    )),
 )
 ```
 

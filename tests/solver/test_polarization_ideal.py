@@ -7,6 +7,14 @@ import numpy as np
 from tests.ideal_helpers import with_ideal
 import torch
 
+from equicdft.solver import (
+    AndersonOptions,
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+    MinimizeOptions,
+)
 from equicdft import FixedDipoleIdeal, GridSolver
 from equicdft.functional.polarization_ideal import (
     inverse_langevin,
@@ -154,13 +162,14 @@ class TestGridSolverPolarization(unittest.TestCase):
             rho *= torch.as_tensor(numbers)/(data["grid_spacing"].prod()*rho.sum(0))
             polar = 0.1*torch.randn(*rho.shape, 3)
             polar /= 1 + polar.norm(dim=-1, keepdim=True)
-            kwargs = {"initial_rho": rho, "initial_polarization": polar*(rho*torch.as_tensor(moments))[..., None]}
+            kwargs = {"initial": Initialization(
+                rho=rho, polarization=polar*(rho*torch.as_tensor(moments))[..., None],
+            )}
         result = solver.solve(
             data,
-            particle_numbers=numbers,
-            max_iter=350,
-            tolerance_residual=1e-7,
             **kwargs,
+            convergence=ConvergenceOptions(max_iter=350, tolerance_residual=1e-7),
+            constraints=Constraints(particle_numbers=numbers),
         )
         self.assertTrue(result["converged"], str(result["maximum_residual"]))
         expected_rho, expected_p = exact_solution(data, numbers, moments)
@@ -212,10 +221,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         torch.testing.assert_close(second["beta_mu"]-first["beta_mu"], data["beta"]*shift)
         result = solver.solve(
             data,
-            particle_numbers=[3., 4.],
-            max_iter=1,
-            tolerance_residual=1e-12,
-            step_size=0.1,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1e-12),
+            minimize=MinimizeOptions(step_size=0.1),
+            constraints=Constraints(particle_numbers=[3., 4.]),
         )
         self.assertFalse(result["converged"])
         self.assertEqual(result["status"], "max_iter")
@@ -228,18 +236,24 @@ class TestGridSolverPolarization(unittest.TestCase):
                         {"grid_spacing": torch.tensor([1., 2., 1.])}):
             with self.assertRaises(ValueError):
                 solver.solve(
-                    dict(data, **changes), particle_numbers=[3., 4.]
+                    dict(data, **changes),
+                    constraints=Constraints(particle_numbers=[3., 4.]),
                 )
         with self.assertRaises(ValueError):
             solver.solve(
                 data,
-                particle_numbers=[3., 4.],
-                initial_rho=torch.ones(24, 2),
+                constraints=Constraints(particle_numbers=[3., 4.]),
+                initial=Initialization(rho=torch.ones(24, 2)),
             )
         with self.assertRaisesRegex(ValueError, "requires particle_numbers"):
             solver.solve(data)
         with self.assertRaisesRegex(ValueError, "Anderson"):
-            solver.solve(data, particle_numbers=[3., 4.], anderson=True)
+            solver.solve(
+                data,
+                method="euler",
+                euler=EulerOptions(anderson=AndersonOptions()),
+                constraints=Constraints(particle_numbers=[3., 4.]),
+            )
 
     def test_density_cap_is_enforced_by_both_solvers(self):
         data = {
@@ -255,14 +269,10 @@ class TestGridSolverPolarization(unittest.TestCase):
             with self.subTest(method=method):
                 result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
                     data,
-                    particle_numbers=[2.0],
                     method=method,
-                    maximum_density=0.6,
-                    max_iter=500,
-                    tolerance_residual=1.0e-10,
-                    tolerance_change=1.0e-12,
-                    adaptive_mixing=False,
-                    mixing=0.2,
+                    convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-10),
+                    euler=EulerOptions(tolerance_change=1.0e-12, adaptive_mixing=False, mixing=0.2) if method == 'euler' else None,
+                    constraints=Constraints(particle_numbers=[2.0], maximum_density=0.6),
                 )
                 self.assertTrue(
                     result["converged"], str(result["maximum_residual"])
@@ -290,12 +300,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         polarization[..., 0] = 0.2 * 0.8 * rho
         result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
             data,
-            initial_rho=rho,
-            initial_polarization=polarization,
-            particle_numbers=[2.0],
-            maximum_density=0.6,
-            max_iter=1,
-            tolerance_residual=100.0,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=100.0),
+            constraints=Constraints(particle_numbers=[2.0], maximum_density=0.6),
+            initial=Initialization(rho=rho, polarization=polarization),
         )
         self.assertEqual(result["n_iter"], 0)
         self.assertAlmostEqual(result["rho"].max().item(), 0.6, places=12)
@@ -319,15 +326,10 @@ class TestGridSolverPolarization(unittest.TestCase):
             with self.subTest(method=method):
                 result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
                     data,
-                    particle_numbers=[2.0],
                     method=method,
-                    maximum_polarization_fraction=0.2,
-                    max_iter=500,
-                    tolerance_residual=1.0e-8,
-                    tolerance_change=1.0e-12,
-                    adaptive_mixing=False,
-                    mixing=1.0,
-                    maximum_mixing=1.0,
+                    convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-8),
+                    euler=EulerOptions(tolerance_change=1.0e-12, adaptive_mixing=False, mixing=1.0, maximum_mixing=1.0) if method == 'euler' else None,
+                    constraints=Constraints(particle_numbers=[2.0], maximum_polarization_fraction=0.2),
                 )
                 self.assertTrue(
                     result["converged"], str(result["maximum_residual"])
@@ -357,16 +359,14 @@ class TestGridSolverPolarization(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "lie in \\(0, 1\\)"):
                     solver.solve(
                         self.case(),
-                        particle_numbers=[3.0, 4.0],
-                        maximum_polarization_fraction=value,
+                        constraints=Constraints(particle_numbers=[3.0, 4.0], maximum_polarization_fraction=value),
                     )
 
     def test_infeasible_density_cap_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "infeasible"):
             GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9]))).solve(
                 self.case(),
-                particle_numbers=[3.0, 4.0],
-                maximum_density=[0.9, 1.0],
+                constraints=Constraints(particle_numbers=[3.0, 4.0], maximum_density=[0.9, 1.0]),
             )
 
     def test_initial_polarization_without_initial_density(self):
@@ -383,9 +383,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         )
         result = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9]))).solve(
             data,
-            particle_numbers=numbers,
-            initial_polarization=initial_p,
-            tolerance_residual=100.0,
+            convergence=ConvergenceOptions(tolerance_residual=100.0),
+            constraints=Constraints(particle_numbers=numbers),
+            initial=Initialization(polarization=initial_p),
         )
         self.assertEqual(result["n_iter"], 0)
         torch.testing.assert_close(result["dipole_density"], initial_p)
@@ -420,7 +420,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         data["E_ext"] = (ideal["ideal_polarization_derivative"] + model.strength.detach()*target_p)/data["beta"]
         numbers = target_rho.sum(0)*data["grid_spacing"].prod()
         result = GridSolver(with_ideal(model, FixedDipoleIdeal(moments))).solve(
-            data, particle_numbers=numbers, tolerance_residual=1.0e-7
+            data,
+            convergence=ConvergenceOptions(tolerance_residual=1.0e-7),
+            constraints=Constraints(particle_numbers=numbers),
         )
         self.assertTrue(result["converged"], str(result["maximum_residual"]))
         torch.testing.assert_close(result["rho"], target_rho, rtol=0, atol=3e-8)
@@ -431,9 +433,8 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertTrue(model.training)
         failure = GridSolver(with_ideal(model, FixedDipoleIdeal(moments))).solve(
             data,
-            particle_numbers=numbers,
-            step_size=100.,
-            minimum_step_size=100.,
+            minimize=MinimizeOptions(step_size=100., minimum_step_size=100.),
+            constraints=Constraints(particle_numbers=numbers),
         )
         self.assertFalse(failure["converged"])
         self.assertEqual(failure["status"], "line_search_failed")
@@ -459,13 +460,10 @@ class TestGridSolverPolarization(unittest.TestCase):
         initial_rho = target_rho.roll(1, dims=0)
         fixed_p = solver.solve(
             fixed_p_data,
-            initial_rho=initial_rho,
-            initial_polarization=target_p,
-            particle_numbers=numbers,
             method="minimize",
-            fixed_field="dipole_density",
-            max_iter=500,
-            tolerance_residual=1.0e-8,
+            convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-8),
+            constraints=Constraints(particle_numbers=numbers, fixed_field="dipole_density"),
+            initial=Initialization(rho=initial_rho, polarization=target_p),
         )
         self.assertTrue(fixed_p["converged"], str(fixed_p["maximum_residual"]))
         torch.testing.assert_close(fixed_p["rho"], target_rho, atol=2.0e-8, rtol=0)
@@ -482,13 +480,10 @@ class TestGridSolverPolarization(unittest.TestCase):
         )
         fixed_rho = solver.solve(
             fixed_rho_data,
-            initial_rho=target_rho,
-            initial_polarization=torch.zeros_like(target_p),
-            particle_numbers=numbers,
             method="minimize",
-            fixed_field="rho",
-            max_iter=500,
-            tolerance_residual=1.0e-8,
+            convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-8),
+            constraints=Constraints(particle_numbers=numbers, fixed_field="rho"),
+            initial=Initialization(rho=target_rho, polarization=torch.zeros_like(target_p)),
         )
         self.assertTrue(
             fixed_rho["converged"], str(fixed_rho["maximum_residual"])
@@ -514,14 +509,10 @@ class TestGridSolverPolarization(unittest.TestCase):
         polarization[0, 0, 0] = 0.3
         result = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
             data,
-            initial_rho=rho,
-            initial_polarization=polarization,
-            particle_numbers=[2.0],
             method="minimize",
-            fixed_field="dipole_density",
-            maximum_polarization_fraction=0.75,
-            max_iter=500,
-            tolerance_residual=1.0e-9,
+            convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-9),
+            constraints=Constraints(particle_numbers=[2.0], fixed_field="dipole_density", maximum_polarization_fraction=0.75),
+            initial=Initialization(rho=rho, polarization=polarization),
         )
         self.assertTrue(result["converged"], str(result["maximum_residual"]))
         self.assertAlmostEqual(float(result["rho"][0]), 0.4, places=9)
@@ -539,26 +530,21 @@ class TestGridSolverPolarization(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixed_field must"):
             solver.solve(
                 data,
-                initial_rho=rho,
-                initial_polarization=polarization,
-                particle_numbers=[3.0, 4.0],
-                fixed_field="temperature",
+                constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="temperature"),
+                initial=Initialization(rho=rho, polarization=polarization),
             )
         with self.assertRaisesRegex(ValueError, "only with method='minimize'"):
             solver.solve(
                 data,
-                initial_rho=rho,
-                initial_polarization=polarization,
-                particle_numbers=[3.0, 4.0],
                 method="euler",
-                fixed_field="rho",
+                constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="rho"),
+                initial=Initialization(rho=rho, polarization=polarization),
             )
         with self.assertRaisesRegex(ValueError, "requires an initial polarization"):
             solver.solve(
                 data,
-                initial_rho=rho,
-                particle_numbers=[3.0, 4.0],
-                fixed_field="dipole_density",
+                constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="dipole_density"),
+                initial=Initialization(rho=rho),
             )
 
     def test_coupled_euler_expression(self):
@@ -567,13 +553,10 @@ class TestGridSolverPolarization(unittest.TestCase):
         numbers = [3.0, 4.0]
         result = GridSolver(with_ideal(None, FixedDipoleIdeal(moments))).solve(
             data,
-            particle_numbers=numbers,
             method="euler",
-            mixing=1.0,
-            adaptive_mixing=False,
-            maximum_mixing=1.0,
-            max_iter=2,
-            tolerance_residual=1.0e-10,
+            convergence=ConvergenceOptions(max_iter=2, tolerance_residual=1.0e-10),
+            euler=EulerOptions(mixing=1.0, adaptive_mixing=False, maximum_mixing=1.0),
+            constraints=Constraints(particle_numbers=numbers),
         )
         expected_rho, expected_p = exact_solution(data, numbers, moments)
         self.assertTrue(result["converged"])
@@ -587,8 +570,8 @@ class TestGridSolverPolarization(unittest.TestCase):
         data["excluded_mask"][[0, 7, 19]] = True
         result = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9]))).solve(
             data,
-            particle_numbers=[3.0, 4.0],
-            tolerance_residual=1.0e-9,
+            convergence=ConvergenceOptions(tolerance_residual=1.0e-9),
+            constraints=Constraints(particle_numbers=[3.0, 4.0]),
         )
         excluded = data["excluded_mask"]
         self.assertTrue(result["converged"])
@@ -613,7 +596,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         }
         solver = GridSolver(with_ideal(None, FixedDipoleIdeal(1.2)))
         reference = solver.solve(
-            data, particle_numbers=[5.0], tolerance_residual=1.0e-10
+            data,
+            convergence=ConvergenceOptions(tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[5.0]),
         )
         actions = [
             np.eye(3, dtype=int)[list(permutation)]
@@ -637,8 +622,8 @@ class TestGridSolverPolarization(unittest.TestCase):
             transformed["E_ext"][destination] = data["E_ext"] @ matrix.T
             result = solver.solve(
                 transformed,
-                particle_numbers=[5.0],
-                tolerance_residual=1.0e-10,
+                convergence=ConvergenceOptions(tolerance_residual=1.0e-10),
+                constraints=Constraints(particle_numbers=[5.0]),
             )
             torch.testing.assert_close(
                 result["rho"][destination], reference["rho"]
@@ -672,11 +657,10 @@ class TestGridSolverPolarization(unittest.TestCase):
             with self.subTest(method=method), torch.no_grad():
                 result = solver.solve(
                     data,
-                    particle_numbers=rho.sum(0)*0.5**3,
                     method=method,
-                    max_iter=400,
-                    tolerance_residual=1.0e-7,
-                    tolerance_change=1.0e-10,
+                    convergence=ConvergenceOptions(max_iter=400, tolerance_residual=1.0e-7),
+                    euler=EulerOptions(tolerance_change=1.0e-10) if method == 'euler' else None,
+                    constraints=Constraints(particle_numbers=rho.sum(0)*0.5**3),
                 )
                 self.assertTrue(
                     result["converged"], str(result["maximum_residual"])
@@ -692,7 +676,7 @@ class TestGridSolverPolarization(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "beta must agree"):
             solver.solve(
                 dict(data, beta=data["beta"]*2),
-                particle_numbers=rho.sum(0)*0.5**3,
+                constraints=Constraints(particle_numbers=rho.sum(0)*0.5**3),
             )
 
 

@@ -1,20 +1,18 @@
-"""Convert whole-object ``torch.save(model)`` files to the current format.
+"""Convert trusted old model files to the current format.
 
-Run from an environment where ``equicdft`` is installed::
+    python -m equicdft.conversion old_model.pt converted_model.pt
 
-    python -m equicdft.convert legacy_model.pt [converted_model.pt]
-
-Without a destination the legacy file is replaced in place. The converted
-file loads with :func:`equicdft.load_model`.
+The source is never overwritten. Legacy training-checkpoint resume is not
+supported; this command converts fitted model files only.
 """
 
 import argparse
 import sys
 from typing import Optional, Sequence
 
-from .legacy import convert_legacy_model
-from .functional.polarization_ideal import FixedDipoleIdeal
-from .serialization import read_model_config
+from .models import convert_model
+from ..functional.polarization_ideal import FixedDipoleIdeal
+from ..serialization import read_model_config
 
 __all__ = [
     "build_parser",
@@ -24,16 +22,14 @@ __all__ = [
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m equicdft.convert",
+        prog="python -m equicdft.conversion",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("source", help="whole-object torch.save(model) file")
+    parser.add_argument("source", help="trusted whole-object or versioned model file")
     parser.add_argument(
         "destination",
-        nargs="?",
-        default=None,
-        help="output path (default: replace the source file)",
+        help="separate output path (source is never replaced)",
     )
     parser.add_argument(
         "--no-verify",
@@ -59,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(arguments: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(arguments)
-    destination = convert_legacy_model(
+    destination = convert_model(
         args.source,
         args.destination,
         verify=not args.no_verify,

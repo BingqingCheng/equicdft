@@ -5,8 +5,8 @@ def finalize_result(result, state, *, method, beta_multiplier, converged):
     """Attach counters/history without recomputing energies or residuals.
 
     Drivers supply their final convergence decision after any projections.
-    An explicit driver status is retained when unconverged (the coupled Euler
-    driver historically labels a small-change stop as max_iter, not stalled).
+    A small-change stop before the iteration budget is exhausted is stalled;
+    max_iter means the driver actually exhausted its budget.
     """
 
     if converged:

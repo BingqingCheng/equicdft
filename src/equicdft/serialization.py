@@ -18,35 +18,12 @@ so it loads under PyTorch's restricted ``weights_only`` unpickler and never
 references package module paths. :func:`load_model` rebuilds the module from
 its configuration through the type registry and then restores the state.
 
-Format history
---------------
-1
-    Initial configuration-plus-state format.
-2
-    The containing ``GridCACEModel`` owns the density scale ``mean_density``,
-    which version 1 kept on the feature module and repeated on every
-    ``LDAReadout``. :func:`migrate_model_payload` upgrades a version-1 payload
-    in memory and :func:`migrate_model_state_dict` a bare model state (as a
-    training checkpoint holds it), so old files keep loading.
-
-Whole-object ``torch.save(model)`` files predating this format are converted
-by :mod:`equicdft.legacy`.
-
-Format 3 stores the model-owned ideal reference. Older polarized files lack
-the physical molecular moment: load/conversion requires an explicit
-FixedDipoleIdeal supplied from the original run metadata, never inferred
-from descriptor scales. Original files are not modified by loading.
-
-Format 4 removes model-owned training masks and chemical-potential averaging.
-Migration discards compute_local_mu and rho_min from old configurations;
-fitted parameters and intrinsic thermodynamics are unchanged. Applications
-must specify their original masks and gauges in losses/metrics explicitly.
+Historical files are converted explicitly with :mod:`equicdft.conversion`.
+Normal loading accepts only the current format.
 """
 
 from contextlib import contextmanager
-import copy
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Union
 
@@ -54,7 +31,7 @@ import torch
 from torch import nn
 
 from ._version import __version__
-from ._config import TYPE_KEY, Configurable, build
+from ._config import Configurable, build
 from ._io import atomic_torch_save
 from .functional.base import EnergyReadout
 
@@ -70,8 +47,6 @@ __all__ = [
     "read_model_payload",
     "validate_model_payload",
     "read_model_config",
-    "migrate_model_state_dict",
-    "migrate_model_payload",
     "build_model",
     "load_model",
 ]
@@ -231,7 +206,7 @@ def read_model_payload(path: PathLike, map_location: Any = "cpu") -> Dict[str, A
     except Exception as error:  # noqa: BLE001 - re-raised with guidance
         raise ValueError(
             "{} is not an {} file. A whole-object torch.save(model) file "
-            "can be converted with `python -m equicdft.convert`.".format(
+            "can be converted with `python -m equicdft.conversion`.".format(
                 source,
                 MODEL_FORMAT,
             )
@@ -239,13 +214,15 @@ def read_model_payload(path: PathLike, map_location: Any = "cpu") -> Dict[str, A
     return validate_model_payload(payload, source)
 
 
-def validate_model_payload(payload: Any, source: Any = "<payload>") -> Dict[str, Any]:
+def validate_model_payload(
+    payload: Any, source: Any = "<payload>", *, require_current: bool = True,
+) -> Dict[str, Any]:
     """Check the envelope fields of a loaded payload and return it."""
 
     if not isinstance(payload, dict) or payload.get("format") != MODEL_FORMAT:
         raise ValueError(
             "{} is not an {} file. A whole-object torch.save(model) file "
-            "can be converted with `python -m equicdft.convert`.".format(
+            "can be converted with `python -m equicdft.conversion`.".format(
                 source,
                 MODEL_FORMAT,
             )
@@ -263,6 +240,13 @@ def validate_model_payload(payload: Any, source: Any = "<payload>") -> Dict[str,
                 MODEL_FORMAT_VERSION,
             )
         )
+    if version < 1:
+        raise ValueError("{} has an unsupported format_version {}".format(source, version))
+    if require_current and version != MODEL_FORMAT_VERSION:
+        raise ValueError(
+            "old model format {}; convert explicitly with "
+            "`python -m equicdft.conversion SOURCE DESTINATION`".format(version)
+        )
     for key in ("config", "state_dict", "default_dtype"):
         if key not in payload:
             raise ValueError("{} is missing '{}'".format(source, key))
@@ -276,206 +260,12 @@ def validate_model_payload(payload: Any, source: Any = "<payload>") -> Dict[str,
 def read_model_config(path: PathLike) -> Dict[str, Any]:
     """Return the configuration stored in a model file, in the current format."""
 
-    return migrate_model_payload(read_model_payload(path))["config"]
+    return read_model_payload(path)["config"]
 
 
-_READOUT_SCALE_KEY = re.compile(r"readout\.(\d+)\.mean_density")
-
-
-def _one_density_scale(scales: Dict[str, Any], source: str) -> Any:
-    """Return the first value in ``scales`` or reject disagreeing ones.
-
-    The feature module's scale is listed first by every caller, because the
-    version-1 constructor made each readout scale match it (within
-    ``allclose``) and used it for the feature normalization.
-    """
-
-    values = list(scales.values())
-    reference = values[0]
-    for value in values[1:]:
-        same = torch.allclose(
-            torch.as_tensor(reference, dtype=torch.float64),
-            torch.as_tensor(value, dtype=torch.float64),
-        )
-        if not same:
-            raise ValueError(
-                "cannot migrate {}: it records different density scales {} "
-                "but the model owns one mean_density".format(
-                    source,
-                    ", ".join(
-                        "{}={}".format(name, float(value))
-                        for name, value in scales.items()
-                    ),
-                )
-            )
-    return reference
-
-
-def migrate_model_state_dict(
-    state_dict: Dict[str, torch.Tensor],
-    expects_model_scale: bool,
-    ideal=None,
-) -> Dict[str, torch.Tensor]:
-    """Return ``state_dict`` with the density scale where the model keeps it.
-
-    Before model file format 2 the model had no ``mean_density`` buffer: the
-    feature module carried the scale as ``a_features.mean_density`` and every
-    LDA readout repeated it as ``readout.<i>.mean_density``. The readout
-    entries are always removed. When the current model expects a
-    ``mean_density`` buffer and the state has none, the feature module's
-    scale supplies it, whether or not the model has LDA readouts; a state
-    without a feature module falls back to the readouts' common scale. Every
-    scale the state records must agree, so a state whose copies disagree is
-    rejected rather than silently altered. Training checkpoints written
-    before format version 2 go through this before they are loaded strictly.
-    """
-
-    state = dict(state_dict)
-    old_ideal = ("thermal_wavelength" in state
-                 or not any(key.startswith("ideal.") for key in state))
-    if "thermal_wavelength" in state:
-        state["ideal.thermal_wavelength"] = state.pop("thermal_wavelength")
-    if old_ideal and ideal is not None:
-        for name, value in ideal.state_dict().items():
-            key = "ideal." + name
-            if key in state and state[key].shape != value.shape:
-                stored = state[key]
-                if not torch.allclose(stored.to(value), value):
-                    raise ValueError("checkpoint ideal reference differs from configured model")
-                state[key] = value.detach().clone()
-            state.setdefault(key, value.detach().clone())
-    scales = {}
-    if "a_features.mean_density" in state:
-        scales["a_features.mean_density"] = state["a_features.mean_density"]
-    for key in list(state):
-        if _READOUT_SCALE_KEY.fullmatch(key):
-            scales[key] = state.pop(key)
-    if "mean_density" in state:
-        scales["mean_density"] = state["mean_density"]
-    if not scales:
-        return state
-    scale = _one_density_scale(scales, "the model state")
-    if expects_model_scale and "mean_density" not in state:
-        state["mean_density"] = scale.detach().clone().reshape(())
-    return state
-
-
-def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Give the model the density scale that version 1 kept elsewhere.
-
-    The configuration takes the feature module's scale (the readouts' common
-    scale when there is no feature module) and loses the per-readout copies;
-    the state is migrated by :func:`migrate_model_state_dict`.
-    """
-
-    config = payload["config"]
-    if config.get(TYPE_KEY) != "GridCACEModel":
-        return payload
-    scales = {}
-    a_features = config.get("a_features")
-    if isinstance(a_features, dict) and a_features.get("mean_density") is not None:
-        scales["a_features"] = a_features["mean_density"]
-    for index, item in enumerate(config.get("readout") or ()):
-        if isinstance(item, dict) and item.get(TYPE_KEY) == "LDAReadout":
-            value = item.pop("mean_density", None)
-            if value is not None:
-                scales["readout.{}".format(index)] = value
-    if config.get("mean_density") is None:
-        config["mean_density"] = (
-            _one_density_scale(scales, "this model file") if scales else None
-        )
-    payload["state_dict"] = migrate_model_state_dict(
-        payload["state_dict"],
-        expects_model_scale=config["mean_density"] is not None,
-    )
-    if config["mean_density"] is not None and "mean_density" not in payload["state_dict"]:
-        payload["state_dict"]["mean_density"] = torch.tensor(
-            config["mean_density"],
-            dtype=dtype_from_name(payload["default_dtype"]),
-        )
-    return payload
-
-
-def _migrate_v2_to_v3(payload):
-    """Move the ideal reference into the model; never guess molecular moments."""
-    config = payload["config"]
-    if config.get("ideal") is not None:
-        return payload
-    wavelength = config.pop("thermal_wavelength", 1.0)
-
-    def polarized(value):
-        if isinstance(value, dict):
-            return (value.get("include_polarization", False)
-                    or value.get("variable") == "dipole_density"
-                    or (value.get(TYPE_KEY) == "LDAReadout"
-                        and value.get("dipole_density_scale") is not None)
-                    or any(polarized(v) for v in value.values()))
-        return isinstance(value, list) and any(polarized(v) for v in value)
-
-    if polarized(config):
-        config["ideal"] = None
-        # This field is migration metadata, consumed by build_model rather
-        # than passed to the constructor. An explicit ideal is required.
-        payload["missing_ideal_wavelength"] = wavelength
-        payload["state_dict"].pop("thermal_wavelength", None)
-        payload["state_dict"].pop("ideal.thermal_wavelength", None)
-    else:
-        config["ideal"] = {"type": "IdealGas", "thermal_wavelength": wavelength}
-        state = payload["state_dict"]
-        value = state.pop("thermal_wavelength", state.get("ideal.thermal_wavelength"))
-        if value is None:
-            value = torch.as_tensor(wavelength, dtype=dtype_from_name(payload["default_dtype"]))
-        state["ideal.thermal_wavelength"] = value
-    return payload
-
-
-def _migrate_v3_to_v4(payload):
-    """Discard retired training policy; fitted functional parameters are unchanged."""
-    config = payload["config"]
-    if config.get(TYPE_KEY) == "GridCACEModel":
-        config.pop("compute_local_mu", None)
-        config.pop("rho_min", None)
-    return payload
-
-
-_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
-
-
-def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a copy of ``payload`` upgraded to ``MODEL_FORMAT_VERSION``."""
-
+def build_model(payload: Dict[str, Any]) -> nn.Module:
+    """Construct a current-format model and strictly restore its state."""
     payload = validate_model_payload(payload)
-    version = payload["format_version"]
-    if version == MODEL_FORMAT_VERSION:
-        return payload
-    upgraded = dict(payload)
-    upgraded["config"] = copy.deepcopy(payload["config"])
-    upgraded["state_dict"] = dict(payload["state_dict"])
-    while version < MODEL_FORMAT_VERSION:
-        upgraded = _MIGRATIONS[version](upgraded)
-        version += 1
-        upgraded["format_version"] = version
-    return upgraded
-
-
-def build_model(payload: Dict[str, Any], *, ideal=None) -> nn.Module:
-    """Construct a model from a validated payload and load its state.
-
-    Payloads written by earlier format versions are migrated in memory first.
-    """
-
-    payload = migrate_model_payload(payload)
-    if "missing_ideal_wavelength" in payload and ideal is None:
-        raise ValueError("old polarization model has no molecular dipole magnitude; "
-                         "pass ideal=FixedDipoleIdeal(...) using the original run metadata")
-    if ideal is not None:
-        payload = copy.deepcopy(payload)
-        if payload["config"].get("ideal") is not None:
-            raise ValueError("this model already records an ideal reference")
-        payload["config"]["ideal"] = ideal.to_config()
-        payload["state_dict"].update({
-            "ideal." + name: value for name, value in ideal.state_dict().items()
-        })
     with default_dtype(dtype_from_name(payload["default_dtype"])):
         model = build(payload["config"])
     if not isinstance(model, nn.Module):
@@ -497,8 +287,6 @@ def load_model(
     path: PathLike,
     map_location: Optional[Union[str, torch.device]] = None,
     eval_mode: bool = True,
-    *,
-    ideal=None,
 ) -> nn.Module:
     """Rebuild a model saved by :func:`save_model`.
 
@@ -509,7 +297,7 @@ def load_model(
     """
 
     payload = read_model_payload(path, map_location="cpu")
-    model = build_model(payload, ideal=ideal)
+    model = build_model(payload)
     if map_location is not None:
         model = model.to(torch.device(map_location))
     return model.eval() if eval_mode else model.train()

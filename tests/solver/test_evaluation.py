@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from equicdft.solver import Constraints, ConvergenceOptions, Initialization
 from equicdft import FixedDipoleIdeal, GridSolver
 from tests.ideal_helpers import IdealOnly
 from tests.model_fixtures import example_model, grid_data
@@ -132,13 +133,18 @@ class TestSolverEvaluation(unittest.TestCase):
                     with self.subTest(polarized=polarized, method=method, fixed=fixed):
                         data = self.data(polarized)
                         numbers = (data["rho"].sum(0) * data["grid_spacing"].prod()).tolist()
-                        options = dict(particle_numbers=numbers, maximum_density=.4, max_iter=2)
+                        constraints = dict(particle_numbers=numbers, maximum_density=.4)
+                        initial = None
                         if polarized:
-                            options.update(maximum_polarization_fraction=.1, fixed_field=fixed)
+                            constraints.update(maximum_polarization_fraction=.1, fixed_field=fixed)
                             if fixed is not None:
                                 # The constrained initialization must have the prescribed N.
                                 rho = data["rho"].clone()
-                                options.update(initial_rho=rho, initial_polarization=torch.zeros_like(data["dipole_density"]))
-                        result = self.solver(polarized).solve(data, method=method, **options)
+                                initial = Initialization(rho=rho, polarization=torch.zeros_like(data["dipole_density"]))
+                        result = self.solver(polarized).solve(
+                            data, method=method, initial=initial,
+                            convergence=ConvergenceOptions(max_iter=2),
+                            constraints=Constraints(**constraints),
+                        )
                         self.assert_canonical_residual_names(result)
                         self.assertIn("beta_A", result)

@@ -62,24 +62,6 @@ class LossTerm(nn.Module):
 
         return self.evaluate(outputs, batch, model)["loss"]
 
-    def load_legacy_state(
-        self,
-        state: Dict[str, torch.Tensor],
-        prefix: str,
-        model: Optional[nn.Module] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Return ``state`` without entries this term no longer registers.
-
-        A checkpoint written before a term stopped owning one of its buffers
-        still carries it, and a strict load would reject the whole file. The
-        term that retired the buffer decides what to do with the saved value
-        -- usually check it against wherever the quantity lives now -- and
-        removes it. ``prefix`` is this term's dotted path in the checkpoint,
-        empty for a top-level term. The default keeps every entry.
-        """
-
-        return state
-
 
 class MetricCollection(nn.Module):
     """Base class of streaming metric accumulators used by the trainer.

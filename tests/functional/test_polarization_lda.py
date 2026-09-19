@@ -4,6 +4,7 @@ import io
 import unittest
 
 from tests.ideal_helpers import with_ideal
+from equicdft.solver import Constraints, ConvergenceOptions
 from equicdft import FixedDipoleIdeal
 import torch
 
@@ -185,10 +186,14 @@ class TestPolarizationLDA(unittest.TestCase):
                 "beta": 1. / (model.boltzmann_constant * 1.2),
                 "grid_spacing": torch.full((3,), .5)}
         ideal = GridSolver(with_ideal(None, FixedDipoleIdeal(.7))).solve(
-            data, particle_numbers=[.5], tolerance_residual=1e-10
+            data,
+            convergence=ConvergenceOptions(tolerance_residual=1e-10),
+            constraints=Constraints(particle_numbers=[.5]),
         )
         with_lda = GridSolver(with_ideal(model, FixedDipoleIdeal(.7))).solve(
-            data, particle_numbers=[.5], tolerance_residual=1e-10
+            data,
+            convergence=ConvergenceOptions(tolerance_residual=1e-10),
+            constraints=Constraints(particle_numbers=[.5]),
         )
         self.assertEqual(ideal["status"], "converged")
         self.assertEqual(with_lda["status"], "converged")

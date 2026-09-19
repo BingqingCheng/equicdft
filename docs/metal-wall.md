@@ -177,12 +177,13 @@ model.readout[2] = MetalWall(
     external_field=(0.0, 0.0, E_z),
 )
 
+from equicdft.solver import Constraints, Initialization
+
 result = GridSolver(model).solve(
     data,
     method="minimize",
-    particle_numbers=particle_numbers,
-    initial_rho=initial_rho,
-    homogeneous_axes=["x", "y"],
+    constraints=Constraints(particle_numbers=particle_numbers, homogeneous_axes=["x", "y"]),
+    initial=Initialization(rho=initial_rho),
 )
 ```
 
@@ -192,5 +193,5 @@ set its z component to the same `E_z`. Construct the model with `ideal=FixedDipo
 to minimize density and polarization together. Here `m` is the molecular dipole
 magnitude, stored in the model rather than the solver. It supports `excluded_mask` and keeps both fields zero there.
 No charge-based scalar voltage term is needed for neutral molecules.
-Pass particle counts with `solve(data, particle_numbers=...)`. Coupled dipole
+Pass particle counts with `solve(data, constraints=Constraints(particle_numbers=...))`. Coupled dipole
 solves do not currently support `homogeneous_axes`.

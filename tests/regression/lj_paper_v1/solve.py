@@ -2,6 +2,12 @@
 
 import torch
 
+from equicdft.solver import (
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+)
 from .common import check_thresholds, load_case, print_metrics, r2, rmse
 
 
@@ -13,14 +19,11 @@ def evaluate_solve():
     particle_numbers = volume_element * torch.sum(target, dim=0)
     result = solver.solve(
         solve_data,
-        particle_numbers=particle_numbers,
         method="euler",
-        beta_multiplier=0.0,
-        max_iter=200,
-        tolerance_residual=1.0e-2,
-        tolerance_change=1.0e-6,
-        residual_density_threshold=1.0e-3,  # Frozen regression mask.
-        maximum_density=2.0,
+        convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-2, residual_density_threshold=1.0e-3),
+        euler=EulerOptions(tolerance_change=1.0e-6),
+        constraints=Constraints(particle_numbers=particle_numbers, maximum_density=2.0),
+        initial=Initialization(beta_multiplier=0.0),
     )
     prediction = result["rho"].detach()
     predicted_particles = volume_element * torch.sum(prediction, dim=0)

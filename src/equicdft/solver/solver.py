@@ -28,7 +28,7 @@ from .options import (
     EulerOptions,
     Initialization,
     MinimizeOptions,
-    resolve_options,
+    SolveOptions,
 )
 from .numerics import (
     _resolve_accessibility_masks,
@@ -296,7 +296,7 @@ class GridSolver:
     convergence. The exclusion mask does not alter the periodic
     neighborhood topology.
 
-    When no density is supplied through ``initial_rho`` or ``data["rho"]``,
+    When no density is supplied through ``initial.rho`` or ``data["rho"]``,
     the initial profile is proportional to
     ``exp(-beta_multiplier * beta * V_ext)``. The default
     ``beta_multiplier=0`` exactly recovers the former uniform
@@ -309,7 +309,8 @@ class GridSolver:
     iteration. By default, its mixing is increased after an improving
     density-weighted RMS residual and backtracked after a worsening
     trial. Set ``adaptive_mixing=False`` to use a fixed mixing value.
-    ``anderson=True`` additionally forms a log-density Anderson trial from
+    ``euler=EulerOptions(anderson=AndersonOptions(...))`` additionally forms
+    a log-density Anderson trial from
     recent fixed-point residuals. The accelerated trial is projected onto
     the same accessibility, density-bound, and particle-number constraints
     and is accepted only when neither its maximum nor its density-weighted
@@ -401,36 +402,36 @@ class GridSolver:
         minimize: Optional[MinimizeOptions] = None,
         constraints: Optional[Constraints] = None,
         initial: Optional[Initialization] = None,
-        **flat_options: Any,
     ) -> Dict[str, Any]:
         """Minimize the thermodynamic functional to obtain equilibrium.
 
         ``method`` selects the driver; it defaults to Euler for a scalar
         model and to minimization for a fixed-dipole one. Options come in
-        the validated groups of :mod:`equicdft.solver.options`, which also
-        documents the equivalent flat keywords. What each method does, and
+        the validated groups of :mod:`equicdft.solver.options`. Method-specific
+        groups require the corresponding method. What each method does, and
         what every constraint and initialization means, is described in this
         class's own docstring.
         """
 
-        options = resolve_options(
-            {
-                "convergence": convergence,
-                "euler": euler,
-                "minimize": minimize,
-                "constraints": constraints,
-                "initial": initial,
-            },
-            flat_options,
+        polarized = isinstance(self.model.ideal, FixedDipoleIdeal)
+        options = SolveOptions(
+            convergence=ConvergenceOptions() if convergence is None else convergence,
+            euler=EulerOptions() if euler is None else euler,
+            minimize=MinimizeOptions() if minimize is None else minimize,
+            constraints=Constraints() if constraints is None else constraints,
+            initial=Initialization() if initial is None else initial,
         )
+        method, homogeneous_axes = _resolve_method(method, polarized, options.constraints)
+        if method == "euler" and minimize is not None:
+            raise ValueError("minimize options require method='minimize'")
+        if method == "minimize" and euler is not None:
+            raise ValueError("euler options require method='euler'")
         convergence = options.convergence
         euler = options.euler
         minimize = options.minimize
         constraints = options.constraints
         initial = options.initial
 
-        polarized = isinstance(self.model.ideal, FixedDipoleIdeal)
-        method, homogeneous_axes = _resolve_method(method, polarized, constraints)
         if polarized:
             return solve_fixed_dipoles(self, data, method, options)
         _reject_fixed_dipole_only_options(constraints, initial)

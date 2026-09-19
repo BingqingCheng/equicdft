@@ -10,6 +10,7 @@ import json
 import numpy as np
 import torch
 
+from equicdft.solver import Constraints, ConvergenceOptions
 from equicdft import GridSolver, GridCACEModel, FixedDipoleIdeal
 
 
@@ -69,9 +70,9 @@ def main():
                 initial = {"initial_rho": rho, "initial_polarization": moment*rho[..., None]*fraction}
             result = GridSolver(model).solve(
                 data,
-                particle_numbers=number,
-                tolerance_residual=1e-8,
                 **initial,
+                convergence=ConvergenceOptions(tolerance_residual=1e-8),
+                constraints=Constraints(particle_numbers=number),
             )
             density_error = float((result["rho"]-reference_rho).abs().max()/reference_rho.mean())
             polar_error = float((result["dipole_density"]-reference_p).abs().max()/(moment*reference_rho.mean()))

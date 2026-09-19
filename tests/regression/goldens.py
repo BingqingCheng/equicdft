@@ -21,6 +21,13 @@ from typing import Callable, Dict, Tuple
 
 import numpy as np
 from tests.ideal_helpers import with_ideal, IdealOnly
+from equicdft.solver import (
+    AndersonOptions,
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+)
 from equicdft import FixedDipoleIdeal
 import torch
 from torch import nn
@@ -347,8 +354,10 @@ def _quadratic_homogeneous():
             V_ext = data["V_ext"].reshape(4, 3, 3, 1).mean(dim=(0, 1), keepdim=True)
             data["V_ext"] = V_ext.expand(4, 3, 3, 1).reshape(-1, 1).clone()
             return _solver_result(solver.solve(
-                data, particle_numbers=[3.0], method="minimize",
-                homogeneous_axes=("x", "y"), tolerance_residual=1e-9,
+                data,
+                method="minimize",
+                convergence=ConvergenceOptions(tolerance_residual=1e-9),
+                constraints=Constraints(particle_numbers=[3.0], homogeneous_axes=("x", "y")),
             ))
 
     return case
@@ -370,8 +379,10 @@ def _lda_local_solve():
             data.pop("rho")
             solver = GridSolver(model)
             return _solver_result(solver.solve(
-                data, particle_numbers=[20.0], max_iter=60,
-                tolerance_residual=1e-6, mixing=0.1,
+                data,
+                convergence=ConvergenceOptions(max_iter=60, tolerance_residual=1e-6),
+                euler=EulerOptions(mixing=0.1),
+                constraints=Constraints(particle_numbers=[20.0]),
             ))
 
     return case
@@ -397,8 +408,11 @@ def _ideal_dipoles(method, **kwargs):
             torch.manual_seed(23)
             solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
             return _solver_result(solver.solve(
-                _ideal_dipoles_case(), particle_numbers=[3.0, 4.0],
-                method=method, max_iter=400, tolerance_residual=1e-6, **kwargs,
+                _ideal_dipoles_case(),
+                method=method,
+                **kwargs,
+                convergence=ConvergenceOptions(max_iter=400, tolerance_residual=1e-6),
+                constraints=Constraints(particle_numbers=[3.0, 4.0]),
             ))
 
     return case
@@ -420,16 +434,18 @@ def _model_dipoles(method, fixed_field=None):
                 V_ext=torch.zeros_like(data["rho"]),
                 E_ext=0.05 * torch.randn_like(data["dipole_density"]),
             )
-            kwargs = {}
-            if fixed_field is not None:
-                kwargs = dict(
-                    fixed_field=fixed_field,
-                    initial_rho=data["rho"],
-                    initial_polarization=data["dipole_density"],
-                )
+            initial = None if fixed_field is None else Initialization(
+                rho=data["rho"], polarization=data["dipole_density"],
+            )
             return _solver_result(solver.solve(
-                external, particle_numbers=data["rho"].sum(0) * 0.5 ** 3, method=method,
-                max_iter=200, tolerance_residual=1e-5, **kwargs,
+                external,
+                method=method,
+                initial=initial,
+                convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1e-5),
+                constraints=Constraints(
+                    particle_numbers=data["rho"].sum(0) * 0.5 ** 3,
+                    fixed_field=fixed_field,
+                ),
             ))
 
     return case
@@ -509,13 +525,17 @@ CASES: Dict[str, Callable[[], Dict[str, torch.Tensor]]] = {
     "model/polarization_beta": _polarization("beta", False, False),
     "model/polarization_physical_scalar_batched": _polarization("physical", True, True),
     "model/polarization_coulomb_response": _polar_coulomb(),
-    "solver/quadratic_euler_mu": _quadratic_solve(mu=-0.3, max_iter=300, tolerance_residual=1e-6),
+    "solver/quadratic_euler_mu": _quadratic_solve(
+        mu=-0.3, convergence=ConvergenceOptions(max_iter=300, tolerance_residual=1e-6),
+    ),
     "solver/quadratic_euler_N_anderson_cap": _quadratic_solve(
-        particle_numbers=[4.0], anderson=True, maximum_density=[1.2],
-        max_iter=300, tolerance_residual=1e-6,
+        constraints=Constraints(particle_numbers=[4.0], maximum_density=[1.2]),
+        euler=EulerOptions(anderson=AndersonOptions()),
+        convergence=ConvergenceOptions(max_iter=300, tolerance_residual=1e-6),
     ),
     "solver/quadratic_minimize_N": _quadratic_solve(
-        particle_numbers=[6.0], method="minimize", max_iter=100, tolerance_residual=1e-8,
+        constraints=Constraints(particle_numbers=[6.0]), method="minimize",
+        convergence=ConvergenceOptions(max_iter=100, tolerance_residual=1e-8),
     ),
     "solver/quadratic_minimize_homogeneous": _quadratic_homogeneous(),
     "solver/lda_local_euler_N": _lda_local_solve(),

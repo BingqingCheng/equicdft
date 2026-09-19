@@ -14,12 +14,12 @@ from equicdft import (
     load_model,
     read_model_config,
 )
-from equicdft import convert as convert_cli
-from equicdft.legacy import (
+from equicdft.conversion import __main__ as convert_cli
+from equicdft.conversion import convert_model, load_converted_model
+from equicdft.conversion.legacy import (
     _CLASS_ALIASES,
     _MODULE_ALIASES,
     _RemappingUnpickler,
-    convert_legacy_model,
     legacy_model_to_current,
     load_legacy_model,
     upgrade_legacy_model,
@@ -190,7 +190,7 @@ class TestLegacyConversion(unittest.TestCase):
         expected = model(copy.deepcopy(data))
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "converted.pt"
-            written = convert_legacy_model(legacy_file, destination)
+            written = convert_model(legacy_file, destination)
             self.assertEqual(written, destination)
             restored = load_model(destination)
         self.assertEqual(restored.to_config(), model.to_config())
@@ -356,17 +356,19 @@ class TestLegacyConversion(unittest.TestCase):
             destination = Path(directory) / "taken.pt"
             destination.write_bytes(b"occupied")
             with self.assertRaises(FileExistsError):
-                convert_legacy_model(legacy_file, destination)
-            convert_legacy_model(legacy_file, destination, overwrite=True)
+                convert_model(legacy_file, destination)
+            convert_model(legacy_file, destination, overwrite=True)
             load_model(destination)
 
-    def test_in_place_conversion_replaces_the_legacy_file(self):
+    def test_in_place_conversion_is_rejected(self):
         model = example_model()
         model(copy.deepcopy(grid_data()))
         with tempfile.TemporaryDirectory() as directory:
             legacy_file = _whole_object_file(model, directory)
-            convert_legacy_model(legacy_file)
-            self.assertEqual(read_model_config(legacy_file)["type"], "GridCACEModel")
+            original = legacy_file.read_bytes()
+            with self.assertRaisesRegex(ValueError, "differ from the source"):
+                convert_model(legacy_file, legacy_file, overwrite=True)
+            self.assertEqual(legacy_file.read_bytes(), original)
 
     def test_command_line_conversion(self):
         model = example_model()
@@ -396,7 +398,7 @@ class TestFrozenProductionModel(unittest.TestCase):
     def test_published_whole_object_model_converts_and_verifies(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "lj_paper_v1.pt"
-            convert_legacy_model(FROZEN_WHOLE_OBJECT_MODEL, destination)
+            convert_model(FROZEN_WHOLE_OBJECT_MODEL, destination)
             converted = load_model(destination)
         config = converted.to_config()
         self.assertEqual(config["a_features"]["radial_basis"], "none")
@@ -415,7 +417,7 @@ class TestFrozenProductionModel(unittest.TestCase):
         the configuration and every state tensor must agree.
         """
 
-        committed = load_model(FROZEN_CONVERTED_MODEL)
+        committed = load_converted_model(FROZEN_CONVERTED_MODEL)
         legacy = load_legacy_model(FROZEN_WHOLE_OBJECT_MODEL)
         rebuilt = legacy_model_to_current(legacy)
         self.assertEqual(committed.to_config(), rebuilt.to_config())

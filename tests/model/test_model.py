@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from equicdft.solver import ConvergenceOptions
 from equicdft import (
     BChiMessage,
     BulkReadout,
@@ -809,7 +810,7 @@ class TestGridCACEModel(unittest.TestCase):
             self._make_model(free_energy_mode="unknown")
 
     def test_pre_mode_checkpoint_defaults_to_beta_free_energy(self):
-        from equicdft.legacy import upgrade_legacy_model
+        from equicdft.conversion.legacy import upgrade_legacy_model
 
         model = self._make_model()
         # Whole-object models saved before the mode flag existed lack the
@@ -1327,7 +1328,10 @@ class TestOutputKeys(unittest.TestCase):
         for old in ("local_chemical_potential", "average_chemical_potential", "chemical_potential_weights"):
             self.assertNotIn(old, outputs)
         data["mu"] = torch.tensor([0.0])
-        result = GridSolver(model).solve(data, max_iter=2)
+        result = GridSolver(model).solve(
+            data,
+            convergence=ConvergenceOptions(max_iter=2),
+        )
         self.assertIs(type(result), dict)
         self.assertIn("beta_mu", result)
         self.assertNotIn("equilibrium_chemical_potential", result)

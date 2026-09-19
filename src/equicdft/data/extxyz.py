@@ -21,7 +21,6 @@ from ..geometry.stencil import (
     make_stencil,
 )
 from ..geometry.grid import _grid_center_origin
-from ..functional.thermodynamics import local_chemical_potential
 
 
 GRID_INFO_KEYS = {
@@ -438,23 +437,14 @@ def build_grid_data(
             wavelength_values,
             dtype=dtype,
         )
-    _add_thermodynamic_fields(
-        data=data,
-        # With independent polarization, the ideal orientational functional
-        # must be specified before equilibrium c1 targets can be constructed.
-        # Preserve beta_mu metadata, but do not apply the scalar-fluid formula.
-        rho=rho_values if dipole_density_values is None else None,
-        V_ext=V_ext_values,
-        mu=mu_values,
-        beta=beta,
-        thermal_wavelength=wavelength_values,
-        excluded_mask=excluded_mask_values,
-    )
+    if mu_values is not None:
+        data["mu"] = torch.tensor(mu_values, dtype=dtype)
+        data["beta_mu"] = torch.tensor(beta * mu_values, dtype=dtype)
     return data
 
 
-def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
-    """Make optional target keys compatible with default PyTorch collation."""
+def harmonize_optional_fields(data: List[Dict[str, torch.Tensor]]) -> None:
+    """Make optional field metadata compatible with default PyTorch collation."""
 
     if any("grid_center" in frame for frame in data):
         for frame in data:
@@ -465,14 +455,6 @@ def harmonize_optional_targets(data: List[Dict[str, torch.Tensor]]) -> None:
         available = [name in frame for frame in data]
         if any(available) and not all(available):
             raise ValueError("{} must be present in every frame or none".format(name))
-
-    if any("c1_plus_beta_mu" not in frame for frame in data):
-        for frame in data:
-            frame.pop("c1_plus_beta_mu", None)
-            frame.pop("c1", None)
-    elif any("c1" not in frame for frame in data):
-        for frame in data:
-            frame.pop("c1", None)
 
     has_beta_mu = ["beta_mu" in frame for frame in data]
     if not any(has_beta_mu) or all(has_beta_mu):
@@ -749,44 +731,3 @@ def _geometry_tensors(
     if geometry_cache is not None:
         geometry_cache[geometry_key] = geometry
     return geometry
-
-
-def _add_thermodynamic_fields(
-    data: Dict[str, torch.Tensor],
-    rho: Optional[np.ndarray],
-    V_ext: Optional[np.ndarray],
-    mu: Optional[np.ndarray],
-    beta: float,
-    thermal_wavelength: Optional[np.ndarray],
-    excluded_mask: np.ndarray,
-) -> None:
-    dtype = torch.get_default_dtype()
-    if mu is not None:
-        data["mu"] = torch.tensor(mu, dtype=dtype)
-        data["beta_mu"] = torch.tensor(beta * mu, dtype=dtype)
-    if (
-        rho is None
-        or V_ext is None
-        or thermal_wavelength is None
-        or not np.all(rho[~excluded_mask] > 0.0)
-    ):
-        return
-    # The Euler-Lagrange target is evaluated in double precision from the
-    # parsed fields and only then cast to the working dtype.
-    accessible = torch.as_tensor(~excluded_mask)[:, None]
-    c1_plus_beta_mu = local_chemical_potential(
-        torch.as_tensor(rho, dtype=torch.float64),
-        torch.as_tensor(V_ext, dtype=torch.float64),
-        float(beta),
-        None,
-        torch.as_tensor(thermal_wavelength, dtype=torch.float64),
-        mask=accessible,
-    )
-    data["c1_plus_beta_mu"] = c1_plus_beta_mu.to(dtype=dtype)
-    if mu is not None:
-        c1 = c1_plus_beta_mu - float(beta) * torch.as_tensor(
-            mu, dtype=torch.float64,
-        )[None, :]
-        data["c1"] = torch.where(
-            accessible, c1, torch.zeros_like(c1),
-        ).to(dtype=dtype)

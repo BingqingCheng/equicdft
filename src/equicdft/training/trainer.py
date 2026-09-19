@@ -30,9 +30,7 @@ from .._validation import (
 from .noise import NoiseOptions
 from .._config import Configurable
 from .checkpoint import (
-    checkpoint_noise,
-    checkpoint_stream_noise,
-    load_loss_state,
+    CHECKPOINT_VERSION,
     read_checkpoint,
     restore_history,
     restore_random_state,
@@ -42,7 +40,6 @@ from .._device import GeometryDeviceCache, move_batch
 from .._io import atomic_torch_save
 from ..objectives import MetricCollection
 from .loss import Loss
-from ..serialization import migrate_model_state_dict
 
 __all__ = [
     "TrainingStream",
@@ -506,16 +503,11 @@ class Trainer:
     ) -> None:
         """Write model, optimization, scheduler, and history state.
 
-        Version 2 checkpoints additionally record ``model_config``, the
-        model's ``to_config()`` structure, so a checkpoint describes the
-        architecture whose state it holds (models without a configuration
-        store ``None`` there). Version 3 stores the noise settings once as
-        ``noise`` and ``stream_noise`` (:meth:`NoiseOptions.to_dict`);
-        :meth:`load_checkpoint` still reads the version-2 keys.
+        Only current-format training checkpoints can be resumed.
         """
 
         checkpoint = {
-            "checkpoint_version": 3,
+            "checkpoint_version": CHECKPOINT_VERSION,
             "epoch": record["epoch"],
             "model_config": (
                 self.model.to_config()
@@ -573,24 +565,19 @@ class Trainer:
         replacement process.
         """
 
+        checkpoint = read_checkpoint(path, self.device)
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization()
-        checkpoint = read_checkpoint(path, self.device)
 
-        # Checkpoints written before model file format 2 have no model-level
-        # density scale: recover it from the feature module (or from the LDA
-        # readouts, whose copies are dropped) before the strict load.
-        model_state = migrate_model_state_dict(
-            checkpoint["model_state_dict"],
-            expects_model_scale="mean_density" in self.model.state_dict(),
-            ideal=getattr(self.model, "ideal", None),
-        )
-        self.model.load_state_dict(model_state, strict=True)
-        self.noise = checkpoint_noise(checkpoint)
-        stream_noise = checkpoint_stream_noise(checkpoint)
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.noise = NoiseOptions.from_dict(checkpoint["noise"])
+        stream_noise = {
+            name: NoiseOptions.from_dict(values)
+            for name, values in checkpoint["stream_noise"].items()
+        }
         for stream in self._streams:
             stream.noise = stream_noise.get(stream.name, NoiseOptions())
-        load_loss_state(self.loss, checkpoint["loss_state_dict"], self.model)
+        self.loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:
             expected_names = checkpoint.get("stream_names", [])
@@ -599,7 +586,7 @@ class Trainer:
                 raise ValueError(
                     "checkpoint stream names do not match configured streams"
                 )
-            load_loss_state(self.stream_losses, stream_loss_state, self.model)
+            self.stream_losses.load_state_dict(stream_loss_state, strict=True)
         elif self._streams:
             raise ValueError(
                 "checkpoint has no stream-loss state for configured streams"

@@ -9,6 +9,7 @@ import torch
 from ase import Atoms
 from ase.io import write
 
+from equicdft.solver import Constraints, ConvergenceOptions
 from equicdft import GridData, GridSolver
 
 
@@ -47,7 +48,8 @@ class TestGridExclusion(unittest.TestCase):
         frame = self._read(atoms)
         self.assertTrue(torch.equal(frame["excluded_mask"], torch.tensor(excluded)))
         self.assertTrue(torch.all(frame["rho"][excluded] == 0.))
-        self.assertTrue(torch.all(frame["c1_plus_beta_mu"][excluded] == 0.))
+        self.assertNotIn("c1_plus_beta_mu", frame)
+        self.assertNotIn("c1", frame)
 
     def test_nonzero_density_on_exclusion_is_rejected(self):
         atoms, _ = _grid_atoms()
@@ -66,8 +68,10 @@ class TestGridExclusion(unittest.TestCase):
     def test_solver_preserves_exclusions(self):
         data = self._read(_grid_atoms()[0])
         result = GridSolver(_IdealGas()).solve(
-            data, method="minimize", particle_numbers=[1.3, 2.6],
-            max_iter=20, tolerance_residual=1.e-6,
+            data,
+            method="minimize",
+            convergence=ConvergenceOptions(max_iter=20, tolerance_residual=1.e-6),
+            constraints=Constraints(particle_numbers=[1.3, 2.6]),
         )
         self.assertTrue(result["converged"])
         self.assertTrue(torch.all(result["rho"][data["excluded_mask"]] == 0.))

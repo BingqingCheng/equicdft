@@ -3,7 +3,7 @@
 Whole-object model files written under the flat layout record module paths
 such as ``equicdft.features``; ``legacy._MODULE_ALIASES`` and
 ``_CLASS_ALIASES`` map every one of them to the current home so
-``python -m equicdft.convert`` keeps working without shim modules.
+``python -m equicdft.conversion`` keeps working without shim modules.
 """
 
 import importlib
@@ -13,7 +13,7 @@ import sys
 import unittest
 
 import equicdft
-from equicdft.legacy import _CLASS_ALIASES, _MODULE_ALIASES, _RemappingUnpickler
+from equicdft.conversion.legacy import _CLASS_ALIASES, _MODULE_ALIASES, _RemappingUnpickler
 
 
 # Flat-layout module -> public classes it held (for the pickle remapping).
@@ -41,6 +41,7 @@ OLD_MODULE_CLASSES = {
 PACKAGES = {"equicdft.data", "equicdft.response", "equicdft.solver"}
 
 REMOVED_MODULES = [
+    "equicdft.legacy", "equicdft.convert",
     "equicdft.stencil", "equicdft.features", "equicdft.symmetrize",
     "equicdft.interaction", "equicdft.energy", "equicdft.thermodynamics",
     "equicdft.readout", "equicdft.semilocal", "equicdft.pairwise",
@@ -52,6 +53,15 @@ REMOVED_MODULES = [
 
 
 class TestPackageLayout(unittest.TestCase):
+    def test_normal_runtime_does_not_import_conversion(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, equicdft; "
+             "assert not any(k.startswith('equicdft.conversion') for k in sys.modules)"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_flat_module_paths_are_gone(self):
         for name in REMOVED_MODULES:
             with self.subTest(module=name):

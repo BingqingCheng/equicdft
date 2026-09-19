@@ -20,7 +20,6 @@ from .modes import (
     wavevector_magnitude as _wavevector_magnitude,
 )
 from .curvature import polarization_fourier_curvature
-from ..functional.polarization_ideal import FixedDipoleIdeal
 from ..objectives import LossTerm
 from .response import FourierResponse
 
@@ -383,36 +382,6 @@ class FourierStabilityLoss(LossTerm):
         return "variable={!r}, ideal_reference={!r}".format(
             self.variable, self.ideal_reference,
         )
-
-    def load_legacy_state(self, state, prefix="", model=None):
-        """Drop a checkpoint's own moment after checking it against the model.
-
-        This term used to register ``dipole_magnitude``; the moment now comes
-        from ``model.ideal`` alone, so a saved copy is verified against it and
-        removed rather than loaded back into a buffer that no longer exists.
-        """
-
-        key = prefix + "dipole_magnitude"
-        if key not in state:
-            return state
-        state = dict(state)
-        saved = state.pop(key)
-        ideal = getattr(model, "ideal", None)
-        if self.variable != "dipole_density" or not isinstance(ideal, FixedDipoleIdeal):
-            raise ValueError(
-                "legacy Fourier moment requires model.ideal=FixedDipoleIdeal(...)"
-            )
-        expected = ideal.dipole_magnitude.reshape(-1)
-        saved = saved.to(expected).reshape(-1)
-        if (
-            saved.numel() != expected.numel()
-            and min(saved.numel(), expected.numel()) != 1
-            or not torch.allclose(saved, expected)
-        ):
-            raise ValueError(
-                "legacy Fourier dipole magnitude conflicts with model ideal"
-            )
-        return state
 
     def evaluate(
         self,

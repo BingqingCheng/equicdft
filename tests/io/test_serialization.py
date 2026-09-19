@@ -7,6 +7,9 @@ from pathlib import Path
 
 import torch
 
+from equicdft.conversion import (
+    build_converted_model, convert_model, migrate_model_payload, migrate_model_state_dict,
+)
 from equicdft import (
     MODEL_FORMAT,
     MODEL_FORMAT_VERSION,
@@ -20,8 +23,6 @@ from equicdft.serialization import (
     default_dtype,
     dtype_from_name,
     dtype_name,
-    migrate_model_payload,
-    migrate_model_state_dict,
     model_dtype,
     model_payload,
     read_model_payload,
@@ -194,7 +195,7 @@ class TestSaveLoadModel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.pt"
             torch.save(model, str(path))
-            with self.assertRaisesRegex(ValueError, "equicdft.convert"):
+            with self.assertRaisesRegex(ValueError, "equicdft.conversion"):
                 load_model(path)
 
     def test_foreign_dictionaries_are_rejected(self):
@@ -260,16 +261,20 @@ class TestSaveLoadModel(unittest.TestCase):
         self.assertEqual(legacy["format_version"], 1)
         self.assertEqual(legacy["config"], legacy_copy["config"])
         self.assertEqual(set(legacy["state_dict"]), set(legacy_copy["state_dict"]))
-        restored = build_model(legacy).eval()
+        restored = build_converted_model(legacy).eval()
         actual = restored(copy.deepcopy(data))
         for key in ("beta_F_exc", "c1"):
             self.assertTrue(torch.equal(actual[key].detach(), expected[key].detach()), key)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "v1.pt"
             torch.save(legacy, str(path))
-            self.assertEqual(read_model_config(path), current["config"])
-            self.assertEqual(read_model_payload(path)["format_version"], 1)
-            load_model(path)
+            for reader in (read_model_config, read_model_payload, load_model):
+                with self.assertRaisesRegex(ValueError, "convert explicitly"):
+                    reader(path)
+            converted = Path(directory) / "current.pt"
+            convert_model(path, converted)
+            self.assertEqual(read_model_config(converted), current["config"])
+            load_model(converted)
 
     def test_version_one_files_with_disagreeing_scales_are_rejected(self):
         model, _ = _materialized_example()
@@ -335,7 +340,7 @@ class TestSaveLoadModel(unittest.TestCase):
         self.assertTrue(
             torch.equal(migrated["state_dict"]["mean_density"], current["state_dict"]["mean_density"])
         )
-        restored = build_model(legacy)
+        restored = build_converted_model(legacy)
         self.assertTrue(torch.equal(restored.mean_density, model.mean_density))
 
     def test_version_one_without_local_features_keeps_the_readout_scale(self):
@@ -365,7 +370,7 @@ class TestSaveLoadModel(unittest.TestCase):
                 "thermal_wavelength": torch.ones(1, dtype=torch.float64),
             },
         }
-        model = build_model(legacy)
+        model = build_converted_model(legacy)
         self.assertEqual(model.mean_density.dtype, torch.float64)
         self.assertAlmostEqual(model.mean_density.item(), 0.7)
         self.assertNotIn("mean_density", model.readout[0].to_config())

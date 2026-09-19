@@ -74,21 +74,15 @@ class TestDensityNoise(unittest.TestCase):
         batch['rho_std'] = torch.zeros_like(rho)
         self.assertTrue(torch.equal(add_density_noise(batch, 0.)['rho'], rho))
 
-    def test_derived_logarithmic_targets_use_noisy_rho(self):
+    def test_targets_are_not_recomputed_from_noisy_rho(self):
         rho = torch.ones(2, 4, 3)
-        batch = {'rho': rho, 'rho_std': rho * .1,
-                 'thermal_wavelength': torch.full((2, 3), 2.),
-                 'beta': torch.tensor([2., 3.]), 'V_ext': rho * .4,
-                 'beta_mu': torch.ones(2, 3) * .2,
-                 'c1': rho.clone(), 'c1_plus_beta_mu': rho.clone()}
+        batch = dict(rho=rho, rho_std=rho * .1, target=-rho,
+                     c1=rho.clone(), c1_plus_beta_mu=rho.clone())
         with patch('torch.randn_like', return_value=torch.ones_like(rho)):
             out = add_density_noise(batch, 0.)
-        expected = torch.log(out['rho'] * 8.) + batch['beta'][:, None, None] * .4
-        torch.testing.assert_close(out['c1_plus_beta_mu'], expected)
-        torch.testing.assert_close(out['c1'], expected - .2)
-        with patch('torch.randn_like', return_value=-100 * rho):
-            out = add_density_noise(batch, 0.)
-        self.assertTrue(torch.isfinite(out['c1']).all())
+        torch.testing.assert_close(out["rho"], rho * 1.1)
+        for key in ("target", "c1", "c1_plus_beta_mu"):
+            self.assertIs(out[key], batch[key])
 
     def test_invalid_noise(self):
         rho = torch.ones(1, 2, 3)
@@ -137,7 +131,7 @@ class TestDensityNoise(unittest.TestCase):
             self.assertTrue(restored_streams[0].noise.density)
             self.assertFalse(restored_streams[1].noise.density)
 
-    def test_checkpoint_resume_is_exact_and_legacy_disables_noise(self):
+    def test_checkpoint_resume_is_exact_and_legacy_is_rejected(self):
         torch.manual_seed(7)
         full = trainer(noise=NoiseOptions(density=True))
         full.fit(loader(), loader(), epochs=3, verbose=False)
@@ -153,23 +147,12 @@ class TestDensityNoise(unittest.TestCase):
             self.assertTrue(torch.equal(full.model.weight, resumed.model.weight))
             self.assertEqual(full.history, resumed.history)
             checkpoint = torch.load(Path(tmp) / 'last.pt', weights_only=False)
-            self.assertEqual(checkpoint['checkpoint_version'], 3)
-            # A version-2 checkpoint spelled the settings out; it still loads.
-            version_two = dict(checkpoint)
-            version_two.pop('noise')
-            version_two.pop('stream_noise')
-            version_two.update(checkpoint_version=2, density_noise=True,
-                               density_noise_floor=0.25, stream_density_noise={})
-            torch.save(version_two, Path(tmp) / 'v2.pt')
-            resumed.load_checkpoint(Path(tmp) / 'v2.pt', train)
-            self.assertEqual(resumed.noise, NoiseOptions(density=True, density_floor=0.25))
-            # Without any noise keys, noise is off.
-            for key in ('density_noise', 'density_noise_floor', 'stream_density_noise'):
-                version_two.pop(key)
-            legacy = Path(tmp) / 'legacy.pt'
-            torch.save(version_two, legacy)
-            resumed.load_checkpoint(legacy, train)
-            self.assertFalse(resumed.noise.density)
+            self.assertEqual(checkpoint['checkpoint_version'], 4)
+            checkpoint["checkpoint_version"] = 2
+            legacy = Path(tmp) / "legacy.pt"
+            torch.save(checkpoint, legacy)
+            with self.assertRaisesRegex(ValueError, "legacy training-checkpoint"):
+                resumed.load_checkpoint(legacy, train)
 
     def test_real_functional_gradients_and_clean_validation_forwards(self):
         atoms = TestDensityUncertaintyData.frame(n_types=2)

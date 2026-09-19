@@ -4,7 +4,6 @@ import unittest
 import torch
 from equicdft import FixedDipoleIdeal, FourierStabilityLoss, GridCACEModel, LDAReadout, Loss
 from equicdft.response.curvature import polarization_fourier_curvature
-from equicdft.training.checkpoint import load_loss_state
 from tests.training import test_loss as fixtures
 
 
@@ -78,20 +77,12 @@ class TestStabilityReference(unittest.TestCase):
         )
         torch.testing.assert_close(curvature[valid], torch.ones_like(curvature[valid]))
 
-    def test_legacy_loss_state_is_checked_then_moment_is_discarded(self):
-        """The term retires its own buffer; the trainer holds no special case."""
-
-        model = self.model(moment=.7)
-        for loss in (Loss([self.term()]), torch.nn.ModuleDict({"P": Loss([self.term()])})):
-            state = loss.state_dict()
-            prefix = "P.terms.0." if isinstance(loss, torch.nn.ModuleDict) else "terms.0."
-            state[prefix + "dipole_magnitude"] = torch.tensor([.7])
-            load_loss_state(loss, state, model)
-            self.assertNotIn(prefix + "dipole_magnitude", loss.state_dict())
-            self.assertIn(prefix + "dipole_magnitude", state)
-            state[prefix + "dipole_magnitude"] = torch.tensor([1.])
-            with self.assertRaisesRegex(ValueError, "conflicts"):
-                load_loss_state(loss, state, model)
+    def test_retired_moment_is_not_silently_loaded(self):
+        loss = Loss([self.term()])
+        state = loss.state_dict()
+        state["terms.0.dipole_magnitude"] = torch.tensor([.7])
+        with self.assertRaisesRegex(RuntimeError, "Unexpected key"):
+            loss.load_state_dict(state, strict=True)
 
 
 if __name__ == "__main__":

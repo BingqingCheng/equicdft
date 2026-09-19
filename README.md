@@ -251,16 +251,17 @@ structure (`model.to_config()`, a plain JSON-compatible dictionary) next to
 its fitted `state_dict`. The file contains no Python object references, so
 it loads under PyTorch's default `weights_only` unpickler, and
 `read_model_config` inspects the architecture without building it. Model
-files written before this format by `torch.save(model)` are converted once:
+files in older formats, including `torch.save(model)` pickles, are converted explicitly:
 
 ```bash
-python -m equicdft.convert old_model.pt converted_model.pt
+python -m equicdft.conversion old_model.pt converted_model.pt
 ```
 
-The converter rebuilds the model from its configuration, transfers the
-fitted state, and verifies that old and new models evaluate identically.
-Use a distinct destination to preserve the original checkpoint. Only load
-trusted whole-object pickle files.
+The converter rebuilds the model, strictly transfers migrated fitted state,
+and verifies whole-object forward equivalence by default. A distinct output
+path is required; the source is never overwritten. Only convert trusted files.
+Normal loading accepts only current-format models. Training resume likewise
+accepts only current-format checkpoints; legacy checkpoint resume is unsupported.
 
 Application checkpoints containing a configuration and `state_dict` are not
 whole-object files: rebuild them with their original application builder,
@@ -296,11 +297,11 @@ reports the residuals after its bounds and homogeneous projections.
 The solver validates the grid against `model.grid_info`. Its options come in
 validated groups from `equicdft.solver` (`ConvergenceOptions`, `EulerOptions`
 with `AndersonOptions`, `MinimizeOptions`, `Constraints`, `Initialization`),
-and every field can equally be passed as a flat keyword
-(`solver.solve(data, particle_numbers=[N], max_iter=300, mixing=0.1)` is
-`solver.solve(data, constraints=Constraints(particle_numbers=[N]),
-convergence=ConvergenceOptions(max_iter=300), euler=EulerOptions(mixing=0.1))`).
-See the docstring for the full set. Both equilibrium algorithms keep excluded
+and only these groups are accepted. For example,
+`solver.solve(data, method="euler", constraints=Constraints(particle_numbers=[N]),
+convergence=ConvergenceOptions(max_iter=300), euler=EulerOptions(mixing=0.1))`.
+Pass `euler` only for Euler and `minimize` only for minimization; mismatched
+groups raise an error. See the docstring for the full set. Both equilibrium algorithms keep excluded
 densities exactly zero, normalize fixed particle numbers over accessible grid
 points only, and omit excluded points from Euler--Lagrange convergence
 diagnostics. This treats the exclusion mask as an infinite external potential
@@ -322,11 +323,11 @@ reciprocal kernels with nonperiodic boundary conditions.
   losses, metrics and data
 - `equicdft.training`: loss terms, streaming metrics, the trainer, noise
 - `equicdft.solver`: forward thermodynamics and equilibrium density solution
-- `serialization.py`, `legacy.py`, `convert.py`: versioned model files and
-  conversion of whole-object pickles
+- `serialization.py`: current-format model saving/loading
+- `equicdft.conversion`: explicit old-model conversion; not imported by the runtime
 
 Whole-object `torch.save(model)` files written under the flat 0.0.x layout
-still convert with `python -m equicdft.convert`: `equicdft.legacy` maps the
+still convert with `python -m equicdft.conversion`: `equicdft.conversion.legacy` maps the
 old module paths to the current ones while unpickling.
 
 Run the test suite with:

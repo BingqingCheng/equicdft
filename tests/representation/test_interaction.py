@@ -12,7 +12,7 @@ from equicdft import (
     GridCACEModel,
     LocalReadout,
 )
-from equicdft.legacy import upgrade_legacy_model
+from equicdft.conversion.legacy import upgrade_legacy_model
 from equicdft.geometry.stencil import get_neighbor_indices
 
 

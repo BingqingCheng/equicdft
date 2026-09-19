@@ -1,10 +1,12 @@
 """Constrained stationarity, normalization and metal-response regression tests."""
+
 import unittest
 import itertools
 
 import torch
 from tests.metal_helpers import _run
 
+from equicdft.solver import Constraints, ConvergenceOptions
 from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
 from tests.metal_helpers import liquid_coulomb
 from equicdft.solver.symmetry import _HomogeneousDensityProjection
@@ -69,8 +71,13 @@ class TestHomogeneousSolver(unittest.TestCase):
         expected = torch.exp(-p.average(d["V_ext"]))
         expected[d["excluded_mask"]] = 0
         expected *= n/(expected.sum(0)*.125)
-        result = _run(GridSolver(IdealGas()).solve, d, particle_numbers=n, method="minimize",
-                    homogeneous_axes=(0, 1), tolerance_residual=1e-9, max_iter=200)
+        result = _run(
+            GridSolver(IdealGas()).solve,
+            d,
+            method="minimize",
+            convergence=ConvergenceOptions(tolerance_residual=1e-9, max_iter=200),
+            constraints=Constraints(particle_numbers=n, homogeneous_axes=(0, 1)),
+        )
         torch.testing.assert_close(result["rho"], expected, atol=1e-9, rtol=0)
         self.assertTrue(result["converged"])
         self.assertFalse(result["full_converged"])
@@ -89,7 +96,13 @@ class TestHomogeneousSolver(unittest.TestCase):
         p = _HomogeneousDensityProjection(d, (0, 1), ~d["excluded_mask"])
         target = torch.exp(.3-p.average(d["V_ext"]))
         target[d["excluded_mask"]] = 0
-        r = _run(GridSolver(IdealGas()).solve, d, homogeneous_axes=(0, 1), method="minimize", tolerance_residual=1e-9)
+        r = _run(
+            GridSolver(IdealGas()).solve,
+            d,
+            method="minimize",
+            convergence=ConvergenceOptions(tolerance_residual=1e-9),
+            constraints=Constraints(homogeneous_axes=(0, 1)),
+        )
         torch.testing.assert_close(r["rho"], target, atol=1e-9, rtol=0)
         self.assertTrue(r["converged"])
 
@@ -97,8 +110,9 @@ class TestHomogeneousSolver(unittest.TestCase):
         d = self.data(types=1)
         d["V_ext"] *= 10
         s = GridSolver(IdealGas())
-        kw = dict(particle_numbers=[2.], homogeneous_axes=(0, 1), method="minimize",
-                  maximum_density=.3, tolerance_residual=1e-8, max_iter=300)
+        kw = dict(method="minimize",
+                  constraints=Constraints(particle_numbers=[2.], homogeneous_axes=(0, 1), maximum_density=.3),
+                  convergence=ConvergenceOptions(tolerance_residual=1e-8, max_iter=300))
         a = _run(s.solve, d, **kw)
         b = _run(s.solve, dict(d, V_ext=d["V_ext"]+7.), **kw)
         self.assertTrue(a["converged"])
@@ -109,8 +123,18 @@ class TestHomogeneousSolver(unittest.TestCase):
     def test_empty_axes_preserve_default_exactly(self):
         d = self.data(types=1)
         s = GridSolver(IdealGas())
-        a = _run(s.solve, d, particle_numbers=[2.], method="minimize")
-        b = _run(s.solve, d, particle_numbers=[2.], method="minimize", homogeneous_axes=())
+        a = _run(
+            s.solve,
+            d,
+            method="minimize",
+            constraints=Constraints(particle_numbers=[2.]),
+        )
+        b = _run(
+            s.solve,
+            d,
+            method="minimize",
+            constraints=Constraints(particle_numbers=[2.], homogeneous_axes=()),
+        )
         self.assertTrue(torch.equal(a["rho"], b["rho"]))
         self.assertEqual(a["objective_history"], b["objective_history"])
 
@@ -126,10 +150,20 @@ class TestHomogeneousSolver(unittest.TestCase):
                 # Exercise both string and sequence forms for singleton axes.
                 for restrict in ([names[0], names] if count == 1 else [names]):
                     with self.subTest(restrict=restrict):
-                        options = dict(method="minimize", particle_numbers=numbers,
-                                       tolerance_residual=1e-9, max_iter=200)
-                        actual = _run(solver.solve, d, homogeneous_axes=restrict, **options)
-                        old = _run(solver.solve, d, homogeneous_axes=axes, **options)
+                        options = dict(method="minimize",
+                                       convergence=ConvergenceOptions(tolerance_residual=1e-9, max_iter=200))
+                        actual = _run(
+                            solver.solve,
+                            d,
+                            **options,
+                            constraints=Constraints(particle_numbers=numbers, homogeneous_axes=restrict),
+                        )
+                        old = _run(
+                            solver.solve,
+                            d,
+                            **options,
+                            constraints=Constraints(particle_numbers=numbers, homogeneous_axes=axes),
+                        )
                         self.assertTrue(torch.equal(actual["rho"], old["rho"]))
                         self.assertEqual(actual["objective_history"], old["objective_history"])
                         self.assertEqual(actual["solver_homogeneous_axes"], list(axes))
@@ -144,11 +178,17 @@ class TestHomogeneousSolver(unittest.TestCase):
         d = self.data(types=1)
         solver = GridSolver(IdealGas())
         for method in ("minimize", "euler"):
-            options = dict(method=method, particle_numbers=[2.], max_iter=5)
-            expected = _run(solver.solve, d, **options)
+            options = dict(method=method, convergence=ConvergenceOptions(max_iter=5))
+            numbers = [2.]
+            expected = _run(solver.solve, d, constraints=Constraints(particle_numbers=numbers), **options)
             for restrict in (None, [], ()):
                 with self.subTest(method=method, restrict=restrict):
-                    actual = _run(solver.solve, d, homogeneous_axes=restrict, **options)
+                    actual = _run(
+                        solver.solve,
+                        d,
+                        **options,
+                        constraints=Constraints(particle_numbers=numbers, homogeneous_axes=restrict),
+                    )
                     self.assertTrue(torch.equal(actual["rho"], expected["rho"]))
                     self.assertEqual(actual["objective_history"], expected["objective_history"])
                     self.assertEqual(actual.keys(), expected.keys())
@@ -156,15 +196,30 @@ class TestHomogeneousSolver(unittest.TestCase):
     def test_invalid_named_axes_and_equivalent_index_duplicates(self):
         solver = GridSolver(IdealGas())
         d = self.data(types=1)
-        options = dict(method="minimize", particle_numbers=[2.])
+        options = dict(method="minimize")
+        numbers = [2.]
         for axes in ("", "xy", "X", "q", ["x", "x"], ["x", 0],
                      0, True, [None], ["x", 3]):
             with self.subTest(axes=axes), self.assertRaisesRegex(ValueError, "homogeneous_axes"):
-                _run(solver.solve, d, homogeneous_axes=axes, **options)
+                _run(
+                    solver.solve,
+                    d,
+                    **options,
+                    constraints=Constraints(homogeneous_axes=axes),
+                )
         with self.assertRaisesRegex(ValueError, "only with"):
-            _run(solver.solve, d, particle_numbers=[2.], homogeneous_axes="x")
+            _run(
+                solver.solve,
+                d,
+                constraints=Constraints(particle_numbers=[2.], homogeneous_axes="x"),
+            )
         with self.assertRaisesRegex(ValueError, "accessibility"):
-            _run(solver.solve, d, homogeneous_axes="z", **options)
+            _run(
+                solver.solve,
+                d,
+                **options,
+                constraints=Constraints(particle_numbers=numbers, homogeneous_axes="z"),
+            )
         with self.assertRaisesRegex(TypeError, "restrict"):
             _run(solver.solve, d, restrict="x", **options)
 
@@ -175,12 +230,27 @@ class TestHomogeneousSolver(unittest.TestCase):
         for key in ("grid_positions", "V_ext", "excluded_mask"):
             d[key] = d[key][permutation]
         solver = GridSolver(IdealGas())
-        options = dict(method="minimize", tolerance_residual=1e-9)
-        actual = _run(solver.solve, d, homogeneous_axes=("y", "x"), **options)
-        old = _run(solver.solve, d, homogeneous_axes=(1, 0), **options)
+        options = dict(method="minimize", convergence=ConvergenceOptions(tolerance_residual=1e-9))
+        actual = _run(
+            solver.solve,
+            d,
+            **options,
+            constraints=Constraints(homogeneous_axes=("y", "x")),
+        )
+        old = _run(
+            solver.solve,
+            d,
+            **options,
+            constraints=Constraints(homogeneous_axes=(1, 0)),
+        )
         self.assertTrue(torch.equal(actual["rho"], old["rho"]))
         self.assertTrue(actual["converged"])
-        mixed = _run(solver.solve, d, homogeneous_axes=(1, "x"), **options)
+        mixed = _run(
+            solver.solve,
+            d,
+            **options,
+            constraints=Constraints(homogeneous_axes=(1, "x")),
+        )
         self.assertTrue(torch.equal(mixed["rho"], old["rho"]))
 
     def test_other_and_all_axes(self):
@@ -194,10 +264,18 @@ class TestHomogeneousSolver(unittest.TestCase):
     def test_reject_invalid_axes_grid_or_mask(self):
         for axes in ((0, 0), (-1,), (3,), (True,), (.5,)):
             with self.subTest(axes=axes), self.assertRaises(ValueError):
-                _run(GridSolver(IdealGas()).solve, self.data(), particle_numbers=[1., 2., 3.],
-                                             method="minimize", homogeneous_axes=axes)
+                _run(
+                    GridSolver(IdealGas()).solve,
+                    self.data(),
+                    method="minimize",
+                    constraints=Constraints(particle_numbers=[1., 2., 3.], homogeneous_axes=axes),
+                )
         with self.assertRaisesRegex(ValueError, "only with"):
-            _run(GridSolver(IdealGas()).solve, self.data(), particle_numbers=[1., 2., 3.], homogeneous_axes=(0, 1))
+            _run(
+                GridSolver(IdealGas()).solve,
+                self.data(),
+                constraints=Constraints(particle_numbers=[1., 2., 3.], homogeneous_axes=(0, 1)),
+            )
         d = self.data()
         d["excluded_mask"][1] = True
         with self.assertRaisesRegex(ValueError, "accessibility"):
@@ -231,10 +309,20 @@ class TestHomogeneousSolver(unittest.TestCase):
             grid_spacing=.5, mean_temperature=1., boltzmann_constant=1., free_energy_mode="beta",
             mean_density=1.).double()
         solver = GridSolver(model)
-        r = _run(solver.solve, d, particle_numbers=[2., 2.], method="minimize", homogeneous_axes=(0, 1),
-                         tolerance_residual=1e-7, max_iter=200)
-        named = _run(solver.solve, d, particle_numbers=[2., 2.], method="minimize",
-                             homogeneous_axes=["x", "y"], tolerance_residual=1e-7, max_iter=200)
+        r = _run(
+            solver.solve,
+            d,
+            method="minimize",
+            convergence=ConvergenceOptions(tolerance_residual=1e-7, max_iter=200),
+            constraints=Constraints(particle_numbers=[2., 2.], homogeneous_axes=(0, 1)),
+        )
+        named = _run(
+            solver.solve,
+            d,
+            method="minimize",
+            convergence=ConvergenceOptions(tolerance_residual=1e-7, max_iter=200),
+            constraints=Constraints(particle_numbers=[2., 2.], homogeneous_axes=["x", "y"]),
+        )
         self.assertTrue(torch.equal(named["rho"], r["rho"]))
         self.assertTrue(torch.equal(named["metal_site_q"], r["metal_site_q"]))
         self.assertTrue(r["converged"])

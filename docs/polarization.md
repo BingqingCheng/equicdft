@@ -565,7 +565,7 @@ def build_sem_trainer(model, loss, *, learning_rate):
 ```
 
 This example enables both density and polarization noise. For polarization
-noise alone, use `NoiseOptions(polarization=True, ...)` and omit the density-SEM mapping if
+noise alone, use `NoiseOptions(polarization=True)` and omit the density-SEM mapping if
 that property is absent. `dipole_magnitude` must be positive and may be a
 scalar or one value per species; it is the quantity denoted by $m$ in the
 equations. It must come from the physical particle model, not from fitting.
@@ -595,22 +595,25 @@ are unchanged. Excluded cells stay zero and must have zero SEM. Exact vacuum
 is unchanged. Unmasked nonvacuum inputs must already satisfy the ideal domain.
 No particle-number normalization or subtraction of mean polarization is applied.
 
-Both ideal-derived targets change when either field changes. The trainer
-refreshes recognized scalar targets `c1_plus_beta_mu`, `c1`, and `target_c1`
-by adding the change in the local `ideal_density_derivative`; it refreshes
-`polarization_derivative_excess` and `target_P_derivative` by subtracting the change
-in the ideal polarization derivative. The latter names must denote **excess**
-derivative targets `beta*E_ext - ideal_P`, not electric-field values themselves.
-The unsuffixed `polarization_derivative` now denotes a total-derivative target
-and is not adjusted by noise augmentation. Rename old excess-target fields
-explicitly; the code cannot infer their meaning from their numerical values.
-This preserves external fields, chemical-potential/gauge offsets and thermal-
-wavelength conventions. Targets may be full-grid tensors or packed using the
-original `valid` mask. Custom target names are untouched and must be computed
-from the live perturbed fields by the application.
+Augmentation changes only the input fields; **every target stays unchanged**.
+Fit `density_derivative` against `-beta*V_ext` with the canonical gauge
+projection, and `polarization_derivative` against `beta*E_ext`. If absolute
+chemical potentials are known, the density target is `beta*(mu - V_ext)`
+without the canonical projection. These total derivatives already include
+the model's ideal response to the noisy fields. Keep the original masks and
+loss scales, including any physical molecular moment multiplying the P
+residual inside its square. No target-name detection or refresh is performed.
+The loader no longer constructs `c1` or `c1_plus_beta_mu` targets. Model
+outputs `c1`, `c2` and explicit excess derivatives remain available for
+direct-correlation and response analysis.
+
+`NoiseOptions` stores only `density`, `polarization` and `density_floor`.
+Standalone augmentation of polarized fields must also receive the ideal
+reference, for example `options.apply(batch, ideal=model.ideal)`; the trainer
+supplies it automatically. There is no second dipole-magnitude setting.
 
 All flags default off. Validation and explicit evaluation remain clean. Ordinary and per-`TrainingStream` settings and PyTorch RNG states
-are restored by checkpoints; older checkpoints without flags restore noise off.
+are restored by current-format checkpoints. Legacy checkpoint resume is unsupported.
 Turning noise on for a new fit therefore requires an explicit configuration,
 not resuming an old clean checkpoint unchanged.
 
@@ -790,32 +793,32 @@ polarization perturbations do not trigger the exact ideal-domain constraint;
 their separate quadratic ideal reference is unchanged. A polarization model
 built without an ideal reference remains excess-only and cannot be solved.
 
-New model files store the ideal configuration and parameters. Old scalar
-models migrate automatically. Old polarization files require an explicit
-`FixedDipoleIdeal` with the original physical moment and wavelength: descriptor
-normalization scales are not a reliable source of these parameters.
+New model files store the ideal configuration and parameters. Older model
+formats require explicit conversion. Pre-format-3 polarization files require
+a `FixedDipoleIdeal` with the original physical moment and wavelength:
+descriptor normalization scales are not a reliable source of these parameters.
 
 ```python
-from equicdft import FixedDipoleIdeal, load_model, save_model
+from equicdft import FixedDipoleIdeal, load_model
+from equicdft.conversion import convert_model
 
 
 def migrate_polarization_model(source, destination, *, dipole_magnitude,
                                thermal_wavelength=1.0):
-    model = load_model(
-        source,
+    convert_model(
+        source, destination,
         ideal=FixedDipoleIdeal(
             dipole_magnitude, thermal_wavelength=thermal_wavelength,
         ),
     )
-    save_model(model, destination)
-    return model
+    return load_model(destination)
 ```
 
-This helper accepts old **versioned** files; use a different destination to
-preserve the source. For a trusted whole-object pickle, use the existing
-conversion command with `--dipole-magnitude` and, if needed,
-`--thermal-wavelength`. Do not pass an ideal override when loading a file that
-already stores its ideal reference.
+This helper accepts trusted whole-object and old versioned files that lack
+an ideal reference, and requires a distinct destination to preserve the source.
+The command `python -m equicdft.conversion` also accepts
+`--dipole-magnitude` and `--thermal-wavelength`. Do not supply an ideal
+override for a model that already stores its ideal reference.
 
 Model format 4 also discards `compute_local_mu` and `rho_min` from older
 configurations, without changing fitted parameters. Move the original density
@@ -889,7 +892,6 @@ The existing density masking, amplitudes, random draws, normalization and
 relaxed local polarization bound are unchanged. Perturbed model calls use
 `compute_ideal=False` so the exact ideal-domain restriction is not reintroduced.
 
-When a trainer loads an old loss state, a stored Fourier dipole moment must
-agree with the model's ideal reference before that redundant buffer is removed.
-Conflicting physical metadata cause an error. New checkpoints have no separate
-Fourier moment buffer. Existing run scripts still need the explicit API migration.
+Current checkpoints have no separate Fourier moment buffer. Legacy training
+checkpoint resume is not supported. Existing run scripts still need the explicit
+API migration; fitted model conversion is independent of training state.

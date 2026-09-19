@@ -1,38 +1,15 @@
 """Training-only, diagonal-uncertainty perturbations in physical field units."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict
 
 import torch
 
 from .._species import species_vector
 from .._validation import boolean, nonnegative_scalar
-from ..functional.thermodynamics import local_chemical_potential
 from ..functional.polarization_ideal import FixedDipoleIdeal
 
 __all__ = ["NoiseOptions", "add_density_noise", "add_field_noise"]
-
-
-def _noise_dipole_magnitude(value: Any) -> Optional[Union[float, List[float]]]:
-    """Normalize an optional fixed moment; species count is checked per batch."""
-
-    if value is None:
-        return None
-    magnitude = torch.as_tensor(value)
-    if magnitude.dtype == torch.bool or magnitude.is_complex():
-        raise ValueError("noise_dipole_magnitude must contain real numeric values")
-    # Preserve Python/NumPy double precision independently of torch's default.
-    magnitude = torch.as_tensor(value, dtype=torch.float64)
-    if (
-        magnitude.ndim > 1
-        or magnitude.numel() == 0
-        or not torch.all(torch.isfinite(magnitude)).item()
-        or torch.any(magnitude <= 0).item()
-    ):
-        raise ValueError(
-            "noise_dipole_magnitude must be a finite positive scalar or vector"
-        )
-    return magnitude.detach().cpu().tolist()
 
 
 @dataclass(frozen=True)
@@ -43,18 +20,15 @@ class NoiseOptions:
     by the batch ``rho_std`` and ``dipole_density_std`` before each training
     forward; validation stays clean. ``density_floor`` is a nonnegative
     lower density bound of the noisy field (excluded cells stay zero,
-    particle numbers are not renormalized). ``dipole_magnitude`` is the
-    positive fixed single-particle moment (scalar or per species). The trainer
-    obtains it from ``model.ideal``; a standalone caller may supply it here.
-    It is needed even for density-only perturbation of a polarized batch,
-    to preserve the local physical bound and coupled ideal targets. An explicit
-    value conflicting with the model reference is rejected.
+    particle numbers are not renormalized). For polarized batches, the trainer
+    supplies ``model.ideal``; standalone callers pass ``ideal=FixedDipoleIdeal(...)``
+    to ``apply``. The ideal reference supplies the molecular moment needed for
+    the local bound. External-field targets remain unchanged by augmentation.
     """
 
     density: bool = False
     density_floor: float = 0.0
     polarization: bool = False
-    dipole_magnitude: Optional[Union[float, Sequence[float]]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "density", boolean(self.density, "density_noise"))
@@ -64,9 +38,6 @@ class NoiseOptions:
         )
         object.__setattr__(
             self, "polarization", boolean(self.polarization, "polarization_noise"),
-        )
-        object.__setattr__(
-            self, "dipole_magnitude", _noise_dipole_magnitude(self.dipole_magnitude),
         )
 
     @property
@@ -83,7 +54,6 @@ class NoiseOptions:
             density_noise=self.density,
             density_noise_floor=self.density_floor,
             polarization_noise=self.polarization,
-            dipole_magnitude=self.dipole_magnitude,
             ideal=ideal,
         )
 
@@ -92,29 +62,11 @@ class NoiseOptions:
             "density": self.density,
             "density_floor": self.density_floor,
             "polarization": self.polarization,
-            "dipole_magnitude": self.dipole_magnitude,
         }
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any]) -> "NoiseOptions":
         return cls(**values)
-
-    @classmethod
-    def from_legacy(
-        cls,
-        density_noise: Any = False,
-        density_noise_floor: Any = 0.0,
-        polarization_noise: Any = False,
-        noise_dipole_magnitude: Any = None,
-    ) -> "NoiseOptions":
-        """Build from the four keywords used before equicdft 0.1.0."""
-
-        return cls(
-            density=density_noise,
-            density_floor=density_noise_floor,
-            polarization=polarization_noise,
-            dipole_magnitude=noise_dipole_magnitude,
-        )
 
 
 _MAX_NOISE_ATTEMPTS = 1000
@@ -144,9 +96,9 @@ def _noise_std(batch, key, reference, enabled):
 
 @torch.no_grad()
 def add_density_noise(batch, floor):
-    """Legacy scalar-fluid SEM proposal and floor, without N normalization."""
+    """Scalar-fluid SEM proposal and floor, without N normalization."""
     if "dipole_density" in batch:
-        raise ValueError("polarized density noise requires add_field_noise and dipole_magnitude")
+        raise ValueError("polarized density noise requires add_field_noise and an ideal reference")
     rho = batch["rho"].detach()
     std = _noise_std(batch, "rho_std", rho, True)
     noisy = (rho + std * torch.randn_like(rho)).clamp_min(floor)
@@ -156,65 +108,7 @@ def add_density_noise(batch, floor):
         noisy = noisy.masked_fill(excluded, 0.0)
     if not torch.isfinite(noisy).all():
         raise ValueError("density noise produced nonfinite rho")
-    result = dict(batch, rho=noisy)
-    if "c1_plus_beta_mu" in batch or "c1" in batch:
-        target = local_chemical_potential(
-            noisy,
-            batch["V_ext"],
-            batch["beta"],
-            None,
-            batch["thermal_wavelength"],
-            mask=torch.ones_like(noisy, dtype=torch.bool) if excluded is None else ~excluded,
-        )
-        if "c1_plus_beta_mu" in batch:
-            result["c1_plus_beta_mu"] = target
-        if "c1" in batch:
-            c1 = target - batch["beta_mu"][..., None, :]
-            result["c1"] = c1 if excluded is None else c1.masked_fill(excluded, 0.0)
-    return result
-
-
-def _target_delta(target, delta, valid, name):
-    """Accept full-grid targets or targets packed by the original voxel mask."""
-    if target.shape == delta.shape:
-        return delta
-    if valid is not None:
-        selected = delta[valid]
-        # Collation adds batch axes to each case's packed target. Never
-        # reinterpret per-species/component axes as a different target.
-        component_shape = delta.shape[valid.ndim:]
-        if (target.shape[-len(component_shape):] == component_shape
-                and target.numel() == selected.numel()):
-            return selected.reshape_as(target)
-    raise ValueError(name + " must match its full field or original valid-mask selection")
-
-
-def _refresh_polarized_targets(batch, result, active, ideal):
-    """Change only the known ideal parts; external fields and gauges stay fixed."""
-    scalar_keys = ("c1_plus_beta_mu", "c1", "target_c1")
-    vector_keys = ("polarization_derivative_excess", "target_P_derivative")
-    if not any(key in batch for key in scalar_keys + vector_keys):
-        return
-
-    def response(fields):
-        # Non-target vacuum/boundary cells must not enter the finite-interior
-        # ideal formula. The thermal wavelength cancels in the differences.
-        rho = torch.where(active, fields["rho"], torch.ones_like(fields["rho"]))
-        polar = torch.where(active[..., None], fields["dipole_density"], 0.0)
-        return ideal.local(rho, polar)
-
-    before, after = response(batch), response(result)
-    valid = batch.get("valid")
-    if valid is not None:
-        valid = valid.bool()
-    for keys, derivative, sign in (
-        (scalar_keys, "ideal_density_derivative", 1),
-        (vector_keys, "ideal_polarization_derivative", -1),
-    ):
-        delta = sign * (after[derivative] - before[derivative])
-        for key in keys:
-            if key in batch:
-                result[key] = batch[key] + _target_delta(batch[key], delta, valid, key)
+    return dict(batch, rho=noisy)
 
 
 def _dipole_interior(rho, polar, moment):
@@ -266,14 +160,14 @@ def _sample_polarized_fields(rho, polar, rho_std, polar_std, active, moment, flo
 
 @torch.no_grad()
 def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
-                    polarization_noise=False, dipole_magnitude=None, ideal=None):
+                    polarization_noise=False, ideal=None):
     """Apply optional SEM noise, preserving a polarized example's ideal domain.
 
     Polarized proposals use independent Cartesian/component Gaussian draws,
     conditioned on rho>0 and |P|<m*rho by whole (rho,P)-pair rejection. Original
     invalid/excluded voxels remain unchanged. No N or mean-P projection is made.
-    SEM is the proposal sigma, not the variance after truncation. Unknown custom
-    targets are untouched; applications must derive them from the live fields.
+    SEM is the proposal sigma, not the variance after truncation. All targets
+    remain untouched: external fields supervise total intrinsic derivatives.
     """
     if not density_noise and not polarization_noise:
         return batch
@@ -281,18 +175,8 @@ def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
         if polarization_noise:
             raise KeyError("polarization_noise=True requires dipole_density")
         return add_density_noise(batch, density_noise_floor)
-    if ideal is not None:
-        if not isinstance(ideal, FixedDipoleIdeal):
-            raise ValueError("polarized noise requires the model's FixedDipoleIdeal")
-        if dipole_magnitude is not None and not torch.allclose(
-                torch.as_tensor(dipole_magnitude).to(ideal.dipole_magnitude),
-                ideal.dipole_magnitude):
-            raise ValueError("noise dipole magnitude conflicts with model ideal")
-        dipole_magnitude = ideal.dipole_magnitude
-    elif dipole_magnitude is not None:
-        ideal = FixedDipoleIdeal(dipole_magnitude)
-    else:
-        raise ValueError("polarized noise requires the model ideal reference")
+    if not isinstance(ideal, FixedDipoleIdeal):
+        raise ValueError("polarized noise requires a FixedDipoleIdeal reference")
     rho = batch["rho"].detach()
     polar = batch["dipole_density"].detach()
     if rho.ndim < 2 or not rho.is_floating_point():
@@ -305,7 +189,7 @@ def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
             or not torch.isfinite(polar).all()):
         raise ValueError("noise requires finite fields and nonnegative rho")
     moment = species_vector(
-        dipole_magnitude, rho.shape[-1], rho, "noise_dipole_magnitude",
+        ideal.dipole_magnitude, rho.shape[-1], rho, "dipole_magnitude",
         positive=True,
     )
     rho_std = _noise_std(batch, "rho_std", rho, density_noise)
@@ -327,6 +211,4 @@ def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
     noisy_rho, noisy_polar = _sample_polarized_fields(
         rho, polar, rho_std, polar_std, active, moment, density_noise_floor,
     )
-    result = dict(batch, rho=noisy_rho, dipole_density=noisy_polar)
-    _refresh_polarized_targets(batch, result, active, ideal)
-    return result
+    return dict(batch, rho=noisy_rho, dipole_density=noisy_polar)

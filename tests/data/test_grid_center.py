@@ -11,6 +11,12 @@ from ase import Atoms
 from ase.io import write
 from torch.utils.data import DataLoader
 
+from equicdft.solver import (
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+)
 from equicdft import GridData, GridSolver, MetalWall, read_metal_sites
 from tests.data.test_metal_sites_data import _atoms, _grid_values
 from tests.functional.test_metalwall_sites import (
@@ -211,9 +217,15 @@ class TestGridCenter(unittest.TestCase):
         target = physical.pop("rho")
         numbers = model.voxel_volume * target.sum(0)
         for initial in (None, target.flip(0) + .05):
-            result = _run(solver.solve, physical, initial_rho=initial, particle_numbers=numbers,
-                                  method="euler", max_iter=250, mixing=.2,
-                                  tolerance_residual=1e-9, tolerance_change=1e-12)
+            result = _run(
+                solver.solve,
+                physical,
+                method="euler",
+                convergence=ConvergenceOptions(max_iter=250, tolerance_residual=1e-9),
+                euler=EulerOptions(mixing=.2, tolerance_change=1e-12),
+                constraints=Constraints(particle_numbers=numbers),
+                initial=Initialization(rho=initial),
+            )
             self.assertTrue(result["converged"])
             torch.testing.assert_close(result["rho"], target, atol=1e-9, rtol=0)
             torch.testing.assert_close(result["grid_center"], physical["grid_center"])

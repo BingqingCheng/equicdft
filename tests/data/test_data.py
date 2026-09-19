@@ -342,9 +342,7 @@ class TestGridData(unittest.TestCase):
         self.assertTrue(
             torch.all(data["rho"][data["excluded_mask"]] == 0.0)
         )
-        self.assertTrue(
-            torch.all(data["c1"][data["excluded_mask"]] == 0.0)
-        )
+        self.assertNotIn("c1", data)
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertEqual(batch["excluded_mask"].shape, (2, 64))
         self.assertEqual(batch["excluded_mask"].dtype, torch.bool)
@@ -477,16 +475,12 @@ class TestGridData(unittest.TestCase):
                 "excluded_mask",
                 "V_ext",
                 "rho",
-                "c1_plus_beta_mu",
-                "c1",
                 "local_density_index",
                 "local_density_positions",
             },
         )
         self.assertEqual(data["rho"].shape, (64, 1))
         self.assertEqual(data["V_ext"].shape, (64, 1))
-        self.assertEqual(data["c1_plus_beta_mu"].shape, (64, 1))
-        self.assertEqual(data["c1"].shape, (64, 1))
         self.assertEqual(data["n_types"].item(), 1)
         self.assertEqual(data["mu"].shape, (1,))
         self.assertEqual(data["beta_mu"].shape, (1,))
@@ -497,20 +491,6 @@ class TestGridData(unittest.TestCase):
         )
         self.assertTrue(
             torch.allclose(data["beta_mu"], data["beta"] * data["mu"])
-        )
-        self.assertTrue(
-            np.isclose(
-                data["c1_plus_beta_mu"][0, 0].item(),
-                np.log(0.25),
-                rtol=1.0e-6,
-            )
-        )
-        self.assertTrue(
-            np.isclose(
-                data["c1"][0, 0].item(),
-                np.log(0.25) + expected_beta,
-                rtol=1.0e-6,
-            )
         )
         self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertEqual(data["local_density_positions"].shape, (7, 3))
@@ -536,7 +516,7 @@ class TestGridData(unittest.TestCase):
         self.assertNotIn("mu", data)
         self.assertNotIn("beta_mu", data)
         self.assertNotIn("c1", data)
-        self.assertIn("c1_plus_beta_mu", data)
+        self.assertNotIn("c1_plus_beta_mu", data)
         batch = next(iter(DataLoader([data, data], batch_size=2)))
         self.assertNotIn("mu", batch)
         self.assertNotIn("c1", batch)
@@ -570,7 +550,7 @@ class TestGridData(unittest.TestCase):
         self.assertNotIn("mu", data)
         self.assertNotIn("beta_mu", data)
         self.assertNotIn("c1", data)
-        self.assertIn("c1_plus_beta_mu", data)
+        self.assertNotIn("c1_plus_beta_mu", data)
 
     def test_zero_density_is_retained_for_masked_losses(self):
         path = Path(self.temporary_directory.name) / "zero-density.extxyz"
@@ -781,12 +761,7 @@ class TestGridData(unittest.TestCase):
                 torch.tensor([1.0, 1.0, 1.0], dtype=data["grid_spacing"].dtype),
             )
         )
-        expected_c1 = (
-            torch.log(data["rho"])
-            + data["beta"]
-            * (data["V_ext"] - data["mu"].unsqueeze(0))
-        )
-        self.assertTrue(torch.allclose(data["c1"], expected_c1))
+        self.assertNotIn("c1", data)
 
     def test_multitype_fields(self):
         path = Path(self.temporary_directory.name) / "multitype.extxyz"
@@ -812,30 +787,8 @@ class TestGridData(unittest.TestCase):
             )
         )
         self.assertAlmostEqual(data["beta"].item(), 1.0 / 1.5)
-        expected_c1_plus_beta_mu = (
-            torch.log(
-                data["rho"]
-                * data["thermal_wavelength"].unsqueeze(0) ** 3
-            )
-            + data["beta"] * data["V_ext"]
-        )
-        self.assertTrue(
-            torch.allclose(
-                data["c1_plus_beta_mu"],
-                expected_c1_plus_beta_mu,
-                atol=5.0e-6,
-                rtol=1.0e-6,
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                data["c1"],
-                expected_c1_plus_beta_mu
-                - data["beta"] * data["mu"].unsqueeze(0),
-                atol=5.0e-6,
-                rtol=1.0e-6,
-            )
-        )
+        self.assertNotIn("c1_plus_beta_mu", data)
+        self.assertNotIn("c1", data)
         self.assertEqual(data["local_density_index"].shape, (64, 7))
         self.assertTrue(
             torch.equal(data["local_density_index"][:, 0], data["index"])

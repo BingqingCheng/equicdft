@@ -6,11 +6,13 @@ import unittest
 from pathlib import Path
 
 from tests.ideal_helpers import with_ideal
+from equicdft.solver import Constraints, ConvergenceOptions, Initialization
 from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import GridSolver, MetalWall, load_model, save_model
-from equicdft.legacy import convert_legacy_model, legacy_model_to_current, verify_equivalent
+from equicdft.conversion import convert_model
+from equicdft.conversion.legacy import legacy_model_to_current, verify_equivalent
 from tests.representation import test_polarization_symmetry as fixtures
 
 
@@ -86,7 +88,7 @@ class TestPolarizationSerialization(unittest.TestCase):
                     destination = Path(directory) / "converted.pt"
                     torch.save(model, source)
                     original = source.read_bytes()
-                    convert_legacy_model(source, destination, verification_data=data)
+                    convert_model(source, destination, verification_data=data)
                     self.assertEqual(source.read_bytes(), original)
                     restored = load_model(destination)
                 self.assert_outputs(model(dict(data)), restored(dict(data)))
@@ -115,14 +117,19 @@ class TestPolarizationSerialization(unittest.TestCase):
             path = Path(directory) / "model.pt"
             save_model(model, path)
             restored = load_model(path).requires_grad_(False)
-        options = dict(initial_rho=data["rho"], initial_polarization=data["dipole_density"],
-                       particle_numbers=data["rho"].sum(0) * .7**3,
-                       maximum_density=1., max_iter=3, tolerance_residual=1.e-10)
+        options = dict(
+            initial=Initialization(rho=data["rho"], polarization=data["dipole_density"]),
+            convergence=ConvergenceOptions(max_iter=3, tolerance_residual=1.e-10),
+        )
         for method, fixed in (("euler", None), ("minimize", None),
                               ("minimize", "rho"), ("minimize", "dipole_density")):
             with self.subTest(method=method, fixed=fixed):
                 results = [GridSolver(with_ideal(m, FixedDipoleIdeal(1.))).solve(
-                    data, method=method, fixed_field=fixed, **options,
+                    data,
+                    method=method,
+                    **options,
+                    constraints=Constraints(fixed_field=fixed, maximum_density=1.,
+                                            particle_numbers=data["rho"].sum(0) * .7**3),
                 ) for m in (model, restored)]
                 for key in ("rho", "dipole_density", "beta_A"):
                     torch.testing.assert_close(results[0][key], results[1][key], atol=0, rtol=0)

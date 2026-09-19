@@ -166,13 +166,14 @@ class TestPolarizationData(unittest.TestCase):
         data = self.from_dict(dipoles, excluded_mask=excluded)
         self.assertTrue(torch.all(data["dipole_density"][0] == 0))
 
-    def test_absent_field_stays_absent_and_scalar_targets_are_unchanged(self):
+    def test_absent_field_stays_absent_without_implicit_targets(self):
         self.write_frame(None)
         data = GridData.from_xyz(self.path, boltzmann_constant=1)[0]
         self.assertNotIn("dipole_density", data)
         torch.testing.assert_close(data["rho"], torch.full((self.n_grid, 1), 0.5))
-        expected = np.log(0.5) + 1.0 / 1.5
-        torch.testing.assert_close(data["c1"], torch.full_like(data["c1"], expected))
+        self.assertNotIn("c1", data)
+        self.assertNotIn("c1_plus_beta_mu", data)
+        torch.testing.assert_close(data["beta_mu"], torch.tensor([-1 / 1.5]))
         self.assertNotIn("dipole_density", self.from_dict(None))
 
     def test_polarized_frames_do_not_get_scalar_ideal_c1_targets(self):

@@ -119,7 +119,7 @@ class TestIntrinsicAPI(unittest.TestCase):
                             self.assertEqual("density_derivative" in result, derivatives)
                             self.assertEqual("polarization_derivative" in result, polarized and derivatives)
 
-    def test_sem_refreshes_excess_but_not_total_polarization_target(self):
+    def test_sem_preserves_all_supplied_targets(self):
         data = self.data(True)
         ideal = FixedDipoleIdeal(.7)
         data["dipole_density_std"] = torch.full_like(data["dipole_density"], .002)
@@ -128,7 +128,6 @@ class TestIntrinsicAPI(unittest.TestCase):
         before = ideal.local(data["rho"], data["dipole_density"])
         data["polarization_derivative_excess"] = total_target - before["ideal_polarization_derivative"]
         result = add_field_noise(data, polarization_noise=True, ideal=ideal)
-        after = ideal.local(result["rho"], result["dipole_density"])
         torch.testing.assert_close(result["polarization_derivative"], total_target, rtol=0, atol=0)
         torch.testing.assert_close(result["polarization_derivative_excess"],
-                                   total_target - after["ideal_polarization_derivative"])
+                                   data["polarization_derivative_excess"], rtol=0, atol=0)

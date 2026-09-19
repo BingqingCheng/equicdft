@@ -1,37 +1,28 @@
-"""Reading a training checkpoint: format, migration and restore helpers.
+"""Current training-checkpoint validation and state restoration.
 
-:mod:`equicdft.training.trainer` owns optimization and epoch orchestration;
-what a checkpoint file contains, which of its entries older versions wrote
-under other names, and how its saved state is put back belong here, next to
-:mod:`equicdft.training.io`, which owns the history and log files.
-
-Helpers take explicit checkpoint, model, loss or random-generator inputs
-rather than a trainer, keeping the restore phases explicit at the call site
-in ``Trainer.load_checkpoint``.
+Historical training checkpoints are not supported.
 """
 
-import copy
-import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
 
-from ..objectives import LossTerm
-from .noise import NoiseOptions
 
 __all__ = [
     "REQUIRED_KEYS",
-    "checkpoint_noise",
-    "checkpoint_stream_noise",
-    "load_loss_state",
+    "CHECKPOINT_VERSION",
+    "validate_checkpoint",
     "read_checkpoint",
     "restore_history",
     "restore_random_state",
 ]
 
 
+CHECKPOINT_VERSION = 4
+
 REQUIRED_KEYS = frozenset((
+    "noise", "stream_noise", "best_valid_loss", "epochs_without_improvement",
     "epoch",
     "model_state_dict",
     "loss_state_dict",
@@ -52,75 +43,27 @@ def read_checkpoint(path, map_location) -> Dict[str, Any]:
     checkpoint = torch.load(
         str(checkpoint_path), map_location=map_location, weights_only=False,
     )
+    return validate_checkpoint(checkpoint)
+
+
+def validate_checkpoint(checkpoint):
+    """Require a current checkpoint; historical resume is unsupported."""
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint must contain a dictionary")
-    missing_keys = REQUIRED_KEYS - set(checkpoint)
-    if missing_keys:
+    version = checkpoint.get("checkpoint_version")
+    if type(version) is not int or version != CHECKPOINT_VERSION:
         raise ValueError(
-            "checkpoint is missing keys: {}".format(sorted(missing_keys))
+            "old or unsupported checkpoint version; "
+            "legacy training-checkpoint resume is not supported"
         )
+    missing = REQUIRED_KEYS - set(checkpoint)
+    if missing:
+        raise ValueError("checkpoint is missing keys: {}".format(sorted(missing)))
     return checkpoint
 
 
-def checkpoint_noise(checkpoint: Dict[str, Any]) -> NoiseOptions:
-    """Read the trainer noise of a version-3 or earlier checkpoint."""
-
-    if "noise" in checkpoint:
-        return NoiseOptions.from_dict(checkpoint["noise"])
-    return NoiseOptions.from_legacy(
-        density_noise=checkpoint.get("density_noise", False),
-        density_noise_floor=checkpoint.get("density_noise_floor", 0.0),
-        polarization_noise=checkpoint.get("polarization_noise", False),
-        noise_dipole_magnitude=checkpoint.get("noise_dipole_magnitude"),
-    )
-
-
-def checkpoint_stream_noise(checkpoint: Dict[str, Any]) -> Dict[str, NoiseOptions]:
-    """Read the per-stream noise of a version-3 or earlier checkpoint."""
-
-    if "stream_noise" in checkpoint:
-        return {
-            name: NoiseOptions.from_dict(values)
-            for name, values in checkpoint["stream_noise"].items()
-        }
-    density = checkpoint.get("stream_density_noise", {})
-    polarization = checkpoint.get("stream_polarization_noise", {})
-    return {
-        name: NoiseOptions.from_legacy(
-            density_noise=density.get(name, {}).get("enabled", False),
-            density_noise_floor=density.get(name, {}).get("floor", 0.0),
-            polarization_noise=polarization.get(name, {}).get("enabled", False),
-            noise_dipole_magnitude=polarization.get(name, {}).get("dipole_magnitude"),
-        )
-        for name in set(density) | set(polarization)
-    }
-
-
-def load_loss_state(loss, state, model) -> None:
-    """Load loss state, letting each term retire its own old buffers first.
-
-    A term that stopped registering a buffer knows what the saved value
-    meant and where the quantity lives now, so it drops the entry through
-    :meth:`equicdft.objectives.LossTerm.load_legacy_state` rather than
-    having the trainer special-case it. Without that, a strict load would
-    reject the whole file.
-    """
-
-    state = copy.copy(state)
-    for name, term in loss.named_modules():
-        if isinstance(term, LossTerm):
-            state = term.load_legacy_state(
-                state, name + "." if name else "", model,
-            )
-    loss.load_state_dict(state, strict=True)
-
-
 def restore_history(checkpoint: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], float, int]:
-    """Return the completed epoch, history, best loss and stall count.
-
-    A checkpoint written before the counters were saved carries neither, so
-    both are recomputed from the history it does carry.
-    """
+    """Return the recorded epoch, history, best loss and stall count."""
 
     epoch = checkpoint["epoch"]
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
@@ -136,29 +79,10 @@ def restore_history(checkpoint: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any
             "completed epoch, with at most one leading epoch 0 baseline"
         )
 
-    if "best_valid_loss" in checkpoint:
-        best_valid_loss = float(checkpoint["best_valid_loss"])
-    else:
-        best_valid_loss = min(
-            record["valid_losses"]["total"]
-            for record in history
-            if record["epoch"] > 0
-        )
-    if "epochs_without_improvement" in checkpoint:
-        epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
-    else:
-        best_loss = math.inf
-        epochs_without_improvement = 0
-        for record in history:
-            if record["epoch"] == 0:
-                continue
-            valid_loss = record["valid_losses"]["total"]
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-    return epoch, history, best_valid_loss, epochs_without_improvement
+    return (
+        epoch, history, float(checkpoint["best_valid_loss"]),
+        int(checkpoint["epochs_without_improvement"]),
+    )
 
 
 def restore_random_state(

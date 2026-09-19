@@ -13,7 +13,7 @@ from .extxyz import (
     _metadata_positive_integer,
     _metadata_positive_scalar,
     build_grid_data,
-    harmonize_optional_targets,
+    harmonize_optional_fields,
     normalize_grid_info,
     process_atoms,
     validate_frame_grid_info,
@@ -179,8 +179,6 @@ class GridData(dict):
         dipole_density              [n_grid, n_types, 3] (optional, polar vector)
         dipole_density_std          [n_grid, n_types, 3] (optional, P units)
         excluded_mask               [n_grid] bool; true grid points are excluded
-        c1_plus_beta_mu             [n_grid, n_types] (optional, dimensionless)
-        c1                          [n_grid, n_types] (optional)
         local_density_index         [n_grid, n_neighbors] (optional)
         local_density_positions     [n_neighbors, 3]
 
@@ -291,7 +289,7 @@ class GridData(dict):
             )
             for atoms in configurations
         ]
-        harmonize_optional_targets(data)
+        harmonize_optional_fields(data)
         if resolved_grid_info is not None:
             for frame in data:
                 validate_frame_grid_info(frame, resolved_grid_info)

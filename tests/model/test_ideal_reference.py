@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from equicdft.solver import Constraints, ConvergenceOptions
 from equicdft import (GridCACEModel, GridSolver, IdealGas, FixedDipoleIdeal,
                       LDAReadout, load_model, save_model)
 
@@ -83,6 +84,7 @@ class TestModelIdealReference(unittest.TestCase):
 
     def test_old_polar_model_requires_explicit_physical_metadata(self):
         from equicdft.serialization import model_payload, build_model
+        from equicdft.conversion import build_converted_model
         model = GridCACEModel(None, None, [LDAReadout(
             n_types=2, dipole_density_scale=.3,
         )], ideal=FixedDipoleIdeal([.7, 1.9]), grid_spacing=1.,
@@ -94,9 +96,11 @@ class TestModelIdealReference(unittest.TestCase):
         payload["state_dict"] = {k:v for k,v in payload["state_dict"].items()
                                  if not k.startswith("ideal.")}
         payload["state_dict"]["thermal_wavelength"] = torch.ones(2)
-        with self.assertRaisesRegex(ValueError, "molecular dipole magnitude"):
+        with self.assertRaisesRegex(ValueError, "convert explicitly"):
             build_model(payload)
-        converted = build_model(payload, ideal=FixedDipoleIdeal([.7, 1.9]))
+        with self.assertRaisesRegex(ValueError, "molecular dipole magnitude"):
+            build_converted_model(payload)
+        converted = build_converted_model(payload, ideal=FixedDipoleIdeal([.7, 1.9]))
         torch.testing.assert_close(model(self.data(True))["beta_F"],
                                    converted(self.data(True))["beta_F"], rtol=0, atol=0)
 
@@ -124,7 +128,11 @@ class TestModelIdealReference(unittest.TestCase):
         for polarized in (False, True):
             model, data = self.model(polarized), self.data(polarized)
             solver = GridSolver(model)
-            result = solver.solve(data, particle_numbers=[2.4, 2.4], max_iter=4)
+            result = solver.solve(
+                data,
+                convergence=ConvergenceOptions(max_iter=4),
+                constraints=Constraints(particle_numbers=[2.4, 2.4]),
+            )
             torch.testing.assert_close(result["rho"], data["rho"])
             self.assertTrue(result["converged"])
 

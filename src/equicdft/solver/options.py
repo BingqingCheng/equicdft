@@ -11,16 +11,12 @@ acceleration), ``minimize`` (:class:`MinimizeOptions`), ``constraints``
 homogeneous axes, fixed field) and ``initial`` (:class:`Initialization`:
 starting fields and ``beta_multiplier``).
 
-``solve`` accepts them as keyword arguments and, equivalently, every field
-as a flat keyword (``max_iter=``, ``mixing=``, ``anderson=True`` with
-``anderson_history=``, ``particle_numbers=``, ``initial_rho=``, ...), named
-after the field itself and listed in :data:`FLAT_KEYWORDS`;
-:func:`resolve_options` merges the two forms and rejects a field set both
-ways. Each field is documented on its group below.
+``solve`` accepts only these keyword groups. Each field is documented below;
+method-specific options may only accompany the corresponding method.
 """
 
-from dataclasses import dataclass, fields, replace
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, fields
+from typing import Any, Optional, Sequence, Union
 
 import torch
 
@@ -37,11 +33,9 @@ __all__ = [
     "Constraints",
     "ConvergenceOptions",
     "EulerOptions",
-    "FLAT_KEYWORDS",
     "Initialization",
     "MinimizeOptions",
     "SolveOptions",
-    "resolve_options",
 ]
 
 ComponentValues = Union[float, Sequence[float], torch.Tensor]
@@ -256,125 +250,3 @@ class SolveOptions:
                 raise TypeError(
                     "{} must be a {}".format(field.name, expected.__name__)
                 )
-
-
-# flat keyword -> (group attribute of SolveOptions, field name)
-FLAT_KEYWORDS: Dict[str, Tuple[str, str]] = {
-    "max_iter": ("convergence", "max_iter"),
-    "tolerance_residual": ("convergence", "tolerance_residual"),
-    "tolerance_rms_residual": ("convergence", "tolerance_rms_residual"),
-    "residual_density_threshold": ("convergence", "residual_density_threshold"),
-    "mixing": ("euler", "mixing"),
-    "adaptive_mixing": ("euler", "adaptive_mixing"),
-    "minimum_mixing": ("euler", "minimum_mixing"),
-    "maximum_mixing": ("euler", "maximum_mixing"),
-    "mixing_growth": ("euler", "mixing_growth"),
-    "mixing_backtrack_factor": ("euler", "mixing_backtrack_factor"),
-    "tolerance_change": ("euler", "tolerance_change"),
-    "step_size": ("minimize", "step_size"),
-    "minimum_step_size": ("minimize", "minimum_step_size"),
-    "line_search_factor": ("minimize", "line_search_factor"),
-    "armijo_factor": ("minimize", "armijo_factor"),
-    "particle_numbers": ("constraints", "particle_numbers"),
-    "maximum_density": ("constraints", "maximum_density"),
-    "maximum_polarization_fraction": ("constraints", "maximum_polarization_fraction"),
-    "homogeneous_axes": ("constraints", "homogeneous_axes"),
-    "fixed_field": ("constraints", "fixed_field"),
-    "initial_rho": ("initial", "rho"),
-    "initial_polarization": ("initial", "polarization"),
-    "beta_multiplier": ("initial", "beta_multiplier"),
-}
-# max_log_density_change bounds one update of either driver.
-_SHARED_KEYWORDS = ("max_log_density_change",)
-_ANDERSON_KEYWORDS = {
-    "anderson_history": "history",
-    "anderson_regularization": "regularization",
-    "anderson_damping": "damping",
-}
-
-
-def _is_explicit(value: Any, default_value: Any) -> bool:
-    if torch.is_tensor(value) or torch.is_tensor(default_value):
-        return value is not default_value
-    return value != default_value
-
-
-def resolve_options(
-    groups: Dict[str, Any],
-    flat: Dict[str, Any],
-) -> SolveOptions:
-    """Merge option groups and flat keywords into one :class:`SolveOptions`.
-
-    ``groups`` maps ``convergence``, ``euler``, ``minimize``, ``constraints``
-    and ``initial`` to option objects (or ``None``); ``flat`` holds the
-    flat keyword form of :meth:`GridSolver.solve`, including ``anderson``
-    (a bool or an :class:`AndersonOptions`) and its ``anderson_*`` fields.
-    A flat keyword may not repeat a field also set through its group.
-    """
-
-    unknown = sorted(
-        key for key in flat
-        if key not in FLAT_KEYWORDS
-        and key not in _SHARED_KEYWORDS
-        and key not in _ANDERSON_KEYWORDS
-        and key != "anderson"
-    )
-    if unknown:
-        raise TypeError(
-            "solve() got unexpected keyword argument(s): {}".format(", ".join(unknown))
-        )
-    updates: Dict[str, Dict[str, Any]] = {name: {} for name in ("convergence", "euler", "minimize", "constraints", "initial")}
-    for key, value in flat.items():
-        if key in FLAT_KEYWORDS:
-            group, field = FLAT_KEYWORDS[key]
-            updates[group][field] = value
-    for key in _SHARED_KEYWORDS:
-        if key in flat:
-            updates["euler"][key] = flat[key]
-            updates["minimize"][key] = flat[key]
-    anderson = flat.get("anderson", None)
-    anderson_fields = {
-        _ANDERSON_KEYWORDS[key]: flat[key] for key in _ANDERSON_KEYWORDS if key in flat
-    }
-    if isinstance(anderson, AndersonOptions):
-        if anderson_fields:
-            raise TypeError("anderson_* keywords cannot accompany an AndersonOptions")
-        updates["euler"]["anderson"] = anderson
-    elif anderson is not None:
-        if boolean(anderson, "anderson"):
-            updates["euler"]["anderson"] = AndersonOptions(**anderson_fields)
-        else:
-            # Anderson fields without the switch were ignored historically.
-            updates["euler"]["anderson"] = None
-
-    resolved = {}
-    for name, default in (
-        ("convergence", ConvergenceOptions),
-        ("euler", EulerOptions),
-        ("minimize", MinimizeOptions),
-        ("constraints", Constraints),
-        ("initial", Initialization),
-    ):
-        group = groups.get(name)
-        changes = updates[name]
-        if group is None:
-            resolved[name] = default(**changes)
-            continue
-        if not isinstance(group, default):
-            raise TypeError("{} must be a {}".format(name, default.__name__))
-        if changes:
-            defaults = default()
-            explicit = {
-                field.name for field in fields(group)
-                if _is_explicit(getattr(group, field.name), getattr(defaults, field.name))
-            }
-            clash = sorted(set(changes) & explicit)
-            if clash:
-                raise TypeError(
-                    "{} set both through {} and by keyword: {}".format(
-                        ", ".join(clash), name, ", ".join(clash),
-                    )
-                )
-            group = replace(group, **changes)
-        resolved[name] = group
-    return SolveOptions(**resolved)

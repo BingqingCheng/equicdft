@@ -7,6 +7,7 @@ import unittest
 from tests.ideal_helpers import with_ideal
 import torch
 
+from equicdft.solver import Constraints, ConvergenceOptions, Initialization
 from equicdft import (
     FixedDipoleIdeal, GridCACEModel, LDAReadout, LongRangeReadout,
     GridSolver, ReciprocalFeatures,
@@ -65,7 +66,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         buffer = io.BytesIO()
         torch.save(old, buffer)
         buffer.seek(0)
-        from equicdft.legacy import upgrade_legacy_model
+        from equicdft.conversion.legacy import upgrade_legacy_model
         loaded = upgrade_legacy_model(torch.load(buffer, weights_only=False))
         self.assertFalse(loaded.requires_dipole_density)
         self.assertIsNotNone(loaded.coulomb_amplitude)
@@ -285,13 +286,12 @@ class TestPolarizationCoulomb(unittest.TestCase):
         solver = GridSolver(with_ideal(model, FixedDipoleIdeal(.7)))
         perturbed = data["rho"] * (1 + .03 * torch.randn_like(data["rho"]))
         perturbed *= numbers / perturbed.sum(0)
-        for start in ({}, dict(initial_rho=perturbed, initial_polarization=.002*torch.randn_like(data["dipole_density"]))):
+        for start in (None, Initialization(rho=perturbed, polarization=.002*torch.randn_like(data["dipole_density"]))):
             result = solver.solve(
                 external,
-                particle_numbers=numbers,
-                tolerance_residual=1e-9,
-                max_iter=300,
-                **start,
+                initial=start,
+                convergence=ConvergenceOptions(tolerance_residual=1e-9, max_iter=300),
+                constraints=Constraints(particle_numbers=numbers),
             )
             self.assertEqual(result["status"], "converged")
             torch.testing.assert_close(result["rho"], data["rho"], atol=2e-9, rtol=2e-9)

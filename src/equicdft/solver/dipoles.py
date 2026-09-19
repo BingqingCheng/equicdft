@@ -765,7 +765,10 @@ def solve_fixed_dipole_euler(
                 result["maximum_residual"], result["rms_residual"],
                 tolerance_residual, tolerance_rms_residual,
             )
-            status = "converged" if converged else "max_iter"
+            if converged:
+                status = "converged"
+            else:
+                status = "max_iter" if n_iter >= max_iter else "stalled"
             history.append(
                 {
                     "iteration": n_iter,

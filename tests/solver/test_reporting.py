@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from equicdft.solver import Constraints, ConvergenceOptions, EulerOptions
 from equicdft import FixedDipoleIdeal, GridSolver
 from equicdft.solver.reporting import finalize_result
 from tests.ideal_helpers import IdealOnly
@@ -85,7 +86,12 @@ class TestSolveReporting(unittest.TestCase):
                     solver, data = self.case(polarized)
                     with patch("equicdft.solver." + module + ".finalize_result",
                                wraps=finalize_result) as finalize:
-                        result = solver.solve(data, method=method, particle_numbers=[.8], max_iter=2)
+                        result = solver.solve(
+                            data,
+                            method=method,
+                            convergence=ConvergenceOptions(max_iter=2),
+                            constraints=Constraints(particle_numbers=[.8]),
+                        )
                     finalize.assert_called_once()
                     self.assertEqual(result["solver_method"], method)
                     self.assertEqual(result["n_iter"], len(result["objective_history"]) - 1)
@@ -110,5 +116,24 @@ class TestSolveReporting(unittest.TestCase):
 
                 with patch.object(solver, "evaluate", side_effect=fail):
                     with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
-                        solver.solve(data, particle_numbers=[.8], max_iter=2)
+                        solver.solve(
+                            data,
+                            convergence=ConvergenceOptions(max_iter=2),
+                            constraints=Constraints(particle_numbers=[.8]),
+                        )
                 self.assertEqual(solver.model.training, training)
+
+    def test_scalar_and_polarized_euler_distinguish_stall_from_budget(self):
+        for polarized in (False, True):
+            for budget, expected in ((1, "max_iter"), (10, "stalled")):
+                with self.subTest(polarized=polarized, budget=budget):
+                    solver, data = self.case(polarized)
+                    result = solver.solve(
+                        data, method="euler",
+                        constraints=Constraints(particle_numbers=[.8]),
+                        convergence=ConvergenceOptions(max_iter=budget, tolerance_residual=1e-14),
+                        euler=EulerOptions(tolerance_change=1.),
+                    )
+                    self.assertFalse(result["converged"])
+                    self.assertEqual(result["n_iter"], 1)
+                    self.assertEqual(result["status"], expected)

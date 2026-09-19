@@ -293,7 +293,7 @@ def solve_euler(
         else:
             current_mixing = mixing
         if relative_change <= tolerance_change:
-            stalled = True
+            stalled = n_iter < max_iter
             break
 
     return {

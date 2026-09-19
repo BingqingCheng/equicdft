@@ -770,7 +770,7 @@ class TestTrainer(unittest.TestCase):
             checkpoint = torch.load(directory / "last.pt")
 
         self.assertEqual(checkpoint["epoch"], 2)
-        self.assertEqual(checkpoint["checkpoint_version"], 3)
+        self.assertEqual(checkpoint["checkpoint_version"], 4)
         # Toy models carry no configuration; real models record theirs.
         self.assertIn("model_config", checkpoint)
         self.assertIsNone(checkpoint["model_config"])
@@ -892,94 +892,29 @@ class TestTrainer(unittest.TestCase):
             boltzmann_constant=1.0,
         )
 
-    def _resume_from_legacy_scale_layout(self, readout, rewrite, corrupt=None):
-        """Fit one epoch, rewrite the checkpoint's model state, and resume.
-
-        ``rewrite`` turns the saved model state into the layout written
-        before model file format 2 and returns it; the resumed trainer must
-        then hold the original state exactly. ``corrupt`` makes the scales
-        of that layout disagree, which must be rejected.
-        """
-
-        loss = Loss([TensorLoss("energy", "beta_F_exc", "beta_F_exc")])
-        train = DataLoader(
-            [self._grid_frame(1), self._grid_frame(2)], batch_size=2,
-        )
-        valid = DataLoader([self._grid_frame(3)], batch_size=1)
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            torch.manual_seed(5)
-            trainer = Trainer(
-                model=self._grid_model(readout), loss=loss,
-                optimizer_args={"lr": 1.0e-3}, checkpoint_dir=temporary_directory,
-            )
-            trainer.fit(train, valid, epochs=1, verbose=False)
-            path = Path(temporary_directory) / "last.pt"
-            checkpoint = torch.load(path, weights_only=False)
-            expected_state = {
-                key: value.clone()
-                for key, value in checkpoint["model_state_dict"].items()
-            }
-            self.assertIn("mean_density", expected_state)
-            legacy_state = rewrite(dict(checkpoint["model_state_dict"]))
-            self.assertNotIn("mean_density", legacy_state)
-            checkpoint["model_state_dict"] = legacy_state
-            torch.save(checkpoint, path)
-
-            torch.manual_seed(6)
-            resumed = Trainer(
-                model=self._grid_model(readout), loss=loss,
-                optimizer_args={"lr": 1.0e-3},
-            )
-            completed = resumed.load_checkpoint(path, train)
-
-            self.assertEqual(completed, 1)
-            self.assertEqual(set(resumed.model.state_dict()), set(expected_state))
-            for key, value in resumed.model.state_dict().items():
-                self.assertTrue(torch.equal(value, expected_state[key]), key)
-
-            if corrupt is None:
-                return
-            checkpoint["model_state_dict"] = corrupt(legacy_state)
-            torch.save(checkpoint, path)
-            with self.assertRaisesRegex(ValueError, "different density scales"):
-                Trainer(
-                    model=self._grid_model(readout), loss=loss,
-                    optimizer_args={"lr": 1.0e-3},
-                ).load_checkpoint(path, train)
-
-    def test_checkpoints_with_readout_density_scales_are_migrated(self):
-        """Checkpoints written before model format 2 stored LDA scales."""
-
+    def test_legacy_checkpoints_are_rejected_before_restoring_model(self):
         from equicdft import LDAReadout
-
-        def rewrite(state):
-            state["readout.0.mean_density"] = state.pop("mean_density").clone()
-            return state
-
-        def corrupt(state):
-            state["readout.0.mean_density"] = 2.0 * state["readout.0.mean_density"]
-            return state
-
-        self._resume_from_legacy_scale_layout(
-            lambda: LDAReadout(n_types=1, hidden_sizes=(2,)), rewrite, corrupt,
-        )
-
-    def test_checkpoints_without_lda_readouts_recover_the_feature_scale(self):
-        """Before model format 2 no checkpoint held a model-level scale.
-
-        A model without LDA readouts recorded the density scale only on its
-        feature module, so resuming takes ``mean_density`` from there.
-        """
-
-        from equicdft import LocalReadout
-
-        def rewrite(state):
-            del state["mean_density"]
-            return state
-
-        self._resume_from_legacy_scale_layout(
-            lambda: LocalReadout(n_types=1, hidden_sizes=(2,)), rewrite,
-        )
+        train = DataLoader([self._grid_frame(1)], batch_size=1)
+        with tempfile.TemporaryDirectory() as directory:
+            original = Trainer(
+                model=self._grid_model(LDAReadout), loss=Loss([TensorLoss("energy", "beta_F_exc", "beta_F_exc")]),
+                checkpoint_dir=directory,
+            )
+            original.fit(train, train, epochs=1, verbose=False)
+            checkpoint = torch.load(Path(directory) / "last.pt", weights_only=False)
+            for version in (None, 1, 2, 3, 999):
+                old = dict(checkpoint)
+                if version is None:
+                    old.pop("checkpoint_version")
+                else:
+                    old["checkpoint_version"] = version
+                path = Path(directory) / "old.pt"
+                torch.save(old, path)
+                before = {k: v.clone() for k, v in original.model.state_dict().items()}
+                with self.assertRaisesRegex(ValueError, "legacy training-checkpoint"):
+                    original.load_checkpoint(path, train)
+                for key, value in original.model.state_dict().items():
+                    torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
     def test_checkpoint_resume_restores_complete_training_state(self):
         train_values = [1, 2, 3, 4]

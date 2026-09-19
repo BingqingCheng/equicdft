@@ -8,6 +8,12 @@ import unittest
 import torch
 from tests.metal_helpers import _run, liquid_coulomb, metal_sites
 
+from equicdft.solver import (
+    Constraints,
+    ConvergenceOptions,
+    EulerOptions,
+    Initialization,
+)
 from equicdft import GridSolver, MetalWall
 
 
@@ -434,10 +440,14 @@ class TestExplicitMetalSites(unittest.TestCase):
         numbers = model.voxel_volume * target.sum(0)
         solutions = []
         for initialization in (None, torch.flip(target, dims=(0,)) + .05):
-            result = _run(GridSolver(model).solve,
-                data, initial_rho=initialization, particle_numbers=numbers,
-                method="euler", max_iter=250, tolerance_residual=1e-9,
-                tolerance_change=1e-12, mixing=.2,
+            result = _run(
+                GridSolver(model).solve,
+                data,
+                method="euler",
+                convergence=ConvergenceOptions(max_iter=250, tolerance_residual=1e-9),
+                euler=EulerOptions(tolerance_change=1e-12, mixing=.2),
+                constraints=Constraints(particle_numbers=numbers),
+                initial=Initialization(rho=initialization),
             )
             self.assertTrue(result["converged"])
             self.assertTrue(torch.equal(result["excluded_mask"], excluded))
@@ -454,9 +464,14 @@ class TestExplicitMetalSites(unittest.TestCase):
         baseline = torch.zeros_like(target)
         baseline[~excluded] = numbers / (model.voxel_volume * (~excluded).sum())
         initial_q = _model_reference(dict(data, rho=baseline))["metal_site_q"]
-        truncated = _run(GridSolver(model).solve,
-            data, initial_rho=baseline, particle_numbers=numbers, method="euler",
-            max_iter=1, tolerance_residual=1e-9, mixing=.2,
+        truncated = _run(
+            GridSolver(model).solve,
+            data,
+            method="euler",
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1e-9),
+            euler=EulerOptions(mixing=.2),
+            constraints=Constraints(particle_numbers=numbers),
+            initial=Initialization(rho=baseline),
         )
         self.assertFalse(truncated["converged"])
         self.assertGreater(
