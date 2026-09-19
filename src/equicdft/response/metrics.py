@@ -7,7 +7,7 @@ from .._validation import (
     nonempty_string,
     unique_strings,
 )
-from ..training.metrics import MetricCollection
+from ..objectives import MetricCollection
 
 __all__ = [
     "FourierResponseMetrics",

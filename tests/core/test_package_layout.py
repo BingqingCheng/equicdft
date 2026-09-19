@@ -7,6 +7,7 @@ such as ``equicdft.features``; ``legacy._MODULE_ALIASES`` and
 """
 
 import importlib
+import pathlib
 import subprocess
 import sys
 import unittest
@@ -92,6 +93,35 @@ class TestPackageLayout(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(int(result.stdout.strip()), len(equicdft.__all__))
+
+    def test_objective_bases_are_below_training_and_response(self):
+        """The two protocol classes depend on neither package, so no cycle.
+
+        ``response`` subclasses them and the trainer inspects response terms,
+        which is a cycle whenever the bases live on the training side. Both
+        original module paths still export them.
+        """
+
+        from equicdft import objectives
+        from equicdft.training import loss as training_loss
+        from equicdft.training import metrics as training_metrics
+        from equicdft.response import stability
+
+        source = (
+            pathlib.Path(objectives.__file__).read_text()
+        )
+        for forbidden in ("from .training", "from .response",
+                          "import equicdft.training", "import equicdft.response"):
+            self.assertNotIn(forbidden, source)
+        self.assertIs(training_loss.LossTerm, objectives.LossTerm)
+        self.assertIs(training_metrics.MetricCollection, objectives.MetricCollection)
+        self.assertIs(equicdft.LossTerm, objectives.LossTerm)
+        self.assertTrue(issubclass(stability.FourierStabilityLoss, objectives.LossTerm))
+        # The trainer no longer needs a function-local import to reach them.
+        trainer_source = pathlib.Path(
+            importlib.import_module("equicdft.training.trainer").__file__
+        ).read_text()
+        self.assertNotIn("    from ..response", trainer_source)
 
     def test_console_script_module_runs(self):
         result = subprocess.run(

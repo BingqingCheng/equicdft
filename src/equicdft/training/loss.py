@@ -5,10 +5,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from .._validation import (
-    nonempty_string,
-    nonnegative_scalar,
-)
+from .._validation import nonempty_string
+from ..objectives import LossTerm
 from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
 
 __all__ = [
@@ -16,44 +14,6 @@ __all__ = [
     "TensorLoss",
     "Loss",
 ]
-
-
-class LossTerm(nn.Module):
-    """Base class of every named, weighted scalar loss term.
-
-    Subclasses implement :meth:`evaluate`, which returns a mapping holding
-    the weighted scalar ``"loss"`` together with any diagnostics that
-    a :class:`equicdft.metrics.MetricCollection` may reuse. :meth:`forward`
-    returns the scalar alone. :class:`Loss` accepts only ``LossTerm``
-    instances and passes the model to every term, so a term that needs the
-    model documents that by raising when ``model`` is ``None``.
-    """
-
-    def __init__(self, name: str, weight: float = 1.0) -> None:
-        super().__init__()
-
-        self.name = nonempty_string(name, "loss term name")
-        self.weight = nonnegative_scalar(weight, "weight")
-
-    def evaluate(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        batch: Dict[str, torch.Tensor],
-        model: Optional[nn.Module] = None,
-    ) -> Dict[str, Any]:
-        """Return ``{"loss": weighted scalar, ...diagnostics}``."""
-
-        raise NotImplementedError
-
-    def forward(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        batch: Dict[str, torch.Tensor],
-        model: Optional[nn.Module] = None,
-    ) -> torch.Tensor:
-        """Return this term's weighted scalar loss."""
-
-        return self.evaluate(outputs, batch, model)["loss"]
 
 
 class TensorLoss(LossTerm):

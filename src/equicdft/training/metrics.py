@@ -3,13 +3,13 @@
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
-from torch import nn
 
 from .._validation import (
     boolean,
     nonempty_string,
     unique_strings,
 )
+from ..objectives import MetricCollection
 from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
 
 __all__ = [
@@ -102,61 +102,6 @@ def compute_metric(
             SUPPORTED_METRICS,
         )
     )
-
-
-class MetricCollection(nn.Module):
-    """Base class of streaming metric accumulators used by the trainer.
-
-    A collection owns one accumulator per named subset. The trainer calls
-    :meth:`update_metrics` after every batch with the model outputs, the
-    batch, and the per-term details returned by :meth:`equicdft.Loss.evaluate`,
-    then :meth:`retrieve_metrics` once per epoch. Subclasses decide which of
-    those inputs they consume.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        subsets: Sequence[str] = ("train", "valid", "test"),
-    ) -> None:
-        super().__init__()
-
-        self.name = nonempty_string(name, "name")
-        self.subsets = unique_strings(subsets, "subsets")
-
-    def update_metrics(
-        self,
-        subset: str,
-        outputs: Dict[str, torch.Tensor],
-        batch: Dict[str, torch.Tensor],
-        details: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
-    ) -> None:
-        """Accumulate one detached batch into a subset's statistics."""
-
-        raise NotImplementedError
-
-    def retrieve_metrics(
-        self,
-        subset: str,
-        clear: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        """Return metrics over all recorded batches for one subset."""
-
-        raise NotImplementedError
-
-    def clear_metrics(self, subset: str) -> None:
-        """Discard all batches recorded for one subset."""
-
-        raise NotImplementedError
-
-    def _require_subset(self, subset: str) -> None:
-        if subset not in self.subsets:
-            raise KeyError(
-                "unknown metric subset '{}'; choose from {}".format(
-                    subset,
-                    tuple(self.subsets),
-                )
-            )
 
 
 class Metrics(MetricCollection):

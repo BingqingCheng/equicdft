@@ -1,6 +1,5 @@
 """Training orchestration for grid density-functional models."""
 
-import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,41 +29,25 @@ from .._validation import (
 )
 from .noise import NoiseOptions
 from .._config import Configurable
+from .checkpoint import (
+    checkpoint_noise,
+    checkpoint_stream_noise,
+    load_loss_state,
+    read_checkpoint,
+    restore_history,
+    restore_random_state,
+)
 from .io import append_log_message, format_record, write_history_csv
 from .._device import GeometryDeviceCache, move_batch
 from .._io import atomic_torch_save
+from ..objectives import MetricCollection
 from .loss import Loss
-from .metrics import MetricCollection
 from ..serialization import migrate_model_state_dict
 
 __all__ = [
     "TrainingStream",
     "Trainer",
 ]
-
-
-def _load_loss_state(loss, state, model):
-    """Retire old Fourier moment buffers only after checking model ownership."""
-    from ..response.stability import FourierStabilityLoss
-    from ..functional.polarization_ideal import FixedDipoleIdeal
-
-    state = copy.copy(state)
-    for name, term in loss.named_modules():
-        if not isinstance(term, FourierStabilityLoss):
-            continue
-        key = (name + "." if name else "") + "dipole_magnitude"
-        if key not in state:
-            continue
-        saved = state.pop(key)
-        ideal = getattr(model, "ideal", None)
-        if term.variable != "dipole_density" or not isinstance(ideal, FixedDipoleIdeal):
-            raise ValueError("legacy Fourier moment requires model.ideal=FixedDipoleIdeal(...)")
-        expected = ideal.dipole_magnitude.reshape(-1)
-        saved = saved.to(expected).reshape(-1)
-        if (saved.numel() != expected.numel() and min(saved.numel(), expected.numel()) != 1
-                or not torch.allclose(saved, expected)):
-            raise ValueError("legacy Fourier dipole magnitude conflicts with model ideal")
-    loss.load_state_dict(state, strict=True)
 
 
 @dataclass
@@ -112,40 +95,6 @@ class TrainingStream:
             self.noise = NoiseOptions()
         elif not isinstance(self.noise, NoiseOptions):
             raise TypeError("noise must be a NoiseOptions")
-
-
-def _checkpoint_noise(checkpoint: Dict[str, Any]) -> NoiseOptions:
-    """Read the trainer noise of a version-3 or earlier checkpoint."""
-
-    if "noise" in checkpoint:
-        return NoiseOptions.from_dict(checkpoint["noise"])
-    return NoiseOptions.from_legacy(
-        density_noise=checkpoint.get("density_noise", False),
-        density_noise_floor=checkpoint.get("density_noise_floor", 0.0),
-        polarization_noise=checkpoint.get("polarization_noise", False),
-        noise_dipole_magnitude=checkpoint.get("noise_dipole_magnitude"),
-    )
-
-
-def _checkpoint_stream_noise(checkpoint: Dict[str, Any]) -> Dict[str, NoiseOptions]:
-    """Read the per-stream noise of a version-3 or earlier checkpoint."""
-
-    if "stream_noise" in checkpoint:
-        return {
-            name: NoiseOptions.from_dict(values)
-            for name, values in checkpoint["stream_noise"].items()
-        }
-    density = checkpoint.get("stream_density_noise", {})
-    polarization = checkpoint.get("stream_polarization_noise", {})
-    return {
-        name: NoiseOptions.from_legacy(
-            density_noise=density.get(name, {}).get("enabled", False),
-            density_noise_floor=density.get(name, {}).get("floor", 0.0),
-            polarization_noise=polarization.get(name, {}).get("enabled", False),
-            noise_dipole_magnitude=polarization.get(name, {}).get("dipole_magnitude"),
-        )
-        for name in set(density) | set(polarization)
-    }
 
 
 class Trainer:
@@ -624,37 +573,9 @@ class Trainer:
         replacement process.
         """
 
-        checkpoint_path = Path(path).expanduser()
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(
-                "checkpoint does not exist: {}".format(checkpoint_path)
-            )
-
         self._train_loader_generator = getattr(train_loader, "generator", None)
         self._initialize_optimization()
-        checkpoint = torch.load(
-            str(checkpoint_path),
-            map_location=self.device,
-            weights_only=False,
-        )
-        if not isinstance(checkpoint, dict):
-            raise ValueError("checkpoint must contain a dictionary")
-
-        required_keys = {
-            "epoch",
-            "model_state_dict",
-            "loss_state_dict",
-            "optimizer_state_dict",
-            "scheduler_state_dict",
-            "history",
-        }
-        missing_keys = required_keys - set(checkpoint)
-        if missing_keys:
-            raise ValueError(
-                "checkpoint is missing keys: {}".format(
-                    sorted(missing_keys)
-                )
-            )
+        checkpoint = read_checkpoint(path, self.device)
 
         # Checkpoints written before model file format 2 have no model-level
         # density scale: recover it from the feature module (or from the LDA
@@ -665,11 +586,11 @@ class Trainer:
             ideal=getattr(self.model, "ideal", None),
         )
         self.model.load_state_dict(model_state, strict=True)
-        self.noise = _checkpoint_noise(checkpoint)
-        stream_noise = _checkpoint_stream_noise(checkpoint)
+        self.noise = checkpoint_noise(checkpoint)
+        stream_noise = checkpoint_stream_noise(checkpoint)
         for stream in self._streams:
             stream.noise = stream_noise.get(stream.name, NoiseOptions())
-        _load_loss_state(self.loss, checkpoint["loss_state_dict"], self.model)
+        load_loss_state(self.loss, checkpoint["loss_state_dict"], self.model)
         stream_loss_state = checkpoint.get("stream_loss_state_dict")
         if stream_loss_state is not None:
             expected_names = checkpoint.get("stream_names", [])
@@ -678,7 +599,7 @@ class Trainer:
                 raise ValueError(
                     "checkpoint stream names do not match configured streams"
                 )
-            _load_loss_state(self.stream_losses, stream_loss_state, self.model)
+            load_loss_state(self.stream_losses, stream_loss_state, self.model)
         elif self._streams:
             raise ValueError(
                 "checkpoint has no stream-loss state for configured streams"
@@ -697,78 +618,18 @@ class Trainer:
         if self.scheduler is not None:
             self.scheduler.load_state_dict(scheduler_state)
 
-        epoch = checkpoint["epoch"]
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
-            raise ValueError("checkpoint epoch must be a positive integer")
-        history = checkpoint["history"]
-        if not isinstance(history, list):
-            raise ValueError("checkpoint history must be a list")
-        history_epochs = [record.get("epoch") for record in history]
-        expected_epochs = list(range(1, epoch + 1))
-        if history_epochs not in (expected_epochs, [0] + expected_epochs):
-            raise ValueError(
-                "checkpoint history must contain epochs 1 through its "
-                "completed epoch, with at most one leading epoch 0 baseline"
-            )
-        self.history = history
+        (
+            epoch,
+            self.history,
+            self.best_valid_loss,
+            self.epochs_without_improvement,
+        ) = restore_history(checkpoint)
 
-        if "best_valid_loss" in checkpoint:
-            self.best_valid_loss = float(checkpoint["best_valid_loss"])
-        else:
-            self.best_valid_loss = min(
-                record["valid_losses"]["total"]
-                for record in history
-                if record["epoch"] > 0
-            )
-        if "epochs_without_improvement" in checkpoint:
-            self.epochs_without_improvement = int(
-                checkpoint["epochs_without_improvement"]
-            )
-        else:
-            best_loss = math.inf
-            epochs_without_improvement = 0
-            for record in history:
-                if record["epoch"] == 0:
-                    continue
-                valid_loss = record["valid_losses"]["total"]
-                if valid_loss < best_loss:
-                    best_loss = valid_loss
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
-            self.epochs_without_improvement = epochs_without_improvement
-
-        if checkpoint.get("torch_rng_state") is not None:
-            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
-        cuda_states = checkpoint.get("cuda_rng_state_all")
-        if cuda_states is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
-        loader_state = checkpoint.get("train_loader_generator_state")
-        if loader_state is not None:
-            if self._train_loader_generator is None:
-                raise ValueError(
-                    "checkpoint contains a train-loader random state, but the "
-                    "current loader has no generator"
-                )
-            self._train_loader_generator.set_state(loader_state.cpu())
-
-        stream_loader_states = checkpoint.get(
-            "stream_loader_generator_states",
-            {},
+        restore_random_state(
+            checkpoint,
+            self._train_loader_generator,
+            self._stream_loader_generators,
         )
-        for name, state in stream_loader_states.items():
-            if name not in self._stream_loader_generators:
-                raise ValueError(
-                    "checkpoint contains an unknown stream loader '{}'".format(name)
-                )
-            generator = self._stream_loader_generators[name]
-            if state is not None:
-                if generator is None:
-                    raise ValueError(
-                        "checkpoint contains a loader state for stream '{}', "
-                        "but its current loader has no generator".format(name)
-                    )
-                generator.set_state(state.cpu())
 
         for metric in self.metrics:
             for subset in metric.subsets:
