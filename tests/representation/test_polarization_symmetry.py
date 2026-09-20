@@ -8,7 +8,7 @@ from equicdft import FixedDipoleIdeal
 import torch
 
 from equicdft import (
-    BChiMessage, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
+    BChiMessage, CACEBranch, CartesianAFeatures, CartesianBFeatures, GridCACEModel, LDAReadout,
     LocalReadout, LongRangeReadout, ReciprocalFeatures,
 )
 from equicdft.geometry.stencil import get_neighbor_indices
@@ -41,7 +41,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         }
 
     @staticmethod
-    def model(backend, charge, message_count=0):
+    def model(backend, charge, message_count=0, independent_branches=False):
         a = CartesianAFeatures(
             max_power=1, mean_density=.5,
             include_polarization=True, separate_center=True, cutoff_grid=1,
@@ -73,7 +73,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 features=gaussian_features,
             ),
         ]
-        return GridCACEModel(
+        model = GridCACEModel(
             a, b, readouts, polarization_scale=.3, grid_spacing=.7, mean_temperature=1.5,
             ideal=FixedDipoleIdeal(1.0),
             compute_c1=True, compute_polarization_derivative=True,
@@ -85,6 +85,23 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             ) for _ in range(message_count)],
             boltzmann_constant=1.0,
         ).eval()
+        if independent_branches:
+            joint = CACEBranch(model.a_features, model.b_features, model.readout[0],
+                               message_layers=list(model.message_layers))
+            rho_a = CartesianAFeatures(
+                max_power=1, mean_density=.5, cutoff_grid=1, separate_center=True,
+                radial_basis="gaussian", radial_exponents=(.125,),
+                convolution_backend=backend,
+            )
+            rho_b = CartesianBFeatures(1, 2, separate_center=True)
+            rho = CACEBranch(rho_a, rho_b, LocalReadout(hidden_sizes=(5,)))
+            model = GridCACEModel(
+                readout=[joint, *list(model.readout[1:]), rho],
+                polarization_scale=.3, grid_spacing=.7, mean_temperature=1.5,
+                ideal=FixedDipoleIdeal(1.), compute_polarization_derivative=True,
+                boltzmann_constant=1.,
+            ).eval()
+        return model
 
     @staticmethod
     def evaluate(model, data):
@@ -112,11 +129,15 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         self.assertEqual(sum(round(np.linalg.det(r)) == 1 for r in actions), 24)
 
         # Neutral dipoles and a mixed charge/dipole source; both SR backends.
-        for backend, charge, messages in itertools.product(("gather", "fft"), (0., .7), (0, 1)):
-            with self.subTest(backend=backend, charge=charge, messages=messages):
-                full = self.model(backend, charge, messages)
+        for backend, charge, messages, independent in itertools.product(
+            ("gather", "fft"), (0., .7), (0, 1), (False, True),
+        ):
+            with self.subTest(backend=backend, charge=charge, messages=messages, independent=independent):
+                full = self.model(backend, charge, messages, independent)
                 models = {"complete": full}
                 branches = ("short_range", "LDA", "Coulomb_LR", "Gaussian_P")
+                if independent:
+                    branches += ("rho_only",)
                 for index, name in enumerate(branches):
                     branch = copy.deepcopy(full)
                     branch.readout = torch.nn.ModuleList([branch.readout[index]])
@@ -130,7 +151,10 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 # silently disabled (in particular, the LDA final layer).
                 for name in branches:
                     self.assertGreater(reference[name]["beta_F_exc"].abs().item(), 1e-8)
-                    self.assertGreater(reference[name]["polarization_derivative_excess"].abs().max().item(), 1e-8)
+                    if name == "rho_only":
+                        self.assertEqual(reference[name]["polarization_derivative_excess"].abs().max().item(), 0.)
+                    else:
+                        self.assertGreater(reference[name]["polarization_derivative_excess"].abs().max().item(), 1e-8)
                 for key in ("beta_F_exc", "c1", "polarization_derivative_excess"):
                     summed = sum(reference[name][key] for name in models if name != "complete")
                     torch.testing.assert_close(reference["complete"][key], summed,

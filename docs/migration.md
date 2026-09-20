@@ -8,7 +8,7 @@ model file format; this page covers the parts that need a decision from you.
 ## Model files
 
 Normal `load_model`, `read_model_config` and `build_model` accept only the
-current model format (4). Older files must be converted explicitly using the
+current model format (5). Older files must be converted explicitly using the
 installed, optional-use `equicdft.conversion` package:
 
 ```bash

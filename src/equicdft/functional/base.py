@@ -299,6 +299,9 @@ class EnergyReadout(nn.Module):
     requires_dipole_density = False
     # Learned readouts request normalization independently of physical P.
     requires_polarization_scale = False
+    # A local stencil is needed even when FFT avoids explicit neighbor rows.
+    # All configured stencils currently share one grid_info cutoff.
+    cutoff_grid: Optional[int] = None
     n_types: Optional[int] = None
 
     @property

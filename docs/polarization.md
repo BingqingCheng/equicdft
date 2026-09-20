@@ -130,6 +130,111 @@ Both must use the same floating-point dtype and device. Construct the remaining 
 
 The polarization toggle is fixed when constructing the model. With it enabled, every input must provide `dipole_density`.
 
+### Independent additive CACE branches
+
+Use `CACEBranch` when the density-only and joint density/polarization terms
+need **independent** A features, B features, message layers and neural readouts:
+
+$$
+\beta F = \beta F_{\mathrm{id}}
+ + \beta F_{\rho}[\rho]
+ + \beta F_{\mathrm{joint}}[\rho,\mathbf P]
+ + \beta F_{\mathrm{LDA}}[\rho,\mathbf P]
+ + \beta F_{\mathrm{LR}}[\rho,\mathbf P].
+$$
+
+Each branch returns only its scalar **excess** energy. The parent sums all
+excess readouts before differentiating, and adds the single model-owned ideal
+contribution. Density derivatives therefore include both branches; the
+density-only branch has exactly zero polarization derivative. The global LDA,
+Coulomb and any other LR terms are listed once, outside the branches.
+
+This builder is complete; physical reference values and any global LR
+readouts are explicit caller inputs. The example architecture uses p2/v3,
+one Gaussian radial channel and no messages by default. `radial_exponent`
+is in grid-coordinate units: for physical Gaussian width sigma and cubic
+spacing h, it is h²/(2 sigma²). These defaults are architecture choices,
+not universal physical constants.
+
+```python
+from equicdft import (
+    BChiMessage, CACEBranch, CartesianAFeatures, CartesianBFeatures,
+    FixedDipoleIdeal, GridCACEModel, LDAReadout, LocalReadout,
+)
+
+
+def build_additive_model(
+    *, density_reference, polarization_scale, dipole_magnitude,
+    grid_spacing, temperature_reference, boltzmann_constant,
+    global_readouts=(), n_types=1, cutoff_grid=3,
+    max_power=2, max_product_order=3, radial_exponent=0.125,
+    message_count=0, hidden_sizes=(16, 8),
+):
+    def branch(include_polarization):
+        a = CartesianAFeatures(
+            n_types=n_types, mean_density=density_reference,
+            cutoff_grid=cutoff_grid, max_power=max_power,
+            include_polarization=include_polarization, separate_center=True,
+            coordinate_scaling="cutoff", convolution_backend="fft",
+            radial_basis="gaussian", radial_exponents=(radial_exponent,),
+            radial_centers=(0.0,), trainable_radial_exponents=True,
+            trainable_radial_centers=False,
+        )
+        b = CartesianBFeatures(
+            max_power=max_power, max_product_order=max_product_order,
+            include_polarization=include_polarization, separate_center=True,
+        )
+        messages = [BChiMessage(
+            b.n_features, a.n_radial_channels, a.n_output_channels,
+            hidden_sizes=hidden_sizes, include_polarization=include_polarization,
+            convolution_backend="fft",
+        ) for _ in range(message_count)]
+        return CACEBranch(
+            a, b, LocalReadout(n_types=n_types, hidden_sizes=hidden_sizes),
+            message_layers=messages,
+        )
+
+    return GridCACEModel(
+        readout=[
+            branch(False), branch(True),
+            LDAReadout(n_types=n_types, include_polarization=True,
+                       hidden_sizes=hidden_sizes, zero_init=True),
+            *global_readouts,
+        ],
+        ideal=FixedDipoleIdeal(dipole_magnitude),
+        mean_density=density_reference, polarization_scale=polarization_scale,
+        grid_spacing=grid_spacing, mean_temperature=temperature_reference,
+        boltzmann_constant=boltzmann_constant,
+        compute_c1=True, compute_polarization_derivative=True,
+    )
+```
+
+Use ordinary global `LongRangeReadout` instances in `global_readouts`; do not
+wrap them or the ideal term in a CACE branch. To fit local chemical potentials,
+also enable the model's `compute_local_mu` and choose `rho_min` as described
+in the fitting section. The branch API changes neither losses nor physical
+units. There is no automatic coupling between branch parameters: construct
+fresh A/B/message/readout modules for each branch.
+
+All branches currently share one grid cutoff, species count and density
+normalization; inconsistent settings raise at model construction. The single
+model `polarization_scale` is passed to every polarized branch and LDA. Only
+gather-based pipelines need explicit neighbor indices. Local readouts are
+bound to their own feature widths at construction, before making an optimizer.
+
+The original `GridCACEModel(a_features=..., b_features=..., readout=[...])`
+syntax remains supported, including its state-dictionary paths. Its ordinary
+local readouts share one feature vector; it may coexist with independent
+`CACEBranch` readouts. `model.has_local_features` and `model.n_local_features`
+describe that top-level shared pipeline, not the branch pipelines.
+Existing format-5 models need no conversion; older formats still use the
+explicit converter. New branch models use the same config/state format and
+require a package version that knows `CACEBranch`.
+
+The joint branch also contains pure-density invariants. This decomposition
+does **not** enforce `F_joint(rho, 0) = 0` and is not a unique separation of
+physical contributions; only the total energy and its derivatives are fitted.
+
 ## 2. What polarization density means
 
 Write the molecular number density as $\rho(\mathbf{r})$ and the electric dipole density as $\mathbf{P}(\mathbf{r})$.

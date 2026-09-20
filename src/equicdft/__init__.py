@@ -4,6 +4,7 @@ from ._version import __version__
 from .data.grid_data import GridData, GridDataset, default_data_key, read_metal_sites
 from .data.loaders import make_dataloaders
 from .functional.base import EnergyReadout
+from .functional.cace import CACEBranch
 from .functional.ideal import IdealGas, IdealReference
 from .functional.metalwall import MetalWall
 from .functional.pairwise import PairwiseReadout
@@ -37,6 +38,7 @@ __all__ = [
     "__version__",
     "CartesianAFeatures",
     "CartesianBFeatures",
+    "CACEBranch",
     "BulkReadout",
     "BChiMessage",
     "GridData",
