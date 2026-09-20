@@ -52,7 +52,7 @@ class TestChemicalPotential(unittest.TestCase):
     def loss():
         return Loss([TensorLoss(
             "beta_mu_local", "beta_mu_local", "beta_mu_average",
-            weights_key="beta_mu_weights",
+            weights_key="voxel_weights",
         )])
 
     def test_total_derivative_and_separate_field_species_means(self):
@@ -71,7 +71,7 @@ class TestChemicalPotential(unittest.TestCase):
                 self.assertNotIn("average_chemical_potential", output)
                 self.assertNotIn("chemical_potential_weights", output)
                 self.assertIn("c1", output)  # requested automatically despite compute_c1=False
-                self.assertFalse(output["beta_mu_weights"].requires_grad)
+                self.assertFalse(output["voxel_weights"].requires_grad)
 
     def test_mask_exclusions_and_explicit_weights(self):
         model, data = self.model(), self.data()
@@ -83,11 +83,11 @@ class TestChemicalPotential(unittest.TestCase):
         data["valid"][:, 2] = False
         weights = torch.ones_like(data["rho"])
         weights[:, 3] = .3
-        data["beta_mu_weights"] = weights.requires_grad_()
+        data["voxel_weights"] = weights.requires_grad_()
         output = model(data)
         expected = weights.detach().clone()
         expected[:, [0, 2]] = 0
-        torch.testing.assert_close(output["beta_mu_weights"], expected)
+        torch.testing.assert_close(output["voxel_weights"], expected)
         self.assertTrue(torch.isfinite(output["beta_mu_local"]).all())
         self.assertTrue((output["beta_mu_local"][:, [0, 2]] == 0).all())
         self.loss()(output, data)["total"].backward()
@@ -108,19 +108,19 @@ class TestChemicalPotential(unittest.TestCase):
                 self.model(rho_min=value)
         for bad in (torch.ones(2), torch.full_like(data["rho"], -1.),
                     torch.full_like(data["rho"], float("nan"))):
-            with self.assertRaisesRegex(ValueError, "beta_mu_weights"):
-                model(dict(data, beta_mu_weights=bad))
+            with self.assertRaisesRegex(ValueError, "voxel_weights"):
+                model(dict(data, voxel_weights=bad))
         weights = torch.ones_like(data["rho"])
         weights[0, :, 1] = 0
         with self.assertRaisesRegex(ValueError, "every field/species"):
-            model(dict(data, beta_mu_weights=weights))
+            model(dict(data, voxel_weights=weights))
         with self.assertRaisesRegex(ValueError, "V_ext must be finite"):
             model(dict(data, V_ext=torch.full_like(data["rho"], float("nan"))))
         vacuum = copy.deepcopy(data)
         vacuum["rho"].detach_()
         vacuum["rho"][:, 0] = 0
         with self.assertRaisesRegex(ValueError, "vacuum"):
-            model(dict(vacuum, beta_mu_weights=torch.ones_like(data["rho"])))
+            model(dict(vacuum, voxel_weights=torch.ones_like(data["rho"])))
 
     def test_external_shift_changes_only_diagnostics_and_not_the_loss(self):
         model, data = self.model(True), self.data(True)
@@ -142,7 +142,7 @@ class TestChemicalPotential(unittest.TestCase):
             actual = self.loss()(output, data)["total"]
             data["target"] = -data["V_ext"] / data["temperature"][:, None, None]
             expected = TensorLoss("rho", "density_derivative", "target", center_axis=-2,
-                                  weights_key="beta_mu_weights")(output, data)
+                                  weights_key="voxel_weights")(output, data)
             torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
             parameters = tuple(model.parameters())
             for left, right in zip(torch.autograd.grad(actual, parameters, retain_graph=True),
@@ -159,7 +159,7 @@ class TestChemicalPotential(unittest.TestCase):
             if polarized:
                 batch["dipole_density"].zero_()
                 batch["dipole_density_std"] = torch.zeros_like(batch["dipole_density"])
-            original = model.beta_mu_weights(batch)
+            original = model.voxel_weights(batch)
             trainer = Trainer(model, self.loss(), device="cpu")
             def draws(value):
                 return torch.tensor([1., -1., 1., -1.]).reshape_as(value) if polarized else torch.where(
@@ -167,16 +167,16 @@ class TestChemicalPotential(unittest.TestCase):
             with patch("torch.randn_like", side_effect=draws):
                 noisy, output, losses, _ = trainer._forward_loss(
                     batch, trainer.loss, noise=NoiseOptions(density=True, density_floor=.01))
-            torch.testing.assert_close(output["beta_mu_weights"], original)
+            torch.testing.assert_close(output["voxel_weights"], original)
             self.assertTrue((noisy["rho"][:, 1, 0] > .15).all())
             self.assertTrue((noisy["rho"][:, 3, 0] < .15).all())
             expected = (output["density_derivative"] + noisy["V_ext"] / noisy["temperature"][:, None, None])
             torch.testing.assert_close(output["beta_mu_average"],
                                        (expected * original).sum(-2) / original.sum(-2))
-            self.assertNotIn("beta_mu_weights", batch)
+            self.assertNotIn("voxel_weights", batch)
             noisy["target"] = -noisy["V_ext"] / noisy["temperature"][:, None, None]
             centered = TensorLoss("rho", "density_derivative", "target", center_axis=-2,
-                                  weights_key="beta_mu_weights")(output, noisy)
+                                  weights_key="voxel_weights")(output, noisy)
             torch.testing.assert_close(losses["total"], centered, rtol=1e-12, atol=1e-12)
             parameters = tuple(model.parameters())
             for left, right in zip(torch.autograd.grad(losses["total"], parameters, retain_graph=True),
@@ -215,7 +215,7 @@ class TestChemicalPotential(unittest.TestCase):
             self.assertNotIn("beta_mu_local", energy)
             for derivatives in (False, True):
                 output = GridSolver(model).evaluate(data, compute_derivatives=derivatives)
-                self.assertNotIn("beta_mu_weights", output)
+                self.assertNotIn("voxel_weights", output)
                 self.assertNotIn("beta_mu_average", output)
                 if derivatives:
                     torch.testing.assert_close(output["beta_mu_local"],
@@ -226,7 +226,7 @@ class TestChemicalPotential(unittest.TestCase):
         model, data = self.model(), self.data()
         output = model(data)
         metric = Metrics("beta_mu_average", prediction_key="beta_mu_local",
-                         selection_mask_key="beta_mu_weights")
+                         selection_mask_key="voxel_weights")
         actual = metric(output, data)
         expected = self.loss()(output, data)["total"].sqrt()
         torch.testing.assert_close(actual["rmse"], expected)

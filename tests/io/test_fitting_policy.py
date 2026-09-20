@@ -26,20 +26,19 @@ class TestFittingPolicyConversion(unittest.TestCase):
         for key, expected in model.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[key], expected, rtol=0, atol=0)
         # The policy travels with the file; compare the full physical
-        # functional independently of its selected fitting ideal. Disabling
-        # mu diagnostics alone intentionally no longer disables ideal masking.
+        # functional independently of its fitting selection. Ordinary forwards
+        # now evaluate full energy; fitting masking is explicitly requested.
         self.assertTrue(restored.compute_local_mu)
         self.assertEqual(restored.rho_min, .123)
         data = grid_data()
-        expected = model(dict(data), compute_local_mu=False, apply_ideal_mask=False)
-        actual = restored(dict(data), compute_local_mu=False, apply_ideal_mask=False)
+        expected = model(dict(data), compute_local_mu=False)
+        actual = restored(dict(data), compute_local_mu=False)
         self.assertEqual(set(expected), set(actual))
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
-        selected = restored(dict(data), compute_local_mu=False)
+        selected = restored(dict(data), compute_local_mu=False, use_voxel_mask=True)
         torch.testing.assert_close(selected["ideal_derivative_mask"], data["rho"] > .123)
-        for key in ("beta_F_exc", "c1"):
-            torch.testing.assert_close(selected[key], expected[key], rtol=0, atol=0)
+        self.assertFalse(torch.equal(selected["beta_F_exc"], expected["beta_F_exc"]))
 
     def test_whole_object_upgrade_keeps_the_fitting_policy(self):
         model = example_model()

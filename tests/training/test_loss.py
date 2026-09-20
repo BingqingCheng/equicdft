@@ -196,7 +196,7 @@ class TestWeightedTensorLoss(unittest.TestCase):
             "beta_mu_average": local[:, [0, 1, 3], :].mean(
                 dim=-2
             ),
-            "beta_mu_weights": (rho > 0.5).to(rho.dtype),
+            "voxel_weights": (rho > 0.5).to(rho.dtype),
         }
         return outputs, {}
 
@@ -206,7 +206,7 @@ class TestWeightedTensorLoss(unittest.TestCase):
             name="beta_mu_local",
             prediction_key="beta_mu_local",
             target_key="beta_mu_average",
-            weights_key="beta_mu_weights",
+            weights_key="voxel_weights",
         )
 
     def test_unknown_mu_is_masked_spatial_mean(self):
@@ -224,7 +224,7 @@ class TestWeightedTensorLoss(unittest.TestCase):
             name="beta_mu_local",
             prediction_key="beta_mu_local",
             target_key="beta_mu",
-            weights_key="beta_mu_weights",
+            weights_key="voxel_weights",
         )(outputs, {"beta_mu": torch.tensor([[2.0]])})
         self.assertAlmostEqual(loss.item(), 11.0 / 3.0, places=6)
 
@@ -236,14 +236,14 @@ class TestWeightedTensorLoss(unittest.TestCase):
         outputs = {
             "beta_mu_local": prediction,
             "beta_mu_average": torch.tensor([[2.0], [5.0]]),
-            "beta_mu_weights": torch.ones_like(prediction),
+            "voxel_weights": torch.ones_like(prediction),
         }
         batch = {"beta_mu": torch.tensor([[float("nan")], [4.0]])}
         term = TensorLoss(
             name="beta_mu_local",
             prediction_key="beta_mu_local",
             target_key=("beta_mu", "beta_mu_average"),
-            weights_key="beta_mu_weights",
+            weights_key="voxel_weights",
         )
         loss = term(outputs, batch)
         loss.backward()
@@ -273,7 +273,7 @@ class TestWeightedTensorLoss(unittest.TestCase):
 
     def test_zero_total_element_weight_is_rejected(self):
         outputs, batch = self._example()
-        outputs["beta_mu_weights"].zero_()
+        outputs["voxel_weights"].zero_()
         with self.assertRaisesRegex(ValueError, "positive sum"):
             self._loss()(outputs, batch)
 

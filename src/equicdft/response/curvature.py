@@ -86,6 +86,10 @@ def _symmetric_energy_difference(
     # These probes conserve each component's particle number, so the
     # thermal-wavelength term is linear and has zero projected curvature.
     thermal_wavelength = rho.new_ones(rho.shape[-1])
+    if "local_energy_mask" in outputs:
+        # A field loss may have supplied a masked fitting forward. Reference
+        # and displaced energies must use the same full excess functional.
+        outputs = _energy_only_model(model, dict(batch, rho=rho))
     reference_energy = (
         ideal_free_energy(rho, thermal_wavelength, volume_element)
         + outputs["beta_F_exc"]
@@ -380,6 +384,11 @@ def _polarization_excess_energy_difference(
 ):
     """Return excess-energy central differences for polarization probes."""
 
+    if "local_energy_mask" in outputs:
+        outputs = _energy_only_model(
+            model, dict(batch, rho=rho, dipole_density=polarization),
+        )
+
     delta = relative_amplitude[..., None, None, None] * directions
     plus = polarization[:, None] + delta
     minus = polarization[:, None] - delta
@@ -411,6 +420,8 @@ def _energy_only_model(model, batch):
     """Evaluate energy without optional response derivatives."""
 
     kwargs = {"compute_c1": False}
+    if hasattr(model, "voxel_weights"):
+        kwargs["use_voxel_mask"] = False
     if hasattr(model, "compute_local_mu"):
         kwargs["compute_local_mu"] = False
     if hasattr(model, "ideal"):

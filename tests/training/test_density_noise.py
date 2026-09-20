@@ -242,7 +242,7 @@ class TestDensityNoise(unittest.TestCase):
             noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4},
             device='cpu')
         t.fit(DataLoader(fields), DataLoader(fields), epochs=1, verbose=False)
-        outputs = model(dict(fields[0]))
+        outputs = model(dict(fields[0]), use_voxel_mask=True)
         self.assertFalse(outputs['ideal_derivative_mask'].any())
         self.assertEqual(float(outputs['beta_F_id'].detach()), 0.)
 

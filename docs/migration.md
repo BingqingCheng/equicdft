@@ -94,7 +94,7 @@ The explicit physical fitting interface is restored as an opt-in:
 `GridCACEModel(..., compute_local_mu=True, rho_min=...)`. The model returns
 `beta_mu_local` (total density derivative plus beta V), its weighted
 per-field/per-species `beta_mu_average`, and
-`beta_mu_weights`. Both chemical potentials are dimensionless beta mu.
+`voxel_weights`. Both chemical potentials are dimensionless beta mu.
 Use those keys with ordinary `TensorLoss` and `Metrics`; no custom loss or
 trainer output transform is needed. The intrinsic energy remains independent
 of V. Local-mu evaluation requests the total density derivative automatically.
@@ -111,7 +111,7 @@ evaluation. Missing V raises when diagnostics are requested, as does
 fitting diagnostics independently of the saved defaults.
 
 The cutoff and optional `valid`/exclusion masks define weights unless explicit
-input `beta_mu_weights` provide the fixed selection. SEM training
+input `voxel_weights` provide the fixed selection. SEM training
 freezes the original selection before noise, then recalculates local and mean
 chemical potentials on the perturbed fields. A selected noisy vacuum raises;
 set a positive `NoiseOptions.density_floor` when needed. Every field/species
@@ -123,22 +123,41 @@ and R² normalization differs from comparison against mean chemical potentials.
 
 ## Solver evaluation
 
-### Ideal selection during fitting versus solving
+### Explicit voxel selection during fitting
 
-Ordinary model forwards now restrict the ideal to `model.ideal_mask(data)`:
-rho above `rho_min`, or positive explicit `beta_mu_weights`, intersected with
-`valid` and nonexcluded voxels. Both translational and orientational ideal
-terms are zero outside the selection. Unphysical fixed-dipole alignment there
-is ignored by the ideal only; active entries remain strictly checked. No rho/P
-projection or change to excess-feature inputs occurs. This is a deliberate
-change to masked ideal/total outputs, not to fitted excess functions.
+`model(data)` now evaluates the full physical intrinsic functional. Use
+`model(data, use_voxel_mask=True)` for fitting: omit ideal/LDA/CACE-centered
+energy outside `model.voxel_weights(data) > 0`, retaining original rho/P in
+all descriptors and full Coulomb/Gaussian LR. Masked centers can have nonzero
+excess derivatives through neighboring or LR contributions. Bulk, pairwise
+and GGA readouts remain full; this is not a generic mask on every readout.
 
-`model(data, apply_ideal_mask=False)` restores full physical ideal evaluation.
-`GridSolver` requests this automatically, preserving its previous physics and
-ignoring fitting masks. Merely disabling `compute_local_mu` does not disable
-ideal masking. No format/config/state migration is required; the new switch
-is per-forward. Standalone `IdealReference.evaluate(..., mask=None)` retains
-its former full-domain default; an explicit mask is Boolean with rho's shape.
+Rename the input/output/loss key `beta_mu_weights` to `voxel_weights` and use
+the single public `model.voxel_weights(data)` method instead of
+`beta_mu_weights()`, `density_weights()` or `ideal_mask()`. Nonnegative
+fractional weights are preserved for averages/losses; only their positive
+support selects local energy. Empty selections are valid except when computing
+a chemical-potential average. `beta_mu_local` and `beta_mu_average` are unchanged.
+
+The old `apply_ideal_mask` switch is removed. `use_voxel_mask` defaults to
+False and is not a serialized model setting. Merely supplying voxel weights
+does not mask energy. `Trainer` defaults to True for models exposing the weight
+method and freezes weights before SEM; direct fitting, scoring and parity calls
+must now opt in explicitly. A `TrainingStream` can override this default via
+`model_kwargs={"use_voxel_mask": False}`.
+
+This deliberately changes masked *excess* energy and its derivatives compared
+with the former ideal-only mask. It is a new fitting objective, not a
+loss-preserving script rename; do not resume an old campaign silently. Full
+physical evaluation and solves retain their previous functional. Converted
+models retain their parameters and saved rho_min; no model format/state
+migration is required. Historical executed scripts must retain their pinned
+source, with application API changes made in a new copy.
+
+Solvers use full energy. Fourier stability retains its existing ideal reference
+formulas and full excess energy, recomputing the full central energy if supplied
+a masked forward. Standalone `IdealReference.evaluate(..., mask=None)` is
+unchanged, and still accepts its optional Boolean ideal-only mask.
 
 `solver.evaluate(data, compute_derivatives=True)` replaces the old
 `compute_c1` keyword, and overrides the model's derivative defaults;

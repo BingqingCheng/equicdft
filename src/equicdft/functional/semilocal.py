@@ -24,7 +24,6 @@ from .._nn import (
     validate_hidden_sizes,
 )
 from .base import EnergyReadout, ReadoutContext
-from .thermodynamics import density_weighted_integral
 
 __all__ = [
     "LDAReadout",
@@ -164,11 +163,7 @@ class LDAReadout(EnergyReadout, Configurable):
                 "LDAReadout must return one scalar per grid point"
             )
         per_particle = scalar_per_particle.expand_as(rho)
-        return density_weighted_integral(
-            rho,
-            per_particle,
-            context.voxel_volume,
-        )
+        return context.integrate_local(per_particle)
 
 
 @register

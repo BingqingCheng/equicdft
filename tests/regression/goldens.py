@@ -672,6 +672,9 @@ def compare(
     retired = {"solve/beta_mu_average", "solve/beta_mu_weights"}
     recorded = {k: v for k, v in recorded.items()
                 if k in actual or k not in retired}
+    # Public fitting-weight rename only: compare the original tensor values,
+    # without rewriting the golden archive or changing any tolerance.
+    recorded = _rename_recorded(recorded, {"beta_mu_weights": "voxel_weights"})
     if "state/thermal_wavelength" in recorded and "state/ideal.thermal_wavelength" in actual:
         actual["state/thermal_wavelength"] = actual.pop("state/ideal.thermal_wavelength")
     added_outputs = {"beta_F_id", "beta_F", "ideal_derivative_mask",

@@ -206,7 +206,7 @@ def main():
                 name="beta_mu_local",
                 prediction_key="beta_mu_local",
                 target_key="beta_mu_average",
-                weights_key="beta_mu_weights",
+                weights_key="voxel_weights",
             )
         ]
     )
@@ -216,7 +216,7 @@ def main():
             prediction_key="beta_mu_local",
             target_key="beta_mu_average",
             metric_keys=("mae", "rmse", "rmse_percent", "r2"),
-            selection_mask_key="beta_mu_weights",
+            selection_mask_key="voxel_weights",
         )
     ]
 

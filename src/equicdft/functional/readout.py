@@ -150,11 +150,7 @@ class LocalReadout(EnergyReadout, Configurable):
             raise ValueError(
                 "LocalReadout must return one value per grid and type"
             )
-        return density_weighted_integral(
-            rho,
-            per_particle,
-            context.voxel_volume,
-        )
+        return context.integrate_local(per_particle)
 
 
 @register

@@ -18,6 +18,7 @@ from ..geometry.grid import (
     grid_spacing_tensor,
     voxel_volume as compute_voxel_volume,
 )
+from .thermodynamics import density_weighted_integral
 
 __all__ = [
     "FREE_ENERGY_MODES",
@@ -71,6 +72,9 @@ class ReadoutContext:
         separates the central grid point from its neighbor moments.
     dipole_density
         Independent polar vector field ``[..., n_grid, n_types, 3]``.
+    local_energy_mask
+        Optional Boolean selection shaped like rho. Selects ideal/LDA/CACE
+        energy centers, never descriptor inputs or long-range source fields.
     local_density_index, grid_positions, grid_center, excluded_mask
         Grid geometry passed through from the batch when available.
     """
@@ -92,6 +96,7 @@ class ReadoutContext:
     grid_positions: Optional[torch.Tensor] = None
     grid_center: Optional[torch.Tensor] = None
     excluded_mask: Optional[torch.Tensor] = None
+    local_energy_mask: Optional[torch.Tensor] = None
     _cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, init=False, repr=False,
     )
@@ -123,6 +128,16 @@ class ReadoutContext:
             self.mean_density = scale.reshape(())
         if self.free_energy_mode not in FREE_ENERGY_MODES:
             raise ValueError("free_energy_mode must be 'beta' or 'physical'")
+
+    def integrate_local(self, per_particle: torch.Tensor) -> torch.Tensor:
+        """Integrate selected local energy centers, preserving all inputs."""
+        rho = self.rho
+        mask = self.local_energy_mask
+        if mask is not None:
+            if mask.dtype != torch.bool or mask.shape != rho.shape:
+                raise ValueError("local_energy_mask must be Boolean with rho's shape")
+            rho = torch.where(mask.detach(), rho, torch.zeros_like(rho))
+        return density_weighted_integral(rho, per_particle, self.voxel_volume)
 
     @classmethod
     def from_data(

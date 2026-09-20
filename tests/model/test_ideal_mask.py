@@ -1,4 +1,4 @@
-"""Masked ideal evaluation without changing excess inputs or solver physics."""
+"""Explicitly masked ideal evaluation, with unchanged inputs and full solves."""
 
 import copy
 import unittest
@@ -87,14 +87,14 @@ class TestIdealMask(unittest.TestCase):
         expected[[2, 3]] = False
         data["dipole_density"][~expected] = 10.
         batch = {key: torch.stack((value, value)) for key, value in data.items()}
-        output = model(batch)
-        torch.testing.assert_close(model.ideal_mask(batch), expected.expand(2, -1, -1))
+        output = model(batch, use_voxel_mask=True)
+        torch.testing.assert_close(model.voxel_weights(batch) > 0, expected.expand(2, -1, -1))
         torch.testing.assert_close(output["ideal_derivative_mask"], expected.expand(2, -1, -1))
         for key in ("ideal_density_derivative", "ideal_polarization_derivative"):
             self.assertEqual(output[key][:, ~expected].abs().max().item(), 0.)
         data["dipole_density"][4] = 10.
         with self.assertRaisesRegex(ValueError, "fixed dipoles"):
-            model(data)
+            model(data, use_voxel_mask=True)
 
     def test_scalar_mask_and_empty_selection(self):
         for polarized in (False, True):
@@ -102,15 +102,15 @@ class TestIdealMask(unittest.TestCase):
             data["rho"][0] = 1e-5
             if polarized:
                 data["dipole_density"][0] = 10.
-            output = model(data)
+            output = model(data, use_voxel_mask=True)
             self.assertEqual(output["ideal_density_derivative"][0].abs().max().item(), 0.)
             model.rho_min = 100.
-            empty = model(data)
+            empty = model(data, use_voxel_mask=True)
             self.assertEqual(empty["beta_F_id"].item(), 0.)
             self.assertEqual(empty["ideal_density_derivative"].abs().max().item(), 0.)
             self.assertFalse(empty["ideal_derivative_mask"].any())
             with self.assertRaisesRegex(ValueError, "positive weight"):
-                model(data, compute_local_mu=True)
+                model(data, compute_local_mu=True, use_voxel_mask=True)
 
     def test_explicit_weights_freeze_selection_without_weighting_energy(self):
         model, data = self.model(), self.data()
@@ -119,12 +119,12 @@ class TestIdealMask(unittest.TestCase):
         weights = torch.ones_like(data["rho"])
         weights[1] = 0.
         data["dipole_density"][1] = 10.
-        data["beta_mu_weights"] = weights
-        output = model(data, compute_local_mu=True)
+        data["voxel_weights"] = weights
+        output = model(data, compute_local_mu=True, use_voxel_mask=True)
         self.assertTrue(output["ideal_derivative_mask"][0].all())
         self.assertFalse(output["ideal_derivative_mask"][1].any())
-        data["beta_mu_weights"] = 2.3 * weights
-        scaled = model(data, compute_local_mu=True)
+        data["voxel_weights"] = 2.3 * weights
+        scaled = model(data, compute_local_mu=True, use_voxel_mask=True)
         for key in ("beta_F_id", "ideal_density_derivative", "ideal_polarization_derivative"):
             torch.testing.assert_close(output[key], scaled[key], atol=0, rtol=0)
 
@@ -136,8 +136,8 @@ class TestIdealMask(unittest.TestCase):
         data["rho"][0] = 1e-5
         data["dipole_density"][0] = 1.
         original = copy.deepcopy(data)
-        excess = model(copy.deepcopy(data), compute_ideal=False)
-        output = model(data)
+        excess = model(copy.deepcopy(data), compute_ideal=False, use_voxel_mask=True)
+        output = model(data, use_voxel_mask=True)
         for key in ("beta_F_exc", "c1", "polarization_derivative_excess"):
             torch.testing.assert_close(output[key], excess[key], atol=0, rtol=0)
         for key, value in original.items():
@@ -146,7 +146,7 @@ class TestIdealMask(unittest.TestCase):
         for gradient, key in zip(gradients, ("density_derivative", "polarization_derivative")):
             torch.testing.assert_close(gradient / model.voxel_volume, output[key])
         with self.assertRaisesRegex(ValueError, "fixed dipoles"):
-            model(copy.deepcopy(original), apply_ideal_mask=False)
+            model(copy.deepcopy(original), use_voxel_mask=False)
 
     def test_solver_evaluation_and_updates_ignore_fitting_masks(self):
         for polarized in (False, True):
@@ -154,10 +154,10 @@ class TestIdealMask(unittest.TestCase):
             masked_model = self.model(polarized, rho_min=100.)
             data = self.data(polarized)
             masked_data = dict(data, valid=torch.zeros(8, dtype=torch.bool),
-                               beta_mu_weights=torch.zeros_like(data["rho"]))
-            self.assertEqual(masked_model(copy.deepcopy(masked_data))["beta_F_id"].item(), 0.)
+                               voxel_weights=torch.zeros_like(data["rho"]))
+            self.assertEqual(masked_model(copy.deepcopy(masked_data), use_voxel_mask=True)["beta_F_id"].item(), 0.)
             expected = reference_model(copy.deepcopy(data))
-            full = masked_model(copy.deepcopy(masked_data), apply_ideal_mask=False)
+            full = masked_model(copy.deepcopy(masked_data), use_voxel_mask=False)
             for key in expected:
                 torch.testing.assert_close(full[key], expected[key], atol=0, rtol=0)
             reference, masked = GridSolver(reference_model), GridSolver(masked_model)
@@ -187,9 +187,9 @@ class TestIdealMask(unittest.TestCase):
                 ideal.evaluate(data, 1., mask=mask)
         for key in ("valid", "excluded_mask"):
             with self.assertRaisesRegex(ValueError, key):
-                self.model()(dict(data, **{key: torch.ones(8)}))
-        with self.assertRaisesRegex((ValueError, TypeError), "apply_ideal_mask"):
-            self.model()(data, apply_ideal_mask="yes")
+                self.model()(dict(data, **{key: torch.ones(8)}), use_voxel_mask=True)
+        with self.assertRaisesRegex((ValueError, TypeError), "use_voxel_mask"):
+            self.model()(data, use_voxel_mask="yes")
         # Masking does not legalize nonfinite fields or nonzero hard-wall rho.
         data = self.data()
         mask = torch.zeros_like(data["rho"], dtype=torch.bool)

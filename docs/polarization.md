@@ -788,50 +788,56 @@ Exact vacuum with zero polarization has zero energy; returned ideal derivatives
 there are zero placeholders, marked by `ideal_derivative_mask=False`, not
 finite physical vacuum derivatives.
 
-Ordinary `model(data)` evaluation applies the **model-owned ideal mask**:
-`rho > model.rho_min`, intersected with `valid` and nonexcluded voxels. When
-explicit `beta_mu_weights` are present, their positive entries replace the
-density cutoff, preserving the original selection during SEM augmentation.
-Their magnitudes do not weight the energy. The selection is per species;
-`valid` and `excluded_mask` are per voxel.
+Ordinary `model(data)` evaluates the **full physical intrinsic functional**.
+For fitting, use `model(data, use_voxel_mask=True)`. This selects ideal,
+LDA and CACE-centered energy contributions using
+`model.voxel_weights(data) > 0`: normally `rho > model.rho_min`,
+intersected with `valid` and nonexcluded voxels. Explicit
+`data["voxel_weights"]` replace the cutoff with their positive support.
+Weights have rho's shape, including species. Their magnitudes weight fitting
+averages and losses, **not energy**. `valid` and `excluded_mask` are per voxel.
 
-Masked entries contribute zero **whole ideal** energy (translational and
-orientational) and zero ideal derivatives. The fixed-dipole domain condition
-is enforced only on selected positive-density entries. Thus a finite but
-unphysical P at a discarded low-density voxel does not prevent training.
-`ideal_derivative_mask` identifies the entries actually evaluated. An empty
-ideal selection is allowed, although chemical-potential averaging still
-requires positive weight for every field/species.
+The original rho/P arrays remain unchanged in descriptors, messages, LDA
+inputs and all long-range sources. Masked voxels still influence CACE
+contributions centered on retained neighbors, with gradients intact. Coulomb
+and Gaussian LR always use the full fields. Bulk, pairwise and GGA readouts
+are not selected by this ideal/LDA/CACE policy.
 
-Only internal arguments to the ideal reference use safe placeholders. The
-original rho/P arrays are neither projected nor zeroed: CACE, LDA, Coulomb
-and all other excess readouts see the original fields and retain their full
-contributions/derivatives. Finite-field, shape and dtype checks still apply;
-hard-wall `excluded_mask` still requires zero density.
+Masked entries contribute zero whole ideal energy (translation and orientation)
+and zero ideal derivatives. The fixed-dipole domain condition applies to
+selected positive-density entries. A finite but unphysical P at an omitted
+center is ignored by the ideal, not projected out of other inputs. Global
+finite-field, shape/dtype and hard-wall density checks still apply.
+An empty energy selection is allowed; chemical-potential averages require
+positive weight for every field/species.
 
-For **full physical thermodynamics**, use
-`model(data, apply_ideal_mask=False)`. `GridSolver.evaluate` and both solve
-methods do this automatically, ignoring fitting masks and retaining strict
-physical ideal/domain checks (including zero rho/P at hard walls). This keeps
-analytic Euler updates, minimization objectives and residuals consistent.
-The masked training energy is not used as a solver objective: switching ideal
-terms on at a density cutoff would introduce a discontinuity. Away from mask
-boundaries, masked-model derivatives are derivatives of the masked energy with
-the selection held fixed.
+The returned `local_energy_mask` identifies a masked fitting forward;
+`ideal_derivative_mask` additionally excludes exact vacuum. Total/excess
+derivatives at omitted centers can be nonzero through neighboring and LR
+contributions. They are derivatives of the selected scalar energy with its
+selection held fixed, not post-hoc masked derivatives.
 
-Standalone `ideal.evaluate(data, voxel_volume, mask=mask)` accepts an optional
-Boolean tensor with rho's full shape, including species. Its default
-`mask=None` retains full physical ideal evaluation. `ideal.local(...)` is
-unchanged and always enforces its finite-interior domain. The model exposes
-`model.ideal_mask(data)` for inspecting its selection. Masks affect the ideal
-whether or not chemical-potential diagnostics are enabled; use
-`apply_ideal_mask=False`, not just `compute_local_mu=False`, to bypass them.
+`Trainer` requests `use_voxel_mask=True` for models exposing
+`voxel_weights`, for both training and validation. It freezes weights before
+SEM augmentation; local chemical potentials and their weighted mean are
+recomputed from the perturbed fields. A `TrainingStream` can explicitly set
+`model_kwargs={"use_voxel_mask": False}` for full-functional fitting.
+Standalone augmentation callers must freeze the weights themselves.
+Merely putting weights in the input does not mask an ordinary model forward.
+
+`GridSolver` uses full physical evaluation, ignoring fitting selections and
+retaining strict physical ideal/domain checks (including zero rho/P at hard
+walls). It never minimizes an energy with density-threshold switches.
+
+Standalone `ideal.evaluate(data, voxel_volume, mask=mask)` retains its
+optional Boolean ideal-only mask. Its default `mask=None` and
+`ideal.local(...)` remain full physical ideal evaluation.
 
 For normal evaluation, the model returns:
 
 | Output | Meaning |
 | --- | --- |
-| `beta_F_id`, `beta_F_exc`, `beta_F` | Selected ideal, full excess and their sum (full physical ideal when `apply_ideal_mask=False`) |
+| `beta_F_id`, `beta_F_exc`, `beta_F` | Ideal, excess and total intrinsic energy; full by default, selected local terms with `use_voxel_mask=True` |
 | `ideal_density_derivative` | Ideal derivative with respect to density at fixed polarization |
 | `ideal_polarization_derivative` | Ideal derivative with respect to polarization at fixed density |
 | `density_derivative` | Total density derivative, `ideal_density_derivative - c1` |
@@ -905,7 +911,9 @@ density derivative, including ideal orientation entropy. The following
 standalone helper uses a fixed density mask and the model's independent
 mean chemical potential for each density field/species.
 Polarization is not mean-centered. Pass **one unbatched frame** to the data
-helper before batching. `beta` is inverse energy; V is energy per particle,
+helper before batching. Direct fitting/parity forwards must request
+`model(frame, use_voxel_mask=True)`; `Trainer` does this automatically.
+`beta` is inverse energy; V is energy per particle,
 and E is energy per dipole moment.
 
 ```python
@@ -915,8 +923,8 @@ from equicdft import FixedDipoleIdeal, Loss, TensorLoss
 def prepare_field_targets(frame, model):
     result = dict(frame)
     result["beta_E_target"] = frame["beta"] * frame["E_ext"]
-    mask = model.beta_mu_weights(frame)
-    result["beta_mu_weights"] = mask
+    mask = model.voxel_weights(frame)
+    result["voxel_weights"] = mask
     result["polarization_weights"] = mask[..., None].expand_as(
         frame["dipole_density"]
     )
@@ -932,7 +940,7 @@ def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0
     return Loss([
         TensorLoss(
             "beta_mu_local", "beta_mu_local", "beta_mu_average",
-            weights_key="beta_mu_weights", weight=density_weight,
+            weights_key="voxel_weights", weight=density_weight,
         ),
         TensorLoss(
             "polarization", "polarization_derivative", "beta_E_target",
@@ -1015,6 +1023,11 @@ training objective or automatically migrate an application script.
 `model.ideal`. Do not pass a second `dipole_magnitude` to the loss or to
 `polarization_fourier_curvature`. Polarization probes require the model to
 own a `FixedDipoleIdeal`, even though they do not evaluate its exact entropy.
+
+Fourier probes always use the full excess functional. If their input outputs
+came from a masked field-fitting forward, they recompute the full central
+excess energy as well as the displaced energies. The local fitting mask does
+not enter these energy differences.
 
 The two regularizers retain their original ideal **reference approximations**:
 

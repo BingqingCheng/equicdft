@@ -61,7 +61,7 @@ need no chemical-potential labels: the loss is the masked spatial variance of
 $\beta\mu_g^{\mathrm{loc}}$ about its per-field, per-species mean.
 Construct the model with `compute_local_mu=True` and a chosen `rho_min` to
 return `beta_mu_local`, `beta_mu_average`, and
-`beta_mu_weights`. Both chemical potentials are dimensionless
+`voxel_weights`. Both chemical potentials are dimensionless
 **beta mu**, not energies. The default cutoff is
 zero; the LJ example uses `rho_min=1e-3` in reduced density units.
 
@@ -73,24 +73,31 @@ loss = Loss(terms=[
         name="beta_mu_local",
         prediction_key="beta_mu_local",
         target_key="beta_mu_average",
-        weights_key="beta_mu_weights",
+        weights_key="voxel_weights",
     )
 ])
 metrics = [Metrics(
     name="local beta mu",
     prediction_key="beta_mu_local",
     target_key="beta_mu_average",
-    selection_mask_key="beta_mu_weights",
+    selection_mask_key="voxel_weights",
     metric_keys=("mae", "rmse", "rmse_percent", "r2"),
 )]
 ```
 
 Weights select `rho > rho_min`, intersected with accessibility and an optional
-Boolean `valid` voxel mask. Explicit input `beta_mu_weights` replace
+Boolean `valid` voxel mask. Explicit input `voxel_weights` replace
 the cutoff selection, enabling fixed masks or nonnegative statistical weights;
 every field/species must retain positive weight. The local output is zero
 outside this mask. With SEM augmentation, the trainer freezes the original
 weights and the model recomputes both chemical potentials on the noisy fields.
+
+`model(data)` evaluates the full physical intrinsic energy. Direct fitting
+calls use `model(data, use_voxel_mask=True)` to omit ideal/LDA/CACE energy
+contributions centered outside the weights' positive support; neighboring
+descriptors and long-range terms still use the original fields. Weight
+magnitudes affect averages/losses, not energy. `Trainer` requests this fitting
+mode automatically for training and validation; solves retain full energy.
 
 RMSE is the dimensionless chemical-potential residual. `rmse_percent` is
 100 times RMSE divided by the standard deviation of the target means over

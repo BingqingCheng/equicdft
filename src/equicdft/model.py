@@ -69,7 +69,8 @@ RESERVED_OUTPUT_KEYS = frozenset((
     "ideal_polarization_derivative",
     "beta_mu_local",
     "beta_mu_average",
-    "beta_mu_weights",
+    "voxel_weights",
+    "local_energy_mask",
 ))
 
 
@@ -279,17 +280,17 @@ class GridCACEModel(nn.Module, Configurable):
     those learned inputs, stored as a fixed buffer and never subtracted from P.
     Ideal, Coulomb, external coupling and reciprocal kernels use physical P.
 
-    Ordinary forwards evaluate the ideal only on :meth:`ideal_mask`: rho above
-    ``rho_min`` (or positive frozen fitting weights), valid and nonexcluded.
-    Masked ideal energies/derivatives are zero, while all excess inputs remain
-    unmodified. ``apply_ideal_mask=False`` requests the full physical ideal;
-    solvers use this explicitly, independently of fitting selections.
+    Ordinary forwards evaluate the full physical intrinsic functional.
+    ``use_voxel_mask=True`` selects ideal/LDA/CACE energy centers using the
+    positive support of :meth:`voxel_weights`. All descriptor inputs and LR
+    terms remain unmodified; derivatives at omitted centers may be nonzero
+    through neighboring or long-range contributions. Solvers use full energy.
 
     ``compute_local_mu=True`` additionally returns dimensionless beta mu as
     ``beta_mu_local = density_derivative + beta * V_ext``, its
     weighted spatial ``beta_mu_average`` per field/species, and
-    ``beta_mu_weights``. ``rho_min`` selects rho > rho_min unless
-    explicit weights are supplied. See :meth:`beta_mu_weights`.
+    ``voxel_weights``. ``rho_min`` selects rho > rho_min unless
+    explicit weights are supplied. See :meth:`voxel_weights`.
     These are fitting diagnostics, not extra intrinsic energy terms; V_ext
     and a full ideal reference are required only when requesting them.
     """
@@ -689,47 +690,24 @@ class GridCACEModel(nn.Module, Configurable):
             self.polarization_scale,
         )
 
-    def beta_mu_weights(self, data):
-        """Return detached fitting weights with rho's shape [..., grid, species].
+    def voxel_weights(self, data):
+        """Return detached nonnegative fitting weights [..., grid, species].
 
-        Normally select rho > rho_min. Explicit ``beta_mu_weights``
-        replace that cutoff selection, allowing SEM training to freeze the
-        original mask. The optional Boolean ``valid`` voxel mask and hard-wall
-        exclusions always apply. Every field/species must retain positive weight.
-        """
-        weights = self.density_weights(data)
-        if torch.any(weights.sum(dim=-2) <= 0):
-            raise ValueError("chemical-potential mask must retain positive weight for every field/species")
-        return weights
-
-    def ideal_mask(self, data):
-        """Return the model's detached Boolean selection for ideal evaluation.
-
-        Use rho > rho_min, or positive explicit beta_mu_weights when supplied
-        (e.g. a frozen SEM selection), intersected with valid and nonexcluded
-        voxels. Unlike a chemical-potential mean, an empty selection is valid.
-        This masks only the ideal evaluation, never excess-feature inputs.
-        Solvers bypass this fitting selection to retain full ideal physics.
-        """
-        return self.density_weights(data) > 0
-
-    def density_weights(self, data):
-        """Return the selection policy shared by ideal evaluation and mu.
-
-        The weights are detached and carry the caller's magnitudes when
-        ``beta_mu_weights`` is supplied, so freezing them before a noisy
-        training forward preserves the clean field's ideal selection and
-        chemical-potential averaging weights. The chemical-potential values
-        and their weighted mean are recomputed from the noisy fields. Unlike
-        :meth:`beta_mu_weights` an empty selection is allowed here, because
-        an empty ideal selection is valid.
+        Select rho > rho_min unless explicit ``voxel_weights`` are supplied;
+        intersect with valid and nonexcluded voxels. Preserve explicit weight
+        magnitudes for fitting averages and losses. Only their positive support
+        selects ideal/LDA/CACE energy when ``use_voxel_mask=True``. Descriptor
+        inputs and long-range terms always retain the complete physical fields.
+        Empty selections are allowed here, but not for a chemical-potential
+        average. Freezing weights before SEM does not freeze the noisy field's
+        chemical-potential values or their weighted mean.
         """
         rho = data["rho"]
-        if "beta_mu_weights" in data:
-            weights = torch.as_tensor(data["beta_mu_weights"], device=rho.device)
+        if "voxel_weights" in data:
+            weights = torch.as_tensor(data["voxel_weights"], device=rho.device)
             if (weights.shape != rho.shape or weights.is_complex()
                     or not torch.isfinite(weights).all() or torch.any(weights < 0)):
-                raise ValueError("beta_mu_weights must be finite nonnegative with rho's shape")
+                raise ValueError("voxel_weights must be finite nonnegative with rho's shape")
             weights = weights.detach().to(rho)
         else:
             weights = (rho.detach() > self.rho_min).to(rho)
@@ -751,7 +729,9 @@ class GridCACEModel(nn.Module, Configurable):
         if (not torch.is_tensor(potential) or potential.shape != rho.shape
                 or not potential.is_floating_point()):
             raise ValueError("V_ext must be floating with rho's shape")
-        weights = self.beta_mu_weights(data)
+        weights = self.voxel_weights(data)
+        if torch.any(weights.sum(dim=-2) <= 0):
+            raise ValueError("chemical-potential mask must retain positive weight for every field/species")
         active = weights > 0
         if torch.any(active & ~outputs["ideal_derivative_mask"]):
             raise ValueError("chemical-potential weights select vacuum; use a positive SEM density_floor")
@@ -766,7 +746,7 @@ class GridCACEModel(nn.Module, Configurable):
             raise ValueError("local chemical potential must be finite on its mask")
         outputs.update(
             beta_mu_local=local,
-            beta_mu_weights=weights,
+            voxel_weights=weights,
             beta_mu_average=(weights * local).sum(dim=-2) / weights.sum(dim=-2),
         )
 
@@ -779,13 +759,13 @@ class GridCACEModel(nn.Module, Configurable):
         compute_polarization_derivative: Optional[bool] = None,
         compute_ideal: Optional[bool] = None,
         compute_local_mu: Optional[bool] = None,
-        apply_ideal_mask: bool = True,
+        use_voxel_mask: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Return free energy and responses, masking only the ideal by default.
+        """Return the full intrinsic free energy and requested responses.
 
-        ``apply_ideal_mask=False`` selects full physical ideal evaluation,
-        independently of rho_min/valid/frozen fitting weights. GridSolver uses
-        this explicitly; excess readouts always receive the original fields.
+        ``use_voxel_mask=True`` selects ideal/LDA/CACE energy centers using
+        positive :meth:`voxel_weights`. Descriptor inputs and LR remain full.
+        The default ignores fitting selections in every energy contribution.
         """
 
         if METAL_DATA_KEYS & data.keys():
@@ -793,7 +773,7 @@ class GridCACEModel(nn.Module, Configurable):
                 "Set electrode geometry, constraints, and field on MetalWall, not in data"
             )
 
-        apply_ideal_mask = boolean(apply_ideal_mask, "apply_ideal_mask")
+        use_voxel_mask = boolean(use_voxel_mask, "use_voxel_mask")
         compute_local_mu = optional_boolean(compute_local_mu, "compute_local_mu")
         if compute_local_mu is None:
             compute_local_mu = self.compute_local_mu
@@ -873,6 +853,8 @@ class GridCACEModel(nn.Module, Configurable):
             if "beta" in data:
                 self._check_unit_contract(data["beta"], context.beta)
             rho = context.rho
+            weights = self.voxel_weights(data) if use_voxel_mask else None
+            context.local_energy_mask = weights > 0 if weights is not None else None
             normalized_temperature = context.normalized_temperature
             volume_element = context.voxel_volume
             if any(item.requires_local_features for item in self.readout):
@@ -930,6 +912,8 @@ class GridCACEModel(nn.Module, Configurable):
                 beta_F_exc = readout_energy
                 outputs = {"beta_F_exc": beta_F_exc}
             outputs.update(readout_outputs)
+            if context.local_energy_mask is not None:
+                outputs["local_energy_mask"] = context.local_energy_mask
 
             if response_fields:
                 # One backward pass differentiates the same scalar energy
@@ -1006,7 +990,7 @@ class GridCACEModel(nn.Module, Configurable):
             if compute_ideal:
                 outputs.update(self.ideal.evaluate(
                     data, volume_element,
-                    mask=self.ideal_mask(data) if apply_ideal_mask else None,
+                    mask=context.local_energy_mask,
                 ))
                 outputs["beta_F"] = outputs["beta_F_id"] + outputs["beta_F_exc"]
                 if compute_c1:
@@ -1020,5 +1004,7 @@ class GridCACEModel(nn.Module, Configurable):
                     )
             if compute_local_mu:
                 self._chemical_potential_outputs(data, outputs, context.beta)
+            elif weights is not None:
+                outputs["voxel_weights"] = weights
 
         return outputs

@@ -105,6 +105,11 @@ class Trainer:
     :meth:`fit_streams` or :meth:`load_checkpoint` call from the parameters
     the model and loss modules already own.
 
+    Models exposing ``voxel_weights(data)`` are evaluated with
+    ``use_voxel_mask=True`` during training and validation. A TrainingStream
+    may override this through ``model_kwargs``. SEM freezes the original
+    weights before perturbation; energy and derivative values remain noisy.
+
     Parameters
     ----------
     model
@@ -943,17 +948,20 @@ class Trainer:
         """Move one batch, run the model, and evaluate one loss module."""
 
         batch = self._move_batch(batch)
-        selection = getattr(self.model, "density_weights", None)
+        model_kwargs = dict(model_kwargs or {})
+        selection = getattr(self.model, "voxel_weights", None)
+        if selection is not None:
+            model_kwargs.setdefault("use_voxel_mask", True)
         if noise is not None and noise.enabled and selection is not None:
             # The model owns mask construction; freeze it before perturbing
-            # rho so the ideal selection and chemical-potential averaging
+            # rho so the local-energy selection and chemical-potential averaging
             # weights stay fixed. The mean is recomputed from noisy fields.
             # The ideal still intersects the selection with positive density,
             # so frozen weights cannot reintroduce a logarithm at vacuum.
-            batch = dict(batch, beta_mu_weights=selection(batch))
+            batch = dict(batch, voxel_weights=selection(batch))
         if noise is not None:
             batch = noise.apply(batch, ideal=getattr(self.model, "ideal", None))
-        outputs = self.model(batch, **(model_kwargs or {}))
+        outputs = self.model(batch, **model_kwargs)
         losses, details = loss.evaluate(outputs, batch, model=self.model)
         return batch, outputs, losses, details
 
