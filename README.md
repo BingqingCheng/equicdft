@@ -60,7 +60,7 @@ Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
 $\beta\mu_g^{\mathrm{loc}}$ about its per-field, per-species mean.
 Construct the model with `compute_local_mu=True` and a chosen `rho_min` to
-return `beta_mu_local`, `beta_avg_mu`, and
+return `beta_mu_local`, `beta_mu_average`, and
 `beta_mu_weights`. Both chemical potentials are dimensionless
 **beta mu**, not energies. The default cutoff is
 zero; the LJ example uses `rho_min=1e-3` in reduced density units.
@@ -72,14 +72,14 @@ loss = Loss(terms=[
     TensorLoss(
         name="beta_mu_local",
         prediction_key="beta_mu_local",
-        target_key="beta_avg_mu",
+        target_key="beta_mu_average",
         weights_key="beta_mu_weights",
     )
 ])
 metrics = [Metrics(
     name="local beta mu",
     prediction_key="beta_mu_local",
-    target_key="beta_avg_mu",
+    target_key="beta_mu_average",
     selection_mask_key="beta_mu_weights",
     metric_keys=("mae", "rmse", "rmse_percent", "r2"),
 )]

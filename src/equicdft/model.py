@@ -92,7 +92,7 @@ RESERVED_OUTPUT_KEYS = frozenset((
     "polarization_derivative_excess",
     "ideal_polarization_derivative",
     "beta_mu_local",
-    "beta_avg_mu",
+    "beta_mu_average",
     "beta_mu_weights",
 ))
 
@@ -303,7 +303,7 @@ class GridCACEModel(nn.Module, Configurable):
 
     ``compute_local_mu=True`` additionally returns dimensionless beta mu as
     ``beta_mu_local = density_derivative + beta * V_ext``, its
-    weighted spatial ``beta_avg_mu`` per field/species, and
+    weighted spatial ``beta_mu_average`` per field/species, and
     ``beta_mu_weights``. ``rho_min`` selects rho > rho_min unless
     explicit weights are supplied. See :meth:`beta_mu_weights`.
     These are fitting diagnostics, not extra intrinsic energy terms; V_ext
@@ -842,7 +842,7 @@ class GridCACEModel(nn.Module, Configurable):
         outputs.update(
             beta_mu_local=local,
             beta_mu_weights=weights,
-            beta_avg_mu=(weights * local).sum(dim=-2) / weights.sum(dim=-2),
+            beta_mu_average=(weights * local).sum(dim=-2) / weights.sum(dim=-2),
         )
 
     def forward(

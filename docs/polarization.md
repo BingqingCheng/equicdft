@@ -753,7 +753,7 @@ def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0
     moment = model.ideal.dipole_magnitude.reshape(-1, 1)
     return Loss([
         TensorLoss(
-            "beta_mu_local", "beta_mu_local", "beta_avg_mu",
+            "beta_mu_local", "beta_mu_local", "beta_mu_average",
             weights_key="beta_mu_weights", weight=density_weight,
         ),
         TensorLoss(
@@ -784,7 +784,7 @@ the square to make both residuals dimensionless; it is not a statistical task
 weight. No sigma normalization or inverse-SEM weighting is applied.
 External fields and original masks stay fixed under SEM augmentation. The model
 reevaluates total derivatives, `beta_mu_local` and
-`beta_avg_mu` on the perturbed fields. Both named chemical
+`beta_mu_average` on the perturbed fields. Both named chemical
 potentials represent dimensionless beta mu. The density term is exactly the
 spatial-constancy objective above, not a new custom loss. Solver chemical
 potentials use their own physical constraints and are independent of this

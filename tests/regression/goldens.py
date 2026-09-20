@@ -17,7 +17,7 @@ import itertools
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import numpy as np
 from tests.ideal_helpers import with_ideal, IdealOnly
@@ -61,10 +61,30 @@ from tests.model_fixtures import (
 
 GOLDEN_PATH = Path(__file__).with_name("goldens.pt")
 
-# name -> (rtol, atol) for cases whose numbers may legitimately move at the
-# floating-point level; every other case must match exactly when the running
-# torch version is the one that recorded the file.
-TOLERANCES: Dict[str, Tuple[float, float]] = {}
+# name -> (rtol, atol), or name -> {output key or dtype: (rtol, atol)}, for
+# values that may legitimately move at the floating-point level; every other
+# case must match exactly when the running torch version is the one that
+# recorded the file.
+#
+# beta_mu_local was recorded when the model formed
+# ``log(rho*Lambda**3) + beta*V - c1`` in one expression; it now adds
+# ``beta*V`` to the total ``density_derivative``, which is the same quantity
+# with one rounding step in a different place. In every case below the
+# observed difference stays under one float32 ulp of the largest value in the
+# field, so the bound is absolute and tied to that scale rather than to the
+# result: one case averages to 0.014 out of values spanning +-1.8, where a
+# relative bound on the mean would be meaningless. The weights compare
+# exactly, and so does the mean in two of the three cases.
+_CHEMICAL_POTENTIAL_ROUNDING = {
+    "out/beta_mu_local": (0.0, 1.0e-6),
+    "out/beta_mu_average": (0.0, 1.0e-6),
+}
+
+TOLERANCES: Dict[str, Any] = {
+    "model/example_lda_local": _CHEMICAL_POTENTIAL_ROUNDING,
+    "model/example_joint_center": _CHEMICAL_POTENTIAL_ROUNDING,
+    "model/example_two_types_physical_c2": _CHEMICAL_POTENTIAL_ROUNDING,
+}
 
 # Under another torch release kernels differ at rounding level (FFT, matmul
 # accumulation order), so every case is compared with this tolerance instead.
@@ -103,7 +123,12 @@ def _flatten(prefix: str, value, into: Dict[str, torch.Tensor]) -> None:
                 _flatten("{}[{}]".format(prefix, index), item, into)
     elif isinstance(value, (bool, int, float)):
         into[prefix] = torch.tensor(value)
-    # Strings and None are recorded implicitly through the key set only.
+    elif isinstance(value, str):
+        # Labels such as ``status`` and ``solver_method`` carry meaning that a
+        # key set cannot express: when a driver's stopping label changes, the
+        # recording has to be updated deliberately like any other value.
+        into[prefix] = torch.tensor([ord(character) for character in value])
+    # None is recorded implicitly through the key set only.
 
 
 def _outputs(model: nn.Module, data, **kwargs) -> Dict[str, torch.Tensor]:
@@ -118,18 +143,26 @@ def _outputs(model: nn.Module, data, **kwargs) -> Dict[str, torch.Tensor]:
 
 def _example_lda_local():
     torch.manual_seed(11)
-    return _outputs(example_model(), grid_data(cutoff_grid=1))
+    # compute_local_mu reproduces the chemical-potential outputs this case
+    # recorded before the model briefly stopped providing them; rho_min=0
+    # matches the all-ones weights in the recording.
+    return _outputs(example_model(), grid_data(cutoff_grid=1), compute_local_mu=True)
 
 
 def _example_joint_center():
     torch.manual_seed(12)
-    return _outputs(example_model(separate_center=False), grid_data(cutoff_grid=1))
+    return _outputs(
+        example_model(separate_center=False), grid_data(cutoff_grid=1),
+        compute_local_mu=True,
+    )
 
 
 def _example_two_types_physical():
     torch.manual_seed(13)
     model = example_model(n_types=2, free_energy_mode="physical", compute_c2=True)
-    return _outputs(model, grid_data(cutoff_grid=1, n_types=2, seed=3))
+    return _outputs(
+        model, grid_data(cutoff_grid=1, n_types=2, seed=3), compute_local_mu=True,
+    )
 
 
 def _gaussian_message(radial_basis, backend):
@@ -463,31 +496,35 @@ def _trainer_epoch():
             frame["V_ext"] = 0.3 * frame["V_ext"]
             frames.append(frame)
         model = example_model()
-        # Frozen historical trainer regression only: reproduce retired output
-        # arithmetic in the fixture, not in the production model. New fitting
-        # uses total derivatives and loss-side gauge projection instead.
-        def legacy_observables(module, arguments, outputs):
+        # Frozen historical trainer regression: this case reproduces the
+        # arithmetic of the original recording in the fixture, under
+        # fixture-private names so it cannot be mistaken for the model's own
+        # compute_local_mu outputs, which the three model cases above compare
+        # against their recordings instead.
+        def recorded_observables(module, arguments, outputs):
             batch = arguments[0]
             local = (outputs["ideal_density_derivative"].detach()
                      + batch["beta"][..., None, None] * batch["V_ext"]
                      - outputs["c1"])
             weights = (batch["rho"].detach() > 1.e-3).to(local)
-            outputs.update(beta_mu_local=local, beta_mu_weights=weights,
-                           beta_mu_average=(weights * local).sum(-2) / weights.sum(-2))
-        model.register_forward_hook(legacy_observables)
+            outputs.update(
+                fixture_mu_local=local, fixture_mu_weights=weights,
+                fixture_mu_average=(weights * local).sum(-2) / weights.sum(-2),
+            )
+        model.register_forward_hook(recorded_observables)
         loss = Loss([
             TensorLoss(
                 name="mu",
-                prediction_key="beta_mu_local",
-                target_key="beta_mu_average",
-                weights_key="beta_mu_weights",
+                prediction_key="fixture_mu_local",
+                target_key="fixture_mu_average",
+                weights_key="fixture_mu_weights",
             ),
         ])
         metrics = [Metrics(
-            target_key="beta_mu_average",
-            prediction_key="beta_mu_local",
+            target_key="fixture_mu_average",
+            prediction_key="fixture_mu_local",
             name="mu",
-            selection_mask_key="beta_mu_weights",
+            selection_mask_key="fixture_mu_weights",
         )]
         trainer = Trainer(
             model=model, loss=loss, metrics=metrics,
@@ -626,8 +663,10 @@ def compare(
     })
     # Model training-policy outputs were retired; preserve all energy,
     # derivative, solver and historical trainer comparisons.
-    retired = {"out/beta_mu_local", "out/beta_mu_average", "out/beta_mu_weights",
-               "solve/beta_mu_average", "solve/beta_mu_weights"}
+    # The model provides its chemical-potential outputs again, so the three
+    # model cases that recorded them compare against those recordings. The
+    # solver never produced the mean or the weights.
+    retired = {"solve/beta_mu_average", "solve/beta_mu_weights"}
     recorded = {k: v for k, v in recorded.items()
                 if k in actual or k not in retired}
     if "state/thermal_wavelength" in recorded and "state/ideal.thermal_wavelength" in actual:
@@ -646,6 +685,11 @@ def compare(
         "beta_A", "beta_external", "beta_V_ext", "beta_P_ext",
         "density_residual", "max_density_residual", "rms_density_residual",
         "grid_spacing", "thermal_wavelength", "grid_center", "particle_numbers",
+        # This file predates recording string values, so the stopping labels
+        # have no counterpart in it yet. They are captured now and the next
+        # re-record locks them in, after which a driver that changes a label
+        # has to say so here.
+        "status", "solver_method", "solver_fixed_field",
     }
     for key in list(actual):
         if (key.startswith("solve/") and key not in recorded

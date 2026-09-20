@@ -205,7 +205,7 @@ def main():
             TensorLoss(
                 name="beta_mu_local",
                 prediction_key="beta_mu_local",
-                target_key="beta_avg_mu",
+                target_key="beta_mu_average",
                 weights_key="beta_mu_weights",
             )
         ]
@@ -214,7 +214,7 @@ def main():
         Metrics(
             name="local beta mu",
             prediction_key="beta_mu_local",
-            target_key="beta_avg_mu",
+            target_key="beta_mu_average",
             metric_keys=("mae", "rmse", "rmse_percent", "r2"),
             selection_mask_key="beta_mu_weights",
         )

@@ -51,7 +51,7 @@ class TestChemicalPotential(unittest.TestCase):
     @staticmethod
     def loss():
         return Loss([TensorLoss(
-            "beta_mu_local", "beta_mu_local", "beta_avg_mu",
+            "beta_mu_local", "beta_mu_local", "beta_mu_average",
             weights_key="beta_mu_weights",
         )])
 
@@ -64,9 +64,9 @@ class TestChemicalPotential(unittest.TestCase):
                 expected = output["density_derivative"] + data["V_ext"] / data["temperature"][:, None, None]
                 expected = expected.masked_fill(weights == 0, 0.)
                 torch.testing.assert_close(output["beta_mu_local"], expected)
-                torch.testing.assert_close(output["beta_avg_mu"],
+                torch.testing.assert_close(output["beta_mu_average"],
                     (weights * expected).sum(-2) / weights.sum(-2))
-                self.assertEqual(output["beta_avg_mu"].shape, (2, 2))
+                self.assertEqual(output["beta_mu_average"].shape, (2, 2))
                 self.assertNotIn("local_chemical_potential", output)
                 self.assertNotIn("average_chemical_potential", output)
                 self.assertNotIn("chemical_potential_weights", output)
@@ -130,8 +130,8 @@ class TestChemicalPotential(unittest.TestCase):
         second = model(shifted)
         for key in ("beta_F", "beta_F_exc", "beta_F_id", "density_derivative", "c1"):
             torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
-        torch.testing.assert_close(second["beta_avg_mu"],
-                                   first["beta_avg_mu"] + offset)
+        torch.testing.assert_close(second["beta_mu_average"],
+                                   first["beta_mu_average"] + offset)
         torch.testing.assert_close(self.loss()(first, data)["total"],
                                    self.loss()(second, shifted)["total"])
 
@@ -171,7 +171,7 @@ class TestChemicalPotential(unittest.TestCase):
             self.assertTrue((noisy["rho"][:, 1, 0] > .15).all())
             self.assertTrue((noisy["rho"][:, 3, 0] < .15).all())
             expected = (output["density_derivative"] + noisy["V_ext"] / noisy["temperature"][:, None, None])
-            torch.testing.assert_close(output["beta_avg_mu"],
+            torch.testing.assert_close(output["beta_mu_average"],
                                        (expected * original).sum(-2) / original.sum(-2))
             self.assertNotIn("beta_mu_weights", batch)
             noisy["target"] = -noisy["V_ext"] / noisy["temperature"][:, None, None]
@@ -216,7 +216,7 @@ class TestChemicalPotential(unittest.TestCase):
             for derivatives in (False, True):
                 output = GridSolver(model).evaluate(data, compute_derivatives=derivatives)
                 self.assertNotIn("beta_mu_weights", output)
-                self.assertNotIn("beta_avg_mu", output)
+                self.assertNotIn("beta_mu_average", output)
                 if derivatives:
                     torch.testing.assert_close(output["beta_mu_local"],
                                                output["density_derivative"] + data["beta"] * data["V_ext"])
@@ -225,7 +225,7 @@ class TestChemicalPotential(unittest.TestCase):
     def test_metrics_compare_mu_with_its_average(self):
         model, data = self.model(), self.data()
         output = model(data)
-        metric = Metrics("beta_avg_mu", prediction_key="beta_mu_local",
+        metric = Metrics("beta_mu_average", prediction_key="beta_mu_local",
                          selection_mask_key="beta_mu_weights")
         actual = metric(output, data)
         expected = self.loss()(output, data)["total"].sqrt()

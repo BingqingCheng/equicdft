@@ -59,7 +59,7 @@ fit if needed. Model-format and training-checkpoint versions are separate.
 The explicit physical fitting interface is restored as an opt-in:
 `GridCACEModel(..., compute_local_mu=True, rho_min=...)`. The model returns
 `beta_mu_local` (total density derivative plus beta V), its weighted
-per-field/per-species `beta_avg_mu`, and
+per-field/per-species `beta_mu_average`, and
 `beta_mu_weights`. Both chemical potentials are dimensionless beta mu.
 Use those keys with ordinary `TensorLoss` and `Metrics`; no custom loss or
 trainer output transform is needed. The intrinsic energy remains independent
@@ -158,12 +158,14 @@ polarized whole-pair rejection sampling, masks and RNG draw order are unchanged.
 | `full_*euler_lagrange_residual` | `full_*density_residual` |
 | `polarization_euler_lagrange_residual` | `polarization_residual` |
 | `iterations` (coupled solve) | `n_iter` |
-| `mu_loc` (solver) | `beta_mu_local` |
-| `equilibrium_chemical_potential` | `beta_mu` |
+| `mu_loc`, `local_chemical_potential` | `beta_mu_local` |
+| `average_chemical_potential` | `beta_mu_average` |
+| `equilibrium_chemical_potential` | `beta_mu` (solver) |
 
-The old solver spellings carried the same values and are no longer returned.
-The model's optional `beta_mu_local` and `beta_avg_mu`
-are distinct fitting diagnostics with their own mask, not solver aliases.
+The old spellings carried the same values and are no longer returned. The
+model's optional `beta_mu_local` and `beta_mu_average` are the 0.0.x
+quantities under current names, computed from the model's own mask; the
+solver's `beta_mu_local` is a separate solver result.
 `density_derivative_excess` is exactly `-c1`; both names are returned, and
 new code that handles total and excess responses together should prefer the
 `*_derivative*` pair.
