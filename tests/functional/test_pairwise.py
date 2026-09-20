@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from equicdft import GridCACEModel, PairwiseReadout
+from equicdft import (
+    CartesianAFeatures, CartesianBFeatures, GridCACEModel, LocalReadout,
+    PairwiseReadout,
+)
 from equicdft.functional.base import ReadoutContext
 from equicdft.functional.pairwise import _smooth_cutoff_envelope
 
@@ -317,6 +320,44 @@ class TestPairwiseReadout(unittest.TestCase):
         self.assertTrue(
             torch.allclose(output["c2"][neighbor, 1], -kernel[1, 1, 0, 0])
         )
+
+    def test_cutoff_is_independent_of_the_feature_stencil(self):
+        """The pair cutoff builds its own offsets, so it constrains nothing."""
+
+        self.assertFalse(PairwiseReadout.shares_grid_stencil)
+        a_features = CartesianAFeatures(
+            mean_density=0.5,
+            cutoff_grid=1,
+            max_power=1,
+            radial_basis="gaussian",
+            radial_exponents=(0.5,),
+        )
+        b_features = CartesianBFeatures(max_power=1, max_product_order=1)
+        model = GridCACEModel(
+            a_features,
+            b_features,
+            [
+                LocalReadout(n_types=1, hidden_sizes=(4,)),
+                PairwiseReadout(cutoff_grid=4, n_types=1, hidden_sizes=(4,)),
+            ],
+            grid_spacing=0.7,
+            boltzmann_constant=1.0,
+        )
+        # The neighbor list the data carries is the feature stencil's, not the
+        # pair kernel's; a longer pair cutoff must not widen or contradict it.
+        self.assertEqual(model.cutoff_grid, 1)
+        self.assertEqual(model.grid_info["cutoff_grid"], 1)
+
+        alone = GridCACEModel(
+            readout=[PairwiseReadout(cutoff_grid=4, n_types=1, hidden_sizes=(4,))],
+            n_types=1,
+            grid_spacing=0.7,
+            mean_density=0.5,
+            boltzmann_constant=1.0,
+        )
+        # Nothing indexes a neighbor list here, so the data needs none.
+        self.assertEqual(alone.cutoff_grid, 0)
+        self.assertEqual(alone.grid_info["cutoff_grid"], 0)
 
     def test_kernel_parameters_receive_finite_gradients(self):
         readout = PairwiseReadout(

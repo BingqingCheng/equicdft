@@ -300,8 +300,11 @@ class EnergyReadout(nn.Module):
     # Learned readouts request normalization independently of physical P.
     requires_polarization_scale = False
     # A local stencil is needed even when FFT avoids explicit neighbor rows.
-    # All configured stencils currently share one grid_info cutoff.
+    # ``shares_grid_stencil`` marks the readouts whose cutoff_grid must agree
+    # with the model's: those built on the model's A features. A readout with
+    # a cutoff of its own (PairwiseReadout) leaves it False.
     cutoff_grid: Optional[int] = None
+    shares_grid_stencil = False
     n_types: Optional[int] = None
 
     @property

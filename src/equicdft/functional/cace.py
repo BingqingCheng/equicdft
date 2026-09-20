@@ -24,6 +24,10 @@ class CACEBranch(EnergyReadout, Configurable):
     The local readout is fully bound at construction; no warm-up is needed.
     """
 
+    # A branch is built on the model's stencil, so every branch and any
+    # top-level A features must agree on one cutoff_grid.
+    shares_grid_stencil = True
+
     def __init__(self, a_features, b_features, readout, *, message_layers=None):
         super().__init__()
         if a_features is None or b_features is None:

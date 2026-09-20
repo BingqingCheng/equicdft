@@ -141,6 +141,24 @@ def _resolve_polarization(
     return has_polarization
 
 
+def _shared_stencil_cutoffs(
+    a_features: Optional[nn.Module],
+    readouts: Sequence[EnergyReadout],
+) -> list:
+    """Return ``(label, cutoff_grid)`` for every user of the model's stencil.
+
+    A readout that carries its own independent cutoff, such as
+    ``PairwiseReadout``, is not one: it builds its own offsets and never
+    indexes the shared neighbor list.
+    """
+
+    cutoffs = [(type(item).__name__, item.cutoff_grid) for item in readouts
+               if item.shares_grid_stencil]
+    if a_features is not None:
+        cutoffs.insert(0, ("a_features", a_features.cutoff_grid))
+    return cutoffs
+
+
 def _check_cutoff_and_feature_requirements(
     a_features: Optional[nn.Module],
     readouts: Sequence[EnergyReadout],
@@ -148,13 +166,13 @@ def _check_cutoff_and_feature_requirements(
     """Reject disagreeing neighborhoods and missing feature modules."""
 
     # Neighborhood requirements are independent of which fields are read.
-    cutoffs = [item.cutoff_grid for item in readouts
-               if item.cutoff_grid is not None]
-    if a_features is not None:
-        cutoffs.append(a_features.cutoff_grid)
-    if cutoffs and any(value != cutoffs[0] for value in cutoffs):
+    cutoffs = _shared_stencil_cutoffs(a_features, readouts)
+    if cutoffs and any(value != cutoffs[0][1] for _, value in cutoffs):
         raise ValueError(
-            "local and polarization features must use the same cutoff_grid"
+            "modules built on the model's stencil must use the same "
+            "cutoff_grid; got " + ", ".join(
+                "{}={}".format(label, value) for label, value in cutoffs
+            )
         )
     if (
         any(item.requires_local_features for item in readouts)
@@ -517,12 +535,10 @@ class GridCACEModel(nn.Module, Configurable):
     def cutoff_grid(self) -> int:
         """Integer stencil cutoff used by the local representation."""
 
-        if self.has_local_features:
-            return self.a_features.cutoff_grid
-        for item in self.readout:
-            if item.cutoff_grid is not None:
-                return item.cutoff_grid
-        return 0
+        cutoffs = _shared_stencil_cutoffs(
+            self.a_features if self.has_local_features else None, self.readout,
+        )
+        return cutoffs[0][1] if cutoffs else 0
 
     @property
     def n_types(self) -> int:
