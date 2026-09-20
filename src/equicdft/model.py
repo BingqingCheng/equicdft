@@ -718,8 +718,9 @@ class GridCACEModel(nn.Module, Configurable):
 
         The weights are detached and carry the caller's magnitudes when
         ``beta_mu_weights`` is supplied, so freezing them before a noisy
-        training forward reproduces both the ideal selection and the
-        chemical-potential mean of the clean field. Unlike
+        training forward preserves the clean field's ideal selection and
+        chemical-potential averaging weights. The chemical-potential values
+        and their weighted mean are recomputed from the noisy fields. Unlike
         :meth:`beta_mu_weights` an empty selection is allowed here, because
         an empty ideal selection is valid.
         """

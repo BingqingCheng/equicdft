@@ -946,10 +946,10 @@ class Trainer:
         selection = getattr(self.model, "density_weights", None)
         if noise is not None and noise.enabled and selection is not None:
             # The model owns mask construction; freeze it before perturbing
-            # rho so neither the ideal selection nor the chemical-potential
-            # mean drifts between noisy training visits. Physical positivity
-            # is still intersected inside the ideal, so a frozen weight can
-            # never reintroduce a logarithm at vacuum.
+            # rho so the ideal selection and chemical-potential averaging
+            # weights stay fixed. The mean is recomputed from noisy fields.
+            # The ideal still intersects the selection with positive density,
+            # so frozen weights cannot reintroduce a logarithm at vacuum.
             batch = dict(batch, beta_mu_weights=selection(batch))
         if noise is not None:
             batch = noise.apply(batch, ideal=getattr(self.model, "ideal", None))
