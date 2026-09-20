@@ -1,7 +1,7 @@
 """Pointwise and gradient-expanded free-energy building blocks."""
 
 import math
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from torch import nn
