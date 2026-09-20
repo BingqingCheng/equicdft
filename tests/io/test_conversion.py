@@ -46,9 +46,9 @@ class TestExplicitConversion(unittest.TestCase):
     def test_old_polarized_file_requires_metadata_then_loads_normally(self):
         fixture = fixtures.TestModelIdealReference()
         model = GridCACEModel(
-            None, None, [LDAReadout(n_types=2, dipole_density_scale=.3)],
+            None, None, [LDAReadout(n_types=2, include_polarization=True)],
             ideal=FixedDipoleIdeal([.7, 1.9]), n_types=2,
-            grid_spacing=1., boltzmann_constant=1., mean_density=.3,
+            polarization_scale=.3, grid_spacing=1., boltzmann_constant=1., mean_density=.3,
             compute_polarization_derivative=True,
         ).eval()
         data = fixture.data(True)

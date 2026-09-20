@@ -30,6 +30,41 @@ For fixed-magnitude dipoles, one possible normalization is
 `dipole_density_reference = dipole_magnitude * density_reference`.
 Reference scales are application choices, not universal API defaults.
 
+The model owns this scale as `polarization_scale`. Polarized A features,
+message passing and `LDAReadout(include_polarization=True)` share it; feature
+and LDA constructors no longer store separate scales. This is scale-only
+normalization: uniform polarization is not subtracted. The ideal reference,
+Coulomb coupling and reciprocal kernels retain physical P.
+
+Alternatively, compute a rotation-invariant population standard deviation
+from **training plus validation**, never test data:
+
+$$
+\sigma_P = \sqrt{\frac{\langle |\mathbf P-\langle\mathbf P\rangle|^2\rangle}{3}}.
+$$
+
+All retained voxel/species vectors have equal weight; invalid and excluded
+voxels are omitted, without a density cutoff. The vector mean is global across
+the selected data, not separately removed from each frame. The statistic can
+be zero, in which case choose another positive model scale explicitly.
+This dataset standard deviation is not the per-voxel SEM used for noise augmentation.
+
+```python
+from equicdft import make_dataloaders
+
+def loaders_and_polarization_scale(training_data, validation_data):
+    loaders = make_dataloaders(
+        train_dataset=training_data,
+        valid_dataset=validation_data,
+        compute_polarization_std=True,
+    )
+    return loaders, loaders["polarization_std"]
+```
+
+Pass the returned scale as `dipole_density_reference` to the builder below,
+or directly as `GridCACEModel(polarization_scale=...)`. It has the same units
+as the input dipole density and is fixed after model construction.
+
 ```python
 from equicdft import (
     CartesianAFeatures,
@@ -50,7 +85,6 @@ def build_short_range_model(
 ):
     a_features = CartesianAFeatures(
         mean_density=density_reference,
-        dipole_density_scale=dipole_density_reference,
         include_polarization=True,
         separate_center=True,
         n_types=1,
@@ -71,6 +105,7 @@ def build_short_range_model(
         b_features=b_features,
         readout=[LocalReadout(hidden_sizes=(16, 8))],
         ideal=FixedDipoleIdeal(dipole_magnitude),
+        polarization_scale=dipole_density_reference,
         grid_spacing=grid_spacing,
         mean_temperature=temperature_reference,
         boltzmann_constant=boltzmann_constant,

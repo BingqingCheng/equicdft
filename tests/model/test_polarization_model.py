@@ -44,7 +44,7 @@ class TestPolarizationModel(unittest.TestCase):
     @staticmethod
     def model(spacing=0.5, mode="beta", with_scalar=False, **kwargs):
         a_features = CartesianAFeatures(
-            mean_density=0.5, dipole_density_scale=0.3, include_polarization=True,
+            mean_density=0.5, include_polarization=True,
             cutoff_grid=1, max_power=2, radial_basis="gaussian",
             radial_exponents=(0.125, 0.5), trainable_radial_exponents=True,
         )
@@ -58,7 +58,7 @@ class TestPolarizationModel(unittest.TestCase):
             a_features=a_features,
             b_features=b_features,
             readout=readouts,
-            grid_spacing=spacing,
+            polarization_scale=.3, grid_spacing=spacing,
             mean_temperature=1.5,
             free_energy_mode=mode,
             compute_polarization_derivative=True,
@@ -245,7 +245,7 @@ class TestPolarizationModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cubic voxels"):
             GridCACEModel(
                 model.a_features, model.b_features, list(model.readout),
-                grid_spacing=(0.5, 0.5, 0.8),
+                polarization_scale=.3, grid_spacing=(0.5, 0.5, 0.8),
             )
         data = self.data()
         del data["dipole_density"]
@@ -258,7 +258,7 @@ class TestPolarizationModel(unittest.TestCase):
         model.ideal = FixedDipoleIdeal(1.)
         self.assertIn("density_derivative", model(self.data()))
         scalar = GridCACEModel(
-            None, None, [LDAReadout()], grid_spacing=0.5
+            None, None, [LDAReadout()], polarization_scale=.3, grid_spacing=0.5
         )
         self.assertFalse(scalar.requires_dipole_density)
         with self.assertRaisesRegex(ValueError, "requires a dipole-density readout"):
@@ -268,13 +268,13 @@ class TestPolarizationModel(unittest.TestCase):
 
     def test_zero_polarization_response_for_scalar_only_invariant_selection(self):
         a = CartesianAFeatures(
-            mean_density=0.5, dipole_density_scale=0.3, cutoff_grid=1,
+            mean_density=0.5, cutoff_grid=1,
             max_power=0, include_polarization=True,
         )
         b = CartesianBFeatures(0, 1, include_polarization=True)
         model = GridCACEModel(
             a, b, [LocalReadout(n_features=b.n_features + 1, hidden_sizes=(4,))],
-            grid_spacing=0.5, compute_polarization_derivative=True,
+            polarization_scale=.3, grid_spacing=0.5, compute_polarization_derivative=True,
         )
         for training in (False, True):
             model.train(training)

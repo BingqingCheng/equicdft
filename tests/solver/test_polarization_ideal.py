@@ -635,12 +635,12 @@ class TestGridSolverPolarization(unittest.TestCase):
 
     def test_grid_model_energy_integration(self):
         from equicdft import GridCACEModel, GridData, CartesianAFeatures, CartesianBFeatures, LocalReadout
-        a = CartesianAFeatures(mean_density=0.5, dipole_density_scale=0.2,
+        a = CartesianAFeatures(mean_density=0.5,
                               include_polarization=True, cutoff_grid=1, max_power=0)
         b = CartesianBFeatures(0, 2, include_polarization=True)
         model = GridCACEModel(a_features=a, b_features=b,
                              readout=[LocalReadout(n_features=b.n_features + 1, hidden_sizes=(3,))],
-                             grid_spacing=0.5, boltzmann_constant=1.)
+                             polarization_scale=.2, grid_spacing=0.5, boltzmann_constant=1.)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.mul_(0.05)

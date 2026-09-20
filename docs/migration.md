@@ -28,7 +28,7 @@ Normal `load_model` uses restricted loading without this fallback.
   require `--dipole-magnitude` using the original molecular moment in the
   original dipole units, and `--thermal-wavelength` if it differs from 1.
   Descriptor normalization scales are not used to guess physical moments.
-- Conversion to format 4 carries `compute_local_mu` and `rho_min` forward
+- Conversion carries `compute_local_mu` and `rho_min` forward
   without changing fitted parameters: both are optional diagnostics on the
   current model again, computing the same quantities from the same mask, so
   a converted functional evaluates the chemical potential its fit used. A
@@ -59,6 +59,35 @@ resume and conversion are not supported. Converting a fitted model does not
 recover its optimizer or training history; use it as initialization for a new
 fit if needed. Model-format and training-checkpoint versions are separate.
 
+## Model-owned polarization normalization (format 5)
+
+Pass one explicit positive `polarization_scale` to `GridCACEModel`. It normalizes
+polarized Cartesian A features, their message carriers and polarization LDA
+inputs. `CartesianAFeatures` no longer accepts `dipole_density_scale`;
+`LDAReadout(include_polarization=True)` replaces its old scale argument.
+Standalone A evaluation takes `a_features(data, polarization_scale=scale)`;
+standalone LDA gets the scale from `ReadoutContext`.
+
+`make_dataloaders(..., compute_polarization_std=True)` returns the optional
+`polarization_std` statistic over training **and validation**, excluding test
+data. It is the square root of one third of the trace of the population
+covariance, pooling retained voxel/species vectors. Invalid/excluded voxels
+are omitted; no density cutoff is applied. The model divides P by the chosen
+scale without subtracting any mean. The user may instead supply any other
+positive reference with the same units, including molecular moment times
+reference density. A zero dataset standard deviation requires another explicit
+positive choice, not an automatic floor.
+
+Model files now use format 5; convert older files explicitly. Conversion keeps
+the historical feature scale (or the first polarized LDA scale without polarized
+features). If an old LDA used a different scale, its first-layer squared-P
+weights are rescaled by `(new_scale / old_scale)**2` to preserve its function.
+Matching scales leave fitted weights unchanged. Existing data and models are
+never renormalized using newly computed dataset statistics. Density-only
+architectures are unchanged. Training-checkpoint format is separate; historical
+trainer resume is not restored. Analytical physics and reciprocal kernels keep
+physical P and their original units.
+
 ## Model-provided local chemical potential
 
 The explicit physical fitting interface is restored as an opt-in:
@@ -71,8 +100,8 @@ trainer output transform is needed. The intrinsic energy remains independent
 of V. Local-mu evaluation requests the total density derivative automatically.
 
 The defaults are `compute_local_mu=False`, `rho_min=0`. Settings are saved in
-current model configurations; existing format-4 files without them load with
-these defaults, and conversion carries an older file's settings through, so a
+current model configurations; older files without them acquire these defaults
+during explicit conversion, which carries recorded settings through, so a
 converted fitted functional keeps the cutoff its fit used. Model-format
 version and tensor state are unchanged by these optional settings.
 

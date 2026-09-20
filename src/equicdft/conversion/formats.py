@@ -172,7 +172,55 @@ def _migrate_v3_to_v4(payload):
     return payload
 
 
-_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
+def _migrate_v4_to_v5(payload):
+    """Move polarization normalization to the model without changing its energy.
+
+    The feature scale wins when present. Historical LDA scales can differ;
+    absorb that difference into the first linear layer's squared-P columns.
+    Equal scales require no arithmetic on fitted weights.
+    """
+    config, state = payload["config"], payload["state_dict"]
+    if config.get(TYPE_KEY) != "GridCACEModel":
+        return payload
+    scale = state.get("polarization_scale", config.get("polarization_scale"))
+    features = config.get("a_features")
+    if isinstance(features, dict):
+        old = features.pop("dipole_density_scale", None)
+        old = state.pop("a_features.dipole_density_scale", old)
+        if old is not None:
+            if scale is not None and not torch.equal(torch.as_tensor(scale).to(torch.as_tensor(old)), torch.as_tensor(old)):
+                raise ValueError("model and historical feature polarization scales disagree")
+            scale = old
+    lda_scales = []
+    for index, readout in enumerate(config.get("readout") or ()):
+        if not isinstance(readout, dict) or readout.get(TYPE_KEY) != "LDAReadout":
+            continue
+        if "dipole_density_scale" in readout:
+            old = readout.pop("dipole_density_scale")
+            old = state.pop("readout.{}.dipole_density_scale".format(index), old)
+            readout["include_polarization"] = old is not None
+            if old is not None:
+                lda_scales.append((index, int(readout.get("n_types", 1)), old))
+                if scale is None:
+                    scale = old
+    if scale is not None:
+        scale = torch.as_tensor(scale, dtype=dtype_from_name(payload["default_dtype"])).detach().clone().reshape(())
+        config["polarization_scale"] = scale.item()
+        state["polarization_scale"] = scale
+        for index, n_types, old in lda_scales:
+            old = torch.as_tensor(old).to(scale)
+            if not torch.equal(scale, old):
+                key = "readout.{}.mlp.0.weight".format(index)
+                weight = state[key].clone()
+                weight[:, n_types:2*n_types] *= (scale / old).square().to(weight)
+                state[key] = weight
+    else:
+        config["polarization_scale"] = None
+    return payload
+
+
+_MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3,
+               3: _migrate_v3_to_v4, 4: _migrate_v4_to_v5}
 
 
 def migrate_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

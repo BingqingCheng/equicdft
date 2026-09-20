@@ -41,7 +41,7 @@ class TestPolarizationMessage(unittest.TestCase):
     @staticmethod
     def model(backend="gather", layers=1, center=True, radial="shared"):
         a = CartesianAFeatures(
-            1, .7, cutoff_grid=2, include_polarization=True, dipole_density_scale=.3,
+            1, .7, cutoff_grid=2, include_polarization=True,
             radial_basis="gaussian", radial_exponents=(.2, .6),
             trainable_radial_exponents=True, coordinate_scaling="cutoff",
             separate_center=center, convolution_backend="fft" if backend=="fft" else "gather",
@@ -58,7 +58,7 @@ class TestPolarizationMessage(unittest.TestCase):
             convolution_backend=backend, **radial_args,
         ) for _ in range(layers)]
         return GridCACEModel(
-            a, b, [LocalReadout(hidden_sizes=(5,))], grid_spacing=.7,
+            a, b, [LocalReadout(hidden_sizes=(5,))], polarization_scale=.3, grid_spacing=.7,
             message_layers=messages, compute_polarization_derivative=True,
         )
 
@@ -71,18 +71,18 @@ class TestPolarizationMessage(unittest.TestCase):
                     original = {k:v.clone() for k,v in data.items()}
                     a = CartesianAFeatures(
                         1, .7, cutoff_grid=1, include_polarization=True,
-                        dipole_density_scale=.3, separate_center=center,
+                        separate_center=center,
                         n_types=3, density_transform=weights,
                         radial_basis="gaussian", radial_exponents=(.2, .6),
                     )
                     b = CartesianBFeatures(1, 2, include_polarization=True, separate_center=center)
-                    B = b(a(data))
+                    B = b(a(data, polarization_scale=.3))
                     message = BChiMessage(b.n_features, 2, 2, hidden_sizes=(5,), include_polarization=True)
                     # Independent species mixing, scaling and field-major packing.
                     rho = torch.einsum("...gt,ct->...gc", data["rho"], weights) / .7
                     polar = torch.einsum("...gtv,ct->...gvc", data["dipole_density"], weights) / .3
                     fields = torch.cat((rho, polar.flatten(-2)), dim=-1)
-                    raw, scales = a.polarization_fields(data)
+                    raw, scales = a.polarization_fields(data, polarization_scale=.3)
                     torch.testing.assert_close(raw/scales, fields, atol=1e-14, rtol=1e-14)
                     flat = B.flatten(-3)
                     gates = message.mlp(flat) - message.mlp(torch.zeros_like(flat))
@@ -163,9 +163,9 @@ class TestPolarizationMessage(unittest.TestCase):
     def test_message_has_two_hop_polarization_dependence(self):
         data = self.data(size=7)
         data["dipole_density"].requires_grad_(True)
-        a = CartesianAFeatures(1, .7, cutoff_grid=1, include_polarization=True, dipole_density_scale=.3)
+        a = CartesianAFeatures(1, .7, cutoff_grid=1, include_polarization=True, )
         b = CartesianBFeatures(1, 2, include_polarization=True)
-        model = GridCACEModel(a, b, [LocalReadout()], grid_spacing=1., message_layers=[
+        model = GridCACEModel(a, b, [LocalReadout()], polarization_scale=.3, grid_spacing=1., message_layers=[
             BChiMessage(b.n_features, 1, 1, include_polarization=True),
         ])
         # Only the local descriptor is scored: LR cannot create this dependency.
@@ -205,9 +205,9 @@ class TestPolarizationMessage(unittest.TestCase):
         b = CartesianBFeatures(1, 2)
         joint = BChiMessage(b.n_features, 1, 1, include_polarization=True)
         with self.assertRaisesRegex(ValueError, "include_polarization must match"):
-            GridCACEModel(a, b, [LocalReadout()], grid_spacing=1., message_layers=[joint])
+            GridCACEModel(a, b, [LocalReadout()], polarization_scale=.3, grid_spacing=1., message_layers=[joint])
         data = self.data(size=3)
-        B = b(a(data))
+        B = b(a(data, polarization_scale=.3))
         for fields in (None, torch.ones(27, 3), torch.ones(27, 4, dtype=torch.float32)):
             with self.assertRaisesRegex(ValueError, "normalized_fields"):
                 joint(B, data["local_density_index"], a.stencil_basis(), normalized_fields=fields)

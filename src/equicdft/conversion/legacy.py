@@ -42,7 +42,7 @@ from ..functional.reciprocal import ReciprocalFeatures
 from ..representation.invariants import CartesianBFeatures
 from ..functional.semilocal import GGAReadout, LDAReadout
 from ..serialization import default_dtype, model_dtype
-from .formats import _one_density_scale
+from .formats import _one_density_scale, _migrate_v4_to_v5
 
 __all__ = [
     "load_legacy_model",
@@ -206,8 +206,7 @@ def _upgrade_cartesian_a_features(module: CartesianAFeatures) -> None:
     )
     _set_default(module, "convolution_backend", "gather")
     _set_default(module, "include_polarization", False)
-    if not _defines(module, "dipole_density_scale"):
-        module.register_buffer("dipole_density_scale", None)
+    module._buffers.pop("dipole_density_scale", None)
     _set_default(module, "coordinate_scaling", "none")
     _set_default(module, "trainable_radial_exponents", False)
     _set_default(module, "trainable_radial_centers", False)
@@ -335,6 +334,7 @@ def _upgrade_model(module: GridCACEModel) -> None:
         module.message_layers = nn.ModuleList()
     _set_default(module, "a_features", None)
     _set_default(module, "b_features", None)
+    _upgrade_polarization_scale(module)
     if not _defines(module, "mean_density"):
         # The density scale used to live on the feature module and on every
         # LDA readout; the model now owns it. Readout copies are dropped by
@@ -373,6 +373,32 @@ def _upgrade_model(module: GridCACEModel) -> None:
         module._n_types = module.n_types
 
 
+def _upgrade_polarization_scale(module: GridCACEModel) -> None:
+    """Share the versioned normalization migration with whole-object conversion."""
+    features = module.a_features
+    config = {"type": "GridCACEModel", "a_features": {}, "readout": []}
+    if features is not None:
+        config["a_features"]["dipole_density_scale"] = features._buffers.get("dipole_density_scale")
+    for item in module.readout:
+        entry = {"type": type(item).__name__}
+        if isinstance(item, LDAReadout):
+            entry["n_types"] = item.n_types
+            if "dipole_density_scale" in item._buffers:
+                entry["dipole_density_scale"] = item._buffers["dipole_density_scale"]
+        config["readout"].append(entry)
+    payload = _migrate_v4_to_v5({
+        "config": config, "state_dict": module.state_dict(),
+        "default_dtype": str(model_dtype(module)).replace("torch.", ""),
+    })
+    module.register_buffer("polarization_scale", payload["state_dict"].get("polarization_scale"))
+    for index, item in enumerate(module.readout):
+        if isinstance(item, LDAReadout):
+            _set_default(item, "include_polarization", config["readout"][index].get("include_polarization", False))
+            with torch.no_grad():
+                item.mlp[0].weight.copy_(payload["state_dict"]["readout.{}.mlp.0.weight".format(index)])
+            item._buffers.pop("dipole_density_scale", None)
+
+
 def _upgrade_mlp_readout(module: nn.Module) -> None:
     mlp = module._modules.get("mlp")
     if mlp is not None:
@@ -397,8 +423,7 @@ def _upgrade_mlp_readout(module: nn.Module) -> None:
                 module.register_buffer(name, None)
         _set_default(module, "features", None)
     if isinstance(module, LDAReadout):
-        if not _defines(module, "dipole_density_scale"):
-            module.register_buffer("dipole_density_scale", None)
+        _set_default(module, "include_polarization", False)
         # Moved to GridCACEModel.mean_density (see _upgrade_model).
         module._buffers.pop("mean_density", None)
 

@@ -49,6 +49,8 @@ class ReadoutContext:
         Quadrature volume ``Delta V`` of one grid point, scalar or ``[...]``.
     mean_density
         Positive density scale used by every normalized density input.
+    polarization_scale
+        Fixed positive scalar shared by normalized polarization inputs.
     grid_spacing
         Cartesian spacing ``[3]`` of the regular grid.
     grid_size
@@ -77,6 +79,7 @@ class ReadoutContext:
     normalized_temperature: torch.Tensor
     voxel_volume: Union[float, torch.Tensor]
     mean_density: Optional[Union[float, torch.Tensor]] = None
+    polarization_scale: Optional[Union[float, torch.Tensor]] = None
     grid_spacing: Optional[torch.Tensor] = None
     grid_size: Optional[torch.Tensor] = None
     beta: Optional[torch.Tensor] = None
@@ -106,6 +109,11 @@ class ReadoutContext:
         self.voxel_volume = torch.as_tensor(
             self.voxel_volume, dtype=rho.dtype, device=rho.device,
         )
+        if self.polarization_scale is not None:
+            scale = torch.as_tensor(self.polarization_scale, dtype=rho.dtype, device=rho.device)
+            if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+                raise ValueError("polarization_scale must be a positive scalar")
+            self.polarization_scale = scale.reshape(())
         if self.mean_density is not None:
             scale = torch.as_tensor(
                 self.mean_density, dtype=rho.dtype, device=rho.device,
@@ -125,6 +133,7 @@ class ReadoutContext:
         mean_temperature: Union[float, torch.Tensor] = 1.0,
         boltzmann_constant: Union[float, torch.Tensor] = 1.0,
         mean_density: Optional[Union[float, torch.Tensor]] = None,
+        polarization_scale: Optional[Union[float, torch.Tensor]] = None,
         free_energy_mode: str = "beta",
     ) -> "ReadoutContext":
         """Build the context of one GridData-like batch under a unit contract.
@@ -156,6 +165,7 @@ class ReadoutContext:
             normalized_temperature=temperature / reference_temperature.to(rho),
             voxel_volume=compute_voxel_volume(spacing).to(rho),
             mean_density=mean_density,
+            polarization_scale=polarization_scale,
             grid_spacing=spacing.to(rho),
             # Physical analytical readouts use this unit contract, not a
             # possibly stale beta field supplied by a caller.
@@ -208,6 +218,13 @@ class ReadoutContext:
             lambda: self.normalized_temperature[..., None, None].expand(
                 *self.rho.shape[:-1], 1,
             ),
+        )
+
+    def normalized_polarization(self) -> torch.Tensor:
+        """Return physical P divided by the fixed model scale; do not center."""
+        return self._cached(
+            "normalized_polarization",
+            lambda: self.require("dipole_density") / self.require("polarization_scale"),
         )
 
     def local_features(self) -> torch.Tensor:
@@ -280,6 +297,8 @@ class EnergyReadout(nn.Module):
     requires_local_features = False
     requires_local_density_index = False
     requires_dipole_density = False
+    # Learned readouts request normalization independently of physical P.
+    requires_polarization_scale = False
     n_types: Optional[int] = None
 
     @property

@@ -5,7 +5,7 @@ holding a plain dictionary::
 
     {
         "format": "equicdft-model",
-        "format_version": 4,
+        "format_version": 5,
         "equicdft_version": "...",
         "torch_version": "...",
         "default_dtype": "float32",
@@ -53,7 +53,7 @@ __all__ = [
 
 
 MODEL_FORMAT = "equicdft-model"
-MODEL_FORMAT_VERSION = 4
+MODEL_FORMAT_VERSION = 5
 
 _DTYPE_NAMES = {
     "float16": torch.float16,

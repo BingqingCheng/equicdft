@@ -37,7 +37,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         torch.set_default_dtype(self.dtype)
 
     def features(self, **kwargs):
-        args = dict(mean_density=.7, dipole_density_scale=2.,
+        args = dict(mean_density=.7,
                     include_polarization=True, cutoff_grid=1, max_power=1,
                     radial_basis="gaussian", radial_exponents=(.125, .5),
                     trainable_radial_exponents=True)
@@ -51,7 +51,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         for center, power in itertools.product((False, True), (0, 1, 2)):
             a, b = self.features(separate_center=center, max_power=power, n_types=2)
             data, positions = periodic_field(n_types=2)
-            moments = a(data)
+            moments = a(data, polarization_scale=2.)
             reference = b(moments)
             group = 0
             for permutation in itertools.permutations(range(3)):
@@ -63,7 +63,7 @@ class TestPolarizationFeatures(unittest.TestCase):
                     dipole = torch.empty_like(data["dipole_density"])
                     rho[index] = data["rho"]
                     dipole[index] = data["dipole_density"] @ rotation.T
-                    actual = a(dict(data, rho=rho, dipole_density=dipole))[index]
+                    actual = a(dict(data, rho=rho, dipole_density=dipole), polarization_scale=2.)[index]
                     expected = moments.index_select(-2, b.component_indices[group])
                     expected = expected * b.component_signs[group][..., None]
                     torch.testing.assert_close(actual, expected, atol=2e-12, rtol=2e-12)
@@ -88,7 +88,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         a, _ = self.features(radial_exponents=(.125,), separate_center=False)
         b = CartesianBFeatures(1, 2, include_polarization=True, separate_center=False)
         data, _ = periodic_field()
-        moments = a(data)
+        moments = a(data, polarization_scale=2.)
         result = b(moments)
         # K=4; zeroth vector slots Px/Py/Pz are 4,8,12. Spatial rho vector
         # slots are 1,2,3. The orbit of rho_x * P_x is v.P / 3.
@@ -96,7 +96,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         col = b.n_features_by_order[0] + reps.index([1, 4])
         expected = (moments[..., [1, 2, 3], :] * moments[..., [4, 8, 12], :]).sum(-2) / 3
         torch.testing.assert_close(result[..., col, :], expected)
-        self.assertFalse(torch.allclose(b(a(dict(data, dipole_density=-data["dipole_density"]))), result))
+        self.assertFalse(torch.allclose(b(a(dict(data, dipole_density=-data["dipole_density"]), polarization_scale=2.)), result))
 
     def test_shared_basis_direct_sums_center_and_species_transform(self):
         from unittest.mock import patch
@@ -108,7 +108,7 @@ class TestPolarizationFeatures(unittest.TestCase):
                 separate_center=center,
             )
             with patch.object(a, "stencil_basis", wraps=a.stencil_basis) as basis:
-                actual = a(data)
+                actual = a(data, polarization_scale=2.)
             basis.assert_called_once()
             fields = [a.transform_density(data["rho"]) / .7]
             fields.extend(a.transform_density(data["dipole_density"][..., axis]) / 2.
@@ -131,7 +131,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         data, _ = periodic_field(size=5, cutoff=2, n_types=2)
         for basis, center in itertools.product(("none", "gaussian", "bessel"), (False, True)):
             args = dict(max_power=1, cutoff_grid=2, mean_density=.7,
-                        include_polarization=True, dipole_density_scale=2.,
+                        include_polarization=True,
                         n_types=2, radial_basis=basis, separate_center=center,
                         density_transform=((1., 1.), (1., -1.)))
             if basis == "gaussian":
@@ -151,7 +151,7 @@ class TestPolarizationFeatures(unittest.TestCase):
                 inputs["dipole_density"].requires_grad_()
                 if module is fft:
                     inputs.pop("local_density_index")
-                output = b(module(inputs))
+                output = b(module(inputs, polarization_scale=2.))
                 targets = (inputs["rho"], inputs["dipole_density"], *module.parameters())
                 grad = torch.autograd.grad(output.square().sum(), targets, create_graph=True)
                 second = torch.autograd.grad(sum(g.square().sum() for g in grad), targets)
@@ -170,17 +170,17 @@ class TestPolarizationFeatures(unittest.TestCase):
         for key in ("rho", "dipole_density"):
             shifted[key] = torch.empty_like(data[key])
             shifted[key][index] = data[key]
-        torch.testing.assert_close(b(a(shifted))[index], b(a(data)))
+        torch.testing.assert_close(b(a(shifted, polarization_scale=2.))[index], b(a(data, polarization_scale=2.)))
         batch = {key: torch.stack((data[key], shifted[key])) for key in data}
-        torch.testing.assert_close(b(a(batch))[0], b(a(data)))
-        torch.testing.assert_close(b(a(batch))[1], b(a(shifted)))
+        torch.testing.assert_close(b(a(batch, polarization_scale=2.))[0], b(a(data, polarization_scale=2.)))
+        torch.testing.assert_close(b(a(batch, polarization_scale=2.))[1], b(a(shifted, polarization_scale=2.)))
 
     def test_empty_fields_finite_first_and_second_derivatives(self):
         a, b = self.features()
         data, _ = periodic_field()
         data["rho"] = torch.zeros_like(data["rho"], requires_grad=True)
         data["dipole_density"] = torch.zeros_like(data["dipole_density"], requires_grad=True)
-        value = b(a(data)).sum()
+        value = b(a(data, polarization_scale=2.)).sum()
         gradients = torch.autograd.grad(value, (data["rho"], data["dipole_density"]), create_graph=True)
         second = torch.autograd.grad(sum(g.square().sum() for g in gradients),
                                      (data["rho"], data["dipole_density"]))
@@ -220,7 +220,7 @@ class TestPolarizationFeatures(unittest.TestCase):
         fft_a, fft_b = self.features(convolution_backend="fft")
         models = [
             GridCACEModel(af, bf, [LocalReadout(n_features=2*bf.n_features + 1, hidden_sizes=(4,))],
-                          grid_spacing=.5, compute_polarization_derivative=True)
+                          polarization_scale=2., grid_spacing=.5, compute_polarization_derivative=True)
             for af, bf in ((a, b), (fft_a, fft_b))
         ]
         models[1].load_state_dict(models[0].state_dict(), strict=True)
@@ -236,8 +236,7 @@ class TestPolarizationFeatures(unittest.TestCase):
             torch.testing.assert_close(outputs[0][key], outputs[1][key], atol=2e-11, rtol=2e-11)
 
     def test_shape_and_configuration_validation(self):
-        for args in (dict(include_polarization=True),
-                     dict(include_polarization="yes"),
+        for args in (dict(include_polarization="yes"),
                      dict(dipole_density_scale=1.),
                      dict(include_polarization=True, dipole_density_scale=0.)):
             with self.assertRaises((ValueError, TypeError)):
@@ -247,21 +246,21 @@ class TestPolarizationFeatures(unittest.TestCase):
                       CartesianBFeatures(2, 3, include_polarization=True),
                       CartesianBFeatures(1, 3, include_polarization=True, separate_center=False)):
             with self.assertRaisesRegex(ValueError, "A/B"):
-                GridCACEModel(a, wrong, [LocalReadout()], grid_spacing=.5)
+                GridCACEModel(a, wrong, [LocalReadout()], polarization_scale=2., grid_spacing=.5)
         with self.assertRaisesRegex(ValueError, "include_polarization must match"):
-            GridCACEModel(a, b, [LocalReadout()], grid_spacing=.5,
+            GridCACEModel(a, b, [LocalReadout()], polarization_scale=2., grid_spacing=.5,
                           message_layers=[BChiMessage(b.n_features, 2, 1)])
         data, _ = periodic_field()
         missing = dict(data)
         del missing["dipole_density"]
         with self.assertRaisesRegex(ValueError, "dipole_density is required"):
-            a(missing)
+            a(missing, polarization_scale=2.)
         for dipole in (data["rho"], data["dipole_density"].float(),
                        torch.full_like(data["dipole_density"], float("nan"))):
             with self.assertRaises(ValueError):
-                a(dict(data, dipole_density=dipole))
+                a(dict(data, dipole_density=dipole), polarization_scale=2.)
         model = GridCACEModel(a, b, [LocalReadout(n_features=2*b.n_features + 1)],
-                              grid_spacing=.5, compute_polarization_derivative=True)
+                              polarization_scale=2., grid_spacing=.5, compute_polarization_derivative=True)
         self.assertTrue(model.requires_dipole_density)
         self.assertTrue(model.requires_local_density_index)
         self.assertFalse(getattr(model.readout[0], "requires_dipole_density", False))

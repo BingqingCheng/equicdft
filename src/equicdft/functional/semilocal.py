@@ -16,13 +16,11 @@ from .._validation import (
 from .._config import (
     Configurable,
     make_config,
-    optional_buffer_value,
     register,
 )
 from ..geometry.grid import grid_spacing_tensor
 from .._nn import (
     build_mlp,
-    positive_scalar_tensor,
     validate_hidden_sizes,
 )
 from .base import EnergyReadout, ReadoutContext
@@ -55,9 +53,9 @@ class LDAReadout(EnergyReadout, Configurable):
     ``E_exc_lda`` follows the free-energy convention selected by the
     containing model.
 
-    When ``dipole_density_scale`` is supplied, append one local squared
+    When ``include_polarization=True``, append one local squared
     dipole-density magnitude per component before temperature. The input is
-    then ``(rho_a/mean_density, |P_a|^2/dipole_density_scale^2, T/mean_T)``.
+    then ``(rho_a/mean_density, |P_a|^2/polarization_scale^2, T/mean_T)``.
     This is an excess contribution only: translational and orientational
     ideal entropy must still be supplied separately. Squared magnitudes keep
     derivatives smooth at P=0 and never divide by the local density. For
@@ -76,9 +74,9 @@ class LDAReadout(EnergyReadout, Configurable):
         Width of each hidden layer. An empty sequence gives a linear mapping.
     zero_init
         If true, initialize the final layer to zero.
-    dipole_density_scale
-        Optional fixed positive scalar, shared by all Cartesian components
-        and species. Omit to preserve the density-only architecture.
+    include_polarization
+        Include squared polarization magnitudes using the model-owned scale.
+        False preserves the density-only architecture.
     """
 
     def __init__(
@@ -87,20 +85,15 @@ class LDAReadout(EnergyReadout, Configurable):
         *,
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = False,
-        dipole_density_scale: Optional[Union[float, torch.Tensor]] = None,
+        include_polarization: bool = False,
     ) -> None:
         super().__init__()
 
         self.n_types = positive_integer(n_types, "n_types")
+        self.include_polarization = boolean(include_polarization, "include_polarization")
         self.n_state_features = self.n_types + 1
-        if dipole_density_scale is not None:
-            self.register_buffer(
-                "dipole_density_scale",
-                positive_scalar_tensor(dipole_density_scale, "dipole_density_scale"),
-            )
+        if self.include_polarization:
             self.n_state_features += self.n_types
-        else:
-            self.register_buffer("dipole_density_scale", None)
         self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.zero_init = boolean(zero_init, "zero_init")
         self.mlp = build_mlp(
@@ -118,14 +111,18 @@ class LDAReadout(EnergyReadout, Configurable):
             n_types=self.n_types,
             hidden_sizes=self.hidden_sizes,
             zero_init=self.zero_init,
-            dipole_density_scale=optional_buffer_value(self.dipole_density_scale),
+            include_polarization=self.include_polarization,
         )
 
     @property
     def requires_dipole_density(self) -> bool:
         """Whether the LDA includes squared polarization magnitudes."""
 
-        return self.dipole_density_scale is not None
+        return self.include_polarization
+
+    @property
+    def requires_polarization_scale(self) -> bool:
+        return self.include_polarization
 
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
         """Return ``a_exc_lda`` with shape ``[..., n_grid, 1]``."""
@@ -154,7 +151,7 @@ class LDAReadout(EnergyReadout, Configurable):
                 raise ValueError("rho and dipole_density must share dtype and device")
             if not torch.isfinite(dipole).all():
                 raise ValueError("dipole_density must be finite")
-            normalized_dipole = dipole / self.dipole_density_scale.to(rho)
+            normalized_dipole = context.normalized_polarization()
             inputs.append(normalized_dipole.square().sum(dim=-1))
         local_state = (
             context.pointwise_state()

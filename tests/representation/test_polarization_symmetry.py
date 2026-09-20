@@ -43,7 +43,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
     @staticmethod
     def model(backend, charge, message_count=0):
         a = CartesianAFeatures(
-            max_power=1, mean_density=.5, dipole_density_scale=.3,
+            max_power=1, mean_density=.5,
             include_polarization=True, separate_center=True, cutoff_grid=1,
             radial_basis="gaussian", radial_exponents=(.125, .5),
             trainable_radial_exponents=True, convolution_backend=backend,
@@ -59,9 +59,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         readouts = [
             LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
-            LDAReadout(
-                       dipole_density_scale=.3,
-                       hidden_sizes=(5,), zero_init=False),
+            LDAReadout(include_polarization=True, hidden_sizes=(5,), zero_init=False),
             LongRangeReadout(
                 n_kernels=1, charges=(charge,), include_polarization=True,
                 coulomb_amplitude=1.8,
@@ -76,7 +74,7 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
             ),
         ]
         return GridCACEModel(
-            a, b, readouts, grid_spacing=.7, mean_temperature=1.5,
+            a, b, readouts, polarization_scale=.3, grid_spacing=.7, mean_temperature=1.5,
             ideal=FixedDipoleIdeal(1.0),
             compute_c1=True, compute_polarization_derivative=True,
             message_layers=[BChiMessage(

@@ -64,7 +64,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         lda = LDAReadout(n_types=readout.n_types, zero_init=True)
         kwargs.setdefault("boltzmann_constant", 1.0)
         return GridCACEModel(
-            None, None, [lda, readout], grid_spacing=spacing,
+            None, None, [lda, readout], polarization_scale=.2, grid_spacing=spacing,
             compute_polarization_derivative=True, mean_density=.4, **kwargs,
         )
 
@@ -127,7 +127,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         )
         lda = LDAReadout(zero_init=True)
         model = GridCACEModel(
-            None, None, [lda, gaussian, coulomb], grid_spacing=spacing,
+            None, None, [lda, gaussian, coulomb], polarization_scale=.2, grid_spacing=spacing,
             compute_polarization_derivative=True, mean_density=.4,
             boltzmann_constant=1.0,
         ).eval()
@@ -274,7 +274,7 @@ class TestPolarizationGaussian(unittest.TestCase):
 
     def test_model_batch_and_additivity_with_lda_and_coulomb(self):
         gaussian = self.readout()
-        lda = LDAReadout(dipole_density_scale=.2, hidden_sizes=(4,))
+        lda = LDAReadout(include_polarization=True, hidden_sizes=(4,))
         coulomb = LongRangeReadout(
             1, charges=(0.,), coulomb_amplitude=1.3, include_polarization=True,
             features=ReciprocalFeatures((.3,), kernel="coulomb"),
@@ -282,7 +282,7 @@ class TestPolarizationGaussian(unittest.TestCase):
         data = self.data()
         individual = [self.model(item).eval()(self.clone(data)) for item in (gaussian, lda, coulomb)]
         model = GridCACEModel(
-            None, None, [lda, gaussian, coulomb], grid_spacing=.8,
+            None, None, [lda, gaussian, coulomb], polarization_scale=.2, grid_spacing=.8,
             compute_polarization_derivative=True, mean_density=.4,
             boltzmann_constant=1.0,
         ).eval()

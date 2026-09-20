@@ -27,10 +27,10 @@ class TestIntrinsicAPI(unittest.TestCase):
         return data
 
     def model(self, polarized):
-        readout = LDAReadout(n_types=1, dipole_density_scale=.3 if polarized else None)
+        readout = LDAReadout(n_types=1, include_polarization=polarized)
         model = GridCACEModel(
             None, None, [readout], ideal=FixedDipoleIdeal(.7) if polarized else IdealGas(),
-            n_types=1, grid_spacing=.7, mean_density=.3, boltzmann_constant=1.,
+            n_types=1, polarization_scale=.3 if polarized else None, grid_spacing=.7, mean_density=.3, boltzmann_constant=1.,
             compute_polarization_derivative=polarized,
         ).double()
         # Nonzero learned contribution ensures total/excess confusion is visible.

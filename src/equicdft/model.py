@@ -301,6 +301,11 @@ class GridCACEModel(nn.Module, Configurable):
     it when both are given; a model without local features that contains
     density-normalizing readouts must receive it explicitly.
 
+    ``polarization_scale`` is a user-specified positive scalar in dipole-density
+    units, shared by polarized A features, messages and LDA. It is required for
+    those learned inputs, stored as a fixed buffer and never subtracted from P.
+    Ideal, Coulomb, external coupling and reciprocal kernels use physical P.
+
     ``compute_local_mu=True`` additionally returns dimensionless beta mu as
     ``beta_mu_local = density_derivative + beta * V_ext``, its
     weighted spatial ``beta_mu_average`` per field/species, and
@@ -334,6 +339,7 @@ class GridCACEModel(nn.Module, Configurable):
         message_layers: Optional[Sequence[BChiMessage]] = None,
         compute_polarization_derivative: bool = False,
         mean_density: Optional[Union[float, torch.Tensor]] = None,
+        polarization_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
@@ -397,6 +403,13 @@ class GridCACEModel(nn.Module, Configurable):
         )
         _check_cutoff_and_feature_requirements(a_features, readouts)
         n_types = _resolve_n_types(a_features, readouts, n_types)
+        polarization_scale = (None if polarization_scale is None else
+                              positive_scalar_tensor(polarization_scale, "polarization_scale"))
+        needs_polarization_scale = (
+            a_features is not None and a_features.include_polarization
+        ) or any(item.requires_polarization_scale for item in readouts)
+        if needs_polarization_scale and polarization_scale is None:
+            raise ValueError("polarized learned inputs require model polarization_scale")
         density_scale = None
         if mean_density is not None:
             density_scale = positive_scalar_tensor(mean_density, "mean_density")
@@ -479,6 +492,7 @@ class GridCACEModel(nn.Module, Configurable):
 
         self.register_buffer("grid_spacing", spacing)
         self.register_buffer("mean_density", density_scale)
+        self.register_buffer("polarization_scale", polarization_scale)
         self.register_buffer("mean_temperature", mean_temperature_tensor)
         self.register_buffer(
             "boltzmann_constant",
@@ -536,6 +550,8 @@ class GridCACEModel(nn.Module, Configurable):
                 None if self.mean_density is None
                 else scalar_value(self.mean_density)
             ),
+            polarization_scale=(None if self.polarization_scale is None
+                                else scalar_value(self.polarization_scale)),
         )
 
     @classmethod
@@ -758,7 +774,8 @@ class GridCACEModel(nn.Module, Configurable):
         # B has the contract layout [..., n_grid, n_radial, n_B, n_channels];
         # the three feature axes are flattened into one vector per point.
         grid_rank = data["rho"].ndim - 1
-        A = self.a_features(data)
+        A = (self.a_features(data, polarization_scale=self.polarization_scale)
+             if self.a_features.include_polarization else self.a_features(data))
         B = self.b_features(A)
         levels = [B.flatten(start_dim=grid_rank)]
 
@@ -766,7 +783,9 @@ class GridCACEModel(nn.Module, Configurable):
             shared_basis = self.a_features.stencil_basis()
             message_fields = {}
             if self.a_features.include_polarization:
-                fields, scales = self.a_features.polarization_fields(data)
+                fields, scales = self.a_features.polarization_fields(
+                    data, polarization_scale=self.polarization_scale,
+                )
                 message_fields = {
                     "normalized_fields": fields / scales,
                     "separate_center": self.a_features.separate_center,
@@ -935,6 +954,8 @@ class GridCACEModel(nn.Module, Configurable):
                     else self.mean_density.to(data["rho"])
                 ),
                 free_energy_mode=self.free_energy_mode,
+                polarization_scale=(None if self.polarization_scale is None
+                                    else self.polarization_scale.to(data["rho"])),
             )
             if "beta" in data:
                 self._check_unit_contract(data["beta"], context.beta)

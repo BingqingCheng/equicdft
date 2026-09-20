@@ -26,7 +26,7 @@ class TestPolarizationLDA(unittest.TestCase):
     @staticmethod
     def readout(n_types=1, **kwargs):
         return LDAReadout(
-                          dipole_density_scale=.3,
+                          include_polarization=True,
                           n_types=n_types, hidden_sizes=kwargs.pop("hidden_sizes", (5,)), **kwargs)
 
     @staticmethod
@@ -38,7 +38,7 @@ class TestPolarizationLDA(unittest.TestCase):
 
     @staticmethod
     def model(readouts, spacing=.5, mode="beta"):
-        return GridCACEModel(None, None, readouts, grid_spacing=spacing,
+        return GridCACEModel(None, None, readouts, polarization_scale=.3, grid_spacing=spacing,
                              mean_temperature=1.5, free_energy_mode=mode,
                              compute_polarization_derivative=True, mean_density=.5, boltzmann_constant=1.0)
 
@@ -51,7 +51,7 @@ class TestPolarizationLDA(unittest.TestCase):
         data = self.data(3, batched=True)
         context = ReadoutContext(
             rho=data["rho"], normalized_temperature=data["temperature"] / 1.5,
-            voxel_volume=.125, mean_density=.5, dipole_density=data["dipole_density"],
+            voxel_volume=.125, mean_density=.5, polarization_scale=.3, dipole_density=data["dipole_density"],
         )
         with torch.no_grad():
             readout.mlp[0].weight.copy_(torch.tensor([[1., 2., 3., 4., 5., 6., 7.]]))
@@ -150,7 +150,7 @@ class TestPolarizationLDA(unittest.TestCase):
     def test_additive_neighbor_branch_in_either_order(self):
         lda = self.readout()
         a = CartesianAFeatures(1, .5, cutoff_grid=1,
-                              include_polarization=True, dipole_density_scale=.3)
+                              include_polarization=True, )
         b = CartesianBFeatures(1, 2, include_polarization=True)
         polar = LocalReadout(n_features=b.n_features + 1, hidden_sizes=(4,))
         data = self.data()
@@ -158,11 +158,11 @@ class TestPolarizationLDA(unittest.TestCase):
         data["local_density_index"] = torch.tensor(indices)
         separate = [
             self.model([lda]).eval()(self.clone(data)),
-            GridCACEModel(a, b, [polar], grid_spacing=.5, mean_temperature=1.5,
+            GridCACEModel(a, b, [polar], polarization_scale=.3, grid_spacing=.5, mean_temperature=1.5,
                           compute_polarization_derivative=True, boltzmann_constant=1.0).eval()(self.clone(data)),
         ]
         for readouts in ([lda, polar], [polar, lda]):
-            model = GridCACEModel(a, b, readouts, grid_spacing=.5, mean_temperature=1.5,
+            model = GridCACEModel(a, b, readouts, polarization_scale=.3, grid_spacing=.5, mean_temperature=1.5,
                                  compute_polarization_derivative=True, boltzmann_constant=1.0).eval()
             self.assertEqual(model.cutoff_grid, 1)
             self.assertTrue(model.requires_local_density_index)
@@ -206,7 +206,7 @@ class TestPolarizationLDA(unittest.TestCase):
         self.assertEqual(scalar.n_state_features, 2)
         self.assertNotIn("dipole_density_scale", scalar.state_dict())
         for readout in (scalar, self.readout()):
-            model = GridCACEModel(None, None, [readout], grid_spacing=.5, mean_density=.5,
+            model = GridCACEModel(None, None, [readout], polarization_scale=.3, grid_spacing=.5, mean_density=.5,
                                   compute_polarization_derivative=readout.requires_dipole_density, boltzmann_constant=1.0).eval()
             data = self.data()
             output = model(data)
@@ -219,8 +219,9 @@ class TestPolarizationLDA(unittest.TestCase):
 
     def test_rejects_invalid_scale_shapes_and_nonfinite_p(self):
         for scale in (0., -1., float("nan"), float("inf"), [.1, .2]):
-            with self.assertRaisesRegex(ValueError, "dipole_density_scale"):
-                LDAReadout(dipole_density_scale=scale)
+            with self.assertRaisesRegex(ValueError, "polarization_scale"):
+                GridCACEModel(None, None, [self.readout()], grid_spacing=.5,
+                              mean_density=.5, polarization_scale=scale)
         model = self.model([self.readout()])
         data = self.data()
         del data["dipole_density"]

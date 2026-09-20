@@ -32,7 +32,7 @@ class TestModelIdealReference(unittest.TestCase):
         return GridCACEModel(
             None, None, [LDAReadout(n_types=2)] if excess else [],
             ideal=FixedDipoleIdeal([0.7, 1.9]) if polarized else IdealGas(),
-            n_types=2, grid_spacing=1., boltzmann_constant=1.,
+            n_types=2, polarization_scale=.3, grid_spacing=1., boltzmann_constant=1.,
             mean_density=0.3, compute_polarization_derivative=polarized,
         )
 
@@ -86,8 +86,8 @@ class TestModelIdealReference(unittest.TestCase):
         from equicdft.serialization import model_payload, build_model
         from equicdft.conversion import build_converted_model
         model = GridCACEModel(None, None, [LDAReadout(
-            n_types=2, dipole_density_scale=.3,
-        )], ideal=FixedDipoleIdeal([.7, 1.9]), grid_spacing=1.,
+            n_types=2, include_polarization=True,
+        )], ideal=FixedDipoleIdeal([.7, 1.9]), polarization_scale=.3, grid_spacing=1.,
             mean_density=.3, boltzmann_constant=1.)
         payload = model_payload(model)
         payload["format_version"] = 2

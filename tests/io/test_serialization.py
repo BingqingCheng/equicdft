@@ -243,7 +243,7 @@ class TestSaveLoadModel(unittest.TestCase):
         model, data = _materialized_example()
         expected = model(copy.deepcopy(data))
         current = model_payload(model)
-        self.assertEqual(MODEL_FORMAT_VERSION, 4)
+        self.assertEqual(MODEL_FORMAT_VERSION, 5)
         legacy = copy.deepcopy(current)
         legacy["format_version"] = 1
         scale = legacy["config"].pop("mean_density")
@@ -253,7 +253,7 @@ class TestSaveLoadModel(unittest.TestCase):
 
         migrated = migrate_model_payload(legacy)
 
-        self.assertEqual(migrated["format_version"], 4)
+        self.assertEqual(migrated["format_version"], 5)
         self.assertEqual(migrated["config"], current["config"])
         self.assertEqual(set(migrated["state_dict"]), set(current["state_dict"]))
         self.assertEqual(migrated["state_dict"]["mean_density"].dtype, torch.float32)
@@ -346,7 +346,7 @@ class TestSaveLoadModel(unittest.TestCase):
     def test_version_one_without_local_features_keeps_the_readout_scale(self):
         readout_config = {
             "type": "LDAReadout", "mean_density": 0.7, "n_types": 1,
-            "hidden_sizes": [], "zero_init": True, "dipole_density_scale": None,
+            "hidden_sizes": [], "zero_init": True, "include_polarization": False,
         }
         legacy = {
             "format": MODEL_FORMAT,

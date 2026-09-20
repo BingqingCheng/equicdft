@@ -34,8 +34,8 @@ class TestChemicalPotential(unittest.TestCase):
         settings.update(options)
         return GridCACEModel(
             None, None, [LDAReadout(n_types=2, hidden_sizes=(4,), zero_init=False,
-                                   dipole_density_scale=.3 if polarized else None)],
-            ideal=ideal, n_types=2, grid_spacing=.5, mean_density=.4,
+                                   include_polarization=polarized)],
+            ideal=ideal, n_types=2, polarization_scale=.3 if polarized else None, grid_spacing=.5, mean_density=.4,
             boltzmann_constant=1., **settings,
         )
 

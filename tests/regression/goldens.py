@@ -265,7 +265,7 @@ def _polarization_data(batched=False):
 
 def _polarization_model(mode="beta", with_scalar=False):
     a_features = CartesianAFeatures(
-        mean_density=0.5, dipole_density_scale=0.3, include_polarization=True,
+        mean_density=0.5, include_polarization=True,
         cutoff_grid=1, max_power=2, radial_basis="gaussian",
         radial_exponents=(0.125, 0.5), trainable_radial_exponents=True,
     )
@@ -281,6 +281,7 @@ def _polarization_model(mode="beta", with_scalar=False):
         mean_temperature=1.5,
         free_energy_mode=mode,
         compute_polarization_derivative=True,
+        polarization_scale=.3,
         boltzmann_constant=1.0,
     )
 
@@ -637,6 +638,8 @@ def compare(
     """
 
     actual = dict(actual)
+    if "state/a_features.dipole_density_scale" in recorded and "state/polarization_scale" in actual:
+        actual["state/a_features.dipole_density_scale"] = actual.pop("state/polarization_scale")
     # Historical unsuffixed P responses were excess-only. Rename the reference
     # keys, not their tensors, so the same physical quantities are compared.
     # (``_rename_recorded`` below does the same for the retired residual

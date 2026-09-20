@@ -11,12 +11,11 @@ from .._validation import (
     optional_positive_integer,
     positive_integer,
 )
-from .._config import Configurable, make_config, optional_buffer_value, register, scalar_value
+from .._config import Configurable, make_config, register, scalar_value
 from ..geometry.convolution import (
     gather_neighbors,
     periodic_density_convolution,
 )
-from .._nn import positive_scalar_tensor
 from .radial import (
     _RadialTransform,
     _cartesian_stencil_basis,
@@ -164,7 +163,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         Frequencies are the fixed integer sequence ``n*pi/cutoff_grid``.
     mean_density
         Positive scalar used for scale-only density normalization. For fitting,
-        set this to the precomputed mean density of the training split. It is
+        set this to a precomputed reference density. It is
         stored as a fixed buffer; no mean is subtracted, so zero density
         remains zero.
     convolution_backend
@@ -179,10 +178,8 @@ class CartesianAFeatures(nn.Module, Configurable):
         by spatial monomial. With separate_center, append the normalized
         center to each block before symmetrization, rather than feeding a
         raw vector to the readout. Radial/type axes remain independent.
-    dipole_density_scale
-        Positive scalar normalizing the entire polarization vector, required
-        only with include_polarization. This is dipole moment per volume,
-        not orientation per particle.
+    Polarization normalization is supplied by the containing model through
+    the forward argument ``polarization_scale`` (dipole moment per volume).
 
     Notes
     -----
@@ -218,22 +215,10 @@ class CartesianAFeatures(nn.Module, Configurable):
         n_radial_functions: Optional[int] = None,
         convolution_backend: str = "gather",
         include_polarization: bool = False,
-        dipole_density_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
         self.include_polarization = boolean(include_polarization, "include_polarization")
-        if self.include_polarization:
-            if dipole_density_scale is None:
-                raise ValueError("include_polarization requires dipole_density_scale")
-            self.register_buffer(
-                "dipole_density_scale",
-                positive_scalar_tensor(dipole_density_scale, "dipole_density_scale"),
-            )
-        elif dipole_density_scale is not None:
-            raise ValueError("dipole_density_scale requires include_polarization=True")
-        else:
-            self.register_buffer("dipole_density_scale", None)
 
         if not isinstance(radial_basis, str):
             raise TypeError(
@@ -537,7 +522,6 @@ class CartesianAFeatures(nn.Module, Configurable):
             n_radial_functions=self.n_radial_functions if bessel else None,
             convolution_backend=self.convolution_backend,
             include_polarization=self.include_polarization,
-            dipole_density_scale=optional_buffer_value(self.dipole_density_scale),
         )
 
     @property
@@ -668,7 +652,10 @@ class CartesianAFeatures(nn.Module, Configurable):
     def requires_dipole_density(self) -> bool:
         return self.include_polarization
 
-    def forward(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, data: Mapping[str, torch.Tensor], *,
+        polarization_scale: Optional[Union[float, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
         Parameters
@@ -685,6 +672,9 @@ class CartesianAFeatures(nn.Module, Configurable):
             ``grid_positions``, ``grid_size``
                 Complete regular-grid geometry required by the ``"fft"``
                 backend.
+        polarization_scale
+            Positive model-owned scale for all P components. Required only
+            with polarization; standalone calls supply it explicitly.
         Returns
         -------
         torch.Tensor
@@ -701,7 +691,7 @@ class CartesianAFeatures(nn.Module, Configurable):
             descriptor_density = self.transform_density(data["rho"])
             return self._convolve(descriptor_density, self.mean_density, stencil_basis, data)
 
-        fields, scales = self.polarization_fields(data)
+        fields, scales = self.polarization_fields(data, polarization_scale=polarization_scale)
         moments = self._convolve(fields, scales, stencil_basis, data)
         if self.separate_center:
             center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
@@ -711,13 +701,19 @@ class CartesianAFeatures(nn.Module, Configurable):
         moments = moments.unflatten(-1, (4, self.n_output_channels))
         return moments.transpose(-3, -2).flatten(-3, -2)
 
-    def polarization_fields(self, data):
+    def polarization_fields(self, data, *, polarization_scale):
         """Pack original [rho, Px, Py, Pz] channels and their reference scales.
 
         Initial moments and joint messages use the same species mixing and
         normalization. These carriers remain connected to the physical inputs.
         """
         rho = data["rho"]
+        if polarization_scale is None:
+            raise ValueError("polarized features require polarization_scale from the model")
+        scale = torch.as_tensor(polarization_scale, dtype=rho.dtype, device=rho.device)
+        if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+            raise ValueError("polarization_scale must be a positive scalar")
+        scale = scale.reshape(())
         if "dipole_density" not in data:
             raise ValueError("dipole_density is required when include_polarization=True")
         dipole = data["dipole_density"]
@@ -735,7 +731,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         fields = torch.cat((descriptor_density, vector.flatten(-2)), dim=-1)
         scales = torch.cat((
             self.mean_density.expand(channels),
-            self.dipole_density_scale.expand(3 * channels),
+            scale.expand(3 * channels),
         ))
         return fields, scales
 

@@ -532,7 +532,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
     def test_polarization_stability_integrates_with_grid_model(self):
         batch = self._add_polarization(self._batch())
         readout = LDAReadout(
-            dipole_density_scale=0.5,
+            include_polarization=True,
             hidden_sizes=(),
         ).to(dtype=torch.float64)
         with torch.no_grad():
@@ -545,6 +545,7 @@ class TestFourierStabilityLoss(unittest.TestCase):
             b_features=None,
             readout=[readout],
             ideal=FixedDipoleIdeal(1.0),
+            polarization_scale=.5,
             grid_spacing=1.0,
             mean_temperature=1.0,
             compute_c1=False,

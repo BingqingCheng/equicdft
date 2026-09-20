@@ -51,7 +51,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
     @staticmethod
     def model(readout, spacing=.8, **kwargs):
         kwargs.setdefault("boltzmann_constant", 1.0)
-        return GridCACEModel(None, None, [readout], grid_spacing=spacing,
+        return GridCACEModel(None, None, [readout], polarization_scale=.2, grid_spacing=spacing,
                              compute_polarization_derivative=True,
                              mean_density=.4, **kwargs)
 
@@ -71,7 +71,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
         self.assertFalse(loaded.requires_dipole_density)
         self.assertIsNotNone(loaded.coulomb_amplitude)
         torch.testing.assert_close(loaded.energy(ctx(data)), new.energy(ctx(data)))
-        scalar = GridCACEModel(None, None, [loaded], grid_spacing=.8, boltzmann_constant=1.0).eval()
+        scalar = GridCACEModel(None, None, [loaded], polarization_scale=.2, grid_spacing=.8, boltzmann_constant=1.0).eval()
         polar = self.model(new).eval()
         for key, value in scalar(self.clone(data), compute_ideal=False).items():
             torch.testing.assert_close(value, polar(self.clone(data))[key])
@@ -221,12 +221,12 @@ class TestPolarizationCoulomb(unittest.TestCase):
         self.assertTrue(torch.autograd.gradgradcheck(energy, (rho, p), atol=2e-8, rtol=2e-6))
 
     def test_additivity_with_squared_p_lda(self):
-        lda = LDAReadout(dipole_density_scale=.2, hidden_sizes=(4,))
+        lda = LDAReadout(include_polarization=True, hidden_sizes=(4,))
         coulomb = self.readout()
         data = self.data()
         separate = [self.model(item).eval()(self.clone(data)) for item in (lda, coulomb)]
         for readouts in ([lda, coulomb], [coulomb, lda]):
-            model = GridCACEModel(None, None, readouts, grid_spacing=.8,
+            model = GridCACEModel(None, None, readouts, polarization_scale=.2, grid_spacing=.8,
                                  compute_polarization_derivative=True,
                                  mean_density=.4, boltzmann_constant=1.0).eval()
             result = model(self.clone(data))
@@ -262,7 +262,7 @@ class TestPolarizationCoulomb(unittest.TestCase):
     def test_learned_amplitude_has_response_loss_gradients(self):
         readout = self.readout((0., 1.), amplitude=None)
         lda = LDAReadout(n_types=2, zero_init=True)
-        model = GridCACEModel(None, None, [lda, readout], grid_spacing=.8,
+        model = GridCACEModel(None, None, [lda, readout], polarization_scale=.2, grid_spacing=.8,
                              compute_polarization_derivative=True,
                              mean_density=.4, boltzmann_constant=1.0).train()
         # A spatially varying target tests response-loss training even from

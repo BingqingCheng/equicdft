@@ -56,8 +56,8 @@ class TestStabilityReference(unittest.TestCase):
         batch = self.batch()
         batch["dipole_density"][..., 0] = 1.05 * batch["rho"]
         model = GridCACEModel(
-            None, None, [LDAReadout(dipole_density_scale=.5)],
-            ideal=FixedDipoleIdeal(1.), grid_spacing=1., mean_density=.5,
+            None, None, [LDAReadout(include_polarization=True)],
+            ideal=FixedDipoleIdeal(1.), polarization_scale=.5, grid_spacing=1., mean_density=.5,
             compute_c1=False,
         ).double()
         outputs = model(batch, compute_ideal=False)

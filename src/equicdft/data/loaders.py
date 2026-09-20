@@ -55,6 +55,7 @@ def make_dataloaders(
     compute_mean_temperature: bool = False,
     num_workers: int = 0,
     reuse_grid_geometry: bool = False,
+    compute_polarization_std: bool = False,
 ) -> LoaderResult:
     """Build train, validation, and optional test loaders.
 
@@ -86,6 +87,13 @@ def make_dataloaders(
     compute_mean_temperature
         If true, append the scalar mean temperature over train and validation
         frames to the returned loaders. Test frames are always excluded.
+    compute_polarization_std
+        Return ``polarization_std = sqrt(mean(|P - mean(P)|^2) / 3)`` over
+        train and validation, excluding test data and invalid/excluded voxels.
+        Pool all retained voxel/species vectors with equal weight, using the
+        global vector mean (not per-frame means). No density cutoff is applied.
+        This population statistic is rotation invariant and may be zero;
+        choosing a positive model scale remains the caller's responsibility.
     num_workers
         Number of worker processes used by each data loader.
     reuse_grid_geometry
@@ -99,7 +107,7 @@ def make_dataloaders(
         Always contains the ``train``, ``valid``, and ``test`` loaders, where
         ``test`` is ``None`` when no test dataset is supplied. Requested
         statistics are added under ``mean_density`` and
-        ``mean_temperature``.
+        ``mean_temperature`` and ``polarization_std``.
 
     Notes
     -----
@@ -115,6 +123,7 @@ def make_dataloaders(
             "provide exactly one of valid_dataset and valid_fraction"
         )
     batch_size = positive_integer(batch_size, "batch_size")
+    compute_polarization_std = boolean(compute_polarization_std, "compute_polarization_std")
     num_workers = nonnegative_integer(num_workers, "num_workers")
     reuse_grid_geometry = boolean(
         reuse_grid_geometry,
@@ -187,6 +196,8 @@ def make_dataloaders(
         result["mean_density"] = _mean_density(statistics_datasets)
     if compute_mean_temperature:
         result["mean_temperature"] = _mean_temperature(statistics_datasets)
+    if compute_polarization_std:
+        result["polarization_std"] = _polarization_std(statistics_datasets)
     return result
 
 
@@ -320,6 +331,43 @@ def _mean_density(datasets: Sequence[Dataset]) -> float:
             raise ValueError("rho tensors must contain finite values")
         frame_means.append(frame_mean)
     return torch.stack(frame_means).mean().item()
+
+
+def _polarization_std(datasets: Sequence[Dataset]) -> float:
+    """Stream the trace of the population covariance in float64, without RNG."""
+    count = 0
+    mean = torch.zeros(3, dtype=torch.float64)
+    squared_deviation = torch.zeros((), dtype=torch.float64)
+    for frame in _frames(datasets):
+        if "dipole_density" not in frame:
+            raise KeyError("dataset frame is missing required field 'dipole_density'")
+        polar = torch.as_tensor(frame["dipole_density"]).detach().to(device="cpu", dtype=torch.float64)
+        rho = torch.as_tensor(frame["rho"])
+        if rho.ndim != 2 or polar.shape != (*rho.shape, 3):
+            raise ValueError("dipole_density must have shape [grid, species, 3]")
+        active = torch.ones(rho.shape[0], dtype=torch.bool)
+        for key in ("valid", "excluded_mask"):
+            if key in frame:
+                mask = torch.as_tensor(frame[key], device="cpu")
+                if mask.dtype != torch.bool or mask.shape != active.shape:
+                    raise ValueError(key + " must be Boolean with the grid shape")
+                active &= ~mask if key == "excluded_mask" else mask
+        values = polar[active].reshape(-1, 3)
+        size = values.shape[0]
+        if size == 0:
+            continue
+        if not torch.isfinite(values).all():
+            raise ValueError("dipole_density must be finite on retained voxels")
+        frame_mean = values.mean(0)
+        delta = frame_mean - mean
+        total = count + size
+        squared_deviation += ((values - frame_mean).square().sum()
+                              + delta.square().sum() * (count * size / total))
+        mean += delta * (size / total)
+        count = total
+    if count == 0:
+        raise ValueError("polarization statistics require retained voxel/species vectors")
+    return (squared_deviation / (3 * count)).sqrt().item()
 
 
 def _mean_temperature(datasets: Sequence[Dataset]) -> float:
