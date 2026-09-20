@@ -943,14 +943,14 @@ class Trainer:
         """Move one batch, run the model, and evaluate one loss module."""
 
         batch = self._move_batch(batch)
-        compute_local_mu = (model_kwargs or {}).get("compute_local_mu")
-        if compute_local_mu is None:
-            compute_local_mu = getattr(self.model, "compute_local_mu", False)
-        if noise is not None and noise.enabled and compute_local_mu:
+        selection = getattr(self.model, "density_weights", None)
+        if noise is not None and noise.enabled and selection is not None:
             # The model owns mask construction; freeze it before perturbing
-            # rho so selection cannot drift between noisy training visits.
-            batch = dict(batch, beta_mu_weights=
-                         self.model.beta_mu_weights(batch))
+            # rho so neither the ideal selection nor the chemical-potential
+            # mean drifts between noisy training visits. Physical positivity
+            # is still intersected inside the ideal, so a frozen weight can
+            # never reintroduce a logarithm at vacuum.
+            batch = dict(batch, beta_mu_weights=selection(batch))
         if noise is not None:
             batch = noise.apply(batch, ideal=getattr(self.model, "ideal", None))
         outputs = self.model(batch, **(model_kwargs or {}))

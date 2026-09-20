@@ -697,7 +697,7 @@ class GridCACEModel(nn.Module, Configurable):
         original mask. The optional Boolean ``valid`` voxel mask and hard-wall
         exclusions always apply. Every field/species must retain positive weight.
         """
-        weights = self._density_weights(data)
+        weights = self.density_weights(data)
         if torch.any(weights.sum(dim=-2) <= 0):
             raise ValueError("chemical-potential mask must retain positive weight for every field/species")
         return weights
@@ -711,10 +711,18 @@ class GridCACEModel(nn.Module, Configurable):
         This masks only the ideal evaluation, never excess-feature inputs.
         Solvers bypass this fitting selection to retain full ideal physics.
         """
-        return self._density_weights(data) > 0
+        return self.density_weights(data) > 0
 
-    def _density_weights(self, data):
-        """Shared selection policy for ideal evaluation and mu diagnostics."""
+    def density_weights(self, data):
+        """Return the selection policy shared by ideal evaluation and mu.
+
+        The weights are detached and carry the caller's magnitudes when
+        ``beta_mu_weights`` is supplied, so freezing them before a noisy
+        training forward reproduces both the ideal selection and the
+        chemical-potential mean of the clean field. Unlike
+        :meth:`beta_mu_weights` an empty selection is allowed here, because
+        an empty ideal selection is valid.
+        """
         rho = data["rho"]
         if "beta_mu_weights" in data:
             weights = torch.as_tensor(data["beta_mu_weights"], device=rho.device)

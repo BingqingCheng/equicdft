@@ -196,6 +196,73 @@ class TestDensityNoise(unittest.TestCase):
         self.assertTrue(any(torch.any(g != 0) for g in grads))
 
 
+    def test_ideal_selection_is_frozen_across_noisy_visits(self):
+        """rho_min selects the ideal, so noise must not move the selection."""
+
+        atoms = TestDensityUncertaintyData.frame(n_types=2)
+        atoms.arrays['V_ext'] = .2 * np.sin(atoms.arrays['density'])
+        fields = TestDensityUncertaintyData().read(atoms)
+        for frame in fields:
+            frame['negative_beta_V_ext'] = -frame['beta'] * frame['V_ext']
+        # The cutoff sits inside the density range and within a noise draw of
+        # many voxels, so an unfrozen selection would follow each draw.
+        model = self.masking_model(rho_min=.15)
+        selections = []
+        hook = model.register_forward_hook(
+            lambda module, args, output: selections.append(
+                (module.training, output['ideal_derivative_mask'].clone()))
+        )
+        t = Trainer(model, Loss([TensorLoss(
+            'mu', 'density_derivative', 'negative_beta_V_ext', center_axis=-2)]),
+            noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4},
+            device='cpu')
+        t.fit(DataLoader(fields), DataLoader(fields), epochs=3, verbose=False)
+        hook.remove()
+        training = [mask for is_training, mask in selections if is_training]
+        validation = [mask for is_training, mask in selections if not is_training]
+        self.assertEqual(len(training), 3)
+        self.assertTrue(validation)
+        self.assertTrue(training[0].any() and not training[0].all())
+        for mask in training[1:]:
+            self.assertTrue(torch.equal(mask, training[0]))
+        # The frozen selection is the clean field's, which validation also uses,
+        # so the two subsets score the same voxels.
+        self.assertTrue(torch.equal(validation[0], training[0]))
+
+    def test_training_allows_an_entirely_deselected_field(self):
+        """An empty ideal selection is valid, unlike an empty mu average."""
+
+        fields = TestDensityUncertaintyData().read(
+            TestDensityUncertaintyData.frame(n_types=2))
+        for frame in fields:
+            frame['negative_beta_V_ext'] = torch.zeros_like(frame['rho'])
+        model = self.masking_model(rho_min=10.)
+        t = Trainer(model, Loss([TensorLoss(
+            'mu', 'density_derivative', 'negative_beta_V_ext')]),
+            noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4},
+            device='cpu')
+        t.fit(DataLoader(fields), DataLoader(fields), epochs=1, verbose=False)
+        outputs = model(dict(fields[0]))
+        self.assertFalse(outputs['ideal_derivative_mask'].any())
+        self.assertEqual(float(outputs['beta_F_id'].detach()), 0.)
+
+    @staticmethod
+    def masking_model(rho_min):
+        """A real functional whose ideal is restricted by a density cutoff."""
+
+        return GridCACEModel(
+            a_features=CartesianAFeatures(
+                mean_density=1., cutoff_grid=1, max_power=1, n_types=2,
+                radial_basis='gaussian', radial_exponents=(.2,),
+                convolution_backend='fft'),
+            b_features=CartesianBFeatures(max_power=1, max_product_order=1),
+            readout=[LocalReadout(n_types=2, hidden_sizes=(4,))],
+            grid_spacing=.5, mean_temperature=1., boltzmann_constant=1.,
+            thermal_wavelength=1., free_energy_mode='beta',
+            rho_min=rho_min, compute_local_mu=False,
+        )
+
+
 class TestDensityUncertaintyData(unittest.TestCase):
     @staticmethod
     def frame(n_types=3, sem=True):
