@@ -676,7 +676,7 @@ response_stream = TrainingStream(
     loss=Loss([response_loss]),
     metrics=(FourierResponseMetrics(("number", "charge")),),
     batches_per_step=1,
-    model_kwargs={"compute_c1": False},
+    model_kwargs={"compute_c1": False, "compute_local_mu": False},
     cycle=True,
 )
 

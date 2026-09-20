@@ -80,7 +80,7 @@ def parse_arguments():
     )
 
     # Optimization controls. rho_min removes essentially empty cells from the
-    # logarithm-based local-chemical-potential loss.
+    # local-chemical-potential loss (dimensionless beta*mu).
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--rho-min", type=float, default=1.0e-3)
     parser.add_argument("--early-stopping-patience", type=int, default=10)
@@ -118,9 +118,6 @@ def main():
         boltzmann_constant=1.0,
         thermal_wavelength=1.0,
     )
-    for frame in dataset:
-        frame["negative_beta_V_ext"] = -frame["beta"] * frame["V_ext"]
-        frame["fit_weights"] = (frame["rho"] > args.rho_min).to(frame["rho"])
     loaders = make_dataloaders(
         train_dataset=dataset,
         valid_fraction=args.valid_fraction,
@@ -191,34 +188,35 @@ def main():
         boltzmann_constant=1.0,
         thermal_wavelength=1.0,
         compute_c1=True,
+        compute_local_mu=True,
+        rho_min=args.rho_min,
         # The selected protocol learns beta*F_exc directly. The model also
         # supports free_energy_mode="physical" for F_exc/(k_B*T_reference).
         free_energy_mode="beta",
         # message_layers=message_layers,
     ).to(device)
 
-    # NVT fields have no known reservoir mu. At equilibrium beta*mu_local is
-    # constant. Center the intrinsic derivative and -beta*V independently
-    # on the same mask, removing one canonical constant per field/species.
+    # At NVT equilibrium beta*mu_local = delta(beta F)/delta rho + beta*V_ext
+    # is spatially constant. The model computes its masked mean independently
+    # for each field/species. Loss is sum(w*(beta*mu_local-mean)**2)/sum(w),
+    # with w = 1[rho > rho_min] on accessible voxels and no extra loss scale.
     loss = Loss(
         terms=[
             TensorLoss(
                 name="beta_mu_local",
-                prediction_key="density_derivative",
-                target_key="negative_beta_V_ext",
-                weights_key="fit_weights",
-                center_axis=-2,
+                prediction_key="beta_mu_local",
+                target_key="beta_avg_mu",
+                weights_key="beta_mu_weights",
             )
         ]
     )
     metrics = [
         Metrics(
-            name="local chemical potential",
-            prediction_key="density_derivative",
-            target_key="negative_beta_V_ext",
-            center_axis=-2,
-            metric_keys=("mae", "rmse", "rmse_percent"),
-            selection_mask_key="fit_weights",
+            name="local beta mu",
+            prediction_key="beta_mu_local",
+            target_key="beta_avg_mu",
+            metric_keys=("mae", "rmse", "rmse_percent", "r2"),
+            selection_mask_key="beta_mu_weights",
         )
     ]
 

@@ -366,8 +366,9 @@ def _upgrade_model(module: GridCACEModel) -> None:
     _set_default(module, "compute_c1", True)
     _set_default(module, "compute_c2", False)
     _set_default(module, "compute_polarization_derivative", False)
-    module.__dict__.pop("compute_local_mu", None)
-    module.__dict__.pop("rho_min", None)
+    # Historical fitting policy is not inferred for a converted functional.
+    module.compute_local_mu = False
+    module.rho_min = 0.0
     if not _defines(module, "ideal"):
         wavelength = module._buffers.pop("thermal_wavelength", None)
         if wavelength is None:
@@ -601,7 +602,7 @@ def verify_equivalent(
     field = _verification_field(candidate) if verification_data is None else verification_data
     options = dict(compute_c1=True,
                    compute_polarization_derivative=candidate.requires_dipole_density,
-                   compute_ideal=False)
+                   compute_ideal=False, compute_local_mu=False)
     expected = reference(dict(field), **options)
     actual = candidate(dict(field), **options)
     for key in ("beta_F_exc", "c1", "polarization_derivative_excess", "metal_site_q",

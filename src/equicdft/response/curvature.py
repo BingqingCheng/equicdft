@@ -411,6 +411,8 @@ def _energy_only_model(model, batch):
     """Evaluate energy without optional response derivatives."""
 
     kwargs = {"compute_c1": False}
+    if hasattr(model, "compute_local_mu"):
+        kwargs["compute_local_mu"] = False
     if hasattr(model, "ideal"):
         kwargs["compute_ideal"] = False
     if hasattr(model, "compute_polarization_derivative"):

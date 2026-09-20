@@ -63,7 +63,7 @@ class TestReadoutOutputs(unittest.TestCase):
 
     def test_reserved_names_raise_even_when_response_is_disabled(self):
         for key in ("beta_F_exc", "F_exc", "c1", "c2", "beta_mu_local",
-                    "beta_mu_average", "beta_mu_weights"):
+                    "beta_avg_mu", "beta_mu_weights"):
             with self.subTest(key=key):
                 model = self._model([_ObservedReadout(key)])
                 with self.assertRaisesRegex(ValueError, "reserved"):

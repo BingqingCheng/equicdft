@@ -155,11 +155,11 @@ def _migrate_v2_to_v3(payload):
 
 
 def _migrate_v3_to_v4(payload):
-    """Discard retired training policy; fitted functional parameters are unchanged."""
+    """Reset historical fitting policy; fitted functional parameters are unchanged."""
     config = payload["config"]
     if config.get(TYPE_KEY) == "GridCACEModel":
-        config.pop("compute_local_mu", None)
-        config.pop("rho_min", None)
+        config["compute_local_mu"] = False
+        config["rho_min"] = 0.0
     return payload
 
 

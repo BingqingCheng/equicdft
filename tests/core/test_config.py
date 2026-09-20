@@ -239,8 +239,8 @@ class TestConfigRoundTrip(unittest.TestCase):
         config["compute_c1"] = False
         rebuilt = GridCACEModel.from_config(config)
         self.assertFalse(rebuilt.compute_c1)
-        self.assertNotIn("compute_local_mu", config)
-        self.assertNotIn("rho_min", config)
+        self.assertFalse(config["compute_local_mu"])
+        self.assertEqual(config["rho_min"], 0.)
         rebuilt.load_state_dict(model.state_dict(), strict=True)
 
 

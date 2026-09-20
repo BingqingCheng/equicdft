@@ -9,6 +9,7 @@ from torch import nn
 
 from ._validation import (
     boolean,
+    nonnegative_scalar,
     optional_boolean,
     positive_scalar,
 )
@@ -74,11 +75,8 @@ _A_FEATURE_MESSAGE_CONTRACT = (
 )
 _B_FEATURE_CONTRACT = ("n_features", "validate_a_features")
 
-# Output names a readout may not claim through ``energy_and_outputs``. Most
-# are produced by the model itself; ``beta_mu_local`` comes from the solver,
-# and ``beta_mu_average``/``beta_mu_weights`` are the conventional names an
-# application gives the gauge and mask it supplies to its own losses. All of
-# them are reserved so a readout's extra output can never shadow one.
+# Model-owned output names, including opt-in fitting diagnostics. A readout's
+# extra outputs from ``energy_and_outputs`` must never shadow these.
 RESERVED_OUTPUT_KEYS = frozenset((
     "F_exc",
     "beta_F_exc",
@@ -94,7 +92,7 @@ RESERVED_OUTPUT_KEYS = frozenset((
     "polarization_derivative_excess",
     "ideal_polarization_derivative",
     "beta_mu_local",
-    "beta_mu_average",
+    "beta_avg_mu",
     "beta_mu_weights",
 ))
 
@@ -302,6 +300,14 @@ class GridCACEModel(nn.Module, Configurable):
     vectors). It defaults to the scale of ``a_features`` and must agree with
     it when both are given; a model without local features that contains
     density-normalizing readouts must receive it explicitly.
+
+    ``compute_local_mu=True`` additionally returns dimensionless beta mu as
+    ``beta_mu_local = density_derivative + beta * V_ext``, its
+    weighted spatial ``beta_avg_mu`` per field/species, and
+    ``beta_mu_weights``. ``rho_min`` selects rho > rho_min unless
+    explicit weights are supplied. See :meth:`beta_mu_weights`.
+    These are fitting diagnostics, not extra intrinsic energy terms; V_ext
+    and a full ideal reference are required only when requesting them.
     """
 
     def __init__(
@@ -322,6 +328,8 @@ class GridCACEModel(nn.Module, Configurable):
         ]] = None,
         compute_c1: bool = True,
         compute_c2: bool = False,
+        compute_local_mu: bool = False,
+        rho_min: float = 0.0,
         free_energy_mode: str = "beta",
         message_layers: Optional[Sequence[BChiMessage]] = None,
         compute_polarization_derivative: bool = False,
@@ -336,6 +344,8 @@ class GridCACEModel(nn.Module, Configurable):
 
         compute_c1 = boolean(compute_c1, "compute_c1")
         compute_c2 = boolean(compute_c2, "compute_c2")
+        compute_local_mu = boolean(compute_local_mu, "compute_local_mu")
+        rho_min = nonnegative_scalar(rho_min, "rho_min")
         compute_polarization_derivative = boolean(
             compute_polarization_derivative,
             "compute_polarization_derivative",
@@ -428,6 +438,8 @@ class GridCACEModel(nn.Module, Configurable):
         self.readout = nn.ModuleList(readouts)
         self.compute_c1 = compute_c1 or compute_c2
         self.compute_c2 = compute_c2
+        self.compute_local_mu = compute_local_mu
+        self.rho_min = rho_min
         self.compute_polarization_derivative = compute_polarization_derivative
         self.free_energy_mode = free_energy_mode
 
@@ -513,6 +525,8 @@ class GridCACEModel(nn.Module, Configurable):
             n_types=self.n_types,
             compute_c1=self.compute_c1,
             compute_c2=self.compute_c2,
+            compute_local_mu=self.compute_local_mu,
+            rho_min=self.rho_min,
             compute_polarization_derivative=self.compute_polarization_derivative,
             free_energy_mode=self.free_energy_mode,
             message_layers=[
@@ -775,6 +789,62 @@ class GridCACEModel(nn.Module, Configurable):
                 levels.append(B.flatten(start_dim=grid_rank))
         return torch.cat(levels, dim=-1)
 
+    def beta_mu_weights(self, data):
+        """Return detached fitting weights with rho's shape [..., grid, species].
+
+        Normally select rho > rho_min. Explicit ``beta_mu_weights``
+        replace that cutoff selection, allowing SEM training to freeze the
+        original mask. The optional Boolean ``valid`` voxel mask and hard-wall
+        exclusions always apply. Every field/species must retain positive weight.
+        """
+        rho = data["rho"]
+        if "beta_mu_weights" in data:
+            weights = torch.as_tensor(data["beta_mu_weights"], device=rho.device)
+            if (weights.shape != rho.shape or weights.is_complex()
+                    or not torch.isfinite(weights).all() or torch.any(weights < 0)):
+                raise ValueError("beta_mu_weights must be finite nonnegative with rho's shape")
+            weights = weights.detach().to(rho)
+        else:
+            weights = (rho.detach() > self.rho_min).to(rho)
+        for key in ("valid", "excluded_mask"):
+            if key not in data:
+                continue
+            mask = data[key]
+            if (not torch.is_tensor(mask) or mask.dtype != torch.bool
+                    or mask.shape != rho.shape[:-1]):
+                raise ValueError(key + " must be Boolean with rho's field/grid shape")
+            active = ~mask if key == "excluded_mask" else mask
+            weights = weights.masked_fill(~active[..., None], 0.)
+        if torch.any(weights.sum(dim=-2) <= 0):
+            raise ValueError("chemical-potential mask must retain positive weight for every field/species")
+        return weights
+
+    def _chemical_potential_outputs(self, data, outputs, beta):
+        """Add beta mu = delta(beta F)/delta rho + beta V and its spatial mean."""
+        rho = data["rho"]
+        potential = data["V_ext"]
+        if (not torch.is_tensor(potential) or potential.shape != rho.shape
+                or not potential.is_floating_point()):
+            raise ValueError("V_ext must be floating with rho's shape")
+        weights = self.beta_mu_weights(data)
+        active = weights > 0
+        if torch.any(active & ~outputs["ideal_derivative_mask"]):
+            raise ValueError("chemical-potential weights select vacuum; use a positive SEM density_floor")
+        potential = potential.to(rho)
+        if not torch.isfinite(potential[active]).all():
+            raise ValueError("V_ext must be finite on the chemical-potential mask")
+        # Mask before arithmetic so excluded infinite external potentials do
+        # not contaminate either the weighted mean or its autograd graph.
+        local = torch.where(active, outputs["density_derivative"], 0.)
+        local = local + beta[..., None, None] * torch.where(active, potential, 0.)
+        if not torch.isfinite(local[active]).all():
+            raise ValueError("local chemical potential must be finite on its mask")
+        outputs.update(
+            beta_mu_local=local,
+            beta_mu_weights=weights,
+            beta_avg_mu=(weights * local).sum(dim=-2) / weights.sum(dim=-2),
+        )
+
     def forward(
         self,
         data: Dict[str, torch.Tensor],
@@ -783,6 +853,7 @@ class GridCACEModel(nn.Module, Configurable):
         c2_reference: Tuple[int, int] = (0, 0),
         compute_polarization_derivative: Optional[bool] = None,
         compute_ideal: Optional[bool] = None,
+        compute_local_mu: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return the collected free-energy and requested response outputs."""
 
@@ -791,13 +862,18 @@ class GridCACEModel(nn.Module, Configurable):
                 "Set electrode geometry, constraints, and field on MetalWall, not in data"
             )
 
+        compute_local_mu = optional_boolean(compute_local_mu, "compute_local_mu")
+        if compute_local_mu is None:
+            compute_local_mu = self.compute_local_mu
+        if compute_local_mu and "V_ext" not in data:
+            raise ValueError("compute_local_mu=True requires V_ext")
         compute_c2 = optional_boolean(compute_c2, "compute_c2")
         if compute_c2 is None:
             compute_c2 = self.compute_c2
         compute_c1 = optional_boolean(compute_c1, "compute_c1")
         if compute_c1 is None:
             compute_c1 = self.compute_c1
-        compute_c1 = compute_c1 or compute_c2
+        compute_c1 = compute_c1 or compute_c2 or compute_local_mu
         compute_polarization_derivative = optional_boolean(
             compute_polarization_derivative,
             "compute_polarization_derivative",
@@ -808,6 +884,8 @@ class GridCACEModel(nn.Module, Configurable):
         compute_ideal = optional_boolean(compute_ideal, "compute_ideal")
         if compute_ideal is None:
             compute_ideal = self.ideal is not None
+        if compute_local_mu and not compute_ideal:
+            raise ValueError("compute_local_mu requires the total derivative and an ideal reference (compute_ideal=True)")
         if compute_polarization_derivative and not has_polarization:
             raise ValueError(
                 "compute_polarization_derivative requires a dipole-density readout"
@@ -1003,5 +1081,7 @@ class GridCACEModel(nn.Module, Configurable):
                         outputs["ideal_polarization_derivative"]
                         + outputs["polarization_derivative_excess"]
                     )
+            if compute_local_mu:
+                self._chemical_potential_outputs(data, outputs, context.beta)
 
         return outputs

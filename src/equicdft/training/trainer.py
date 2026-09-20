@@ -56,7 +56,8 @@ class TrainingStream:
     stream weight. A stream with ``cycle=True`` is restarted when exhausted
     and follows the epoch length set by the non-cycling streams. Validation is
     always single-pass. ``model_kwargs`` makes response-only forwards such as
-    ``compute_c1=False`` explicit without mutating persistent model flags.
+    ``compute_c1=False, compute_local_mu=False`` explicit without mutating
+    persistent model flags.
     """
 
     name: str
@@ -942,6 +943,14 @@ class Trainer:
         """Move one batch, run the model, and evaluate one loss module."""
 
         batch = self._move_batch(batch)
+        compute_local_mu = (model_kwargs or {}).get("compute_local_mu")
+        if compute_local_mu is None:
+            compute_local_mu = getattr(self.model, "compute_local_mu", False)
+        if noise is not None and noise.enabled and compute_local_mu:
+            # The model owns mask construction; freeze it before perturbing
+            # rho so selection cannot drift between noisy training visits.
+            batch = dict(batch, beta_mu_weights=
+                         self.model.beta_mu_weights(batch))
         if noise is not None:
             batch = noise.apply(batch, ideal=getattr(self.model, "ideal", None))
         outputs = self.model(batch, **(model_kwargs or {}))

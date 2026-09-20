@@ -18,8 +18,8 @@ class TestRetiredTrainingPolicy(unittest.TestCase):
         restored = build_converted_model(payload).eval()
         self.assertIn("rho_min", payload["config"])
         migrated = migrate_model_payload(payload)
-        self.assertNotIn("rho_min", migrated["config"])
-        self.assertNotIn("compute_local_mu", migrated["config"])
+        self.assertEqual(migrated["config"]["rho_min"], 0.)
+        self.assertFalse(migrated["config"]["compute_local_mu"])
         for key, expected in model.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[key], expected, rtol=0, atol=0)
         data = grid_data()
@@ -28,19 +28,19 @@ class TestRetiredTrainingPolicy(unittest.TestCase):
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
 
-    def test_whole_object_upgrade_removes_retired_attributes(self):
+    def test_whole_object_upgrade_resets_historical_fitting_policy(self):
         model = example_model()
         model.compute_local_mu = True
         model.rho_min = .123
         upgraded = upgrade_legacy_model(model)
-        self.assertFalse(hasattr(upgraded, "compute_local_mu"))
-        self.assertFalse(hasattr(upgraded, "rho_min"))
-        self.assertNotIn("rho_min", upgraded.to_config())
+        self.assertFalse(upgraded.compute_local_mu)
+        self.assertEqual(upgraded.rho_min, 0.)
 
-    def test_new_constructor_does_not_accept_training_policy(self):
-        for policy in ({"compute_local_mu": True}, {"rho_min": .1}):
-            with self.assertRaisesRegex(TypeError, "unexpected keyword"):
-                GridCACEModel(None, None, [], n_types=1, grid_spacing=1., **policy)
+    def test_new_constructor_accepts_explicit_diagnostics(self):
+        model = GridCACEModel(None, None, [], n_types=1, grid_spacing=1.,
+                              compute_local_mu=True, rho_min=.1)
+        self.assertTrue(model.compute_local_mu)
+        self.assertEqual(model.rho_min, .1)
 
 
 if __name__ == "__main__":

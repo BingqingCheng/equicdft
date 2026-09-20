@@ -100,6 +100,15 @@ def fixed_dipole_inputs(solver, data):
     return beta, voxel_volume(spacing), moment, wavelength, excluded, accessible
 
 
+def _intrinsic_outputs(model, data, compute_derivatives, polarized=False):
+    """Solvers use physical constraints, never the model's fitting mask."""
+    kwargs = dict(compute_c1=compute_derivatives, compute_c2=False,
+                  compute_polarization_derivative=polarized and compute_derivatives)
+    if hasattr(model, "compute_local_mu"):
+        kwargs["compute_local_mu"] = False
+    return model(data, **kwargs)
+
+
 def _set_density_residuals(result, residual, chemical_potential, maximum, rms):
     """Record the density stationarity residual and its two norms."""
 
@@ -173,10 +182,7 @@ def _evaluate_scalar(solver, data, compute_derivatives):
     validate_density_field(rho, excluded)
     excluded_density = excluded[..., None].expand_as(rho)
 
-    outputs = solver.model(
-        data, compute_c1=compute_derivatives, compute_c2=False,
-        compute_polarization_derivative=False,
-    )
+    outputs = _intrinsic_outputs(solver.model, data, compute_derivatives)
     result = _started_result(data, outputs, rho, volume)
 
     if "V_ext" not in data:
@@ -244,10 +250,7 @@ def _evaluate_fixed_dipole(solver, data, compute_derivatives):
     )
     excluded_density = excluded[..., None].expand_as(rho)
 
-    outputs = solver.model(
-        data, compute_c1=compute_derivatives, compute_c2=False,
-        compute_polarization_derivative=compute_derivatives,
-    )
+    outputs = _intrinsic_outputs(solver.model, data, compute_derivatives, polarized=True)
     if outputs["beta_F_exc"].ndim:
         raise ValueError("model must return scalar beta_F_exc for one field")
     result = _started_result(data, outputs, rho, volume)

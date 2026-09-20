@@ -860,10 +860,11 @@ class TestGridCACEModel(unittest.TestCase):
         second = model(dict(data))
         for key in first:
             torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
-        for key in ("beta_mu_local", "beta_mu_average", "beta_mu_weights"):
+        for key in ("beta_mu_local", "beta_avg_mu", "beta_mu_weights"):
             self.assertNotIn(key, second)
-        for name in ("compute_local_mu", "rho_min", "average_chemical_potential"):
-            self.assertFalse(hasattr(model, name))
+        self.assertFalse(model.compute_local_mu)
+        self.assertEqual(model.rho_min, 0.)
+        self.assertNotIn("local_chemical_potential", second)
 
     def test_vacuum_ideal_derivative_is_marked_invalid(self):
         model = self._make_model()
@@ -1110,7 +1111,7 @@ class TestGridCACEModel(unittest.TestCase):
                 boltzmann_constant=1.0,
             )
 
-        with self.assertRaisesRegex(TypeError, "compute_local_mu"):
+        with self.assertRaisesRegex(ValueError, "rho_min"):
             GridCACEModel(
                 CartesianAFeatures(
                     mean_density=0.5,
@@ -1122,6 +1123,7 @@ class TestGridCACEModel(unittest.TestCase):
                 grid_spacing=0.5,
                 compute_c1=False,
                 compute_local_mu=True,
+                rho_min=-1.,
                 boltzmann_constant=1.0,
             )
 
@@ -1307,7 +1309,7 @@ class TestUnitContract(unittest.TestCase):
 
 
 class TestOutputKeys(unittest.TestCase):
-    """Chemical potentials belong to solver results, not intrinsic outputs."""
+    """Default model outputs are intrinsic; fitting diagnostics are opt-in."""
 
     def test_canonical_keys_only(self):
         from equicdft import GridSolver
@@ -1323,7 +1325,7 @@ class TestOutputKeys(unittest.TestCase):
         data["V_ext"] = 0.1 * torch.rand_like(data["rho"])
         outputs = model(dict(data))
         self.assertIs(type(outputs), dict)
-        for key in ("beta_mu_local", "beta_mu_average", "beta_mu_weights"):
+        for key in ("beta_mu_local", "beta_avg_mu", "beta_mu_weights"):
             self.assertNotIn(key, outputs)
         for old in ("local_chemical_potential", "average_chemical_potential", "chemical_potential_weights"):
             self.assertNotIn(old, outputs)

@@ -25,7 +25,7 @@ Only convert files you trust; whole-object conversion uses Python pickle.
   require `--dipole-magnitude` using the original molecular moment in the
   original dipole units, and `--thermal-wavelength` if it differs from 1.
   Descriptor normalization scales are not used to guess physical moments.
-- Conversion to format 4 discards retired `compute_local_mu` and `rho_min`
+- Conversion to format 4 discards historical `compute_local_mu` and `rho_min`
   settings without changing fitted parameters. Preserve the original masks
   explicitly in application losses and solver residual settings.
 
@@ -54,14 +54,38 @@ resume and conversion are not supported. Converting a fitted model does not
 recover its optimizer or training history; use it as initialization for a new
 fit if needed. Model-format and training-checkpoint versions are separate.
 
-## Chemical potentials moved out of the model
+## Model-provided local chemical potential
 
-The model no longer computes masked or averaged chemical potentials. Fits use
-the intrinsic `density_derivative` against `-beta * V_ext`, with explicit
-loss weights and `TensorLoss(center_axis=-2)`; `Metrics(center_axis=-2)`
-applies the same canonical gauge projection. Masks and mean removal belong to
-those losses and metrics. `GridSolver.evaluate` supplies `beta_mu_local` when
-external fields are given.
+The explicit physical fitting interface is restored as an opt-in:
+`GridCACEModel(..., compute_local_mu=True, rho_min=...)`. The model returns
+`beta_mu_local` (total density derivative plus beta V), its weighted
+per-field/per-species `beta_avg_mu`, and
+`beta_mu_weights`. Both chemical potentials are dimensionless beta mu.
+Use those keys with ordinary `TensorLoss` and `Metrics`; no custom loss or
+trainer output transform is needed. The intrinsic energy remains independent
+of V. Local-mu evaluation requests the total density derivative automatically.
+
+The defaults are `compute_local_mu=False`, `rho_min=0`. Settings are saved in
+current model configurations; existing format-4 files without them load with
+these defaults. Historical conversion continues to reset old fitting policy;
+explicitly enable the new diagnostics after converting a fitted functional.
+Model-format version and tensor state are unchanged by these optional settings.
+
+`model(data, compute_local_mu=False)` overrides the saved setting for intrinsic
+evaluation. Missing V raises when diagnostics are requested, as does
+`compute_ideal=False`. Solvers and internal Fourier energy probes disable these
+fitting diagnostics independently of the saved defaults.
+
+The cutoff and optional `valid`/exclusion masks define weights unless explicit
+input `beta_mu_weights` provide the fixed selection. SEM training
+freezes the original selection before noise, then recalculates local and mean
+chemical potentials on the perturbed fields. A selected noisy vacuum raises;
+set a positive `NoiseOptions.density_floor` when needed. Every field/species
+must retain positive weight.
+
+The equivalent centered `density_derivative` versus `-beta*V_ext` formulation
+remains supported, with the same mask and gauge. Its external-field RMSE/sigma
+and R² normalization differs from comparison against mean chemical potentials.
 
 ## Solver evaluation
 
@@ -134,11 +158,12 @@ polarized whole-pair rejection sampling, masks and RNG draw order are unchanged.
 | `full_*euler_lagrange_residual` | `full_*density_residual` |
 | `polarization_euler_lagrange_residual` | `polarization_residual` |
 | `iterations` (coupled solve) | `n_iter` |
-| `mu_loc`, `local_chemical_potential` | `beta_mu_local` |
-| `average_chemical_potential` | `beta_mu_average` (application-supplied) |
+| `mu_loc` (solver) | `beta_mu_local` |
 | `equilibrium_chemical_potential` | `beta_mu` |
 
-The old spellings carried the same values and are no longer returned.
+The old solver spellings carried the same values and are no longer returned.
+The model's optional `beta_mu_local` and `beta_avg_mu`
+are distinct fitting diagnostics with their own mask, not solver aliases.
 `density_derivative_excess` is exactly `-c1`; both names are returned, and
 new code that handles total and excess responses together should prefer the
 `*_derivative*` pair.

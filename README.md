@@ -58,18 +58,51 @@ $$
 
 Equilibrium requires this quantity to be spatially constant. NVT data therefore
 need no chemical-potential labels: the loss is the masked spatial variance of
-$\beta\mu_g^{\mathrm{loc}}$ about its per-field mean. Fits use the intrinsic
-`density_derivative` against `-beta * V_ext`, with explicit loss weights and
-`TensorLoss(center_axis=-2)`; `Metrics(center_axis=-2)` applies the same
-canonical gauge projection. Masks and mean removal belong to these losses and
-metrics, not the model. `GridSolver.evaluate` supplies `beta_mu_local` when
-external fields are given.
+$\beta\mu_g^{\mathrm{loc}}$ about its per-field, per-species mean.
+Construct the model with `compute_local_mu=True` and a chosen `rho_min` to
+return `beta_mu_local`, `beta_avg_mu`, and
+`beta_mu_weights`. Both chemical potentials are dimensionless
+**beta mu**, not energies. The default cutoff is
+zero; the LJ example uses `rho_min=1e-3` in reduced density units.
+
+```python
+from equicdft import Loss, Metrics, TensorLoss
+
+loss = Loss(terms=[
+    TensorLoss(
+        name="beta_mu_local",
+        prediction_key="beta_mu_local",
+        target_key="beta_avg_mu",
+        weights_key="beta_mu_weights",
+    )
+])
+metrics = [Metrics(
+    name="local beta mu",
+    prediction_key="beta_mu_local",
+    target_key="beta_avg_mu",
+    selection_mask_key="beta_mu_weights",
+    metric_keys=("mae", "rmse", "rmse_percent", "r2"),
+)]
+```
+
+Weights select `rho > rho_min`, intersected with accessibility and an optional
+Boolean `valid` voxel mask. Explicit input `beta_mu_weights` replace
+the cutoff selection, enabling fixed masks or nonnegative statistical weights;
+every field/species must retain positive weight. The local output is zero
+outside this mask. With SEM augmentation, the trainer freezes the original
+weights and the model recomputes both chemical potentials on the noisy fields.
+
+RMSE is the dimensionless chemical-potential residual. `rmse_percent` is
+100 times RMSE divided by the standard deviation of the target means over
+selected entries; R² uses the same target variation. These are undefined for a
+constant target, not normalized by external-field variation. The equivalent
+centered-total-derivative loss remains available for applications needing it.
 
 The model owns its ideal reference (`IdealGas` by default for scalar models).
 It returns `beta_F_id`, `beta_F_exc`, their sum `beta_F`, and requested total
 intrinsic derivatives. `c1` and `c2` retain their excess-only definitions.
 `GridSolver(model)` adds external fields and ensemble constraints; it does not
-construct another ideal functional. `model(data, compute_ideal=False)` evaluates
+construct another ideal functional. `model(data, compute_ideal=False, compute_local_mu=False)` evaluates
 only the excess functional, for example for an excess-response probe.
 
 One complete density field is one dataset item. Fields are never split into

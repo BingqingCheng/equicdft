@@ -14,7 +14,7 @@ from .modes import (
     validate_response,
     validated_wavevector_domain,
 )
-from .curvature import fourier_curvature_matrix, projected_fourier_curvature
+from .curvature import _energy_only_model, fourier_curvature_matrix, projected_fourier_curvature
 
 __all__ = [
     "FourierResponse",
@@ -82,7 +82,7 @@ class FourierResponse(nn.Module):
         """
 
         if outputs is None:
-            outputs = model(batch, compute_c1=False)
+            outputs = _energy_only_model(model, batch)
         n_directions = directions.shape[0]
         rho = validate_response(
             outputs,
@@ -153,7 +153,7 @@ class FourierResponse(nn.Module):
         """
 
         if outputs is None:
-            outputs = model(batch, compute_c1=False)
+            outputs = _energy_only_model(model, batch)
         if "rho" not in batch:
             raise KeyError("batch is missing 'rho'")
         supplied_rho = batch["rho"]

@@ -721,8 +721,11 @@ For training and differentiable observables, including higher derivatives, use
 the model directly. Solves do not retain a graph through their iterations.
 
 Canonical fitting can therefore use two ordinary `TensorLoss` terms, without
-a script-defined Euler loss. The following standalone helper uses a fixed
-density mask and independent mean removal for each density field/species.
+a script-defined Euler loss. Construct the model with `compute_local_mu=True`
+and the desired `rho_min`. Its local chemical potential includes the total
+density derivative, including ideal orientation entropy. The following
+standalone helper uses a fixed density mask and the model's independent
+mean chemical potential for each density field/species.
 Polarization is not mean-centered. Pass **one unbatched frame** to the data
 helper before batching. `beta` is inverse energy; V is energy per particle,
 and E is energy per dipole moment.
@@ -731,12 +734,11 @@ and E is energy per dipole moment.
 from equicdft import FixedDipoleIdeal, Loss, TensorLoss
 
 
-def prepare_field_targets(frame, *, rho_min):
+def prepare_field_targets(frame, model):
     result = dict(frame)
-    result["beta_V_target"] = frame["beta"] * frame["V_ext"]
     result["beta_E_target"] = frame["beta"] * frame["E_ext"]
-    mask = (frame["rho"] > rho_min).to(frame["rho"])
-    result["density_weights"] = mask
+    mask = model.beta_mu_weights(frame)
+    result["beta_mu_weights"] = mask
     result["polarization_weights"] = mask[..., None].expand_as(
         frame["dipole_density"]
     )
@@ -746,12 +748,13 @@ def prepare_field_targets(frame, *, rho_min):
 def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0):
     if not isinstance(model.ideal, FixedDipoleIdeal):
         raise TypeError("joint field fitting requires FixedDipoleIdeal")
+    if not model.compute_local_mu:
+        raise ValueError("construct the model with compute_local_mu=True")
     moment = model.ideal.dipole_magnitude.reshape(-1, 1)
     return Loss([
         TensorLoss(
-            "density", "density_derivative", "beta_V_target",
-            target_scale=-1.0, center_axis=-2,
-            weights_key="density_weights", weight=density_weight,
+            "beta_mu_local", "beta_mu_local", "beta_avg_mu",
+            weights_key="beta_mu_weights", weight=density_weight,
         ),
         TensorLoss(
             "polarization", "polarization_derivative", "beta_E_target",
@@ -779,15 +782,17 @@ number of included entries, not independently normalized per case. The defaults
 are $\lambda_\rho=\lambda_P=1$. The physical per-species moment $m$ is inside
 the square to make both residuals dimensionless; it is not a statistical task
 weight. No sigma normalization or inverse-SEM weighting is applied.
-External targets stay fixed under SEM augmentation because ideal derivatives
-are reevaluated by the model on the perturbed fields. Masks and gauge projection
-belong entirely to the losses; the model does not accept `rho_min` or
-`compute_local_mu`, and does not produce masked/averaged chemical potentials.
-The solver supplies local chemical potentials when external fields are given.
+External fields and original masks stay fixed under SEM augmentation. The model
+reevaluates total derivatives, `beta_mu_local` and
+`beta_avg_mu` on the perturbed fields. Both named chemical
+potentials represent dimensionless beta mu. The density term is exactly the
+spatial-constancy objective above, not a new custom loss. Solver chemical
+potentials use their own physical constraints and are independent of this
+fitting mask.
 
 ### Excess-only evaluation and old models
 
-Use `model(data, compute_ideal=False)` when only the excess functional is
+Use `model(data, compute_ideal=False, compute_local_mu=False)` when only the excess functional is
 needed. Fourier stability probes use this path so their intentionally relaxed
 polarization perturbations do not trigger the exact ideal-domain constraint;
 their separate quadratic ideal reference is unchanged. A polarization model
@@ -820,10 +825,10 @@ The command `python -m equicdft.conversion` also accepts
 `--dipole-magnitude` and `--thermal-wavelength`. Do not supply an ideal
 override for a model that already stores its ideal reference.
 
-Model format 4 also discards `compute_local_mu` and `rho_min` from older
-configurations, without changing fitted parameters. Move the original density
-cutoff into the fitting mask and, where previously used, the solver's
-`residual_density_threshold`. Converting a model does not reconstruct its
+Historical conversion resets `compute_local_mu=False` and `rho_min=0`, without
+changing fitted parameters. Explicitly enable the current diagnostics and
+choose their cutoff when using a converted model for fitting. The solver's
+`residual_density_threshold` remains separate. Converting a model does not reconstruct its
 training objective or automatically migrate an application script.
 
 ## 10. Explicit Fourier stability references
