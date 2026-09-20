@@ -123,6 +123,23 @@ and R² normalization differs from comparison against mean chemical potentials.
 
 ## Solver evaluation
 
+### Ideal selection during fitting versus solving
+
+Ordinary model forwards now restrict the ideal to `model.ideal_mask(data)`:
+rho above `rho_min`, or positive explicit `beta_mu_weights`, intersected with
+`valid` and nonexcluded voxels. Both translational and orientational ideal
+terms are zero outside the selection. Unphysical fixed-dipole alignment there
+is ignored by the ideal only; active entries remain strictly checked. No rho/P
+projection or change to excess-feature inputs occurs. This is a deliberate
+change to masked ideal/total outputs, not to fitted excess functions.
+
+`model(data, apply_ideal_mask=False)` restores full physical ideal evaluation.
+`GridSolver` requests this automatically, preserving its previous physics and
+ignoring fitting masks. Merely disabling `compute_local_mu` does not disable
+ideal masking. No format/config/state migration is required; the new switch
+is per-forward. Standalone `IdealReference.evaluate(..., mask=None)` retains
+its former full-domain default; an explicit mask is Boolean with rho's shape.
+
 `solver.evaluate(data, compute_derivatives=True)` replaces the old
 `compute_c1` keyword, and overrides the model's derivative defaults;
 `compute_derivatives=False` is energy-only. Analytic ideal-reference

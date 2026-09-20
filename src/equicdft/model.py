@@ -261,6 +261,12 @@ class GridCACEModel(nn.Module, Configurable):
     those learned inputs, stored as a fixed buffer and never subtracted from P.
     Ideal, Coulomb, external coupling and reciprocal kernels use physical P.
 
+    Ordinary forwards evaluate the ideal only on :meth:`ideal_mask`: rho above
+    ``rho_min`` (or positive frozen fitting weights), valid and nonexcluded.
+    Masked ideal energies/derivatives are zero, while all excess inputs remain
+    unmodified. ``apply_ideal_mask=False`` requests the full physical ideal;
+    solvers use this explicitly, independently of fitting selections.
+
     ``compute_local_mu=True`` additionally returns dimensionless beta mu as
     ``beta_mu_local = density_derivative + beta * V_ext``, its
     weighted spatial ``beta_mu_average`` per field/species, and
@@ -675,6 +681,24 @@ class GridCACEModel(nn.Module, Configurable):
         original mask. The optional Boolean ``valid`` voxel mask and hard-wall
         exclusions always apply. Every field/species must retain positive weight.
         """
+        weights = self._density_weights(data)
+        if torch.any(weights.sum(dim=-2) <= 0):
+            raise ValueError("chemical-potential mask must retain positive weight for every field/species")
+        return weights
+
+    def ideal_mask(self, data):
+        """Return the model's detached Boolean selection for ideal evaluation.
+
+        Use rho > rho_min, or positive explicit beta_mu_weights when supplied
+        (e.g. a frozen SEM selection), intersected with valid and nonexcluded
+        voxels. Unlike a chemical-potential mean, an empty selection is valid.
+        This masks only the ideal evaluation, never excess-feature inputs.
+        Solvers bypass this fitting selection to retain full ideal physics.
+        """
+        return self._density_weights(data) > 0
+
+    def _density_weights(self, data):
+        """Shared selection policy for ideal evaluation and mu diagnostics."""
         rho = data["rho"]
         if "beta_mu_weights" in data:
             weights = torch.as_tensor(data["beta_mu_weights"], device=rho.device)
@@ -693,8 +717,6 @@ class GridCACEModel(nn.Module, Configurable):
                 raise ValueError(key + " must be Boolean with rho's field/grid shape")
             active = ~mask if key == "excluded_mask" else mask
             weights = weights.masked_fill(~active[..., None], 0.)
-        if torch.any(weights.sum(dim=-2) <= 0):
-            raise ValueError("chemical-potential mask must retain positive weight for every field/species")
         return weights
 
     def _chemical_potential_outputs(self, data, outputs, beta):
@@ -732,14 +754,21 @@ class GridCACEModel(nn.Module, Configurable):
         compute_polarization_derivative: Optional[bool] = None,
         compute_ideal: Optional[bool] = None,
         compute_local_mu: Optional[bool] = None,
+        apply_ideal_mask: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """Return the collected free-energy and requested response outputs."""
+        """Return free energy and responses, masking only the ideal by default.
+
+        ``apply_ideal_mask=False`` selects full physical ideal evaluation,
+        independently of rho_min/valid/frozen fitting weights. GridSolver uses
+        this explicitly; excess readouts always receive the original fields.
+        """
 
         if METAL_DATA_KEYS & data.keys():
             raise ValueError(
                 "Set electrode geometry, constraints, and field on MetalWall, not in data"
             )
 
+        apply_ideal_mask = boolean(apply_ideal_mask, "apply_ideal_mask")
         compute_local_mu = optional_boolean(compute_local_mu, "compute_local_mu")
         if compute_local_mu is None:
             compute_local_mu = self.compute_local_mu
@@ -950,7 +979,10 @@ class GridCACEModel(nn.Module, Configurable):
                                 "polarization_derivative_excess"
                             ].detach()
             if compute_ideal:
-                outputs.update(self.ideal.evaluate(data, volume_element))
+                outputs.update(self.ideal.evaluate(
+                    data, volume_element,
+                    mask=self.ideal_mask(data) if apply_ideal_mask else None,
+                ))
                 outputs["beta_F"] = outputs["beta_F_id"] + outputs["beta_F_exc"]
                 if compute_c1:
                     outputs["density_derivative"] = (

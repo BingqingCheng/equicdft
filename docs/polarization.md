@@ -786,14 +786,52 @@ The orientational part vanishes at $\mathbf{P}=0$, recovering the scalar
 ideal gas. Its domain is $\rho>0$ and $|\mathbf{P}|<m\rho$.
 Exact vacuum with zero polarization has zero energy; returned ideal derivatives
 there are zero placeholders, marked by `ideal_derivative_mask=False`, not
-finite physical vacuum derivatives. `excluded_mask` requires zero fields;
-a statistical training mask does not change the free energy.
+finite physical vacuum derivatives.
+
+Ordinary `model(data)` evaluation applies the **model-owned ideal mask**:
+`rho > model.rho_min`, intersected with `valid` and nonexcluded voxels. When
+explicit `beta_mu_weights` are present, their positive entries replace the
+density cutoff, preserving the original selection during SEM augmentation.
+Their magnitudes do not weight the energy. The selection is per species;
+`valid` and `excluded_mask` are per voxel.
+
+Masked entries contribute zero **whole ideal** energy (translational and
+orientational) and zero ideal derivatives. The fixed-dipole domain condition
+is enforced only on selected positive-density entries. Thus a finite but
+unphysical P at a discarded low-density voxel does not prevent training.
+`ideal_derivative_mask` identifies the entries actually evaluated. An empty
+ideal selection is allowed, although chemical-potential averaging still
+requires positive weight for every field/species.
+
+Only internal arguments to the ideal reference use safe placeholders. The
+original rho/P arrays are neither projected nor zeroed: CACE, LDA, Coulomb
+and all other excess readouts see the original fields and retain their full
+contributions/derivatives. Finite-field, shape and dtype checks still apply;
+hard-wall `excluded_mask` still requires zero density.
+
+For **full physical thermodynamics**, use
+`model(data, apply_ideal_mask=False)`. `GridSolver.evaluate` and both solve
+methods do this automatically, ignoring fitting masks and retaining strict
+physical ideal/domain checks (including zero rho/P at hard walls). This keeps
+analytic Euler updates, minimization objectives and residuals consistent.
+The masked training energy is not used as a solver objective: switching ideal
+terms on at a density cutoff would introduce a discontinuity. Away from mask
+boundaries, masked-model derivatives are derivatives of the masked energy with
+the selection held fixed.
+
+Standalone `ideal.evaluate(data, voxel_volume, mask=mask)` accepts an optional
+Boolean tensor with rho's full shape, including species. Its default
+`mask=None` retains full physical ideal evaluation. `ideal.local(...)` is
+unchanged and always enforces its finite-interior domain. The model exposes
+`model.ideal_mask(data)` for inspecting its selection. Masks affect the ideal
+whether or not chemical-potential diagnostics are enabled; use
+`apply_ideal_mask=False`, not just `compute_local_mu=False`, to bypass them.
 
 For normal evaluation, the model returns:
 
 | Output | Meaning |
 | --- | --- |
-| `beta_F_id`, `beta_F_exc`, `beta_F` | Ideal, excess and total intrinsic beta free energies |
+| `beta_F_id`, `beta_F_exc`, `beta_F` | Selected ideal, full excess and their sum (full physical ideal when `apply_ideal_mask=False`) |
 | `ideal_density_derivative` | Ideal derivative with respect to density at fixed polarization |
 | `ideal_polarization_derivative` | Ideal derivative with respect to polarization at fixed density |
 | `density_derivative` | Total density derivative, `ideal_density_derivative - c1` |
@@ -965,9 +1003,9 @@ The command `python -m equicdft.conversion` also accepts
 `--dipole-magnitude` and `--thermal-wavelength`. Do not supply an ideal
 override for a model that already stores its ideal reference.
 
-Historical conversion resets `compute_local_mu=False` and `rho_min=0`, without
-changing fitted parameters. Explicitly enable the current diagnostics and
-choose their cutoff when using a converted model for fitting. The solver's
+Historical conversion preserves saved `compute_local_mu` and `rho_min` settings,
+using False/zero defaults only when absent, without changing fitted parameters.
+Review these settings when using a converted model for fitting. The solver's
 `residual_density_threshold` remains separate. Converting a model does not reconstruct its
 training objective or automatically migrate an application script.
 

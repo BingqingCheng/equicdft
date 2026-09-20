@@ -106,6 +106,10 @@ def _intrinsic_outputs(model, data, compute_derivatives, polarized=False):
                   compute_polarization_derivative=polarized and compute_derivatives)
     if hasattr(model, "compute_local_mu"):
         kwargs["compute_local_mu"] = False
+    if hasattr(model, "ideal_mask"):
+        # Analytic Euler updates and line-search objectives use the full
+        # physical ideal law, never a density-threshold fitting selection.
+        kwargs["apply_ideal_mask"] = False
     return model(data, **kwargs)
 
 

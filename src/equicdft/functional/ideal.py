@@ -36,7 +36,9 @@ class IdealReference(nn.Module, Configurable):
 
     Exact vacuum has zero energy. Derivatives there are returned as zero
     placeholders with ``ideal_derivative_mask=False``: they are not finite
-    thermodynamic derivatives. Exclusions and statistical masks are distinct.
+    thermodynamic derivatives. An optional explicit mask additionally omits
+    local ideal energy and derivatives; it does not modify physical fields
+    supplied to other parts of a model. Hard-wall density checks still apply.
 
     ``thermal_wavelength`` is the stored default, not a unit contract. A
     batch that carries its own ``thermal_wavelength`` overrides it, because
@@ -65,19 +67,43 @@ class IdealReference(nn.Module, Configurable):
         """
         raise NotImplementedError
 
-    def evaluate(self, data, voxel_volume):
-        """Evaluate full grids, preserving batches and zero-density boundaries."""
+    def evaluate(self, data, voxel_volume, *, mask=None):
+        """Integrate ideal terms only on selected positive-density entries.
+
+        ``mask`` is an optional Boolean tensor with rho's full shape
+        (including species). Omitted entries contribute exactly zero energy
+        and derivatives and are not subject to the dipole-alignment domain
+        check. Shape/dtype/finite-field and hard-wall density checks remain
+        global. Without a mask, the physical ideal domain is unchanged,
+        including the requirement of zero polarization in vacuum.
+
+        Masks are fixed selections, not differentiated. Safe local arguments
+        replace omitted entries internally; the caller's tensors are untouched.
+        """
         rho = data["rho"]
         validate_density_field(rho, data.get("excluded_mask"))
-        active = rho > 0
+        selected = torch.ones_like(rho, dtype=torch.bool)
+        if mask is not None:
+            if (not torch.is_tensor(mask) or mask.dtype != torch.bool
+                    or mask.shape != rho.shape):
+                raise ValueError("ideal mask must be Boolean with rho's shape")
+            selected = mask.detach().to(device=rho.device)
+        active = selected & (rho > 0)
+        polarization = data.get("dipole_density")
         if self.requires_dipole_density:
-            p = data["dipole_density"]
-            if p.shape != (*rho.shape, 3):
+            if polarization is None or polarization.shape != (*rho.shape, 3):
                 raise ValueError("dipole_density must have shape rho.shape + (3,)")
-            if torch.any((~active)[..., None] & (p != 0)):
+            if polarization.dtype != rho.dtype or polarization.device != rho.device:
+                raise ValueError("rho and dipole_density must share dtype and device")
+            if not torch.isfinite(polarization).all():
+                raise ValueError("dipole_density must be finite")
+            if torch.any((selected & (rho == 0))[..., None] & (polarization != 0)):
                 raise ValueError("dipole_density must be zero in vacuum")
+            polarization = torch.where(
+                active[..., None], polarization, torch.zeros_like(polarization),
+            )
         # Safe placeholders avoid evaluating logarithms/inverse Langevin at
-        # vacuum; their local energy/derivatives are removed before integration.
+        # vacuum or omitted voxels; their contributions are removed below.
         safe_rho = torch.where(active, rho, torch.ones_like(rho))
         # A batch wavelength wins over the stored one on purpose, unlike the
         # Boltzmann constant: Lambda = h / sqrt(2*pi*m*k_B*T) depends on the
@@ -86,7 +112,7 @@ class IdealReference(nn.Module, Configurable):
         # The buffer is therefore the default for data that carries none.
         local = self.local(
             safe_rho,
-            data.get("dipole_density"),
+            polarization,
             data.get("thermal_wavelength"),
         )
         density_energy = safe_rho * local.pop("energy_per_particle")
