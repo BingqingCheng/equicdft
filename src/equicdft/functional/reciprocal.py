@@ -391,7 +391,6 @@ class ReciprocalFeatures(nn.Module, Configurable):
             dtype=rho.dtype,
         ).flatten(start_dim=1)
         features = self._pair_features(fourier_source, kernels, volume)
-        # Previously serialized reciprocal modules have no divergence flag.
         if self.include_divergence:
             divergence_hat = self._bound_charge_hat(
                 polarization_hat, (nx, ny, nz), spacing,

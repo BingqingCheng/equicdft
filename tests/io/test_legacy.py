@@ -12,7 +12,6 @@ from equicdft import (
     GridCACEModel,
     LocalReadout,
     load_model,
-    read_model_config,
 )
 from equicdft.conversion import __main__ as convert_cli
 from equicdft.conversion import convert_model, load_converted_model

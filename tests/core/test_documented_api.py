@@ -1,9 +1,14 @@
-"""Every constructor call in the documentation must still be callable.
+"""Every documented call must still be callable.
 
-A keyword that a class no longer accepts survives in prose indefinitely and
-fails only when a reader copies the snippet. Parsing the fenced ``python``
-blocks and checking their keywords against the real signatures catches that
-in a second, without running any of the examples.
+A keyword that a class or method no longer accepts survives in prose
+indefinitely and fails only when a reader copies the snippet. Parsing the
+fenced ``python`` blocks and checking their keywords against the real
+signatures catches that in a second, without running any of the examples.
+
+Constructors are matched by class name. Methods are matched by name against
+an explicit map, because a bare ``.solve(...)`` in a snippet says nothing
+about its receiver; the map lists the methods whose keyword sets the
+documentation actually describes.
 """
 
 import ast
@@ -18,6 +23,7 @@ from equicdft.response.stability import FourierStabilityLoss
 from equicdft.training.loss import Loss, TensorLoss
 from equicdft.training.metrics import Metrics
 from equicdft.training.noise import NoiseOptions
+from equicdft.solver import GridSolver
 from equicdft.training.trainer import Trainer, TrainingStream
 
 
@@ -41,6 +47,17 @@ DOCUMENTED_CLASSES.update({
 })
 
 
+# method name -> the unbound function whose signature the docs describe.
+# ``solve`` lost its two dozen flat keywords, which is exactly the kind of
+# change a stale snippet outlives.
+DOCUMENTED_METHODS = {
+    "solve": GridSolver.solve,
+    "evaluate": GridSolver.evaluate,
+    "fit": Trainer.fit,
+    "fit_streams": Trainer.fit_streams,
+}
+
+
 def _documents():
     for path in sorted(REPOSITORY.glob("*.md")):
         yield path
@@ -59,7 +76,7 @@ def _calls(source):
             yield function.attr, node
 
 
-class TestDocumentedConstructorCalls(unittest.TestCase):
+class TestDocumentedCalls(unittest.TestCase):
     def test_every_documented_keyword_is_a_real_parameter(self):
         checked = 0
         for path in _documents():
@@ -73,10 +90,12 @@ class TestDocumentedConstructorCalls(unittest.TestCase):
                     continue
                 for name, call in _calls(tree_source):
                     cls = DOCUMENTED_CLASSES.get(name)
-                    if cls is None:
+                    method = DOCUMENTED_METHODS.get(name)
+                    if cls is None and method is None:
                         continue
+                    target = cls.__init__ if method is None else method
                     try:
-                        parameters = inspect.signature(cls.__init__).parameters
+                        parameters = inspect.signature(target).parameters
                     except (TypeError, ValueError):
                         continue
                     if any(p.kind == p.VAR_KEYWORD for p in parameters.values()):
@@ -92,7 +111,7 @@ class TestDocumentedConstructorCalls(unittest.TestCase):
                                 path.name, name, keyword.arg, name,
                             ),
                         )
-        self.assertGreater(checked, 0, "no documented constructor calls found")
+        self.assertGreater(checked, 0, "no documented calls found")
 
 
 if __name__ == "__main__":
