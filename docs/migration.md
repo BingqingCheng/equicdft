@@ -18,7 +18,10 @@ python -m equicdft.conversion old_model.pt converted_model.pt
 This accepts trusted whole-object `torch.save(model)` pickles and older
 versioned model files. A distinct destination is required: conversion never
 overwrites the source. Existing output files require `--overwrite`.
-Only convert files you trust; whole-object conversion uses Python pickle.
+Only convert files you trust, including files believed to be versioned. The
+converter tries restricted loading first, but an unpickling rejection falls
+back to the historical object loader, which can execute code from the file.
+Normal `load_model` uses restricted loading without this fallback.
 
 - Density-only format-1/2 models need no extra physical metadata.
 - Format 3 introduced model-owned ideal references. Older polarized models

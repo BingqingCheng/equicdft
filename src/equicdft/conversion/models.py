@@ -1,6 +1,7 @@
 """Convert trusted whole-object or versioned models to the current format."""
 
 import copy
+import pickle
 from pathlib import Path
 
 import torch
@@ -29,18 +30,18 @@ def _conversion_destination(source, destination, overwrite):
 def load_converted_model(source, *, ideal=None, verify=True, verification_data=None):
     """Explicitly convert a trusted old file in memory, without modifying it.
 
-    A versioned file holds only dictionaries, strings, numbers and tensors,
-    so it is read with the restricted unpickler like any current file. Only
-    a whole-object file needs Python pickle, and only those need to be
-    trusted. Versioned files transfer their state strictly. File conversion
-    can also check predictions after rebuilding the current payload.
+    All inputs must be trusted, including files believed to be versioned.
+    Restricted loading is tried first; an unpickling rejection falls back
+    to the historical object loader, which can execute code from the file.
+    That fallback is not a file-type or safety check. Versioned files transfer
+    their state strictly; file conversion can also verify rebuilt predictions.
     """
     source = Path(source).expanduser()
     try:
         payload = torch.load(source, map_location="cpu", weights_only=True)
-    except Exception:
-        # Not a versioned payload: a whole-object pickle needs the remapping
-        # unpickler, which executes the file's own module references.
+    except pickle.UnpicklingError:
+        # Trusted historical objects need the remapping unpickler. Do not
+        # retry unrelated I/O, runtime or resource failures unrestricted.
         payload = torch.load(
             source, map_location="cpu",
             pickle_module=_remapping_pickle_module(),
@@ -58,7 +59,7 @@ def load_converted_model(source, *, ideal=None, verify=True, verification_data=N
 
 def convert_model(source, destination, *, ideal=None, verify=True,
                   verification_data=None, overwrite=False):
-    """Write a separate current-format file; never modify the source."""
+    """Convert a trusted file to a separate current-format file; keep the source."""
     source, destination = _conversion_destination(source, destination, overwrite)
     model = load_converted_model(
         source, ideal=ideal, verify=verify, verification_data=verification_data,

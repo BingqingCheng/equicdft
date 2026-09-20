@@ -2,7 +2,8 @@
 
 Versions 1/2 predate model-owned ideal references; polarized files require
 the physical molecular moment from the original run, never descriptor scales.
-Version 4 retires model-owned fitting policy. Migration leaves inputs intact.
+Saved fitting policy is preserved; absent settings use current defaults.
+Migration leaves inputs intact.
 """
 
 import copy

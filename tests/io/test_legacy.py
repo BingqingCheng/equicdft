@@ -1,9 +1,11 @@
 import copy
 import io
 import json
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -160,6 +162,30 @@ class TestRemappingUnpickler(unittest.TestCase):
 
 
 class TestLegacyConversion(unittest.TestCase):
+    def test_unpickling_rejection_retries_trusted_object_loading(self):
+        model = example_model()
+        with patch("equicdft.conversion.models.torch.load", side_effect=[
+            pickle.UnpicklingError("unsupported global"), model,
+        ]) as load, patch(
+            "equicdft.conversion.models.legacy_model_to_current", return_value=model,
+        ) as convert:
+            self.assertIs(load_converted_model("trusted.pt"), model)
+        self.assertEqual([call.kwargs["weights_only"] for call in load.call_args_list],
+                         [True, False])
+        convert.assert_called_once()
+
+    def test_unrelated_load_failures_are_not_retried(self):
+        for error in (FileNotFoundError("missing"), PermissionError("denied"),
+                      EOFError("truncated"), RuntimeError("bad archive"),
+                      MemoryError("out of memory")):
+            with self.subTest(error=type(error).__name__):
+                with patch("equicdft.conversion.models.torch.load", side_effect=error) as load:
+                    with self.assertRaises(type(error)) as raised:
+                        load_converted_model("trusted.pt")
+                self.assertIs(raised.exception, error)
+                load.assert_called_once()
+                self.assertTrue(load.call_args.kwargs["weights_only"])
+
     def test_loaded_lazy_weights_supply_the_missing_input_width(self):
         torch.manual_seed(20)
         model = example_model()
