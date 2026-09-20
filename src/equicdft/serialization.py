@@ -182,17 +182,9 @@ def save_model(model: nn.Module, path: PathLike) -> Path:
 
 
 def _torch_load_plain(path: Path, map_location: Any) -> Any:
-    """Load a file with the restricted unpickler where PyTorch offers it."""
+    """Load a file with the restricted unpickler."""
 
-    try:
-        return torch.load(
-            str(path),
-            map_location=map_location,
-            weights_only=True,
-        )
-    except TypeError:
-        # PyTorch releases before the weights_only keyword.
-        return torch.load(str(path), map_location=map_location)
+    return torch.load(str(path), map_location=map_location, weights_only=True)
 
 
 def read_model_payload(path: PathLike, map_location: Any = "cpu") -> Dict[str, Any]:

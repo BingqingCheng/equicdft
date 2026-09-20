@@ -29,15 +29,23 @@ def _conversion_destination(source, destination, overwrite):
 def load_converted_model(source, *, ideal=None, verify=True, verification_data=None):
     """Explicitly convert a trusted old file in memory, without modifying it.
 
-    Whole-object files use Python pickle: only convert files you trust.
-    Versioned files transfer their state strictly. File conversion can also
-    check predictions after rebuilding the current serialization payload.
+    A versioned file holds only dictionaries, strings, numbers and tensors,
+    so it is read with the restricted unpickler like any current file. Only
+    a whole-object file needs Python pickle, and only those need to be
+    trusted. Versioned files transfer their state strictly. File conversion
+    can also check predictions after rebuilding the current payload.
     """
-    payload = torch.load(
-        Path(source).expanduser(), map_location="cpu",
-        pickle_module=_remapping_pickle_module(),
-        weights_only=False,
-    )
+    source = Path(source).expanduser()
+    try:
+        payload = torch.load(source, map_location="cpu", weights_only=True)
+    except Exception:
+        # Not a versioned payload: a whole-object pickle needs the remapping
+        # unpickler, which executes the file's own module references.
+        payload = torch.load(
+            source, map_location="cpu",
+            pickle_module=_remapping_pickle_module(),
+            weights_only=False,
+        )
     if isinstance(payload, nn.Module):
         model = legacy_model_to_current(
             payload, ideal=ideal,

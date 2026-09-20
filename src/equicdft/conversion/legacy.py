@@ -133,21 +133,12 @@ def load_legacy_model(
         raise FileNotFoundError(
             "legacy model file does not exist: {}".format(source)
         )
-    pickle_module = _remapping_pickle_module()
-    try:
-        model = torch.load(
-            str(source),
-            map_location=map_location,
-            pickle_module=pickle_module,
-            weights_only=False,
-        )
-    except TypeError:
-        # PyTorch releases before the weights_only keyword.
-        model = torch.load(
-            str(source),
-            map_location=map_location,
-            pickle_module=pickle_module,
-        )
+    model = torch.load(
+        str(source),
+        map_location=map_location,
+        pickle_module=_remapping_pickle_module(),
+        weights_only=False,
+    )
     if not isinstance(model, nn.Module):
         raise TypeError(
             "{} does not contain a pickled model object".format(source)

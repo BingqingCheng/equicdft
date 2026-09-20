@@ -4,7 +4,6 @@ import itertools
 import io
 import math
 import unittest
-import warnings
 from unittest.mock import patch
 
 import torch
@@ -515,22 +514,16 @@ class TestMetalWall(unittest.TestCase):
         for key in ("metal_site_q", "electrode_coulomb_energy"):
             torch.testing.assert_close(actual[key], expected[key], atol=1e-14, rtol=1e-14)
 
-    def test_legacy_torch_lu_solve_preserves_density_gradients(self):
+    def test_charge_solve_preserves_density_gradients(self):
         data = _field()
         data["rho"].requires_grad_(True)
-        expected = _run(_module(), data)
-        expected_gradient = torch.autograd.grad(
-            expected["electrode_coulomb_energy"], data["rho"],
+        result = _run(_module(), data)
+        gradient = torch.autograd.grad(
+            result["electrode_coulomb_energy"], data["rho"],
         )[0]
-        with patch.object(torch.linalg, "lu_solve", None):
-            # torch.lu_solve is deprecated; this is the only place it runs, so
-            # its warning is expected here and kept out of the suite output.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                actual = _run(_module(), data)
-        gradient = torch.autograd.grad(actual["electrode_coulomb_energy"], data["rho"])[0]
-        torch.testing.assert_close(actual["metal_site_q"], expected["metal_site_q"])
-        torch.testing.assert_close(gradient, expected_gradient)
+        self.assertEqual(gradient.shape, data["rho"].shape)
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(float(gradient.abs().max()), 0.)
 
 
 if __name__ == "__main__":

@@ -319,11 +319,8 @@ class MetalWall(EnergyReadout, Configurable):
             -(liquid_potential_unit + energy_scale * external_potential / amplitude),
             group_totals,
         ))
-        lu_solve = getattr(torch.linalg, "lu_solve", None)
-        solution = (
-            torch.lu_solve(rhs[:, None], system.factor, system.pivots)
-            if lu_solve is None else
-            lu_solve(system.factor, system.pivots, rhs[:, None])
+        solution = torch.linalg.lu_solve(
+            system.factor, system.pivots, rhs[:, None],
         ).squeeze(-1)
         n_sites = liquid_potential_unit.numel()
         q = solution[:n_sites]
