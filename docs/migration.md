@@ -25,9 +25,11 @@ Only convert files you trust; whole-object conversion uses Python pickle.
   require `--dipole-magnitude` using the original molecular moment in the
   original dipole units, and `--thermal-wavelength` if it differs from 1.
   Descriptor normalization scales are not used to guess physical moments.
-- Conversion to format 4 discards historical `compute_local_mu` and `rho_min`
-  settings without changing fitted parameters. Preserve the original masks
-  explicitly in application losses and solver residual settings.
+- Conversion to format 4 carries `compute_local_mu` and `rho_min` forward
+  without changing fitted parameters: both are optional diagnostics on the
+  current model again, computing the same quantities from the same mask, so
+  a converted functional evaluates the chemical potential its fit used. A
+  file written while they were briefly absent takes the current defaults.
 
 The Python API is `equicdft.conversion.convert_model(source, destination, ...)`.
 It accepts `ideal=FixedDipoleIdeal(...)` for missing physical metadata and
@@ -67,9 +69,9 @@ of V. Local-mu evaluation requests the total density derivative automatically.
 
 The defaults are `compute_local_mu=False`, `rho_min=0`. Settings are saved in
 current model configurations; existing format-4 files without them load with
-these defaults. Historical conversion continues to reset old fitting policy;
-explicitly enable the new diagnostics after converting a fitted functional.
-Model-format version and tensor state are unchanged by these optional settings.
+these defaults, and conversion carries an older file's settings through, so a
+converted fitted functional keeps the cutoff its fit used. Model-format
+version and tensor state are unchanged by these optional settings.
 
 `model(data, compute_local_mu=False)` overrides the saved setting for intrinsic
 evaluation. Missing V raises when diagnostics are requested, as does

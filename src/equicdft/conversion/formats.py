@@ -155,11 +155,19 @@ def _migrate_v2_to_v3(payload):
 
 
 def _migrate_v3_to_v4(payload):
-    """Reset historical fitting policy; fitted functional parameters are unchanged."""
+    """Carry the fitting policy forward; fitted parameters are unchanged.
+
+    ``compute_local_mu`` and ``rho_min`` were briefly absent from the model
+    and are now optional diagnostics again, computing the same quantities
+    from the same mask, so an old file's settings transfer rather than
+    reset: a converted functional evaluates the chemical potential its fit
+    used. A file written while they were absent has neither key and takes
+    the current defaults.
+    """
     config = payload["config"]
     if config.get(TYPE_KEY) == "GridCACEModel":
-        config["compute_local_mu"] = False
-        config["rho_min"] = 0.0
+        config.setdefault("compute_local_mu", False)
+        config.setdefault("rho_min", 0.0)
     return payload
 
 
