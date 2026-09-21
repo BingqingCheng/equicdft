@@ -80,7 +80,10 @@ def parse_arguments():
     )
 
     # Optimization controls. rho_min removes essentially empty cells from the
-    # local-chemical-potential loss (dimensionless beta*mu).
+    # local-chemical-potential loss (dimensionless beta*mu). Trainer also
+    # evaluates with use_voxel_mask=True, so the same cutoff omits ideal, LDA
+    # and CACE-centered energy there; solves keep the full functional.
+    # See docs/model.md.
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--rho-min", type=float, default=1.0e-3)
     parser.add_argument("--early-stopping-patience", type=int, default=10)

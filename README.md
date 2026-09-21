@@ -10,11 +10,23 @@ The package is research software under active development. The example below
 is the smallest complete training workflow; it uses the same model construction
 and local-chemical-potential objective as the current Lennard--Jones fits.
 
-Three longer documents live in `docs/`: `docs/polarization.md` for fixed-dipole
-fluids and the coupled density/polarization solve, `docs/metal-wall.md` for
-electrode boundary conditions, and `docs/experimental.md` for the stability
-regularizers and other features still being evaluated. `docs/migration.md`
-records what changed for existing models and data files.
+Longer documents live in `docs/`:
+
+- [`model.md`](docs/model.md) — the ideal reference, selecting energy centers
+  for fitting, what a forward returns, and independent `CACEBranch` pipelines
+- [`solving.md`](docs/solving.md) — equilibrium solves: choosing a method,
+  the option groups, and what each stopping status tells you to change
+- [`training.md`](docs/training.md) — running a fit: checkpoints, resume,
+  logging, early stopping, masked fitting forwards and joint streams
+- [`extending.md`](docs/extending.md) — writing your own readout, loss term
+  or metric collection
+- [`polarization.md`](docs/polarization.md) — fixed-dipole fluids, alignment
+  inputs and the coupled density/polarization solve
+- [`metal-wall.md`](docs/metal-wall.md) — electrode boundary conditions
+- [`experimental.md`](docs/experimental.md) — stability regularizers and other
+  features still being evaluated
+- [`migration.md`](docs/migration.md) — what changed for existing models and
+  data files
 
 ## Method in one page
 
@@ -169,7 +181,7 @@ The annotated example exposes the important options while using these defaults:
 | density scale | train+validation mean density |
 | temperature scale | train+validation mean temperature |
 | free-energy convention | directly learn $\beta F_{\mathrm{exc}}$ |
-| density mask | $\rho>10^{-3}$ |
+| density mask (`rho_min`) | $\rho>10^{-3}$ |
 | batch size | 2 complete fields |
 | optimizer | Adam, learning rate $10^{-4}$ |
 | scheduler | ReduceLROnPlateau, factor 0.5, patience 3 |
@@ -182,8 +194,11 @@ validation split.
 
 ## Data format
 
-`GridData.from_xyz` reads one EXTXYZ frame per complete regular grid. The
-default field names and requirements are:
+`GridData.from_xyz` reads one EXTXYZ frame per complete regular grid and
+returns a `GridDataset`, a plain `torch.utils.data.Dataset` of field
+dictionaries. `default_data_key(name)` gives the EXTXYZ name a field is read
+from, and the `data_key` argument overrides individual ones. The default
+field names and requirements are:
 
 | EXTXYZ location | Name | Required | Meaning |
 |---|---|---:|---|
@@ -286,9 +301,10 @@ outputs = model(field)
 print(outputs["beta_F_exc"], outputs["c1"])
 ```
 
-`save_model` and `load_model` use a versioned file that stores the model's
-structure (`model.to_config()`, a plain JSON-compatible dictionary) next to
-its fitted `state_dict`. The file contains no Python object references, so
+`save_model` and `load_model` use a versioned file (currently
+`MODEL_FORMAT_VERSION`, 5) that stores the model's structure
+(`model.to_config()`, a plain JSON-compatible dictionary) next to its fitted
+`state_dict`. The file contains no Python object references, so
 it loads under PyTorch's default `weights_only` unpickler, and
 `read_model_config` inspects the architecture without building it. Model
 files in older formats, including `torch.save(model)` pickles, are converted explicitly:
@@ -358,7 +374,11 @@ reciprocal kernels with nonperiodic boundary conditions.
 - `equicdft.functional`: the readout interface and thermodynamics, local,
   state-dependent, pairwise, reciprocal-space and metal-wall readouts, the
   fixed-dipole ideal gas
-- `model.py`, `derivatives.py`: scalar functional and automatic derivatives
+- `model.py`, `derivatives.py`: scalar functional and automatic derivatives;
+  `CACEBranch` composes several independent A/B/readout pipelines in one
+  functional (see [`model.md`](docs/model.md))
+- `objectives.py`: the `LossTerm` and `MetricCollection` base classes every
+  training objective is built from (see [`extending.md`](docs/extending.md))
 - `equicdft.response`: Fourier probe modes, curvature, stability and response
   losses, metrics and data
 - `equicdft.training`: loss terms, streaming metrics, the trainer, noise
