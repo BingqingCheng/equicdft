@@ -62,10 +62,30 @@ def local_feature_width(a_features, b_features, n_messages):
     return center_width + (1 + n_messages) * invariant_width + 1
 
 
-def local_invariants(a_features, b_features, messages, data, polarization_scale):
+def local_invariants(
+    a_features,
+    b_features,
+    messages,
+    data,
+    polarization_scale,
+    alignment_scale=None,
+    dipole_magnitude=None,
+    alignment_density_floor=None,
+):
     """Evaluate one independent pipeline without changing physical inputs."""
     grid_rank = data["rho"].ndim - 1
-    A = (a_features(data, polarization_scale=polarization_scale)
+    # Preserve the established duck-typed raw-A contract: existing custom
+    # polarized feature modules may accept only polarization_scale.  The new
+    # arguments belong only to feature modules that explicitly request the
+    # alignment carrier.
+    polarization_arguments = {"polarization_scale": polarization_scale}
+    if getattr(a_features, "requires_alignment_scale", False):
+        polarization_arguments.update(
+            alignment_scale=alignment_scale,
+            dipole_magnitude=dipole_magnitude,
+            alignment_density_floor=alignment_density_floor,
+        )
+    A = (a_features(data, **polarization_arguments)
          if a_features.include_polarization else a_features(data))
     B = b_features(A)
     levels = [B.flatten(start_dim=grid_rank)]
@@ -74,7 +94,7 @@ def local_invariants(a_features, b_features, messages, data, polarization_scale)
         message_fields = {}
         if a_features.include_polarization:
             fields, scales = a_features.polarization_fields(
-                data, polarization_scale=polarization_scale,
+                data, **polarization_arguments,
             )
             message_fields = {
                 "normalized_fields": fields / scales,

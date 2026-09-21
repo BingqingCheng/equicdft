@@ -65,6 +65,106 @@ Pass the returned scale as `dipole_density_reference` to the builder below,
 or directly as `GridCACEModel(polarization_scale=...)`. It has the same units
 as the input dipole density and is fixed after model construction.
 
+### Raw polarization and reduced-alignment inputs
+
+Learned polarization inputs have two explicit choices. The default
+`polarization_input="raw"` uses the established rotation-invariant scaling
+
+$$
+\widetilde{\mathbf P}=\mathbf P/P_{\mathrm{scale}}.
+$$
+
+`polarization_input="alignment"` instead uses the smooth reduced-polarization
+field
+
+$$
+\mathbf u_\epsilon
+=\frac{\rho\,\mathbf P}
+       {m\left(\rho^2+\rho_0^2\right)},
+\qquad
+\widetilde{\mathbf u}=\mathbf u_\epsilon/u_{\mathrm{scale}}.
+$$
+
+Here $m$ is the fixed molecular dipole magnitude, $\rho_0$ is a positive
+`alignment_density_floor`, and `alignment_scale` is a separate positive,
+dimensionless dataset scale. The transformation is evaluated inside the
+autograd graph, so derivatives are still taken with respect to the physical
+$\rho$ and $\mathbf P$ and include the complete chain rule. It is smooth at
+vacuum and approaches $\mathbf P/(m\rho)$ away from the density floor.
+
+Use one scalar `alignment_scale` for all three Cartesian components. A useful
+dataset convention is the same one used for $P_{\mathrm{scale}}$: pool retained
+training and validation voxel/species vectors, exclude the test set, center
+only while calculating the rotation-invariant population standard deviation,
+and feed the uncentered field to the model. Because the statistic depends on
+$\rho_0$, record both values with the fitted model.
+
+The selector is available independently on `CartesianAFeatures` and
+`LDAReadout`. This complete helper builds an alignment-only excess model:
+
+```python
+from equicdft import (
+    CACEBranch, CartesianAFeatures, CartesianBFeatures, FixedDipoleIdeal,
+    GridCACEModel, LDAReadout, LocalReadout,
+)
+
+
+def build_alignment_model(
+    *, density_reference, alignment_standard_deviation, density_floor,
+    dipole_magnitude, grid_spacing, temperature_reference,
+    boltzmann_constant,
+):
+    a_features = CartesianAFeatures(
+        max_power=2,
+        mean_density=density_reference,
+        cutoff_grid=3,
+        radial_basis="gaussian",
+        radial_exponents=(0.125,),
+        trainable_radial_exponents=True,
+        include_polarization=True,
+        polarization_input="alignment",
+    )
+    b_features = CartesianBFeatures(
+        max_power=2,
+        max_product_order=2,
+        include_polarization=True,
+    )
+    branch = CACEBranch(
+        a_features,
+        b_features,
+        LocalReadout(hidden_sizes=(16, 8)),
+    )
+    lda = LDAReadout(
+        include_polarization=True,
+        polarization_input="alignment",
+        hidden_sizes=(16, 8),
+    )
+    return GridCACEModel(
+        readout=[branch, lda],
+        ideal=FixedDipoleIdeal(dipole_magnitude),
+        mean_density=density_reference,
+        alignment_scale=alignment_standard_deviation,
+        alignment_density_floor=density_floor,
+        grid_spacing=grid_spacing,
+        mean_temperature=temperature_reference,
+        boltzmann_constant=boltzmann_constant,
+        compute_c1=True,
+        compute_polarization_derivative=True,
+    )
+```
+
+Raw and alignment CACE terms can coexist by constructing two independent
+`CACEBranch` instances and summing them in the parent model. This keeps the
+existing one-vector invariant and message implementations unchanged. Such a
+model has extra learned capacity, includes no explicit raw/alignment
+cross-invariants, and each branch also contains density-only invariants; it is
+therefore an additive alignment correction rather than a parameter-matched
+input substitution.
+
+Only learned inputs are transformed. The ideal functional, long-range
+electrostatics, external coupling, solver state, losses, and serialized output
+fields continue to use the physical polarization density $\mathbf P$.
+
 ```python
 from equicdft import (
     CartesianAFeatures,

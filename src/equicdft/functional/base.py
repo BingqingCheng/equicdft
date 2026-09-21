@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from torch import nn
 
+from .._polarization import regularized_reduced_polarization
 from ..geometry.grid import (
     grid_spacing_tensor,
     voxel_volume as compute_voxel_volume,
@@ -52,6 +53,13 @@ class ReadoutContext:
         Positive density scale used by every normalized density input.
     polarization_scale
         Fixed positive scalar shared by normalized polarization inputs.
+    alignment_scale
+        Fixed positive dimensionless scale for smooth molecular-alignment
+        inputs. It is independent of ``polarization_scale``.
+    alignment_density_floor
+        Positive density entering the smooth vacuum extension of alignment.
+    dipole_magnitude
+        Fixed scalar or species vector used only by alignment inputs.
     grid_spacing
         Cartesian spacing ``[3]`` of the regular grid.
     grid_size
@@ -84,6 +92,9 @@ class ReadoutContext:
     voxel_volume: Union[float, torch.Tensor]
     mean_density: Optional[Union[float, torch.Tensor]] = None
     polarization_scale: Optional[Union[float, torch.Tensor]] = None
+    alignment_scale: Optional[Union[float, torch.Tensor]] = None
+    alignment_density_floor: Optional[Union[float, torch.Tensor]] = None
+    dipole_magnitude: Optional[Union[float, torch.Tensor]] = None
     grid_spacing: Optional[torch.Tensor] = None
     grid_size: Optional[torch.Tensor] = None
     beta: Optional[torch.Tensor] = None
@@ -119,6 +130,14 @@ class ReadoutContext:
             if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
                 raise ValueError("polarization_scale must be a positive scalar")
             self.polarization_scale = scale.reshape(())
+        for name in ("alignment_scale", "alignment_density_floor"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            scale = torch.as_tensor(value, dtype=rho.dtype, device=rho.device)
+            if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+                raise ValueError(name + " must be a positive scalar")
+            setattr(self, name, scale.reshape(()))
         if self.mean_density is not None:
             scale = torch.as_tensor(
                 self.mean_density, dtype=rho.dtype, device=rho.device,
@@ -149,6 +168,9 @@ class ReadoutContext:
         boltzmann_constant: Union[float, torch.Tensor] = 1.0,
         mean_density: Optional[Union[float, torch.Tensor]] = None,
         polarization_scale: Optional[Union[float, torch.Tensor]] = None,
+        alignment_scale: Optional[Union[float, torch.Tensor]] = None,
+        alignment_density_floor: Optional[Union[float, torch.Tensor]] = None,
+        dipole_magnitude: Optional[Union[float, torch.Tensor]] = None,
         free_energy_mode: str = "beta",
     ) -> "ReadoutContext":
         """Build the context of one GridData-like batch under a unit contract.
@@ -181,6 +203,9 @@ class ReadoutContext:
             voxel_volume=compute_voxel_volume(spacing).to(rho),
             mean_density=mean_density,
             polarization_scale=polarization_scale,
+            alignment_scale=alignment_scale,
+            alignment_density_floor=alignment_density_floor,
+            dipole_magnitude=dipole_magnitude,
             grid_spacing=spacing.to(rho),
             # Physical analytical readouts use this unit contract, not a
             # possibly stale beta field supplied by a caller.
@@ -240,6 +265,27 @@ class ReadoutContext:
         return self._cached(
             "normalized_polarization",
             lambda: self.require("dipole_density") / self.require("polarization_scale"),
+        )
+
+    def reduced_polarization(self) -> torch.Tensor:
+        """Return the smooth species-wise molecular alignment field."""
+
+        return self._cached(
+            "reduced_polarization",
+            lambda: regularized_reduced_polarization(
+                self.rho,
+                self.require("dipole_density"),
+                self.require("dipole_magnitude"),
+                self.require("alignment_density_floor"),
+            ),
+        )
+
+    def normalized_alignment(self) -> torch.Tensor:
+        """Return smooth molecular alignment divided by its fixed scale."""
+
+        return self._cached(
+            "normalized_alignment",
+            lambda: self.reduced_polarization() / self.require("alignment_scale"),
         )
 
     def local_features(self) -> torch.Tensor:
@@ -314,6 +360,7 @@ class EnergyReadout(nn.Module):
     requires_dipole_density = False
     # Learned readouts request normalization independently of physical P.
     requires_polarization_scale = False
+    requires_alignment_scale = False
     # A local stencil is needed even when FFT avoids explicit neighbor rows.
     # ``shares_grid_stencil`` marks the readouts whose cutoff_grid must agree
     # with the model's: those built on the model's A features. A readout with

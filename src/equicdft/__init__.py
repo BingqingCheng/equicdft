@@ -13,6 +13,7 @@ from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
 from .functional.reciprocal import ReciprocalFeatures
 from .functional.semilocal import GGAReadout, LDAReadout
 from .model import GridCACEModel
+from ._polarization import regularized_reduced_polarization
 from .representation.cartesian import CartesianAFeatures
 from .representation.invariants import CartesianBFeatures
 from .representation.message import BChiMessage
@@ -68,6 +69,7 @@ __all__ = [
     "PairwiseReadout",
     "FixedDipoleIdeal",
     "ReciprocalFeatures",
+    "regularized_reduced_polarization",
     "TensorLoss",
     "Trainer",
     "TrainingStream",

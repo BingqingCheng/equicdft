@@ -206,6 +206,7 @@ def _upgrade_cartesian_a_features(module: CartesianAFeatures) -> None:
     )
     _set_default(module, "convolution_backend", "gather")
     _set_default(module, "include_polarization", False)
+    _set_default(module, "polarization_input", "raw")
     module._buffers.pop("dipole_density_scale", None)
     _set_default(module, "coordinate_scaling", "none")
     _set_default(module, "trainable_radial_exponents", False)
@@ -335,6 +336,9 @@ def _upgrade_model(module: GridCACEModel) -> None:
     _set_default(module, "a_features", None)
     _set_default(module, "b_features", None)
     _upgrade_polarization_scale(module)
+    for name in ("alignment_scale", "alignment_density_floor"):
+        if not _defines(module, name):
+            module.register_buffer(name, None)
     if not _defines(module, "mean_density"):
         # The density scale used to live on the feature module and on every
         # LDA readout; the model now owns it. Readout copies are dropped by
@@ -424,6 +428,7 @@ def _upgrade_mlp_readout(module: nn.Module) -> None:
         _set_default(module, "features", None)
     if isinstance(module, LDAReadout):
         _set_default(module, "include_polarization", False)
+        _set_default(module, "polarization_input", "raw")
         # Moved to GridCACEModel.mean_density (see _upgrade_model).
         module._buffers.pop("mean_density", None)
 

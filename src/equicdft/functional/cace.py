@@ -66,7 +66,15 @@ class CACEBranch(EnergyReadout, Configurable):
 
     @property
     def requires_polarization_scale(self):
-        return self.a_features.include_polarization
+        return getattr(
+            self.a_features,
+            "requires_polarization_scale",
+            self.a_features.include_polarization,
+        )
+
+    @property
+    def requires_alignment_scale(self):
+        return getattr(self.a_features, "requires_alignment_scale", False)
 
     def wrapped_readouts(self):
         return (self.readout,)
@@ -83,6 +91,9 @@ class CACEBranch(EnergyReadout, Configurable):
         invariants = local_invariants(
             self.a_features, self.b_features, self.message_layers, data,
             context.polarization_scale,
+            context.alignment_scale,
+            context.dipole_magnitude,
+            context.alignment_density_floor,
         )
         center = None
         if self.a_features.separate_center and not self.a_features.include_polarization:

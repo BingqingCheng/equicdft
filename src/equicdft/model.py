@@ -280,6 +280,12 @@ class GridCACEModel(nn.Module, Configurable):
     those learned inputs, stored as a fixed buffer and never subtracted from P.
     Ideal, Coulomb, external coupling and reciprocal kernels use physical P.
 
+    Alignment learned inputs use a separate dimensionless ``alignment_scale``
+    and positive ``alignment_density_floor``. They evaluate the smooth field
+    ``rho P / (m (rho^2 + alignment_density_floor^2))`` inside the autograd
+    graph, with ``m`` taken from the fixed-dipole ideal. Raw learned inputs
+    continue to use ``polarization_scale`` unchanged.
+
     Ordinary forwards evaluate the full physical intrinsic functional.
     ``use_voxel_mask=True`` selects ideal/LDA/CACE energy centers using the
     positive support of :meth:`voxel_weights`. All descriptor inputs and LR
@@ -320,6 +326,8 @@ class GridCACEModel(nn.Module, Configurable):
         compute_polarization_derivative: bool = False,
         mean_density: Optional[Union[float, torch.Tensor]] = None,
         polarization_scale: Optional[Union[float, torch.Tensor]] = None,
+        alignment_scale: Optional[Union[float, torch.Tensor]] = None,
+        alignment_density_floor: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
@@ -351,10 +359,39 @@ class GridCACEModel(nn.Module, Configurable):
         polarization_scale = (None if polarization_scale is None else
                               positive_scalar_tensor(polarization_scale, "polarization_scale"))
         needs_polarization_scale = (
-            a_features is not None and a_features.include_polarization
+            a_features is not None
+            and getattr(
+                a_features,
+                "requires_polarization_scale",
+                a_features.include_polarization,
+            )
         ) or any(item.requires_polarization_scale for item in readouts)
         if needs_polarization_scale and polarization_scale is None:
             raise ValueError("polarized learned inputs require model polarization_scale")
+        alignment_scale = (
+            None if alignment_scale is None
+            else positive_scalar_tensor(alignment_scale, "alignment_scale")
+        )
+        alignment_density_floor = (
+            None if alignment_density_floor is None
+            else positive_scalar_tensor(
+                alignment_density_floor, "alignment_density_floor"
+            )
+        )
+        needs_alignment_scale = (
+            a_features is not None
+            and getattr(a_features, "requires_alignment_scale", False)
+        ) or any(item.requires_alignment_scale for item in readouts)
+        if needs_alignment_scale:
+            if alignment_scale is None or alignment_density_floor is None:
+                raise ValueError(
+                    "alignment learned inputs require model alignment_scale "
+                    "and alignment_density_floor"
+                )
+            if ideal is None or getattr(ideal, "dipole_magnitude", None) is None:
+                raise ValueError(
+                    "alignment learned inputs require an ideal with dipole_magnitude"
+                )
         density_scale = None
         if mean_density is not None:
             density_scale = positive_scalar_tensor(mean_density, "mean_density")
@@ -441,6 +478,8 @@ class GridCACEModel(nn.Module, Configurable):
         self.register_buffer("grid_spacing", spacing)
         self.register_buffer("mean_density", density_scale)
         self.register_buffer("polarization_scale", polarization_scale)
+        self.register_buffer("alignment_scale", alignment_scale)
+        self.register_buffer("alignment_density_floor", alignment_density_floor)
         self.register_buffer("mean_temperature", mean_temperature_tensor)
         self.register_buffer(
             "boltzmann_constant",
@@ -500,6 +539,12 @@ class GridCACEModel(nn.Module, Configurable):
             ),
             polarization_scale=(None if self.polarization_scale is None
                                 else scalar_value(self.polarization_scale)),
+            alignment_scale=(None if self.alignment_scale is None
+                             else scalar_value(self.alignment_scale)),
+            alignment_density_floor=(
+                None if self.alignment_density_floor is None
+                else scalar_value(self.alignment_density_floor)
+            ),
         )
 
     @classmethod
@@ -688,6 +733,9 @@ class GridCACEModel(nn.Module, Configurable):
         return local_invariants(
             self.a_features, self.b_features, self.message_layers, data,
             self.polarization_scale,
+            self.alignment_scale,
+            getattr(self.ideal, "dipole_magnitude", None),
+            self.alignment_density_floor,
         )
 
     def voxel_weights(self, data):
@@ -849,6 +897,13 @@ class GridCACEModel(nn.Module, Configurable):
                 free_energy_mode=self.free_energy_mode,
                 polarization_scale=(None if self.polarization_scale is None
                                     else self.polarization_scale.to(data["rho"])),
+                alignment_scale=(None if self.alignment_scale is None
+                                 else self.alignment_scale.to(data["rho"])),
+                alignment_density_floor=(
+                    None if self.alignment_density_floor is None
+                    else self.alignment_density_floor.to(data["rho"])
+                ),
+                dipole_magnitude=getattr(self.ideal, "dipole_magnitude", None),
             )
             if "beta" in data:
                 self._check_unit_contract(data["beta"], context.beta)

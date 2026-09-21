@@ -12,6 +12,10 @@ from .._validation import (
     positive_integer,
 )
 from .._config import Configurable, make_config, register, scalar_value
+from .._polarization import (
+    polarization_input_name,
+    regularized_reduced_polarization,
+)
 from ..geometry.convolution import (
     gather_neighbors,
     periodic_density_convolution,
@@ -180,6 +184,8 @@ class CartesianAFeatures(nn.Module, Configurable):
         raw vector to the readout. Radial/type axes remain independent.
     Polarization normalization is supplied by the containing model through
     the forward argument ``polarization_scale`` (dipole moment per volume).
+    ``polarization_input='alignment'`` instead uses the model-owned smooth
+    molecular alignment and its separate dimensionless scale.
 
     Notes
     -----
@@ -215,10 +221,15 @@ class CartesianAFeatures(nn.Module, Configurable):
         n_radial_functions: Optional[int] = None,
         convolution_backend: str = "gather",
         include_polarization: bool = False,
+        polarization_input: str = "raw",
     ) -> None:
         super().__init__()
 
         self.include_polarization = boolean(include_polarization, "include_polarization")
+        self.polarization_input = polarization_input_name(
+            polarization_input,
+            include_polarization=self.include_polarization,
+        )
 
         if not isinstance(radial_basis, str):
             raise TypeError(
@@ -522,6 +533,7 @@ class CartesianAFeatures(nn.Module, Configurable):
             n_radial_functions=self.n_radial_functions if bessel else None,
             convolution_backend=self.convolution_backend,
             include_polarization=self.include_polarization,
+            polarization_input=self.polarization_input,
         )
 
     @property
@@ -652,9 +664,20 @@ class CartesianAFeatures(nn.Module, Configurable):
     def requires_dipole_density(self) -> bool:
         return self.include_polarization
 
+    @property
+    def requires_polarization_scale(self) -> bool:
+        return self.include_polarization and self.polarization_input == "raw"
+
+    @property
+    def requires_alignment_scale(self) -> bool:
+        return self.include_polarization and self.polarization_input == "alignment"
+
     def forward(
         self, data: Mapping[str, torch.Tensor], *,
         polarization_scale: Optional[Union[float, torch.Tensor]] = None,
+        alignment_scale: Optional[Union[float, torch.Tensor]] = None,
+        dipole_magnitude: Optional[Union[float, torch.Tensor]] = None,
+        alignment_density_floor: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Return density-weighted Cartesian ``A`` features.
 
@@ -673,8 +696,12 @@ class CartesianAFeatures(nn.Module, Configurable):
                 Complete regular-grid geometry required by the ``"fft"``
                 backend.
         polarization_scale
-            Positive model-owned scale for all P components. Required only
-            with polarization; standalone calls supply it explicitly.
+            Positive model-owned scale for all raw P components. Required only
+            when ``polarization_input='raw'``; standalone calls supply it
+            explicitly.
+        alignment_scale, dipole_magnitude, alignment_density_floor
+            Model-owned values required only when
+            ``polarization_input='alignment'``.
         Returns
         -------
         torch.Tensor
@@ -691,7 +718,13 @@ class CartesianAFeatures(nn.Module, Configurable):
             descriptor_density = self.transform_density(data["rho"])
             return self._convolve(descriptor_density, self.mean_density, stencil_basis, data)
 
-        fields, scales = self.polarization_fields(data, polarization_scale=polarization_scale)
+        fields, scales = self.polarization_fields(
+            data,
+            polarization_scale=polarization_scale,
+            alignment_scale=alignment_scale,
+            dipole_magnitude=dipole_magnitude,
+            alignment_density_floor=alignment_density_floor,
+        )
         moments = self._convolve(fields, scales, stencil_basis, data)
         if self.separate_center:
             center = (fields / scales).unsqueeze(-2).unsqueeze(-2)
@@ -701,19 +734,21 @@ class CartesianAFeatures(nn.Module, Configurable):
         moments = moments.unflatten(-1, (4, self.n_output_channels))
         return moments.transpose(-3, -2).flatten(-3, -2)
 
-    def polarization_fields(self, data, *, polarization_scale):
-        """Pack original [rho, Px, Py, Pz] channels and their reference scales.
+    def polarization_fields(
+        self,
+        data,
+        *,
+        polarization_scale=None,
+        alignment_scale=None,
+        dipole_magnitude=None,
+        alignment_density_floor=None,
+    ):
+        """Pack [rho, Vx, Vy, Vz] for raw P or reduced alignment V.
 
         Initial moments and joint messages use the same species mixing and
         normalization. These carriers remain connected to the physical inputs.
         """
         rho = data["rho"]
-        if polarization_scale is None:
-            raise ValueError("polarized features require polarization_scale from the model")
-        scale = torch.as_tensor(polarization_scale, dtype=rho.dtype, device=rho.device)
-        if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
-            raise ValueError("polarization_scale must be a positive scalar")
-        scale = scale.reshape(())
         if "dipole_density" not in data:
             raise ValueError("dipole_density is required when include_polarization=True")
         dipole = data["dipole_density"]
@@ -723,9 +758,37 @@ class CartesianAFeatures(nn.Module, Configurable):
             raise ValueError("rho and dipole_density must share dtype and device")
         if not torch.isfinite(dipole).all():
             raise ValueError("dipole_density must be finite")
+        if self.polarization_input == "raw":
+            if polarization_scale is None:
+                raise ValueError(
+                    "raw polarized features require polarization_scale from the model"
+                )
+            scale = torch.as_tensor(
+                polarization_scale, dtype=rho.dtype, device=rho.device,
+            )
+            if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+                raise ValueError("polarization_scale must be a positive scalar")
+            vector_source = dipole
+        else:
+            if alignment_scale is None:
+                raise ValueError(
+                    "alignment features require alignment_scale from the model"
+                )
+            scale = torch.as_tensor(
+                alignment_scale, dtype=rho.dtype, device=rho.device,
+            )
+            if scale.numel() != 1 or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+                raise ValueError("alignment_scale must be a positive scalar")
+            vector_source = regularized_reduced_polarization(
+                rho,
+                dipole,
+                dipole_magnitude,
+                alignment_density_floor,
+            )
+        scale = scale.reshape(())
         # Apply the same species mixing to each component, without mixing
         # scalar and vector fields or treating vector axes as species.
-        vector = self.transform_density(dipole.transpose(-1, -2))
+        vector = self.transform_density(vector_source.transpose(-1, -2))
         channels = self.n_output_channels
         descriptor_density = self.transform_density(rho)
         fields = torch.cat((descriptor_density, vector.flatten(-2)), dim=-1)

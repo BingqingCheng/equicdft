@@ -41,10 +41,15 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         }
 
     @staticmethod
-    def model(backend, charge, message_count=0, independent_branches=False):
+    def model(
+        backend, charge, message_count=0, independent_branches=False,
+        alignment=False,
+    ):
+        polarization_input = "alignment" if alignment else "raw"
         a = CartesianAFeatures(
             max_power=1, mean_density=.5,
             include_polarization=True, separate_center=True, cutoff_grid=1,
+            polarization_input=polarization_input,
             radial_basis="gaussian", radial_exponents=(.125, .5),
             trainable_radial_exponents=True, convolution_backend=backend,
         )
@@ -59,7 +64,11 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
         readouts = [
             LocalReadout(n_features=a.n_radial_channels * b.n_features * (message_count + 1) + 1,
                          hidden_sizes=(5,)),
-            LDAReadout(include_polarization=True, hidden_sizes=(5,), zero_init=False),
+            LDAReadout(
+                include_polarization=True,
+                polarization_input=polarization_input,
+                hidden_sizes=(5,), zero_init=False,
+            ),
             LongRangeReadout(
                 n_kernels=1, charges=(charge,), include_polarization=True,
                 coulomb_amplitude=1.8,
@@ -84,6 +93,8 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 convolution_backend=backend,
             ) for _ in range(message_count)],
             boltzmann_constant=1.0,
+            alignment_scale=.2 if alignment else None,
+            alignment_density_floor=.01 if alignment else None,
         ).eval()
         if independent_branches:
             joint = CACEBranch(model.a_features, model.b_features, model.readout[0],
@@ -102,6 +113,51 @@ class TestFullPolarizationSymmetry(unittest.TestCase):
                 boltzmann_constant=1.,
             ).eval()
         return model
+
+    def test_alignment_input_all_48_actions(self):
+        data = self.data()
+        positions = data["grid_positions"].numpy()
+        actions = [
+            np.eye(3, dtype=int)[list(permutation)] * np.array(signs)[:, None]
+            for permutation in itertools.permutations(range(3))
+            for signs in itertools.product((1, -1), repeat=3)
+        ]
+        for backend in ("gather", "fft"):
+            with self.subTest(backend=backend):
+                model = self.model(backend, .7, message_count=1, alignment=True)
+                inputs = dict(data)
+                if backend == "fft":
+                    inputs.pop("local_density_index")
+                reference = self.evaluate(model, inputs)
+                for rotation in actions:
+                    centers = ((2 * positions + 1) @ rotation.T) % 8
+                    destination = torch.tensor(np.ravel_multi_index(
+                        ((centers - 1) // 2).T, (4, 4, 4),
+                    ))
+                    matrix = torch.tensor(rotation, dtype=torch.float64)
+                    transformed = dict(inputs)
+                    transformed["rho"] = torch.empty_like(data["rho"])
+                    transformed["rho"][destination] = data["rho"]
+                    transformed["dipole_density"] = torch.empty_like(
+                        data["dipole_density"]
+                    )
+                    transformed["dipole_density"][destination] = (
+                        data["dipole_density"] @ matrix.T
+                    )
+                    actual = self.evaluate(model, transformed)
+                    for key, expected in reference.items():
+                        value = actual[key]
+                        if key not in ("beta_F_exc", "beta_F_id", "beta_F"):
+                            value = value[destination]
+                        if key in (
+                            "polarization_derivative_excess",
+                            "ideal_polarization_derivative",
+                            "polarization_derivative",
+                        ):
+                            expected = expected @ matrix.T
+                        torch.testing.assert_close(
+                            value, expected, atol=1e-11, rtol=1e-10,
+                        )
 
     @staticmethod
     def evaluate(model, data):

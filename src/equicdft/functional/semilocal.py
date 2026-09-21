@@ -18,6 +18,7 @@ from .._config import (
     make_config,
     register,
 )
+from .._polarization import polarization_input_name
 from ..geometry.grid import grid_spacing_tensor
 from .._nn import (
     build_mlp,
@@ -52,14 +53,15 @@ class LDAReadout(EnergyReadout, Configurable):
     ``E_exc_lda`` follows the free-energy convention selected by the
     containing model.
 
-    When ``include_polarization=True``, append one local squared
-    dipole-density magnitude per component before temperature. The input is
-    then ``(rho_a/mean_density, |P_a|^2/polarization_scale^2, T/mean_T)``.
+    When ``include_polarization=True``, append one local squared vector
+    magnitude per component before temperature. The default raw input is
+    ``(rho_a/mean_density, |P_a|^2/polarization_scale^2, T/mean_T)``.
+    ``polarization_input='alignment'`` replaces P by the smooth reduced field
+    ``rho P / (m (rho^2 + density_floor^2))`` and uses its separate scale.
     This is an excess contribution only: translational and orientational
     ideal entropy must still be supplied separately. Squared magnitudes keep
-    derivatives smooth at P=0 and never divide by the local density. For
-    mixtures this magnitude-only branch does not resolve relative directions
-    between different species' dipoles.
+    derivatives smooth at P=0. For mixtures this magnitude-only branch does
+    not resolve relative directions between different species' dipoles.
 
     No neighboring density enters this module, so it is a strict local-density
     approximation. Supplying the complete local component vector still permits
@@ -76,6 +78,10 @@ class LDAReadout(EnergyReadout, Configurable):
     include_polarization
         Include squared polarization magnitudes using the model-owned scale.
         False preserves the density-only architecture.
+    polarization_input
+        ``"raw"`` uses ``|P / polarization_scale|^2``. ``"alignment"``
+        uses the squared smooth molecular alignment divided by its separate
+        model-owned scale.
     """
 
     def __init__(
@@ -85,11 +91,16 @@ class LDAReadout(EnergyReadout, Configurable):
         hidden_sizes: Sequence[int] = (32, 16),
         zero_init: bool = False,
         include_polarization: bool = False,
+        polarization_input: str = "raw",
     ) -> None:
         super().__init__()
 
         self.n_types = positive_integer(n_types, "n_types")
         self.include_polarization = boolean(include_polarization, "include_polarization")
+        self.polarization_input = polarization_input_name(
+            polarization_input,
+            include_polarization=self.include_polarization,
+        )
         self.n_state_features = self.n_types + 1
         if self.include_polarization:
             self.n_state_features += self.n_types
@@ -111,6 +122,7 @@ class LDAReadout(EnergyReadout, Configurable):
             hidden_sizes=self.hidden_sizes,
             zero_init=self.zero_init,
             include_polarization=self.include_polarization,
+            polarization_input=self.polarization_input,
         )
 
     @property
@@ -121,7 +133,11 @@ class LDAReadout(EnergyReadout, Configurable):
 
     @property
     def requires_polarization_scale(self) -> bool:
-        return self.include_polarization
+        return self.include_polarization and self.polarization_input == "raw"
+
+    @property
+    def requires_alignment_scale(self) -> bool:
+        return self.include_polarization and self.polarization_input == "alignment"
 
     def forward(self, local_state: torch.Tensor) -> torch.Tensor:
         """Return ``a_exc_lda`` with shape ``[..., n_grid, 1]``."""
@@ -150,7 +166,11 @@ class LDAReadout(EnergyReadout, Configurable):
                 raise ValueError("rho and dipole_density must share dtype and device")
             if not torch.isfinite(dipole).all():
                 raise ValueError("dipole_density must be finite")
-            normalized_dipole = context.normalized_polarization()
+            normalized_dipole = (
+                context.normalized_polarization()
+                if self.polarization_input == "raw"
+                else context.normalized_alignment()
+            )
             inputs.append(normalized_dipole.square().sum(dim=-1))
         local_state = (
             context.pointwise_state()
