@@ -192,7 +192,7 @@ class TestCACEBranches(unittest.TestCase):
             self.assert_responses(self.responses(fft, data), expected)
 
     def test_documented_p2v3_builder_trains_without_warmup(self):
-        document = Path(__file__).resolve().parents[2] / "docs/polarization.md"
+        document = Path(__file__).resolve().parents[2] / "docs/model.md"
         source = next(block for block in re.findall(
             r"```python\n(.*?)```", document.read_text(), re.S,
         ) if "def build_additive_model(" in block)
