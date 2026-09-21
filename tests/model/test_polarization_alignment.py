@@ -258,6 +258,11 @@ class TestPolarizationAlignment(unittest.TestCase):
             path = Path(directory) / "alignment.pt"
             save_model(gather, path)
             restored = load_model(path)
+        # load_model returns an evaluating model while a freshly constructed
+        # one is training; that difference alone changes create_graph in the
+        # derivative path and moves c1 by one ulp, so match the mode before
+        # comparing bit for bit.
+        restored.train(gather.training)
         self.assertEqual(restored.to_config(), gather.to_config())
         for key, value in gather(copy.deepcopy(data)).items():
             torch.testing.assert_close(restored(copy.deepcopy(data))[key], value, rtol=0, atol=0)
