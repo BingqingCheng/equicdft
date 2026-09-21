@@ -228,6 +228,275 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertFalse(result["converged"])
         self.assertEqual(result["status"], "max_iter")
 
+    def test_alignment_coordinate_chain_rule(self):
+        data = self.case()
+        moments = torch.tensor([0.7, 1.9])
+        volume = data["grid_spacing"].prod()
+        rho = (0.3 + 0.2 * torch.rand_like(data["V_ext"])).requires_grad_()
+        alignment = (0.15 * torch.randn(*rho.shape, 3)).requires_grad_()
+        polarization = (rho * moments)[..., None] * alignment
+        ideal = FixedDipoleIdeal(moments)
+        intrinsic = ideal.evaluate(
+            {"rho": rho, "dipole_density": polarization}, volume
+        )
+        objective = intrinsic["beta_F_id"] + data["beta"] * volume * (
+            (rho * data["V_ext"]).sum()
+            - (polarization * data["E_ext"]).sum()
+        )
+        grad_rho, grad_alignment = torch.autograd.grad(
+            objective, (rho, alignment)
+        )
+
+        evaluated = GridSolver(with_ideal(None, ideal)).evaluate(
+            dict(data, rho=rho, dipole_density=polarization)
+        )
+        expected_rho = evaluated["beta_mu_local"] + (
+            moments[..., None]
+            * alignment.detach()
+            * evaluated["polarization_residual"]
+        ).sum(dim=-1)
+        expected_alignment = (
+            rho.detach() * moments
+        )[..., None] * evaluated["polarization_residual"]
+        torch.testing.assert_close(
+            grad_rho / volume, expected_rho, atol=2.0e-12, rtol=2.0e-11
+        )
+        torch.testing.assert_close(
+            grad_alignment / volume,
+            expected_alignment,
+            atol=2.0e-12,
+            rtol=2.0e-11,
+        )
+
+    def test_direct_alignment_minimizer(self):
+        data = self.case()
+        moments = torch.tensor([0.7, 1.9])
+        numbers = torch.tensor([3.0, 4.0])
+        volume = data["grid_spacing"].prod()
+        rho = torch.exp(0.4 * torch.randn_like(data["V_ext"]))
+        rho *= numbers / (volume * rho.sum(dim=0))
+        alignment = 0.1 * torch.randn(*rho.shape, 3)
+        alignment /= 1.0 + alignment.norm(dim=-1, keepdim=True)
+        polarization = (rho * moments)[..., None] * alignment
+
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        scale = expected_rho.mean(dim=0)
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(moments))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(
+                fixed_dipole_coordinate="alignment",
+            ),
+            convergence=ConvergenceOptions(
+                max_iter=350, tolerance_residual=1.0e-7
+            ),
+            constraints=Constraints(particle_numbers=numbers),
+            initial=Initialization(rho=rho, polarization=polarization),
+        )
+
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertEqual(
+            result["solver_fixed_dipole_coordinate"], "alignment"
+        )
+        self.assertLess(float(result["maximum_alignment"]), 1.0)
+        self.assertTrue(np.isfinite(result["final_relative_alignment_change"]))
+        torch.testing.assert_close(result["particle_numbers"], numbers)
+        torch.testing.assert_close(
+            result["rho"] / scale,
+            expected_rho / scale,
+            atol=3.0e-7,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            result["dipole_density"] / (scale * moments)[..., None],
+            expected_p / (scale * moments)[..., None],
+            atol=3.0e-7,
+            rtol=0,
+        )
+        energies = np.asarray(result["objective_history"])
+        self.assertLessEqual(
+            np.diff(energies).max(initial=0.0),
+            1.0e-11 * max(1.0, abs(energies[0])),
+        )
+
+    def test_direct_alignment_minimizer_enforces_fraction_cap(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.tensor([[[10.0, 0.0, 0.0]]] * 4),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(0.8))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"),
+            convergence=ConvergenceOptions(
+                max_iter=500, tolerance_residual=1.0e-8
+            ),
+            constraints=Constraints(
+                particle_numbers=[2.0],
+                maximum_polarization_fraction=0.2,
+            ),
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertAlmostEqual(
+            float(result["maximum_alignment"]), 0.2, places=10
+        )
+        self.assertLess(float(result["max_polarization_residual"]), 1.0e-8)
+
+    def test_direct_alignment_minimizer_allows_cap_beyond_safety_margin(self):
+        cap = 1.0 - 1.0e-10
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.tensor([[[1.0e10, 0.0, 0.0]]] * 4),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(1.0))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"),
+            convergence=ConvergenceOptions(
+                max_iter=10, tolerance_residual=1.0e-8
+            ),
+            constraints=Constraints(
+                particle_numbers=[2.0],
+                maximum_polarization_fraction=cap,
+            ),
+        )
+
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertEqual(result["n_iter"], 1)
+        self.assertAlmostEqual(
+            float(result["maximum_alignment"]), cap, places=12
+        )
+
+    def test_direct_alignment_minimizer_guards_fixed_polarization_trial(self):
+        rho = torch.full((4, 1), 0.5)
+        polarization = torch.zeros(4, 1, 3)
+        polarization[0, 0, 0] = 0.49
+        data = {
+            "V_ext": torch.tensor([[1.0e4], [0.0], [0.0], [0.0]]),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(1.0))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"),
+            convergence=ConvergenceOptions(
+                max_iter=500, tolerance_residual=1.0e-6
+            ),
+            constraints=Constraints(
+                particle_numbers=[2.0], fixed_field="dipole_density"
+            ),
+            initial=Initialization(
+                rho=rho, polarization=polarization
+            ),
+        )
+
+        margin = 1.0 - max(
+            1.0e-8, 64.0 * torch.finfo(rho.dtype).eps
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertLess(float(result["maximum_alignment"]), margin)
+        torch.testing.assert_close(
+            result["dipole_density"], polarization
+        )
+
+    def test_direct_alignment_minimizer_never_lands_on_the_interior_margin(self):
+        """A trial that would cross the margin is backtracked, not clipped.
+
+        The margin is not a constraint: the inverse Langevin diverges there,
+        so an iterate clipped onto it reports a residual of order 1/(1-|u|)
+        and cannot move again, because every later step overshoots and is
+        clipped back to the same point. One entry is enough to hold up the
+        whole solve, so the margin has to stay unreachable.
+        """
+
+        torch.manual_seed(0)
+        data = self.case(amplitude=5.0)
+        moments = torch.tensor([0.7, 1.9])
+        numbers = torch.tensor([3.0, 4.0])
+        volume = data["grid_spacing"].prod()
+        rho = torch.exp(0.4 * torch.randn_like(data["V_ext"]))
+        rho *= numbers / (volume * rho.sum(dim=0))
+        alignment = 0.1 * torch.randn(*rho.shape, 3)
+        alignment /= 1.0 + alignment.norm(dim=-1, keepdim=True)
+
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(moments))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"),
+            convergence=ConvergenceOptions(
+                max_iter=20, tolerance_residual=1.0e-7
+            ),
+            constraints=Constraints(particle_numbers=numbers),
+            initial=Initialization(
+                rho=rho,
+                polarization=(rho * moments)[..., None] * alignment,
+            ),
+        )
+
+        margin = 1.0 - max(1.0e-8, 64.0 * torch.finfo(rho.dtype).eps)
+        self.assertLess(float(result["maximum_alignment"]), margin)
+        self.assertNotEqual(result["status"], "line_search_failed")
+        # Twenty iterations do not converge this problem, but the alignment
+        # already tracks the exact saturation rather than the margin.
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        expected_alignment = float(
+            (expected_p.norm(dim=-1) / (expected_rho * moments)).max()
+        )
+        self.assertAlmostEqual(
+            float(result["maximum_alignment"]), expected_alignment, places=5
+        )
+
+    def test_direct_alignment_minimizer_keeps_safe_interior_margin(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        rho = torch.full((4, 1), 0.5)
+        polarization = torch.zeros(4, 1, 3)
+        polarization[..., 0] = (1.0 - 1.0e-8) * rho
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(1.0))
+        ).solve(
+            data,
+            method="minimize",
+            minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"),
+            convergence=ConvergenceOptions(max_iter=2),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(rho=rho, polarization=polarization),
+        )
+        self.assertTrue(torch.isfinite(result["beta_A"]))
+        self.assertLessEqual(
+            float(result["maximum_alignment"]), 1.0 - 1.0e-8
+        )
+
+    def test_fixed_dipole_coordinate_validation(self):
+        with self.assertRaisesRegex(TypeError, "fixed_dipole_coordinate"):
+            MinimizeOptions(fixed_dipole_coordinate=1)
+        with self.assertRaisesRegex(ValueError, "fixed_dipole_coordinate"):
+            MinimizeOptions(fixed_dipole_coordinate="polarization")
+        with self.assertRaisesRegex(TypeError, "fixed_dipole_coordinate"):
+            EulerOptions(fixed_dipole_coordinate=1)
+        with self.assertRaisesRegex(ValueError, "fixed_dipole_coordinate"):
+            EulerOptions(fixed_dipole_coordinate="conjugate_field")
+
     def test_validation(self):
         solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
         data = self.case()
@@ -563,6 +832,85 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertEqual(result["n_iter"], 1)
         torch.testing.assert_close(result["rho"], expected_rho)
         torch.testing.assert_close(result["dipole_density"], expected_p)
+
+    def test_alignment_coordinate_euler_mixes_density_and_alignment(self):
+        data = self.case()
+        moments = torch.tensor([0.7, 1.9])
+        numbers = torch.tensor([3.0, 4.0])
+        volume = data["grid_spacing"].prod()
+        mixing = 0.2
+        rho = torch.exp(0.4 * torch.randn_like(data["V_ext"]))
+        rho *= numbers / (volume * rho.sum(dim=0))
+        alignment = 0.1 * torch.randn(*rho.shape, 3)
+        alignment /= 1.0 + alignment.norm(dim=-1, keepdim=True)
+        polarization = (rho * moments)[..., None] * alignment
+
+        target_rho, target_p = exact_solution(data, numbers, moments)
+        target_u = target_p / (target_rho * moments)[..., None]
+        expected_rho = (1.0 - mixing) * rho + mixing * target_rho
+        expected_u = (1.0 - mixing) * alignment + mixing * target_u
+        expected_p = (expected_rho * moments)[..., None] * expected_u
+
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(moments))
+        ).solve(
+            data,
+            method="euler",
+            convergence=ConvergenceOptions(
+                max_iter=1, tolerance_residual=1.0e-14
+            ),
+            euler=EulerOptions(
+                mixing=mixing,
+                adaptive_mixing=False,
+                fixed_dipole_coordinate="alignment",
+            ),
+            constraints=Constraints(particle_numbers=numbers),
+            initial=Initialization(rho=rho, polarization=polarization),
+        )
+
+        self.assertEqual(
+            result["solver_fixed_dipole_coordinate"], "alignment"
+        )
+        self.assertTrue(np.isfinite(result["final_relative_alignment_change"]))
+        torch.testing.assert_close(result["rho"], expected_rho)
+        torch.testing.assert_close(result["dipole_density"], expected_p)
+        actual_u = result["dipole_density"] / (
+            result["rho"] * moments
+        )[..., None]
+        torch.testing.assert_close(actual_u, expected_u)
+
+    def test_alignment_coordinate_euler_enforces_fraction_cap(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.tensor([[[10.0, 0.0, 0.0]]] * 4),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        result = GridSolver(
+            with_ideal(None, FixedDipoleIdeal(0.8))
+        ).solve(
+            data,
+            method="euler",
+            convergence=ConvergenceOptions(
+                max_iter=3, tolerance_residual=1.0e-8
+            ),
+            euler=EulerOptions(
+                mixing=1.0,
+                adaptive_mixing=False,
+                maximum_mixing=1.0,
+                fixed_dipole_coordinate="alignment",
+            ),
+            constraints=Constraints(
+                particle_numbers=[2.0],
+                maximum_polarization_fraction=0.2,
+            ),
+        )
+
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertAlmostEqual(
+            float(result["maximum_alignment"]), 0.2, places=10
+        )
+        self.assertLess(float(result["max_polarization_residual"]), 1.0e-8)
 
     def test_excluded_voxels(self):
         data = self.case()

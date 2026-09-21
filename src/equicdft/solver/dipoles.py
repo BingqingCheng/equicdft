@@ -168,6 +168,7 @@ def solve_fixed_dipoles(solver, data, method, options):
     minimum_step_size = minimize.minimum_step_size
     line_search_factor = minimize.line_search_factor
     armijo_factor = minimize.armijo_factor
+    minimize_coordinate = minimize.fixed_dipole_coordinate
     tolerance_change = euler.tolerance_change
     mixing = euler.mixing
     adaptive_mixing = euler.adaptive_mixing
@@ -175,6 +176,7 @@ def solve_fixed_dipoles(solver, data, method, options):
     maximum_mixing = euler.maximum_mixing
     mixing_growth = euler.mixing_growth
     mixing_backtrack_factor = euler.mixing_backtrack_factor
+    euler_coordinate = euler.fixed_dipole_coordinate
 
     data = solver._move_data(data)
     beta, volume, moment, wavelength, excluded, accessible = (
@@ -355,7 +357,7 @@ def solve_fixed_dipoles(solver, data, method, options):
         polarization[accessible],
         thermal_wavelength=wavelength,
     )
-    alignment = (
+    conjugate_field = (
         initial_ideal["ideal_polarization_derivative"] * moment[..., None]
     ).detach()
 
@@ -375,26 +377,17 @@ def solve_fixed_dipoles(solver, data, method, options):
             minimum_density=minimum_density,
         )
         if method == "minimize":
-            state = minimize_fixed_dipoles(solver,
-                data,
-                result,
-                alignment,
-                numbers,
-                moment,
-                volume,
-                accessible,
-                density_cap,
-                polarization_fraction_cap,
-                max_iter,
-                tolerance_residual,
-                tolerance_rms_residual,
-                step_size,
-                minimum_step_size,
-                line_search_factor,
-                armijo_factor,
-                fixed_field,
-                minimum_density,
+            arguments = (
+                solver, data, result, conjugate_field, numbers, moment, volume,
+                accessible, density_cap, polarization_fraction_cap, max_iter,
+                tolerance_residual, tolerance_rms_residual, step_size,
+                minimum_step_size, line_search_factor, armijo_factor,
+                fixed_field, minimum_density,
             )
+            if minimize_coordinate == "alignment":
+                state = _minimize_fixed_dipoles_alignment(*arguments)
+            else:
+                state = _minimize_fixed_dipoles_conjugate_field(*arguments)
         else:
             state = solve_fixed_dipole_euler(solver,
                 data,
@@ -416,6 +409,7 @@ def solve_fixed_dipoles(solver, data, method, options):
                 maximum_mixing,
                 mixing_growth,
                 mixing_backtrack_factor,
+                euler_coordinate,
             )
     finally:
         solver.model.train(was_training)
@@ -429,6 +423,10 @@ def solve_fixed_dipoles(solver, data, method, options):
         solver_fixed_field=fixed_field,
         particle_number_error=result["particle_numbers"] - numbers,
     )
+    if method == "minimize" and minimize_coordinate != "conjugate_field":
+        result["solver_fixed_dipole_coordinate"] = minimize_coordinate
+    if method == "euler" and euler_coordinate != "polarization":
+        result["solver_fixed_dipole_coordinate"] = euler_coordinate
     state["objective_history"] = [item["beta_A"] for item in state["history"]]
     return finalize_result(
         result, state, method=method, beta_multiplier=beta_multiplier,
@@ -436,11 +434,11 @@ def solve_fixed_dipoles(solver, data, method, options):
     )
 
 
-def minimize_fixed_dipoles(
+def _minimize_fixed_dipoles_conjugate_field(
     solver,
     data,
     result,
-    alignment,
+    conjugate_field,
     numbers,
     moment,
     volume,
@@ -463,7 +461,7 @@ def minimize_fixed_dipoles(
     status = "max_iter"
     converged = False
     n_iter = 0
-    maximum_alignment = (
+    maximum_field = (
         None
         if maximum_polarization_fraction is None
         else inverse_langevin(maximum_polarization_fraction)[None, :, None]
@@ -485,12 +483,12 @@ def minimize_fixed_dipoles(
             break
         rho = result["rho"]
         polarization = result["dipole_density"]
-        log_z = log_sinhc(alignment.norm(dim=-1))
+        log_z = log_sinhc(conjugate_field.norm(dim=-1))
         trial_step = step_size
         accepted = False
         while trial_step >= minimum_step_size:
             if fixed_field == "dipole_density":
-                trial_alignment = alignment
+                trial_field = conjugate_field
                 log_weights = (
                     rho[accessible].log()
                     - trial_step * result["density_residual"][accessible]
@@ -509,13 +507,13 @@ def minimize_fixed_dipoles(
                 )
                 trial_p = polarization.clone()
             else:
-                trial_alignment = (
-                    alignment
+                trial_field = (
+                    conjugate_field
                     - trial_step
                     * result["scaled_polarization_residual"][accessible]
                 )
-                trial_alignment = _project_vector_norm(
-                    trial_alignment, maximum_alignment
+                trial_field = _project_vector_norm(
+                    trial_field, maximum_field
                 )
                 if fixed_field == "rho":
                     trial_rho = rho.clone()
@@ -523,7 +521,7 @@ def minimize_fixed_dipoles(
                     log_weights = (
                         rho[accessible].log()
                         - trial_step * result["density_residual"][accessible]
-                        + log_sinhc(trial_alignment.norm(dim=-1))
+                        + log_sinhc(trial_field.norm(dim=-1))
                         - log_z
                     )
                     trial_rho = torch.zeros_like(rho)
@@ -540,7 +538,7 @@ def minimize_fixed_dipoles(
                 trial_p = torch.zeros_like(polarization)
                 trial_p[accessible] = (
                     trial_rho[accessible] * moment
-                )[..., None] * dipole_alignment(trial_alignment)
+                )[..., None] * dipole_alignment(trial_field)
             interior = (
                 torch.isfinite(trial_rho).all()
                 and torch.all(trial_rho[accessible] > 0)
@@ -616,7 +614,7 @@ def minimize_fixed_dipoles(
         )
         history[-1]["accepted_step"] = trial_step
         result = trial
-        alignment = trial_alignment
+        conjugate_field = trial_field
         n_iter += 1
     return {
         "result": result,
@@ -630,6 +628,308 @@ def minimize_fixed_dipoles(
         "final_mixing": None,
         "final_relative_density_change": density_change,
         "final_relative_polarization_change": polarization_change,
+    }
+
+
+def _physical_alignment(rho, polarization, moment, accessible):
+    """Return physical ``u=P/(m rho)`` with zero excluded voxels."""
+
+    alignment = torch.zeros_like(polarization)
+    alignment[accessible] = (
+        polarization[accessible]
+        / (rho[accessible] * moment)[..., None]
+    )
+    return alignment
+
+
+def _alignment_density_residual(
+    result,
+    alignment,
+    moment,
+    maximum_density,
+    accessible,
+):
+    r"""Return the canonical density direction at fixed physical alignment.
+
+    With ``P=m rho u``, the local derivative transforms as
+
+    ``dA/drho|u = dA/drho|P + m u . dA/dP``.
+
+    The physical polarization derivative is deliberately unconstrained here:
+    a polarization-fraction bound is independent of density in ``u``
+    coordinates, so its KKT multiplier must not enter the density direction.
+    """
+
+    local_mu = result["beta_mu_local"] + (
+        moment[..., None]
+        * alignment
+        * result["polarization_residual"]
+    ).sum(dim=-1)
+    residual, _, _, _ = _canonical_density_residual(
+        result["rho"],
+        local_mu,
+        0.0,
+        maximum_density,
+        accessible,
+    )
+    return residual
+
+
+def _alignment_log_density_trial(
+    rho,
+    density_residual,
+    trial_step,
+    numbers,
+    volume,
+    maximum_density,
+    accessible,
+    minimum_density=None,
+):
+    """Take one positivity-preserving canonical log-density step."""
+
+    trial_rho = torch.zeros_like(rho)
+    log_weights = (
+        rho[accessible].log()
+        - trial_step * density_residual[accessible]
+    )
+    trial_rho[accessible] = (
+        torch.softmax(log_weights, dim=0) * numbers / volume
+    )
+    return _project_density_constraints(
+        trial_rho,
+        numbers,
+        volume,
+        maximum_density,
+        accessible,
+        minimum_density=minimum_density,
+    )
+
+
+def _minimize_fixed_dipoles_alignment(
+    solver,
+    data,
+    result,
+    _conjugate_field,
+    numbers,
+    moment,
+    volume,
+    accessible,
+    maximum_density,
+    maximum_polarization_fraction,
+    max_iter,
+    tolerance_residual,
+    tolerance_rms_residual,
+    step_size,
+    minimum_step_size,
+    line_search_factor,
+    armijo_factor,
+    fixed_field,
+    minimum_density,
+):
+    """Minimize by direct steps in density and physical alignment ``u``.
+
+    The density direction is the exact fixed-``u`` chain-rule derivative and
+    uses the positivity-preserving canonical log-density step. Alignment is
+    updated with its exact physical-coordinate gradient ``rho*m*dA/dP`` and
+    projected onto its Euclidean ball. Armijo acceptance uses the exact
+    physical ``(rho, P)`` directional derivative and convergence retains the
+    existing physical KKT residual.
+    """
+
+    history = []
+    n_evaluations = 1
+    density_change = polarization_change = alignment_change = float("inf")
+    status = "max_iter"
+    converged = False
+    n_iter = 0
+    # A user polarization-fraction cap is a constraint whose boundary is a
+    # legitimate solution, so a trial is projected onto it. The interior
+    # margin below is not a constraint but a numerical guard: the inverse
+    # Langevin becomes singular as |u| approaches one, so an uncapped trial
+    # that would cross the margin is rejected and backtracked instead of
+    # being clipped onto it.
+    maximum_alignment = (
+        None
+        if maximum_polarization_fraction is None
+        else maximum_polarization_fraction[None, :, None]
+    )
+    interior_margin = 1.0 - max(1.0e-8, 64.0 * torch.finfo(moment.dtype).eps)
+
+    for iteration in range(max_iter + 1):
+        history.append(
+            {
+                "iteration": iteration,
+                "beta_A": float(result["beta_A"]),
+                "maximum_residual": float(result["maximum_residual"]),
+            }
+        )
+        converged = _residuals_converged(
+            result["maximum_residual"], result["rms_residual"],
+            tolerance_residual, tolerance_rms_residual,
+        )
+        if converged or iteration == max_iter:
+            status = "converged" if converged else "max_iter"
+            break
+
+        rho = result["rho"]
+        polarization = result["dipole_density"]
+        alignment = _physical_alignment(
+            rho, polarization, moment, accessible
+        )
+        trial_step = step_size
+        accepted = False
+        while trial_step >= minimum_step_size:
+            if fixed_field == "dipole_density":
+                trial_u = alignment
+                trial_rho = _alignment_log_density_trial(
+                    rho,
+                    result["density_residual"],
+                    trial_step,
+                    numbers,
+                    volume,
+                    maximum_density,
+                    accessible,
+                    minimum_density=minimum_density,
+                )
+                trial_p = polarization.clone()
+            else:
+                trial_u = alignment.clone()
+                trial_u[accessible] = (
+                    alignment[accessible]
+                    - trial_step
+                    * rho[accessible][..., None]
+                    * result["scaled_polarization_residual"][accessible]
+                )
+                if maximum_alignment is not None:
+                    trial_u[accessible] = _project_vector_norm(
+                        trial_u[accessible], maximum_alignment
+                    )
+                if fixed_field == "rho":
+                    trial_rho = rho.clone()
+                else:
+                    density_residual = _alignment_density_residual(
+                        result,
+                        alignment,
+                        moment,
+                        maximum_density,
+                        accessible,
+                    )
+                    trial_rho = _alignment_log_density_trial(
+                        rho,
+                        density_residual,
+                        trial_step,
+                        numbers,
+                        volume,
+                        maximum_density,
+                        accessible,
+                    )
+                trial_p = torch.zeros_like(polarization)
+                trial_p[accessible] = (
+                    trial_rho[accessible] * moment
+                )[..., None] * trial_u[accessible]
+
+            trial_alignment = _physical_alignment(
+                trial_rho, trial_p, moment, accessible
+            )
+            if (
+                maximum_alignment is None
+                and torch.any(
+                    trial_alignment[accessible].norm(dim=-1)
+                    >= interior_margin
+                )
+            ):
+                trial_step *= line_search_factor
+                continue
+            interior = (
+                torch.isfinite(trial_rho).all()
+                and torch.all(trial_rho[accessible] > 0)
+                and torch.isfinite(trial_p).all()
+                and torch.all(
+                    trial_p[accessible].norm(dim=-1)
+                    < trial_rho[accessible] * moment
+                )
+            )
+            if interior:
+                trial = solver.evaluate(
+                    dict(data, rho=trial_rho, dipole_density=trial_p)
+                )
+                trial = apply_fixed_dipole_bounds(
+                    trial,
+                    maximum_density,
+                    maximum_polarization_fraction,
+                    moment,
+                    accessible,
+                    fixed_field=fixed_field,
+                    minimum_density=minimum_density,
+                )
+                n_evaluations += 1
+                rho_delta = trial_rho - rho
+                p_delta = trial_p - polarization
+                linear_change = volume * (
+                    (
+                        0.0
+                        if fixed_field == "rho"
+                        else (result["beta_mu_local"] * rho_delta).sum()
+                    )
+                    + (
+                        0.0
+                        if fixed_field == "dipole_density"
+                        else (result["polarization_residual"] * p_delta).sum()
+                    )
+                )
+                epsilon = torch.finfo(rho.dtype).eps
+                roundoff = 32 * epsilon * max(
+                    1.0, abs(float(result["beta_A"]))
+                )
+                energy_bound = (
+                    result["beta_A"]
+                    + armijo_factor * linear_change
+                    + roundoff
+                )
+                accepted = bool(
+                    torch.isfinite(trial["maximum_residual"])
+                    and linear_change <= 0
+                    and trial["beta_A"] <= energy_bound
+                    and (
+                        linear_change < -roundoff
+                        or trial["maximum_residual"]
+                        < result["maximum_residual"]
+                    )
+                )
+                if accepted:
+                    break
+            trial_step *= line_search_factor
+
+        if not accepted:
+            status = "line_search_failed"
+            break
+        density_change = _maximum_relative_change(rho, trial_rho)
+        polarization_change = float(
+            (
+                (trial_p - polarization).norm(dim=-1)
+                / torch.clamp(trial_rho * moment, min=1.0e-12)
+            )[accessible].max()
+        )
+        alignment_change = float(
+            (trial_alignment - alignment)[accessible].norm(dim=-1).max()
+        )
+        history[-1]["accepted_step"] = trial_step
+        result = trial
+        n_iter += 1
+
+    return {
+        "result": result,
+        "converged": converged,
+        "status": status,
+        "n_iter": n_iter,
+        "n_evaluations": n_evaluations,
+        "history": history,
+        "line_search_failures": int(status == "line_search_failed"),
+        "mixing_backtracks": 0,
+        "final_mixing": None,
+        "final_relative_density_change": density_change,
+        "final_relative_polarization_change": polarization_change,
+        "final_relative_alignment_change": alignment_change,
     }
 
 
@@ -654,16 +954,17 @@ def solve_fixed_dipole_euler(
     maximum_mixing,
     mixing_growth,
     mixing_backtrack_factor,
+    fixed_dipole_coordinate,
 ):
     history = []
     n_evaluations = 1
     n_iter = 0
     mixing_backtracks = 0
     current_mixing = mixing
-    density_change = polarization_change = float("inf")
+    density_change = polarization_change = coordinate_change = float("inf")
     status = "max_iter"
     converged = False
-    maximum_alignment = (
+    maximum_field = (
         None
         if maximum_polarization_fraction is None
         else inverse_langevin(maximum_polarization_fraction)[None, :, None]
@@ -685,20 +986,19 @@ def solve_fixed_dipole_euler(
             break
         rho = result["rho"]
         polarization = result["dipole_density"]
-        target_alignment = moment[..., None] * (
+        target_field = moment[..., None] * (
             beta * data["E_ext"]
             - result["polarization_derivative_excess"]
         )
-        target_alignment = _project_vector_norm(
-            target_alignment, maximum_alignment
+        target_field = _project_vector_norm(
+            target_field, maximum_field
         )
         logits = (
             -beta * data["V_ext"]
             + result["c1"]
-            + log_sinhc(target_alignment.norm(dim=-1))
+            + log_sinhc(target_field.norm(dim=-1))
         )
         target_rho = torch.zeros_like(rho)
-        target_p = torch.zeros_like(polarization)
         target_rho[accessible] = (
             torch.softmax(logits[accessible], dim=0) * numbers / volume
         )
@@ -709,9 +1009,16 @@ def solve_fixed_dipole_euler(
             maximum_density,
             accessible,
         )
-        target_p[accessible] = (
-            target_rho[accessible] * moment
-        )[..., None] * dipole_alignment(target_alignment[accessible])
+        target_u = torch.zeros_like(polarization)
+        target_u[accessible] = dipole_alignment(target_field[accessible])
+        if fixed_dipole_coordinate == "alignment":
+            current_u = _physical_alignment(
+                rho, polarization, moment, accessible
+            )
+        else:
+            target_p = (
+                target_rho * moment
+            )[..., None] * target_u
 
         trial_mixing = current_mixing
         while True:
@@ -719,10 +1026,19 @@ def solve_fixed_dipole_euler(
                 (1 - trial_mixing) * rho
                 + trial_mixing * target_rho
             )
-            trial_p = (
-                (1 - trial_mixing) * polarization
-                + trial_mixing * target_p
-            )
+            if fixed_dipole_coordinate == "alignment":
+                trial_u = (
+                    (1 - trial_mixing) * current_u
+                    + trial_mixing * target_u
+                )
+                trial_p = (
+                    trial_rho * moment
+                )[..., None] * trial_u
+            else:
+                trial_p = (
+                    (1 - trial_mixing) * polarization
+                    + trial_mixing * target_p
+                )
             trial = solver.evaluate(
                 dict(data, rho=trial_rho, dipole_density=trial_p)
             )
@@ -752,6 +1068,13 @@ def solve_fixed_dipole_euler(
                 / torch.clamp(trial_rho * moment, min=1.0e-12)
             )[accessible].max()
         )
+        if fixed_dipole_coordinate == "alignment":
+            alignment_change = float(
+                (trial_u - current_u)[accessible].norm(dim=-1).max()
+            )
+            coordinate_change = alignment_change
+        else:
+            coordinate_change = polarization_change
         history[-1]["mixing"] = trial_mixing
         result = trial
         n_iter += 1
@@ -760,7 +1083,7 @@ def solve_fixed_dipole_euler(
             if adaptive_mixing
             else mixing
         )
-        if max(density_change, polarization_change) <= tolerance_change:
+        if max(density_change, coordinate_change) <= tolerance_change:
             converged = _residuals_converged(
                 result["maximum_residual"], result["rms_residual"],
                 tolerance_residual, tolerance_rms_residual,
@@ -779,7 +1102,7 @@ def solve_fixed_dipole_euler(
                 }
             )
             break
-    return {
+    state = {
         "result": result,
         "converged": converged,
         "status": status,
@@ -792,3 +1115,6 @@ def solve_fixed_dipole_euler(
         "final_relative_density_change": density_change,
         "final_relative_polarization_change": polarization_change,
     }
+    if fixed_dipole_coordinate == "alignment":
+        state["final_relative_alignment_change"] = coordinate_change
+    return state

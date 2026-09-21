@@ -344,10 +344,17 @@ class GridSolver:
 
     With ``model.ideal=FixedDipoleIdeal(...)``, both methods optimize density
     and dipole density. ``method="euler"`` uses the coupled orientational
-    Euler expression with simultaneous adaptive mixing. The minimizer uses
-    the fixed-dipole entropy mirror map and an Armijo line search, preserving
-    ``rho > 0`` and ``|P| < m*rho``. When ``method`` is omitted, scalar
-    solving defaults to Euler and fixed-dipole solving to minimization.
+    Euler expression with simultaneous adaptive mixing. Set
+    ``EulerOptions(fixed_dipole_coordinate="alignment")`` to mix the physical
+    molecular alignment ``u=P/(m rho)`` and reconstruct ``P=m rho u`` after
+    each density step; the default mixes ``P`` directly. The minimizer uses
+    the fixed-dipole entropy mirror map and an Armijo line search by default,
+    preserving ``rho > 0`` and ``|P| < m*rho``. Set
+    ``MinimizeOptions(fixed_dipole_coordinate="alignment")`` to update the
+    physical molecular alignment ``u=P/(m rho)`` instead of its conjugate
+    field while retaining the canonical log-density step. When ``method`` is
+    omitted, scalar solving defaults to Euler and fixed-dipole solving to
+    minimization.
 
     For fixed-dipole minimization, ``fixed_field="dipole_density"`` holds
     the supplied initial polarization fixed and minimizes only over
@@ -434,6 +441,14 @@ class GridSolver:
 
         if polarized:
             return solve_fixed_dipoles(self, data, method, options)
+        if (
+            euler.fixed_dipole_coordinate != "polarization"
+            or minimize.fixed_dipole_coordinate != "conjugate_field"
+        ):
+            raise ValueError(
+                "fixed-dipole coordinate options are available only with "
+                "model.ideal=FixedDipoleIdeal(...)"
+            )
         _reject_fixed_dipole_only_options(constraints, initial)
 
         problem = _prepare_scalar_problem(

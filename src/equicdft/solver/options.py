@@ -81,6 +81,10 @@ class EulerOptions:
     maximum_mixing]``. ``tolerance_change`` stops the iteration when the
     relative density change falls below it; ``max_log_density_change``
     bounds one update in log density. ``anderson`` enables acceleration.
+    For fixed dipoles, ``fixed_dipole_coordinate`` selects whether the
+    interpolation uses dipole density ``P`` or physical molecular alignment
+    ``u=P/(m rho)``. The default ``"polarization"`` preserves the established
+    behavior; ``"alignment"`` reconstructs ``P=m rho u`` after mixing.
     """
 
     mixing: float = 0.05
@@ -92,6 +96,7 @@ class EulerOptions:
     tolerance_change: float = 1.0e-7
     max_log_density_change: float = 2.0
     anderson: Optional[AndersonOptions] = None
+    fixed_dipole_coordinate: str = "polarization"
 
     def __post_init__(self) -> None:
         _set(self, "tolerance_change", positive_scalar(self.tolerance_change, "tolerance_change"))
@@ -125,6 +130,19 @@ class EulerOptions:
                 )
         if self.anderson is not None and not isinstance(self.anderson, AndersonOptions):
             raise TypeError("anderson must be an AndersonOptions or None")
+        if not isinstance(self.fixed_dipole_coordinate, str):
+            raise TypeError(
+                "fixed_dipole_coordinate must be 'polarization' or "
+                "'alignment'"
+            )
+        if self.fixed_dipole_coordinate not in (
+            "polarization",
+            "alignment",
+        ):
+            raise ValueError(
+                "fixed_dipole_coordinate must be 'polarization' or "
+                "'alignment'"
+            )
 
 
 @dataclass(frozen=True)
@@ -134,7 +152,12 @@ class MinimizeOptions:
     ``step_size`` starts every line search and is reduced by
     ``line_search_factor`` down to ``minimum_step_size``; ``armijo_factor``
     is the sufficient-decrease constant; ``max_log_density_change`` bounds
-    one update in log density.
+    one update in log density. ``fixed_dipole_coordinate`` selects the
+    orientational coordinate only for fixed-dipole minimization:
+    ``"conjugate_field"`` preserves the established entropy mirror map,
+    while ``"alignment"`` updates the physical molecular alignment
+    ``u=P/(m rho)`` directly. Both choices retain the positivity-preserving
+    canonical log-density update.
     """
 
     step_size: float = 1.0
@@ -142,6 +165,7 @@ class MinimizeOptions:
     line_search_factor: float = 0.5
     armijo_factor: float = 1.0e-4
     max_log_density_change: float = 2.0
+    fixed_dipole_coordinate: str = "conjugate_field"
 
     def __post_init__(self) -> None:
         _set(self, "step_size", positive_scalar(self.step_size, "step_size"))
@@ -152,6 +176,19 @@ class MinimizeOptions:
             self, "max_log_density_change",
             positive_scalar(self.max_log_density_change, "max_log_density_change"),
         )
+        if not isinstance(self.fixed_dipole_coordinate, str):
+            raise TypeError(
+                "fixed_dipole_coordinate must be 'conjugate_field' or "
+                "'alignment'"
+            )
+        if self.fixed_dipole_coordinate not in (
+            "conjugate_field",
+            "alignment",
+        ):
+            raise ValueError(
+                "fixed_dipole_coordinate must be 'conjugate_field' or "
+                "'alignment'"
+            )
         if self.minimum_step_size > self.step_size:
             raise ValueError("minimum_step_size must be no larger than step_size")
         if not 0.0 < self.line_search_factor < 1.0:

@@ -611,6 +611,24 @@ class TestGridSolver(unittest.TestCase):
                 euler=EulerOptions(mixing=-1.),
                 convergence=ConvergenceOptions(max_iter=1),
             )
+        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                method="minimize",
+                minimize=MinimizeOptions(
+                    fixed_dipole_coordinate="alignment"
+                ),
+                convergence=ConvergenceOptions(max_iter=1),
+            )
+        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
+            GridSolver(self._make_model()).solve(
+                self._make_data(),
+                method="euler",
+                euler=EulerOptions(
+                    fixed_dipole_coordinate="alignment"
+                ),
+                convergence=ConvergenceOptions(max_iter=1),
+            )
 
     def test_scalar_results_report_status_and_coupled_residual_names(self):
         data = self._make_data()

@@ -40,7 +40,11 @@ def finalize_result(result, state, *, method, beta_multiplier, converged):
         ("anderson_resets", 0),
     ):
         result[key] = state.get(key, default)
-    for key in ("history", "final_relative_polarization_change"):
+    for key in (
+        "history",
+        "final_relative_polarization_change",
+        "final_relative_alignment_change",
+    ):
         if key in state:
             result[key] = state[key]
     return result
