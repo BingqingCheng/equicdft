@@ -725,20 +725,30 @@ functional or convergence criterion.
 
 ## Implementation map
 
-- `_grid.py`: regular-grid validation, neighborhood gathers, and the optional
-  periodic stencil convolution
-- `_radial.py`: radial formulas, validation, discrete conditioning, and
-  pre-invariant transforms
-- `features.py`: Cartesian feature ownership, density transforms, and radial
-  dispatch
-- `interaction.py`: invariant-to-equivariant message layers
-- `_fourier.py`, `response.py`: shared wavevector validation, perturbations, and
-  projected curvature
-- `stability.py`: curvature-positivity regularization
-- `loss.py`, `metrics.py`, `data.py`: supervised response loss, diagnostics,
-  and homogeneous response items
-- `trainer.py`: explicit multi-stream optimization and epoch-zero validation
-- `reciprocal.py`, `readout.py`: reciprocal kernels and coefficient controls
+Paths are relative to `src/equicdft/`.
+
+- `geometry/grid.py`, `geometry/convolution.py`: regular-grid validation,
+  neighborhood gathers, and the optional periodic stencil convolution
+- `representation/radial.py`: radial formulas, validation, discrete
+  conditioning, and pre-invariant transforms
+- `representation/cartesian.py`: Cartesian feature ownership, density
+  transforms, and radial dispatch
+- `representation/message.py`: invariant-to-equivariant message layers
+- `representation/local.py`: the A/B/message pipeline shared by the model's
+  top-level features and every `CACEBranch`
+- `_polarization.py`: the smooth molecular-alignment field shared by the
+  polarized learned inputs
+- `response/modes.py`, `response/response.py`, `response/curvature.py`: shared
+  wavevector validation, perturbations, and projected curvature
+- `response/stability.py`: curvature-positivity regularization
+- `training/loss.py`, `training/metrics.py`, `response/data.py`: supervised
+  response loss, diagnostics, and homogeneous response items
+- `training/trainer.py`: explicit multi-stream optimization and epoch-zero
+  validation
+- `functional/reciprocal.py`, `functional/readout.py`: reciprocal kernels and
+  coefficient controls
+
+The [README's package map](../README.md) describes the layout as a whole.
 
 Before promoting any experimental option into a default workflow, run focused
 tests, the complete test suite, and the compact LJ forward/inverse regression;
