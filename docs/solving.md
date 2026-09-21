@@ -46,10 +46,40 @@ validates itself once:
 | group | governs |
 |---|---|
 | `convergence=ConvergenceOptions(...)` | iteration budget and residual tolerances |
-| `euler=EulerOptions(...)` | mixing schedule and optional `anderson=AndersonOptions(...)` |
-| `minimize=MinimizeOptions(...)` | step size and Armijo line search |
+| `euler=EulerOptions(...)` | mixing schedule, `fixed_dipole_coordinate`, and optional `anderson=AndersonOptions(...)` |
+| `minimize=MinimizeOptions(...)` | step size, Armijo line search, and `fixed_dipole_coordinate` |
 | `constraints=Constraints(...)` | ensemble, density and polarization caps, homogeneous axes, fixed field |
 | `initial=Initialization(...)` | starting `rho`, `polarization` and `beta_multiplier` |
+
+## The orientational coordinate for fixed dipoles
+
+`fixed_dipole_coordinate` selects which orientational variable a fixed-dipole
+solve updates. A scalar model rejects any non-default value rather than
+ignoring it, so the option never silently does nothing. `"alignment"` works
+in the physical molecular alignment `u = P/(m rho)` and reconstructs
+`P = m rho u`, which keeps the update in the variable the saturation bound is
+written in.
+The alternative is the established behaviour of each method: Euler mixes `P`
+directly, and the minimizer steps the conjugate field of the entropy mirror
+map. Both choices keep the positivity-preserving canonical log-density step
+and the same physical KKT residual, so they are two routes to one stationary
+point rather than two problems.
+
+The accepted values differ by group, because the established behaviour they
+name differs:
+
+| group | default | alternative |
+|---|---|---|
+| `EulerOptions` | `"polarization"` | `"alignment"` |
+| `MinimizeOptions` | `"conjugate_field"` | `"alignment"` |
+
+A string valid for one group raises `ValueError` on the other, so
+`MinimizeOptions(fixed_dipole_coordinate="polarization")` is an error rather
+than a synonym for its default. A solve that used anything but its default
+reports the choice back as `solver_fixed_dipole_coordinate`, and an alignment
+solve also reports `final_relative_alignment_change`, the largest change in
+`u` over the last accepted step — the orientational counterpart to
+`final_relative_density_change`.
 
 ## Reading `status`
 

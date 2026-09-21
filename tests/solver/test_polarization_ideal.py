@@ -486,6 +486,11 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertLessEqual(
             float(result["maximum_alignment"]), 1.0 - 1.0e-8
         )
+        # Both bounds above hold vacuously when the solver returns its own
+        # input, which is what a line search with an absolute backtracking
+        # floor does here: the alignment gradient is of order 1/(1-|u|).
+        self.assertNotEqual(result["status"], "line_search_failed")
+        self.assertGreaterEqual(int(result["n_iter"]), 1)
 
     def test_fixed_dipole_coordinate_validation(self):
         with self.assertRaisesRegex(TypeError, "fixed_dipole_coordinate"):

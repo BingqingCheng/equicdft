@@ -352,14 +352,20 @@ def solve_fixed_dipoles(solver, data, method, options):
         polarization[accessible] = _project_vector_norm(
             polarization[accessible], allowed_norm
         )
-    initial_ideal = solver.model.ideal.local(
-        rho[accessible],
-        polarization[accessible],
-        thermal_wavelength=wavelength,
-    )
-    conjugate_field = (
-        initial_ideal["ideal_polarization_derivative"] * moment[..., None]
-    ).detach()
+    # Only the conjugate-field minimizer reads this: the alignment minimizer
+    # takes it as an unused argument and Euler is never passed it. Computing
+    # it eagerly would also evaluate the inverse Langevin on a saturated
+    # start for paths that have no use for the result.
+    conjugate_field = None
+    if method == "minimize" and minimize_coordinate == "conjugate_field":
+        initial_ideal = solver.model.ideal.local(
+            rho[accessible],
+            polarization[accessible],
+            thermal_wavelength=wavelength,
+        )
+        conjugate_field = (
+            initial_ideal["ideal_polarization_derivative"] * moment[..., None]
+        ).detach()
 
     was_training = solver.model.training
     solver.model.eval()
@@ -776,9 +782,40 @@ def _minimize_fixed_dipoles_alignment(
         alignment = _physical_alignment(
             rho, polarization, moment, accessible
         )
+        # Both search directions are loop-invariant: only the step length
+        # changes between trials, so they are built once per outer iteration
+        # rather than once per backtracking trial.
+        alignment_direction = None
+        density_residual = None
+        if fixed_field != "dipole_density":
+            alignment_direction = (
+                rho[accessible][..., None]
+                * result["scaled_polarization_residual"][accessible]
+            )
+            if fixed_field != "rho":
+                density_residual = _alignment_density_residual(
+                    result,
+                    alignment,
+                    moment,
+                    maximum_density,
+                    accessible,
+                )
+        # The alignment gradient diverges like ``1/(1-|u|)`` as the fluid
+        # saturates, so near saturation every step down to an absolute
+        # ``minimum_step_size`` still overshoots the interior margin and the
+        # line search fails without moving at all. The floor is therefore
+        # measured relative to the direction magnitude, so that it bounds the
+        # smallest admissible move in ``u`` rather than the raw multiplier.
+        # For a direction of order one this is the absolute floor unchanged.
+        direction_scale = 1.0
+        if alignment_direction is not None and alignment_direction.numel():
+            largest = alignment_direction.abs().max()
+            if bool(torch.isfinite(largest)):
+                direction_scale = max(1.0, float(largest))
+        smallest_step = minimum_step_size / direction_scale
         trial_step = step_size
         accepted = False
-        while trial_step >= minimum_step_size:
+        while trial_step >= smallest_step:
             if fixed_field == "dipole_density":
                 trial_u = alignment
                 trial_rho = _alignment_log_density_trial(
@@ -796,9 +833,7 @@ def _minimize_fixed_dipoles_alignment(
                 trial_u = alignment.clone()
                 trial_u[accessible] = (
                     alignment[accessible]
-                    - trial_step
-                    * rho[accessible][..., None]
-                    * result["scaled_polarization_residual"][accessible]
+                    - trial_step * alignment_direction
                 )
                 if maximum_alignment is not None:
                     trial_u[accessible] = _project_vector_norm(
@@ -807,13 +842,6 @@ def _minimize_fixed_dipoles_alignment(
                 if fixed_field == "rho":
                     trial_rho = rho.clone()
                 else:
-                    density_residual = _alignment_density_residual(
-                        result,
-                        alignment,
-                        moment,
-                        maximum_density,
-                        accessible,
-                    )
                     trial_rho = _alignment_log_density_trial(
                         rho,
                         density_residual,
