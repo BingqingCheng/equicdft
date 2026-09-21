@@ -15,3 +15,5 @@ dist/
 
 # Output of the bundled pedagogical training example.
 examples/lj_nvt/fit/
+*.patch
+Claude outputs/
