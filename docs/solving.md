@@ -47,7 +47,7 @@ validates itself once:
 |---|---|
 | `convergence=ConvergenceOptions(...)` | iteration budget and residual tolerances |
 | `euler=EulerOptions(...)` | mixing schedule, `fixed_dipole_coordinate`, and optional `anderson=AndersonOptions(...)` |
-| `minimize=MinimizeOptions(...)` | step size, Armijo line search, and `fixed_dipole_coordinate` |
+| `minimize=MinimizeOptions(...)` | step size, Armijo line search, `fixed_dipole_coordinate`, and `lbfgs_history` |
 | `constraints=Constraints(...)` | ensemble, density bounds and polarization cap, homogeneous axes, fixed field |
 | `initial=Initialization(...)` | starting `rho`, `polarization` and `beta_multiplier` |
 
@@ -188,6 +188,39 @@ fallback, so it cannot make a step worse. `anderson_attempts`,
 `anderson_accepted`, `anderson_rejected` and `anderson_resets` report how it
 fared; all-rejected means the history window is not informative and the
 acceleration is only costing evaluations.
+
+### Quasi-Newton minimization for fixed dipoles
+
+`MinimizeOptions(lbfgs_history=50)` replaces the mirror-descent update of a
+fixed-dipole minimization by projected L-BFGS in the same `(log rho, h)`
+coordinates. The mirror-descent step is the gradient preconditioned by the
+ideal Hessian in those coordinates, so it is the initial inverse Hessian of
+the two-loop recursion, scaled each iteration by the Barzilai–Borwein
+estimate in that metric; the stored pairs add the curvature of the excess
+functional, which is what lets one step act on the stiff bulk modes and the
+soft cavity modes together. Line-search trials are evaluated without
+derivatives and only the accepted point is differentiated, so
+`n_energy_evaluations` counts the cheap trials and `n_evaluations` the full
+ones. The density bounds and the polarization cap are an active set: a
+coordinate resting on a bound with an outward gradient is frozen for the
+step and excluded from the curvature pairs, and the KKT residual the result
+reports is exactly the stationarity condition being driven to zero. Whether
+a pinned density voxel is released is decided against the chemical
+potential of the free voxels; when every voxel of a species rests on a
+bound, the multiplier is taken from the KKT bracket between the cap and the
+floor values instead, so a constant shift of the potential never changes
+the outcome. `step_size` scales the direction of every line search (1 is
+the quasi-Newton length) and is reduced by `line_search_factor` as for
+mirror descent.
+`nonmonotone_window` larger than one accepts a step if `beta_A` falls below
+the largest of that many recent values instead of the last one, which lets
+long quasi-Newton steps through on a landscape with a shallow valley while
+still ruling out the saddles a residual method can settle on. A line search
+that fails with pairs in memory forgets them and retries with the mirror
+step; only a failure of that step ends the solve with
+`status="line_search_failed"`. The option requires the `"conjugate_field"`
+coordinate and no `fixed_field`; `lbfgs_pairs` reports the pairs in memory
+at the end.
 
 ## Constraints
 

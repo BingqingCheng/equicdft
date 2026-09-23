@@ -29,6 +29,7 @@ from .numerics import (
 )
 
 from .conjugate import solve_fixed_dipole_conjugate
+from .quasinewton import minimize_fixed_dipoles_lbfgs
 from .evaluation import fixed_dipole_inputs, _set_density_residuals
 from .reporting import finalize_result
 
@@ -430,7 +431,19 @@ def solve_fixed_dipoles(solver, data, method, options):
             fixed_field=fixed_field,
             minimum_density=minimum_density,
         )
-        if method == "minimize":
+        if method == "minimize" and minimize.lbfgs_history > 0:
+            if fixed_field is not None:
+                raise ValueError("lbfgs_history is not supported with fixed_field")
+            state = minimize_fixed_dipoles_lbfgs(
+                solver, data, result, numbers, moment, volume, accessible,
+                density_cap, polarization_fraction_cap, minimum_density,
+                convergence, minimize,
+                lambda evaluation: apply_fixed_dipole_bounds(
+                    evaluation, density_cap, polarization_fraction_cap, moment,
+                    accessible, minimum_density=minimum_density,
+                ),
+            )
+        elif method == "minimize":
             arguments = (
                 solver, data, result, conjugate_field, numbers, moment, volume,
                 accessible, density_cap, polarization_fraction_cap, max_iter,
@@ -488,6 +501,8 @@ def solve_fixed_dipoles(solver, data, method, options):
         result["solver_minimum_density"] = density_floor.detach()
     if method == "minimize" and minimize_coordinate != "conjugate_field":
         result["solver_fixed_dipole_coordinate"] = minimize_coordinate
+    if method == "minimize" and minimize.lbfgs_history > 0:
+        result["solver_lbfgs_history"] = minimize.lbfgs_history
     if method == "euler" and euler_coordinate != "polarization":
         result["solver_fixed_dipole_coordinate"] = euler_coordinate
     state["objective_history"] = [item["beta_A"] for item in state["history"]]

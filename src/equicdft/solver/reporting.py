@@ -45,6 +45,8 @@ def finalize_result(result, state, *, method, beta_multiplier, converged):
         "final_relative_polarization_change",
         "final_relative_alignment_change",
         "final_conjugate_field_change",
+        "n_energy_evaluations",
+        "lbfgs_pairs",
     ):
         if key in state:
             result[key] = state[key]

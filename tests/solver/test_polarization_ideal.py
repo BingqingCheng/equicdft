@@ -1291,6 +1291,278 @@ class TestGridSolverPolarization(unittest.TestCase):
                     torch.tensor([2.0], dtype=dtype), rtol=tolerance, atol=0.0,
                 )
 
+    @staticmethod
+    def quadratic_excess(strength=12.0):
+        class Quadratic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.strength = torch.nn.Parameter(torch.tensor(strength))
+
+            def forward(self, data, **kwargs):
+                energy = 0.5*self.strength*data["grid_spacing"].prod()*(
+                    data["rho"].square().sum() + data["dipole_density"].square().sum())
+                out = self.ideal.evaluate(data, data["grid_spacing"].prod())
+                out.update(beta_F_exc=energy, beta_F=out["beta_F_id"]+energy)
+                if kwargs.get("compute_c1", True):
+                    out["c1"] = -self.strength * data["rho"]
+                    out["density_derivative"] = out["ideal_density_derivative"]-out["c1"]
+                if kwargs.get("compute_polarization_derivative", False):
+                    out["polarization_derivative_excess"] = self.strength * data["dipole_density"]
+                    out["polarization_derivative"] = out["ideal_polarization_derivative"]+out["polarization_derivative_excess"]
+                return out
+
+        return Quadratic()
+
+    def test_lbfgs_minimizer_matches_exact_solution(self):
+        data = self.case()
+        numbers, moments = [3.0, 4.0], [0.7, 1.9]
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal(moments)))
+        rho = torch.exp(0.4 * torch.randn_like(data["V_ext"]))
+        rho *= torch.as_tensor(numbers) / (data["grid_spacing"].prod() * rho.sum(0))
+        polar = 0.1 * torch.randn(*rho.shape, 3)
+        polar /= 1 + polar.norm(dim=-1, keepdim=True)
+        perturbed = Initialization(
+            rho=rho, polarization=polar * (rho * torch.as_tensor(moments))[..., None],
+        )
+        for window in (1, 5):
+            with self.subTest(window=window):
+                result = solver.solve(
+                    data, method="minimize", initial=perturbed,
+                    minimize=MinimizeOptions(lbfgs_history=10, nonmonotone_window=window),
+                    convergence=ConvergenceOptions(max_iter=100, tolerance_residual=1.0e-9),
+                    constraints=Constraints(particle_numbers=numbers),
+                )
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                self.assertLess(result["n_iter"], 40)
+                self.assertEqual(result["solver_lbfgs_history"], 10)
+                self.assertGreater(result["n_energy_evaluations"], 0)
+                scale = expected_rho.mean(0)
+                torch.testing.assert_close(result["rho"] / scale, expected_rho / scale, rtol=0, atol=1e-7)
+                torch.testing.assert_close(
+                    result["dipole_density"] / scale[..., None],
+                    expected_p / scale[..., None], rtol=0, atol=1e-7,
+                )
+                torch.testing.assert_close(
+                    result["particle_numbers"], torch.as_tensor(numbers), rtol=2e-14, atol=0,
+                )
+                energies = np.array([item["beta_A"] for item in result["history"]])
+                if window == 1:
+                    self.assertLessEqual(np.diff(energies).max(initial=0), 1e-9 * abs(energies[0]))
+
+    def test_lbfgs_minimizer_needs_fewer_evaluations_on_a_stiff_excess(self):
+        # The local quadratic excess makes the mirror step's stability limit
+        # 2/(1+strength*rho) ~ 0.3, so mirror descent backtracks on every
+        # iteration; curvature pairs restore unit steps. Trials cost an
+        # energy-only evaluation; only accepted points are differentiated.
+        data = self.case()
+        target_rho = 0.4 + 0.1*torch.rand_like(data["V_ext"])
+        target_p = 0.04*torch.randn(*target_rho.shape, 3)
+        moments = torch.tensor([0.7, 1.9])
+        ideal = FixedDipoleIdeal(moments).local(target_rho, target_p)
+        data["V_ext"] = -(ideal["ideal_density_derivative"] + 12.*target_rho)/data["beta"]
+        data["E_ext"] = (ideal["ideal_polarization_derivative"] + 12.*target_p)/data["beta"]
+        numbers = target_rho.sum(0)*data["grid_spacing"].prod()
+        solver = GridSolver(with_ideal(self.quadratic_excess(), FixedDipoleIdeal(moments)))
+
+        def solve(options):
+            return solver.solve(
+                data, method="minimize", minimize=options,
+                convergence=ConvergenceOptions(max_iter=400, tolerance_residual=1.0e-8),
+                constraints=Constraints(particle_numbers=numbers),
+            )
+
+        mirror = solve(MinimizeOptions())
+        lbfgs = solve(MinimizeOptions(lbfgs_history=10))
+        nonmonotone = solve(MinimizeOptions(lbfgs_history=10, nonmonotone_window=5))
+        for label, result in (("mirror", mirror), ("lbfgs", lbfgs), ("nonmonotone", nonmonotone)):
+            with self.subTest(label):
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                torch.testing.assert_close(result["rho"], target_rho, rtol=0, atol=3e-8)
+                torch.testing.assert_close(result["dipole_density"], target_p, rtol=0, atol=3e-8)
+        self.assertGreater(mirror["n_evaluations"], 3 * lbfgs["n_evaluations"])
+        self.assertGreater(mirror["n_evaluations"], 3 * nonmonotone["n_evaluations"])
+        self.assertGreater(mirror["n_evaluations"], lbfgs["n_evaluations"] + lbfgs["n_energy_evaluations"])
+        self.assertEqual(lbfgs["lbfgs_pairs"], min(10, lbfgs["n_iter"]))
+
+    def test_lbfgs_minimizer_handles_bounds_as_an_active_set(self):
+        # A floor holding an emptied voxel, and a polarization cap holding a
+        # strongly driven one: both are KKT points, and the free voxels must
+        # be exactly Boltzmann distributed among themselves.
+        data = {
+            "V_ext": torch.tensor([[12.0], [0.0], [0.0], [0.0]]),
+            "E_ext": torch.tensor(
+                [[[0.2, -0.1, 0.3]], [[-0.4, 0.2, 0.1]],
+                 [[0.1, 0.5, -0.2]], [[-0.2, -0.3, 0.4]]]
+            ),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
+            data, method="minimize", minimize=MinimizeOptions(lbfgs_history=10),
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-9),
+            constraints=Constraints(particle_numbers=[2.0], minimum_density=0.05),
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        # Active-set membership uses the KKT tolerance of the residual
+        # (1e-6 absolute here), so the voxel rests within it of the floor.
+        self.assertGreaterEqual(result["rho"][0, 0].item(), 0.05 - 1e-12)
+        self.assertLessEqual(result["rho"][0, 0].item(), 0.05 + 2e-6)
+        self.assertGreater((result["beta_mu_local"][0, 0] - result["beta_mu"][0]).item(), 1.0)
+        weights = torch.exp(log_sinhc(0.8 * data["E_ext"][1:, 0].norm(dim=-1)))
+        free = result["rho"][1:, 0]
+        torch.testing.assert_close(free / free.sum(), weights / weights.sum(), rtol=0, atol=1e-8)
+
+        cap = 0.8
+        capped = {
+            "V_ext": torch.zeros(2, 1),
+            "E_ext": torch.tensor([[[0.0, 0.0, 0.0]], [[10.0, 0.0, 0.0]]]),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        h_cap = float(inverse_langevin(torch.tensor(cap)))
+        weight = math.exp(cap * 10.0 - cap * h_cap + float(log_sinhc(torch.tensor(h_cap))))
+        expected = torch.tensor([[2.0 / (1.0 + weight)], [2.0 * weight / (1.0 + weight)]])
+        result = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
+            capped, method="minimize", minimize=MinimizeOptions(lbfgs_history=10),
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[2.0], maximum_polarization_fraction=cap),
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        torch.testing.assert_close(result["rho"], expected, rtol=0, atol=1.0e-8)
+        self.assertAlmostEqual(float(result["maximum_alignment"]), cap, places=8)
+
+    def test_fully_bound_ideal_equilibrium_is_converged(self):
+        data = {
+            "V_ext": torch.tensor([[0.0], [10.0], [-3.0], [-20.0]]),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        # Independent bounded Boltzmann solution: mu=-2.7 lies inside
+        # [max(local at cap), min(local at floor)] and gives N=2 exactly.
+        expected = torch.exp(-2.7 - data["V_ext"]).clamp(0.1, 0.9)
+        drivers = (
+            ("euler", {}),
+            ("minimize", {}),
+            ("minimize", {"minimize": MinimizeOptions(lbfgs_history=5)}),
+        )
+        for method, options in drivers:
+            with self.subTest(method=method, options=options):
+                result = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
+                    data, method=method, **options,
+                    constraints=Constraints(
+                        particle_numbers=[2.0], minimum_density=0.1,
+                        maximum_density=0.9,
+                    ),
+                    initial=Initialization(rho=expected),
+                    convergence=ConvergenceOptions(
+                        max_iter=10, tolerance_residual=1.0e-10,
+                    ),
+                )
+                self.assertTrue(result["converged"], result["status"])
+                self.assertEqual(result["n_iter"], 0)
+                self.assertEqual(float(result["maximum_residual"]), 0.0)
+                torch.testing.assert_close(result["rho"], expected)
+                torch.testing.assert_close(
+                    result["dipole_density"], torch.zeros(4, 1, 3),
+                )
+
+    def test_lbfgs_reaches_fully_bound_equilibrium(self):
+        # These starts previously reached the right solution but reported
+        # a nonzero residual and stalled because the multiplier was wrong.
+        for seed in (0, 7, 8):
+            with self.subTest(seed=seed):
+                potential = 3.0 * torch.randn(6, 1, generator=torch.Generator().manual_seed(seed))
+                expected = torch.full((6, 1), 0.1)
+                expected[potential[:, 0].argsort()[:3]] = 0.9
+                local = expected.log() + potential
+                mu_lower = local[expected == 0.9].max()
+                mu_upper = local[expected == 0.1].min()
+                self.assertLessEqual(float(mu_lower), float(mu_upper))
+                # Verify the analytic bounded Boltzmann certificate.
+                torch.testing.assert_close(
+                    torch.exp(0.5 * (mu_lower + mu_upper) - potential).clamp(0.1, 0.9),
+                    expected,
+                )
+                result = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
+                    dict(V_ext=potential, E_ext=torch.zeros(6, 1, 3),
+                         beta=torch.tensor(1.0), grid_spacing=torch.ones(3)),
+                    method="minimize", minimize=MinimizeOptions(lbfgs_history=5),
+                    constraints=Constraints(
+                        particle_numbers=[3.0], minimum_density=0.1, maximum_density=0.9,
+                    ),
+                    initial=Initialization(rho=torch.tensor([[0.1], [0.9]]).repeat(3, 1)),
+                    convergence=ConvergenceOptions(max_iter=100, tolerance_residual=1.0e-6),
+                )
+                self.assertTrue(result["converged"], result["status"])
+                torch.testing.assert_close(result["rho"], expected, rtol=0, atol=1.0e-10)
+
+    def two_voxel_exchange(self, shift, minimize):
+        # Both voxels start on a bound, so no interior voxel fixes the
+        # chemical potential; the solve must still swap the mass.
+        data = {
+            "V_ext": torch.tensor([[-4.0], [4.0]], dtype=torch.float64) + shift,
+            "E_ext": torch.zeros(2, 1, 3, dtype=torch.float64),
+            "beta": torch.tensor(1.0, dtype=torch.float64),
+            "grid_spacing": torch.ones(3, dtype=torch.float64),
+        }
+        return GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
+            data, method="minimize", minimize=minimize,
+            convergence=ConvergenceOptions(max_iter=100, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[1.0], minimum_density=0.1, maximum_density=0.9),
+            initial=Initialization(rho=torch.tensor([[0.1], [0.9]], dtype=torch.float64)),
+        )
+
+    def test_lbfgs_bound_release_is_gauge_invariant(self):
+        # A constant shift of the potential must not change a canonical
+        # solve, in particular not which pinned voxels are released.
+        expected = torch.tensor([[0.9], [0.1]], dtype=torch.float64)
+        for shift in (0.0, 10.0, -10.0, 1000.0):
+            with self.subTest(shift=shift):
+                result = self.two_voxel_exchange(shift, MinimizeOptions(lbfgs_history=10))
+                self.assertTrue(result["converged"], result["status"])
+                torch.testing.assert_close(result["rho"], expected, rtol=0, atol=1.0e-9)
+
+    def test_lbfgs_line_search_starts_from_step_size(self):
+        # step_size scales the quasi-Newton direction: a step that reaches
+        # the exchange in one trial, and one too short to move the state.
+        result = self.two_voxel_exchange(
+            0.0, MinimizeOptions(lbfgs_history=10, step_size=2.0, minimum_step_size=1.5),
+        )
+        self.assertTrue(result["converged"], result["status"])
+        self.assertEqual(result["n_iter"], 1)
+        self.assertEqual(result["n_energy_evaluations"], 1)
+        self.assertEqual(result["history"][0]["accepted_step"], 2.0)
+        result = self.two_voxel_exchange(
+            0.0, MinimizeOptions(lbfgs_history=10, step_size=1.0e-6, minimum_step_size=1.0e-12),
+        )
+        self.assertEqual(result["history"][0]["accepted_step"], 1.0e-6)
+        self.assertLess(abs(result["rho"][0, 0].item() - 0.1), 1.0e-2)
+
+    def test_lbfgs_minimizer_validation(self):
+        with self.assertRaisesRegex(ValueError, "lbfgs_history"):
+            MinimizeOptions(lbfgs_history=-1)
+        with self.assertRaisesRegex(ValueError, "nonmonotone_window"):
+            MinimizeOptions(nonmonotone_window=0)
+        with self.assertRaisesRegex(ValueError, "conjugate_field"):
+            MinimizeOptions(lbfgs_history=5, fixed_dipole_coordinate="alignment")
+        data = self.case()
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
+        with self.assertRaisesRegex(ValueError, "fixed_field"):
+            solver.solve(
+                data, method="minimize", minimize=MinimizeOptions(lbfgs_history=5),
+                constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="rho"),
+                initial=Initialization(rho=torch.full((24, 2), 0.5) * torch.tensor([3.0, 4.0]) / (0.125 * 12.0)),
+            )
+        from equicdft import IdealGas
+        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
+            GridSolver(with_ideal(None, IdealGas())).solve(
+                {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
+                 "grid_spacing": torch.ones(3)},
+                method="minimize", minimize=MinimizeOptions(lbfgs_history=5),
+            )
+
     def test_conjugate_field_validation(self):
         with self.assertRaisesRegex(ValueError, "max_conjugate_field_change"):
             self.conjugate(max_conjugate_field_change=0.0)

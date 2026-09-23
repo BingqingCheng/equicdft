@@ -23,6 +23,7 @@ import torch
 from .._validation import (
     boolean,
     finite_scalar,
+    nonnegative_integer,
     nonnegative_scalar,
     positive_integer,
     positive_scalar,
@@ -181,6 +182,14 @@ class MinimizeOptions:
     while ``"alignment"`` updates the physical molecular alignment
     ``u=P/(m rho)`` directly. Both choices retain the positivity-preserving
     canonical log-density update.
+
+    ``lbfgs_history`` larger than zero switches a fixed-dipole minimization
+    (``"conjugate_field"`` coordinate, no ``fixed_field``) to projected
+    L-BFGS with that many curvature pairs, the mirror-descent step as the
+    initial inverse Hessian, energy-only line-search trials and the bounds
+    handled as an active set. ``nonmonotone_window`` is the number of recent
+    objectives whose maximum the Armijo test is taken against; one is the
+    strict monotone test.
     """
 
     step_size: float = 1.0
@@ -189,6 +198,8 @@ class MinimizeOptions:
     armijo_factor: float = 1.0e-4
     max_log_density_change: float = 2.0
     fixed_dipole_coordinate: str = "conjugate_field"
+    lbfgs_history: int = 0
+    nonmonotone_window: int = 1
 
     def __post_init__(self) -> None:
         _set(self, "step_size", positive_scalar(self.step_size, "step_size"))
@@ -211,6 +222,12 @@ class MinimizeOptions:
             raise ValueError(
                 "fixed_dipole_coordinate must be 'conjugate_field' or "
                 "'alignment'"
+            )
+        _set(self, "lbfgs_history", nonnegative_integer(self.lbfgs_history, "lbfgs_history"))
+        _set(self, "nonmonotone_window", positive_integer(self.nonmonotone_window, "nonmonotone_window"))
+        if self.lbfgs_history > 0 and self.fixed_dipole_coordinate != "conjugate_field":
+            raise ValueError(
+                "lbfgs_history requires fixed_dipole_coordinate='conjugate_field'"
             )
         if self.minimum_step_size > self.step_size:
             raise ValueError("minimum_step_size must be no larger than step_size")

@@ -595,6 +595,25 @@ def _euler_residual(
     return constrained_residual, chemical_potential, max_residual, rms_residual
 
 
+def _bound_chemical_potential(local, at_floor, at_cap):
+    """Choose a per-species multiplier when no interior voxels remain.
+
+    KKT requires max(local at the cap) <= mu <= min(local at the floor).
+    Use the midpoint, or the sole endpoint when only one bound is occupied.
+    An empty interval still yields a midpoint, leaving nonzero violations
+    on both sides rather than falsely declaring equilibrium. The masks must
+    exclude inaccessible voxels; each all-bound species has an endpoint.
+    """
+
+    floor_value = torch.where(at_floor, local, float("inf")).amin(dim=0)
+    cap_value = torch.where(at_cap, local, -float("inf")).amax(dim=0)
+    return torch.where(
+        torch.isfinite(floor_value) & torch.isfinite(cap_value),
+        0.5 * (floor_value + cap_value),
+        torch.where(torch.isfinite(floor_value), floor_value, cap_value),
+    )
+
+
 def _canonical_density_residual(
     rho: torch.Tensor,
     local_chemical_potential: torch.Tensor,
@@ -611,39 +630,8 @@ def _canonical_density_residual(
         rho,
         torch.zeros_like(rho),
     )
-    free = accessible.clone()
-    if maximum_density is not None:
-        cap_tolerance = 1.0e-6 * torch.maximum(
-            maximum_density,
-            torch.ones_like(maximum_density),
-        )
-        free &= (
-            rho < (maximum_density - cap_tolerance)[None, :]
-        )
-    if minimum_density is not None:
-        minimum = torch.as_tensor(
-            minimum_density, dtype=rho.dtype, device=rho.device
-        ).expand_as(rho)
-        floor_tolerance = 1.0e-6 * torch.maximum(
-            minimum, torch.ones_like(minimum)
-        )
-        free &= rho > minimum + floor_tolerance
-    if maximum_density is not None or minimum_density is not None:
-        free_weights = rho * free
-        has_free_weight = torch.sum(free_weights, dim=0) > 0.0
-        averaging_weights = torch.where(
-            has_free_weight[None, :],
-            free_weights,
-            rho,
-        )
-    chemical_potential = torch.sum(
-        averaging_weights * local_chemical_potential,
-        dim=0,
-    ) / torch.sum(averaging_weights, dim=0)
-    residual = local_chemical_potential - chemical_potential[None, :]
-    residual = torch.where(accessible, residual, torch.zeros_like(residual))
-
-    constrained_residual = residual
+    at_cap = torch.zeros_like(accessible)
+    at_floor = torch.zeros_like(accessible)
     if maximum_density is not None:
         cap_tolerance = 1.0e-6 * torch.maximum(
             maximum_density,
@@ -651,11 +639,6 @@ def _canonical_density_residual(
         )
         at_cap = accessible & (
             rho >= (maximum_density - cap_tolerance)[None, :]
-        )
-        constrained_residual = torch.where(
-            at_cap,
-            torch.clamp(residual, min=0.0),
-            residual,
         )
     if minimum_density is not None:
         minimum = torch.as_tensor(
@@ -665,6 +648,36 @@ def _canonical_density_residual(
             minimum, torch.ones_like(minimum)
         )
         at_floor = accessible & (rho <= minimum + floor_tolerance)
+    if maximum_density is not None or minimum_density is not None:
+        free = accessible & ~(at_floor | at_cap)
+        free_weights = rho * free
+        has_free_weight = torch.sum(free_weights, dim=0) > 0.0
+        averaging_weights = torch.where(
+            has_free_weight[None, :],
+            free_weights,
+            averaging_weights,
+        )
+    chemical_potential = torch.sum(
+        averaging_weights * local_chemical_potential,
+        dim=0,
+    ) / torch.sum(averaging_weights, dim=0)
+    if maximum_density is not None or minimum_density is not None:
+        chemical_potential = torch.where(
+            has_free_weight,
+            chemical_potential,
+            _bound_chemical_potential(local_chemical_potential, at_floor, at_cap),
+        )
+    residual = local_chemical_potential - chemical_potential[None, :]
+    residual = torch.where(accessible, residual, torch.zeros_like(residual))
+
+    constrained_residual = residual
+    if maximum_density is not None:
+        constrained_residual = torch.where(
+            at_cap,
+            torch.clamp(residual, min=0.0),
+            residual,
+        )
+    if minimum_density is not None:
         constrained_residual = torch.where(
             at_floor,
             torch.clamp(constrained_residual, max=0.0),

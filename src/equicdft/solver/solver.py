@@ -363,7 +363,10 @@ class GridSolver:
     preserving ``rho > 0`` and ``|P| < m*rho``. Set
     ``MinimizeOptions(fixed_dipole_coordinate="alignment")`` to update the
     physical molecular alignment ``u=P/(m rho)`` instead of its conjugate
-    field while retaining the canonical log-density step. When ``method`` is
+    field while retaining the canonical log-density step, or
+    ``MinimizeOptions(lbfgs_history=...)`` for projected L-BFGS in the
+    conjugate-field coordinates with the mirror step as its initial inverse
+    Hessian, energy-only trials and the bounds as an active set. When ``method`` is
     omitted, scalar solving defaults to Euler and fixed-dipole solving to
     minimization.
 
@@ -459,6 +462,10 @@ class GridSolver:
             raise ValueError(
                 "fixed-dipole coordinate options are available only with "
                 "model.ideal=FixedDipoleIdeal(...)"
+            )
+        if minimize.lbfgs_history > 0:
+            raise ValueError(
+                "lbfgs_history is available only with model.ideal=FixedDipoleIdeal(...)"
             )
         _reject_fixed_dipole_only_options(constraints, initial)
 
