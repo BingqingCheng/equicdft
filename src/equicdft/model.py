@@ -747,8 +747,9 @@ class GridCACEModel(nn.Module, Configurable):
         selects ideal/LDA/CACE energy when ``use_voxel_mask=True``. Descriptor
         inputs and long-range terms always retain the complete physical fields.
         Empty selections are allowed here, but not for a chemical-potential
-        average. Freezing weights before SEM does not freeze the noisy field's
-        chemical-potential values or their weighted mean.
+        average. With SEM, leave weights implicit so the density cutoff is
+        evaluated on the noisy rho; keep independent support in ``valid`` and
+        ``excluded_mask``. Explicit weights override the density cutoff.
         """
         rho = data["rho"]
         if "voxel_weights" in data:

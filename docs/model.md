@@ -60,11 +60,15 @@ contributions. They are derivatives of the selected scalar energy with its
 selection held fixed, not post-hoc masked derivatives.
 
 `Trainer` requests `use_voxel_mask=True` for models exposing
-`voxel_weights`, for both training and validation. It freezes weights before
-SEM augmentation; local chemical potentials and their weighted mean are
-recomputed from the perturbed fields. A `TrainingStream` can explicitly set
+`voxel_weights`, for both training and validation. SEM augmentation precedes
+selection: the density cutoff, local chemical potentials and their weighted
+mean are recomputed from the perturbed fields, with unchanged independent
+support/exclusion masks. A `TrainingStream` can explicitly set
 `model_kwargs={"use_voxel_mask": False}` for full-functional fitting.
-Standalone augmentation callers must freeze the weights themselves.
+Standalone augmentation callers should not freeze cutoff weights. `valid`
+must encode support independently of the clean density cutoff; old caches
+with a baked-in cutoff cannot recover upward crossings. Explicit input
+weights still override the cutoff.
 Merely putting weights in the input does not mask an ordinary model forward.
 
 `GridSolver` uses full physical evaluation, ignoring fitting selections and

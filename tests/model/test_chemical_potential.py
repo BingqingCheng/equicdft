@@ -149,7 +149,7 @@ class TestChemicalPotential(unittest.TestCase):
                                    torch.autograd.grad(expected, parameters)):
                 torch.testing.assert_close(left, right, rtol=1e-11, atol=1e-12)
 
-    def test_sem_freezes_original_selection_but_recomputes_mu_and_average(self):
+    def test_sem_recomputes_selection_mu_and_average(self):
         for polarized in (False, True):
             model, batch = self.model(polarized), self.data(polarized)
             batch["rho"][:, 3, 0] = .2
@@ -167,12 +167,14 @@ class TestChemicalPotential(unittest.TestCase):
             with patch("torch.randn_like", side_effect=draws):
                 noisy, output, losses, _ = trainer._forward_loss(
                     batch, trainer.loss, noise=NoiseOptions(density=True, density_floor=.01))
-            torch.testing.assert_close(output["voxel_weights"], original)
+            realized = model.voxel_weights(noisy)
+            torch.testing.assert_close(output["voxel_weights"], realized)
+            self.assertFalse(torch.equal(realized, original))
             self.assertTrue((noisy["rho"][:, 1, 0] > .15).all())
             self.assertTrue((noisy["rho"][:, 3, 0] < .15).all())
             expected = (output["density_derivative"] + noisy["V_ext"] / noisy["temperature"][:, None, None])
             torch.testing.assert_close(output["beta_mu_average"],
-                                       (expected * original).sum(-2) / original.sum(-2))
+                                       (expected * realized).sum(-2) / realized.sum(-2))
             self.assertNotIn("voxel_weights", batch)
             noisy["target"] = -noisy["V_ext"] / noisy["temperature"][:, None, None]
             centered = TensorLoss("rho", "density_derivative", "target", center_axis=-2,

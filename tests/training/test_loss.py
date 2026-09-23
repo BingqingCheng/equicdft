@@ -1,4 +1,5 @@
 import unittest
+from math import prod
 from unittest.mock import patch
 
 import torch
@@ -276,6 +277,35 @@ class TestWeightedTensorLoss(unittest.TestCase):
         outputs["voxel_weights"].zero_()
         with self.assertRaisesRegex(ValueError, "positive sum"):
             self._loss()(outputs, batch)
+
+    def test_voxel_weights_expand_over_vector_components(self):
+        for shape in ((5, 2, 3), (2, 5, 2, 3)):
+            for center_axis in (None, -3):
+                with self.subTest(shape=shape, center_axis=center_axis):
+                    prediction = torch.arange(prod(shape), dtype=torch.float64).reshape(shape)
+                    prediction.requires_grad_()
+                    target = torch.sin(prediction.detach())
+                    weights = torch.ones(shape[:-1], dtype=torch.float64)
+                    weights[..., 0, :] = 0.
+                    weights[..., 1, :] = .4
+                    outputs = dict(P=prediction, voxel_weights=weights)
+                    # Output selection wins over a stale batch selection.
+                    batch = dict(target=target, voxel_weights=torch.zeros_like(weights))
+                    term = TensorLoss('P', 'P', 'target', weights_key='voxel_weights',
+                                      center_axis=center_axis, residual_scale=torch.tensor([[.5], [.8]]))
+                    actual = term(outputs, batch)
+                    expected = term(dict(outputs, voxel_weights=weights[..., None].expand_as(prediction)), batch)
+                    torch.testing.assert_close(actual, expected)
+                    actual_grad, = torch.autograd.grad(actual, prediction, retain_graph=True)
+                    expected_grad, = torch.autograd.grad(expected, prediction)
+                    torch.testing.assert_close(actual_grad, expected_grad)
+                    self.assertTrue(torch.equal(actual_grad[..., 0, :, :], torch.zeros_like(actual_grad[..., 0, :, :])))
+
+    def test_vector_weights_reject_missing_species_axis(self):
+        term = TensorLoss('P', 'P', 'target', weights_key='voxel_weights')
+        prediction = torch.ones(2, 5, 2, 3)
+        with self.assertRaisesRegex(ValueError, 'weights and prediction'):
+            term(dict(P=prediction, voxel_weights=torch.ones(2, 5)), dict(target=prediction))
 
 
 class TestFourierStabilityLoss(unittest.TestCase):

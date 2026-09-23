@@ -196,38 +196,42 @@ class TestDensityNoise(unittest.TestCase):
         self.assertTrue(any(torch.any(g != 0) for g in grads))
 
 
-    def test_ideal_selection_is_frozen_across_noisy_visits(self):
-        """rho_min selects the ideal, so noise must not move the selection."""
+    def test_ideal_selection_follows_each_noisy_visit(self):
+        """The realized rho selects local energy; validation stays clean."""
 
         atoms = TestDensityUncertaintyData.frame(n_types=2)
         atoms.arrays['V_ext'] = .2 * np.sin(atoms.arrays['density'])
         fields = TestDensityUncertaintyData().read(atoms)
         for frame in fields:
             frame['negative_beta_V_ext'] = -frame['beta'] * frame['V_ext']
-        # The cutoff sits inside the density range and within a noise draw of
-        # many voxels, so an unfrozen selection would follow each draw.
+        # Opposite draws move voxels across the cutoff in both directions.
         model = self.masking_model(rho_min=.15)
         selections = []
         hook = model.register_forward_hook(
             lambda module, args, output: selections.append(
-                (module.training, output['ideal_derivative_mask'].clone()))
+                (module.training, args[0]['rho'].detach().clone(),
+                 output['ideal_derivative_mask'].clone()))
         )
         t = Trainer(model, Loss([TensorLoss(
             'mu', 'density_derivative', 'negative_beta_V_ext', center_axis=-2)]),
             noise=NoiseOptions(density=True), optimizer_args={'lr': 1.e-4},
             device='cpu')
-        t.fit(DataLoader(fields), DataLoader(fields), epochs=3, verbose=False)
+        shape = fields[0]['rho'].unsqueeze(0)
+        with patch('torch.randn_like', side_effect=[
+            torch.full_like(shape, 5.), torch.full_like(shape, -5.),
+        ]):
+            t.fit(DataLoader(fields), DataLoader(fields), epochs=2, verbose=False)
         hook.remove()
-        training = [mask for is_training, mask in selections if is_training]
-        validation = [mask for is_training, mask in selections if not is_training]
-        self.assertEqual(len(training), 3)
+        for _, rho, mask in selections:
+            self.assertTrue(torch.equal(mask, rho > .15))
+        training = [mask for is_training, _, mask in selections if is_training]
+        validation = [mask for is_training, _, mask in selections if not is_training]
+        self.assertEqual(len(training), 2)
         self.assertTrue(validation)
         self.assertTrue(training[0].any() and not training[0].all())
-        for mask in training[1:]:
-            self.assertTrue(torch.equal(mask, training[0]))
-        # The frozen selection is the clean field's, which validation also uses,
-        # so the two subsets score the same voxels.
-        self.assertTrue(torch.equal(validation[0], training[0]))
+        self.assertFalse(torch.equal(training[0], training[1]))
+        for mask in validation:
+            self.assertTrue(torch.equal(mask, shape > .15))
 
     def test_training_allows_an_entirely_deselected_field(self):
         """An empty ideal selection is valid, unlike an empty mu average."""

@@ -165,7 +165,9 @@ def add_field_noise(batch, *, density_noise=False, density_noise_floor=0.0,
 
     Polarized proposals use independent Cartesian/component Gaussian draws,
     conditioned on rho>0 and |P|<m*rho by whole (rho,P)-pair rejection. Original
-    invalid/excluded voxels remain unchanged. No N or mean-P projection is made.
+    invalid/excluded voxels remain unchanged. ``valid`` must describe
+    cutoff-independent support, not a mask precomputed from clean rho.
+    No N or mean-P projection is made.
     SEM is the proposal sigma, not the variance after truncation. All targets
     remain untouched: external fields supervise total intrinsic derivatives.
     """

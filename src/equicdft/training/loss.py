@@ -24,6 +24,9 @@ class TensorLoss(LossTerm):
     is used. A componentwise target without a grid axis is expanded over that
     axis. If ``weights_key`` is supplied, the loss function must return one
     value per prediction and those values are reduced by a weighted mean.
+    Weights may match the prediction or omit its final component axis;
+    voxel weights then apply equally to every vector component. Model-output
+    weights take precedence over batch weights.
 
     ``center_axis`` removes each tensor's weighted mean along that axis,
     independently for all other indices (e.g. -2 for scalar grid/species
@@ -112,7 +115,7 @@ class TensorLoss(LossTerm):
         target = target * self.target_scale.to(prediction)
         if self.center_axis is not None:
             weights = (None if self.weights_key is None else
-                       _resolve_weights(self.weights_key, outputs, batch))
+                       _resolve_weights(self.weights_key, outputs, batch, prediction))
             prediction, target = center_fields(
                 prediction, target, weights, self.center_axis,
             )
@@ -125,7 +128,7 @@ class TensorLoss(LossTerm):
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError("loss_fn must return one scalar tensor")
         else:
-            weights = _resolve_weights(self.weights_key, outputs, batch)
+            weights = _resolve_weights(self.weights_key, outputs, batch, prediction)
             if weights.shape != prediction.shape:
                 raise ValueError("weights and prediction must have same shape")
             if value.shape != prediction.shape:
@@ -219,13 +222,18 @@ def _resolve_weights(
     key: str,
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
+    prediction: torch.Tensor,
 ) -> torch.Tensor:
-    """Return element weights, preferring model outputs over batch fields."""
+    """Resolve weights and expand a shared trailing-component selection."""
 
     if key in outputs:
-        return outputs[key]
-    if key in batch:
-        return batch[key]
-    raise KeyError(
-        "batch and model outputs are missing weights '{}'".format(key)
-    )
+        weights = outputs[key]
+    elif key in batch:
+        weights = batch[key]
+    else:
+        raise KeyError(
+            "batch and model outputs are missing weights '{}'".format(key)
+        )
+    if weights.shape == prediction.shape[:-1]:
+        weights = weights.unsqueeze(-1).expand_as(prediction)
+    return weights

@@ -110,14 +110,28 @@ training forward and leaves validation and explicit evaluation clean. The
 batch must carry `rho_std`; polarized fields additionally use the model's
 ideal reference for the local bound.
 
-The weights are computed from the clean field and frozen into the batch
-before the perturbation, so the energy selection and the averaging weights
-cannot drift between noisy visits to the same field; the chemical potentials
-themselves, and their weighted mean, are recomputed from the perturbed
-fields. Training and validation therefore select the same voxels of a field,
-which is what makes the two comparable. A caller that augments outside the
-trainer has to freeze the weights itself — putting weights in the batch does
-not by itself mask an ordinary forward.
+Apply noise first, then let the model compute `rho_noisy > model.rho_min`
+intersected with the unchanged `valid` and nonexcluded support. This realized
+selection controls local energy, the chemical-potential spatial mean, and
+losses using output `voxel_weights`. Supported nonvacuum voxels may enter or
+leave the selection on each visit; validation uses the clean density.
+`TensorLoss(weights_key="voxel_weights")` also works for polarization:
+weights are expanded over the final vector-component axis and the weighted
+mean includes all components.
+
+For this protocol, `valid` must be a **cutoff-independent support mask**.
+Do not cache clean-cutoff `voxel_weights` or separate `polarization_weights`
+in the input. Explicit `voxel_weights` remain an intentional override of
+the cutoff, not something the trainer can safely reinterpret. The library
+cannot infer how a Boolean support mask was constructed. A legacy cache
+whose `valid` includes `rho_clean > rho_min`, or which discarded targets
+outside that selection, must be rebuilt before using this protocol; it
+cannot support upward crossings. Keep external-field targets on the full
+support. Standalone augmentation callers use the same order: augment, then
+`model(noisy_batch, use_voxel_mask=True)` without frozen cutoff weights.
+
+This changes the noisy training objective from the former frozen-mask
+behavior. Do not silently resume an existing frozen-mask campaign.
 
 ## Joint training over several datasets
 

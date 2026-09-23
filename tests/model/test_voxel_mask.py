@@ -115,7 +115,7 @@ class TestVoxelMask(unittest.TestCase):
         self.assertEqual(out['ideal_density_derivative'][:, 0].abs().max().item(), 0.)
         self.assertGreater(out['density_derivative_excess'][:, 0].abs().max().item(), 0.)
 
-    def test_trainer_freezes_weights_before_sem_and_supports_full_override(self):
+    def test_trainer_recomputes_weights_after_sem_and_supports_full_override(self):
         model = GridCACEModel(readout=[LDAReadout(zero_init=False)], mean_density=.5,
                               grid_spacing=1., rho_min=.15, compute_local_mu=False).double()
         data = dict(rho=torch.tensor([[[.1], [.2]]]), temperature=torch.ones(1),
@@ -125,13 +125,22 @@ class TestVoxelMask(unittest.TestCase):
         with patch('torch.randn_like', return_value=torch.tensor([[[1.], [-1.]]])):
             noisy, out, _, _ = trainer._forward_loss(data, loss, noise=NoiseOptions(density=True))
         torch.testing.assert_close(noisy['rho'], torch.tensor([[[.2], [.1]]]))
-        torch.testing.assert_close(out['local_energy_mask'], data['rho'] > .15)
+        torch.testing.assert_close(out['local_energy_mask'], noisy['rho'] > .15)
         self.assertNotIn('voxel_weights', data)
+        self.assertNotIn('voxel_weights', noisy)
         _, validation, _, _ = trainer._forward_loss(data, loss)
-        torch.testing.assert_close(validation['local_energy_mask'], out['local_energy_mask'])
+        torch.testing.assert_close(validation['local_energy_mask'], data['rho'] > .15)
         _, full, _, _ = trainer._forward_loss(data, loss, model_kwargs={'use_voxel_mask': False})
         self.assertNotIn('local_energy_mask', full)
         self.assertTrue(full['ideal_derivative_mask'].all())
+
+        # Explicit weights remain a caller override, not a cached density
+        # cutoff the trainer can safely infer or discard.
+        explicit = dict(data, voxel_weights=torch.tensor([[[.25], [0.]]]))
+        with patch('torch.randn_like', return_value=torch.tensor([[[1.], [-1.]]])):
+            _, fixed, _, _ = trainer._forward_loss(explicit, loss, noise=NoiseOptions(density=True))
+        torch.testing.assert_close(fixed['voxel_weights'], explicit['voxel_weights'])
+        torch.testing.assert_close(fixed['local_energy_mask'], explicit['voxel_weights'] > 0)
 
     def test_fourier_uses_full_central_energy_even_after_a_masked_forward(self):
         model = symmetry.TestFullPolarizationSymmetry.model('fft', .4).train()

@@ -9,7 +9,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from equicdft import FixedDipoleIdeal, Loss, TensorLoss, Trainer, TrainingStream
+from equicdft import (
+    FixedDipoleIdeal, GridCACEModel, LDAReadout, Loss, TensorLoss, Trainer, TrainingStream,
+)
 from equicdft.training.noise import NoiseOptions, add_field_noise
 
 
@@ -250,6 +252,81 @@ class TestPolarizationNoise(unittest.TestCase):
                         resumed.load_stream_checkpoint(Path(tmp)/"legacy.pt", streams)
                     else:
                         resumed.load_checkpoint(Path(tmp)/"legacy.pt", streams[0].train_loader)
+
+    def test_noisy_cutoff_controls_energy_gauge_and_both_field_losses(self):
+        moments = torch.tensor([.5, .8])
+        model = GridCACEModel(
+            readout=[LDAReadout(n_types=2, include_polarization=True, hidden_sizes=(4,))],
+            ideal=FixedDipoleIdeal(moments), mean_density=2.e-4,
+            polarization_scale=1.e-4, grid_spacing=1., boltzmann_constant=1.,
+            mean_temperature=1., rho_min=1.e-4, compute_local_mu=True,
+            compute_polarization_derivative=True,
+        )
+        rho = torch.tensor([[[1.2, .8], [.8, 1.2], [2., 2.], [.8, .8], [0., 0.], [0., 0.]]]) * 1.e-4
+        polar = torch.zeros(*rho.shape, 3)
+        polar[..., 0] = .1 * moments * rho
+        rho_std = torch.full_like(rho, .4e-4)
+        rho_std[:, [2, 4]] = 0.
+        polar_std = torch.full_like(polar, 1.e-6)
+        polar_std[:, [2, 4]] = 0.
+        batch = dict(
+            rho=rho, dipole_density=polar, rho_std=rho_std,
+            dipole_density_std=polar_std, temperature=torch.ones(1),
+            V_ext=torch.arange(12).reshape_as(rho) * .1,
+            beta_E_target=torch.full_like(polar, .2),
+            valid=torch.tensor([[True, True, True, False, True, True]]),
+            excluded_mask=torch.tensor([[False, False, False, False, True, False]]),
+        )
+        original = {key: value.clone() for key, value in batch.items()}
+        loss = Loss([
+            TensorLoss('rho', 'beta_mu_local', 'beta_mu_average', weights_key='voxel_weights'),
+            TensorLoss('P', 'polarization_derivative', 'beta_E_target',
+                       weights_key='voxel_weights', residual_scale=moments[:, None]),
+        ])
+        t = Trainer(model, loss, device='cpu')
+        noise = NoiseOptions(density=True, polarization=True)
+        support = batch['valid'][..., None] & ~batch['excluded_mask'][..., None]
+        masks = []
+        for signs in ([-1., 1., 1., -1.], [1., -1., -1., 1.]):
+            # Only the four supported nonvacuum voxel/species pairs with
+            # nonzero SEM are proposed, despite SEM at invalid/vacuum cells.
+            with patch('torch.randn_like', side_effect=[
+                torch.tensor(signs), torch.zeros(4, 3),
+            ]):
+                noisy, outputs, losses, _ = t._forward_loss(batch, loss, noise=noise)
+            selected = support & (noisy['rho'] > model.rho_min)
+            masks.append(selected)
+            weights = selected.to(rho)
+            torch.testing.assert_close(outputs['voxel_weights'], weights)
+            torch.testing.assert_close(outputs['local_energy_mask'], selected)
+            torch.testing.assert_close(outputs['ideal_derivative_mask'], selected)
+            average = (weights * outputs['beta_mu_local']).sum(-2) / weights.sum(-2)
+            torch.testing.assert_close(outputs['beta_mu_average'], average)
+            residual = outputs['beta_mu_local'] - average[..., None, :]
+            torch.testing.assert_close(losses['rho'], (weights * residual.square()).sum() / weights.sum())
+            p_residual = moments[:, None] * (outputs['polarization_derivative'] - batch['beta_E_target'])
+            p_weights = weights[..., None].expand_as(p_residual)
+            torch.testing.assert_close(losses['P'], (p_weights * p_residual.square()).sum() / p_weights.sum())
+            # Support exclusion, excluded cells, and exact vacuum are fixed.
+            for key in ('rho', 'dipole_density'):
+                torch.testing.assert_close(noisy[key][:, 3:], original[key][:, 3:])
+            for key in ('valid', 'excluded_mask', 'V_ext', 'beta_E_target'):
+                torch.testing.assert_close(noisy[key], original[key])
+            self.assertTrue(torch.isfinite(losses['total']))
+            model.zero_grad(set_to_none=True)
+            losses['total'].backward()
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            self.assertTrue(grads)
+            self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+            self.assertTrue(any(torch.any(g != 0) for g in grads))
+        self.assertFalse(masks[0][0, 0, 0])  # downward crossing
+        self.assertTrue(masks[0][0, 0, 1])   # upward crossing
+        self.assertFalse(torch.equal(masks[0], masks[1]))
+        _, clean, _, _ = t._forward_loss(batch, loss)
+        torch.testing.assert_close(clean['voxel_weights'], (support & (rho > model.rho_min)).to(rho))
+        self.assertNotIn('voxel_weights', batch)
+        for key, value in original.items():
+            torch.testing.assert_close(batch[key], value)
 
     def test_complete_functional_training_has_finite_gradients(self):
         from tests.representation.test_polarization_symmetry import TestFullPolarizationSymmetry

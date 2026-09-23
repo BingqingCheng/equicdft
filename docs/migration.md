@@ -111,11 +111,12 @@ evaluation. Missing V raises when diagnostics are requested, as does
 fitting diagnostics independently of the saved defaults.
 
 The cutoff and optional `valid`/exclusion masks define weights unless explicit
-input `voxel_weights` provide the fixed selection. SEM training
-freezes the original selection before noise, then recalculates local and mean
-chemical potentials on the perturbed fields. A selected noisy vacuum raises;
-set a positive `NoiseOptions.density_floor` when needed. Every field/species
-must retain positive weight.
+input `voxel_weights` provide the fixed selection. SEM training now applies
+noise before selecting voxels, then recalculates local and mean chemical
+potentials on that realized selection. Keep independent support in `valid`
+and exclusions, not a clean-density cutoff or cached `voxel_weights`.
+Explicit weights remain overrides; selecting noisy vacuum explicitly raises.
+Every field/species must retain positive weight for the spatial mean.
 
 The equivalent centered `density_derivative` versus `-beta*V_ext` formulation
 remains supported, with the same mask and gauge. Its external-field RMSE/sigma
@@ -142,9 +143,17 @@ a chemical-potential average. `beta_mu_local` and `beta_mu_average` are unchange
 The old `apply_ideal_mask` switch is removed. `use_voxel_mask` defaults to
 False and is not a serialized model setting. Merely supplying voxel weights
 does not mask energy. `Trainer` defaults to True for models exposing the weight
-method and freezes weights before SEM; direct fitting, scoring and parity calls
+method; SEM density cutoffs follow the noisy realization. Direct fitting, scoring and parity calls
 must now opt in explicitly. A `TrainingStream` can override this default via
 `model_kwargs={"use_voxel_mask": False}`.
+
+For SEM migration, remove cached clean `voxel_weights` and
+`polarization_weights`; both field `TensorLoss` terms can use output
+`voxel_weights`, which expands over polarization components. A legacy
+`valid` that already includes the clean density cutoff is not independent
+support. Rebuild that cache with full-support fields/targets and a separate
+support mask; renaming the old mask does not fix it. This is a changed noise
+objective and requires a separately identified run, not silent resumption.
 
 This deliberately changes masked *excess* energy and its derivatives compared
 with the former ideal-only mask. It is a new fitting objective, not a

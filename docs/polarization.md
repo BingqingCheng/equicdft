@@ -733,7 +733,8 @@ and `rho_std` (e.g. mapped to `density_sem`), the entire `(rho', P')` proposal
 is redrawn together; `density_floor` defaults to zero. The scalar-fluid
 density-noise API retains its original Gaussian-plus-floor behavior.
 
-The optional original `valid` voxel mask is kept fixed, and its false cells
+The optional original `valid` voxel mask must describe cutoff-independent
+support. It is kept fixed, and its false cells
 are unchanged. Excluded cells stay zero and must have zero SEM. Exact vacuum
 is unchanged. Unmasked nonvacuum inputs must already satisfy the ideal domain.
 No particle-number normalization or subtraction of mean polarization is applied.
@@ -743,9 +744,15 @@ Fit `density_derivative` against `-beta*V_ext` with the canonical gauge
 projection, and `polarization_derivative` against `beta*E_ext`. If absolute
 chemical potentials are known, the density target is `beta*(mu - V_ext)`
 without the canonical projection. These total derivatives already include
-the model's ideal response to the noisy fields. Keep the original masks and
-loss scales, including any physical molecular moment multiplying the P
+the model's ideal response to the noisy fields. Keep the independent support
+and loss scales, including any physical molecular moment multiplying the P
 residual inside its square. No target-name detection or refresh is performed.
+The trainer no longer freezes the density-cutoff selection: with implicit
+weights, local energy and losses select `rho_noisy > model.rho_min` within
+the fixed support on every visit. Do not precompute cutoff weights in the
+batch. Legacy caches whose `valid` already includes a clean-density cutoff
+must be rebuilt from full-support fields; otherwise upward crossings remain
+impossible. Explicit `voxel_weights` still override the cutoff deliberately.
 The loader no longer constructs `c1` or `c1_plus_beta_mu` targets. Model
 outputs `c1`, `c2` and explicit excess derivatives remain available for
 direct-correlation and response analysis.
@@ -858,7 +865,7 @@ Canonical fitting can therefore use two ordinary `TensorLoss` terms, without
 a script-defined Euler loss. Construct the model with `compute_local_mu=True`
 and the desired `rho_min`. Its local chemical potential includes the total
 density derivative, including ideal orientation entropy. The following
-standalone helper uses a fixed density mask and the model's independent
+standalone helper uses the evaluated density's mask and the model's independent
 mean chemical potential for each density field/species.
 Polarization is not mean-centered. Pass **one unbatched frame** to the data
 helper before batching. Direct fitting/parity forwards must request
@@ -870,14 +877,9 @@ and E is energy per dipole moment.
 from equicdft import FixedDipoleIdeal, Loss, TensorLoss
 
 
-def prepare_field_targets(frame, model):
+def prepare_field_targets(frame):
     result = dict(frame)
     result["beta_E_target"] = frame["beta"] * frame["E_ext"]
-    mask = model.voxel_weights(frame)
-    result["voxel_weights"] = mask
-    result["polarization_weights"] = mask[..., None].expand_as(
-        frame["dipole_density"]
-    )
     return result
 
 
@@ -894,7 +896,7 @@ def build_joint_field_loss(model, *, density_weight=1.0, polarization_weight=1.0
         ),
         TensorLoss(
             "polarization", "polarization_derivative", "beta_E_target",
-            residual_scale=moment, weights_key="polarization_weights",
+            residual_scale=moment, weights_key="voxel_weights",
             weight=polarization_weight,
         ),
     ])
