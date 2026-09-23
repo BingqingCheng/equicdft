@@ -48,7 +48,7 @@ validates itself once:
 | `convergence=ConvergenceOptions(...)` | iteration budget and residual tolerances |
 | `euler=EulerOptions(...)` | mixing schedule, `fixed_dipole_coordinate`, and optional `anderson=AndersonOptions(...)` |
 | `minimize=MinimizeOptions(...)` | step size, Armijo line search, and `fixed_dipole_coordinate` |
-| `constraints=Constraints(...)` | ensemble, density and polarization caps, homogeneous axes, fixed field |
+| `constraints=Constraints(...)` | ensemble, density bounds and polarization cap, homogeneous axes, fixed field |
 | `initial=Initialization(...)` | starting `rho`, `polarization` and `beta_multiplier` |
 
 ## The orientational coordinate for fixed dipoles
@@ -68,9 +68,9 @@ point rather than two problems.
 The accepted values differ by group, because the established behaviour they
 name differs:
 
-| group | default | alternative |
+| group | default | alternatives |
 |---|---|---|
-| `EulerOptions` | `"polarization"` | `"alignment"` |
+| `EulerOptions` | `"polarization"` | `"alignment"`, `"conjugate_field"` |
 | `MinimizeOptions` | `"conjugate_field"` | `"alignment"` |
 
 A string valid for one group raises `ValueError` on the other, so
@@ -80,6 +80,32 @@ reports the choice back as `solver_fixed_dipole_coordinate`, and an alignment
 solve also reports `final_relative_alignment_change`, the largest change in
 `u` over the last accepted step — the orientational counterpart to
 `final_relative_density_change`.
+
+`EulerOptions(fixed_dipole_coordinate="conjugate_field")` is the third Euler
+coordinate and the one to reach for when the coupled iteration is slow. It
+carries the density as `log rho` and the polarization as the conjugate field
+`h = L^-1(u)` with `P = m rho L(h)`, so that any linear combination of
+iterates is a positive density with an interior polarization; particle
+numbers and the density bounds are imposed by projection. It is the only
+fixed-dipole path that accepts `anderson=AndersonOptions(...)`, which combines
+the recent iterates with a sliding window (`history=40` is a good start), and
+two safeguards keep the acceleration honest. An accelerated step after which
+the fixed-point residual has grown by more than `AndersonOptions.safeguard`
+discards the history, and every step, accelerated or mixed, must not raise
+`beta_A`. The second test is what lets the driver cross a coexistence region
+instead of settling on the unstable uniform fixed point. When it fires on a
+mixed step the mixing shrinks by `mixing_backtrack_factor` and the step is
+retried, and an accepted step lets it grow again by `mixing_growth`, so
+`mixing` is the starting value of a schedule rather than a fixed number;
+`mixing_backtracks` and `final_mixing` report how it fared. When even
+`minimum_mixing` (or the fixed `mixing`, with `adaptive_mixing=False`) would
+raise the free energy, the driver keeps the current state and stops with
+`status="line_search_failed"`, exactly as the minimizer does; lower `mixing`
+or turn the schedule on. `max_conjugate_field_change` bounds one update of
+`h`; the alignment itself is limited only by `maximum_polarization_fraction`,
+whose KKT residual the result reports, never by a hidden numerical margin.
+The result carries `final_conjugate_field_change` beside the density and
+polarization changes.
 
 ## Reading `status`
 
@@ -171,6 +197,13 @@ number every update is projected onto the intersection of the cap and the
 normalization — so a capped voxel may report a negative unconstrained
 residual, because raising its density is forbidden. That is the KKT condition,
 not a failure.
+
+`minimum_density` floors every accessible voxel of a fixed-dipole solve in the
+same way: a voxel resting on the floor with an outward residual counts as
+stationary, and `solver_minimum_density` records the floor. Use it when a
+learned functional is not trusted at vanishing density; a floor around one
+hundredth of the bulk density keeps cavities and vacuum regions from carrying
+the whole residual budget while the rest of the fluid equilibrates.
 
 `maximum_polarization_fraction` bounds `|P| <= q_max * m * rho` per component
 for fixed-dipole solves, a density-aware restriction on alignment rather than

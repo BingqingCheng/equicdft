@@ -1,6 +1,7 @@
 """Independent thermodynamic and canonical equilibrium tests for fixed dipoles."""
 
 import itertools
+import math
 import unittest
 
 import numpy as np
@@ -500,7 +501,7 @@ class TestGridSolverPolarization(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "fixed_dipole_coordinate"):
             EulerOptions(fixed_dipole_coordinate=1)
         with self.assertRaisesRegex(ValueError, "fixed_dipole_coordinate"):
-            EulerOptions(fixed_dipole_coordinate="conjugate_field")
+            EulerOptions(fixed_dipole_coordinate="field")
 
     def test_validation(self):
         solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
@@ -585,6 +586,113 @@ class TestGridSolverPolarization(unittest.TestCase):
             / (0.8 * result["rho"])
         )
         torch.testing.assert_close(alignment, torch.full_like(alignment, 0.2))
+
+    def test_density_floor_is_enforced_by_all_drivers(self):
+        # A strongly repulsive voxel would empty without the floor; with it
+        # the voxel rests on the floor, its outward residual is a satisfied
+        # KKT condition, and the rest of the fluid is in equilibrium.
+        data = {
+            "V_ext": torch.tensor([[12.0], [0.0], [0.0], [0.0]]),
+            "E_ext": torch.tensor(
+                [[[0.2, -0.1, 0.3]], [[-0.4, 0.2, 0.1]],
+                 [[0.1, 0.5, -0.2]], [[-0.2, -0.3, 0.4]]]
+            ),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        drivers = [
+            ("minimize", dict(minimize=MinimizeOptions())),
+            ("minimize", dict(minimize=MinimizeOptions(fixed_dipole_coordinate="alignment"))),
+            ("euler", dict(euler=EulerOptions(tolerance_change=1.0e-12, adaptive_mixing=False, mixing=0.2))),
+            ("euler", dict(euler=EulerOptions(tolerance_change=1.0e-12, adaptive_mixing=False, mixing=0.2, fixed_dipole_coordinate="alignment"))),
+        ]
+        for method, options in drivers:
+            with self.subTest(method=method, **{k: v.fixed_dipole_coordinate for k, v in options.items()}):
+                result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
+                    data,
+                    method=method,
+                    convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-8),
+                    constraints=Constraints(particle_numbers=[2.0], minimum_density=0.05),
+                    **options,
+                )
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                self.assertGreaterEqual(result["rho"].min().item(), 0.05 - 1.0e-12)
+                self.assertAlmostEqual(result["rho"][0, 0].item(), 0.05, places=7)
+                self.assertAlmostEqual(result["rho"].sum().item(), 2.0, places=12)
+                # The floor voxel wants to drain (positive unconstrained
+                # residual) and that wish is excluded from the KKT residual.
+                unconstrained = (
+                    result["beta_mu_local"][0, 0] - result["beta_mu"][0]
+                ).item()
+                self.assertGreater(unconstrained, 1.0)
+                self.assertAlmostEqual(result["density_residual"][0, 0].item(), 0.0, places=8)
+                torch.testing.assert_close(
+                    result["solver_minimum_density"], torch.tensor([0.05])
+                )
+                # Away from the floor the ideal fluid is exactly Boltzmann
+                # distributed over the free voxels, orientational partition
+                # function included.
+                weights = torch.exp(log_sinhc(0.8 * data["E_ext"][1:, 0].norm(dim=-1)))
+                free = result["rho"][1:, 0]
+                torch.testing.assert_close(
+                    free / free.sum(), weights / weights.sum(), rtol=0, atol=1.0e-8
+                )
+
+    def test_density_floor_projects_the_start_and_reports_it(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        rho = torch.tensor([[0.01], [0.79], [0.6], [0.6]])
+        polarization = torch.zeros(4, 1, 3)
+        polarization[..., 0] = 0.2 * 0.8 * rho
+        result = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8))).solve(
+            data,
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=100.0),
+            constraints=Constraints(particle_numbers=[2.0], minimum_density=0.1),
+            initial=Initialization(rho=rho, polarization=polarization),
+        )
+        self.assertEqual(result["n_iter"], 0)
+        self.assertAlmostEqual(result["rho"].min().item(), 0.1, places=12)
+        self.assertAlmostEqual(result["rho"].sum().item(), 2.0, places=12)
+        alignment = result["dipole_density"][..., 0] / (0.8 * result["rho"])
+        torch.testing.assert_close(alignment, torch.full_like(alignment, 0.2))
+
+    def test_density_floor_validation(self):
+        data = {
+            "V_ext": torch.zeros(4, 1),
+            "E_ext": torch.zeros(4, 1, 3),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal(0.8)))
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            solver.solve(data, constraints=Constraints(particle_numbers=[2.0], minimum_density=0.0))
+        with self.assertRaisesRegex(ValueError, "below maximum_density"):
+            solver.solve(data, constraints=Constraints(
+                particle_numbers=[2.0], minimum_density=0.6, maximum_density=0.6))
+        with self.assertRaisesRegex(ValueError, "infeasible under minimum_density"):
+            solver.solve(data, constraints=Constraints(particle_numbers=[2.0], minimum_density=0.5))
+        with self.assertRaisesRegex(ValueError, "below minimum_density"):
+            solver.solve(
+                data,
+                method="minimize",
+                constraints=Constraints(particle_numbers=[2.0], minimum_density=0.1, fixed_field="rho"),
+                initial=Initialization(
+                    rho=torch.tensor([[0.05], [0.65], [0.65], [0.65]]),
+                    polarization=torch.zeros(4, 1, 3),
+                ),
+            )
+        from equicdft import IdealGas
+        scalar = GridSolver(with_ideal(None, IdealGas()))
+        with self.assertRaisesRegex(ValueError, "minimum_density requires"):
+            scalar.solve(
+                {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
+                 "grid_spacing": torch.ones(3)},
+                constraints=Constraints(minimum_density=0.1),
+            )
 
     def test_polarization_fraction_cap_is_enforced_with_kkt_residual(self):
         data = {
@@ -916,6 +1024,293 @@ class TestGridSolverPolarization(unittest.TestCase):
             float(result["maximum_alignment"]), 0.2, places=10
         )
         self.assertLess(float(result["max_polarization_residual"]), 1.0e-8)
+
+    @staticmethod
+    def conjugate(**changes):
+        options = dict(
+            mixing=0.5, adaptive_mixing=False, tolerance_change=1.0e-13,
+            fixed_dipole_coordinate="conjugate_field",
+        )
+        options.update(changes)
+        return EulerOptions(**options)
+
+    def test_conjugate_field_euler_matches_exact_solution(self):
+        # The ideal fluid's Euler map is exact in one step, so unit mixing
+        # converges immediately; Anderson and the adaptive schedule must
+        # reproduce the same closed-form solution from a perturbed start.
+        data = self.case()
+        numbers, moments = [3.0, 4.0], [0.7, 1.9]
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal(moments)))
+        rho = torch.exp(0.4 * torch.randn_like(data["V_ext"]))
+        rho *= torch.as_tensor(numbers) / (data["grid_spacing"].prod() * rho.sum(0))
+        polar = 0.1 * torch.randn(*rho.shape, 3)
+        polar /= 1 + polar.norm(dim=-1, keepdim=True)
+        perturbed = Initialization(
+            rho=rho, polarization=polar * (rho * torch.as_tensor(moments))[..., None],
+        )
+        variants = [
+            ("unit mixing", self.conjugate(mixing=1.0), Initialization(), 1),
+            ("anderson", self.conjugate(anderson=AndersonOptions(history=6)), perturbed, 12),
+            (
+                "adaptive anderson",
+                self.conjugate(
+                    mixing=0.2, adaptive_mixing=True, minimum_mixing=0.05,
+                    maximum_mixing=1.0, anderson=AndersonOptions(history=6),
+                ),
+                perturbed, 12,
+            ),
+        ]
+        for label, euler, initial, budget in variants:
+            with self.subTest(label):
+                result = solver.solve(
+                    data, method="euler", euler=euler, initial=initial,
+                    convergence=ConvergenceOptions(max_iter=60, tolerance_residual=1.0e-9),
+                    constraints=Constraints(particle_numbers=numbers),
+                )
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                self.assertLessEqual(result["n_iter"], budget)
+                self.assertEqual(result["solver_fixed_dipole_coordinate"], "conjugate_field")
+                scale = expected_rho.mean(0)
+                torch.testing.assert_close(result["rho"] / scale, expected_rho / scale, rtol=0, atol=1e-7)
+                torch.testing.assert_close(
+                    result["dipole_density"] / scale[..., None],
+                    expected_p / scale[..., None], rtol=0, atol=1e-7,
+                )
+                torch.testing.assert_close(
+                    result["particle_numbers"], torch.as_tensor(numbers), rtol=2e-14, atol=0,
+                )
+                self.assertEqual(result["solver_anderson"], euler.anderson is not None)
+                energies = np.array([item["beta_A"] for item in result["history"]])
+                self.assertLessEqual(np.diff(energies).max(initial=0), 1e-9 * abs(energies[0]))
+                if euler.adaptive_mixing:
+                    self.assertGreater(result["final_mixing"], euler.mixing)
+
+    def test_conjugate_field_euler_respects_the_density_floor(self):
+        data = self.case()
+        data["V_ext"][5, 0] = 9.0
+        numbers, moments = [3.0, 4.0], [0.7, 1.9]
+        result = GridSolver(with_ideal(None, FixedDipoleIdeal(moments))).solve(
+            data, method="euler",
+            euler=self.conjugate(anderson=AndersonOptions(history=6)),
+            convergence=ConvergenceOptions(max_iter=80, tolerance_residual=1.0e-9),
+            constraints=Constraints(particle_numbers=numbers, minimum_density=0.05),
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertGreaterEqual(float(result["rho"].min()), 0.05 - 1e-12)
+        self.assertAlmostEqual(float(result["rho"][5, 0]), 0.05, places=9)
+        self.assertGreater(float(result["beta_mu_local"][5, 0] - result["beta_mu"][0]), 1.0)
+        self.assertAlmostEqual(float(result["density_residual"][5, 0]), 0.0, places=9)
+        torch.testing.assert_close(result["particle_numbers"], torch.as_tensor(numbers), rtol=2e-14, atol=0)
+
+    def test_conjugate_field_anderson_accelerates_a_stiff_excess(self):
+        class Quadratic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.strength = torch.nn.Parameter(torch.tensor(12.))
+
+            def forward(self, data, **kwargs):
+                energy = 0.5*self.strength*data["grid_spacing"].prod()*(
+                    data["rho"].square().sum() + data["dipole_density"].square().sum())
+                out = self.ideal.evaluate(data, data["grid_spacing"].prod())
+                out.update(beta_F_exc=energy, beta_F=out["beta_F_id"]+energy)
+                if kwargs.get("compute_c1", True):
+                    out["c1"] = -self.strength * data["rho"]
+                    out["density_derivative"] = out["ideal_density_derivative"]-out["c1"]
+                if kwargs.get("compute_polarization_derivative", False):
+                    out["polarization_derivative_excess"] = self.strength * data["dipole_density"]
+                    out["polarization_derivative"] = out["ideal_polarization_derivative"]+out["polarization_derivative_excess"]
+                return out
+
+        # A local quadratic excess gives the Euler map the Jacobian
+        # -strength*rho, so plain mixing is stable only below
+        # 2/(1+strength*rho) ~ 0.3 and converges slowly at 0.15. Anderson
+        # keeps the same fixed point and needs a fraction of the steps; the
+        # free-energy safeguard turns an unstable mixing of 0.5 into a
+        # convergent schedule instead of a divergence.
+        data = self.case()
+        target_rho = 0.4 + 0.1*torch.rand_like(data["V_ext"])
+        target_p = 0.04*torch.randn(*target_rho.shape, 3)
+        moments = torch.tensor([0.7, 1.9])
+        ideal = FixedDipoleIdeal(moments).local(target_rho, target_p)
+        data["V_ext"] = -(ideal["ideal_density_derivative"] + 12.*target_rho)/data["beta"]
+        data["E_ext"] = (ideal["ideal_polarization_derivative"] + 12.*target_p)/data["beta"]
+        numbers = target_rho.sum(0)*data["grid_spacing"].prod()
+        solver = GridSolver(with_ideal(Quadratic(), FixedDipoleIdeal(moments)))
+
+        def solve(euler):
+            return solver.solve(
+                data, method="euler", euler=euler,
+                convergence=ConvergenceOptions(max_iter=400, tolerance_residual=1.0e-8),
+                constraints=Constraints(particle_numbers=numbers),
+            )
+
+        plain = solve(self.conjugate(mixing=0.15))
+        accelerated = solve(self.conjugate(mixing=0.15, anderson=AndersonOptions(history=10)))
+        adaptive = solve(self.conjugate(
+            mixing=0.5, adaptive_mixing=True, minimum_mixing=0.01, maximum_mixing=1.0,
+            anderson=AndersonOptions(history=10),
+        ))
+        for label, result in (("plain", plain), ("anderson", accelerated), ("adaptive", adaptive)):
+            with self.subTest(label):
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                torch.testing.assert_close(result["rho"], target_rho, rtol=0, atol=3e-8)
+                torch.testing.assert_close(result["dipole_density"], target_p, rtol=0, atol=3e-8)
+        self.assertGreater(plain["n_iter"], 3 * accelerated["n_iter"])
+        self.assertGreater(plain["n_iter"], accelerated["n_iter"] + adaptive["n_iter"])
+        self.assertGreater(adaptive["mixing_backtracks"], 0)
+        self.assertLess(min(item["mixing"] for item in adaptive["history"] if "mixing" in item), 0.5)
+
+    def test_euler_density_target_honours_an_active_polarization_cap(self):
+        # Two voxels of an ideal dipolar fluid, one in a strong field whose
+        # alignment the cap holds at q. The constrained equilibrium keeps
+        # the work of the field beyond the cap in the density weight:
+        # rho_2/rho_1 = exp(q |h| - q h_c + log sinhc(h_c)), h_c = L^-1(q).
+        cap = 0.8
+        data = {
+            "V_ext": torch.zeros(2, 1),
+            "E_ext": torch.tensor([[[0.0, 0.0, 0.0]], [[10.0, 0.0, 0.0]]]),
+            "beta": torch.tensor(1.0),
+            "grid_spacing": torch.ones(3),
+        }
+        h_cap = float(inverse_langevin(torch.tensor(cap)))
+        weight = math.exp(cap * 10.0 - cap * h_cap + float(log_sinhc(torch.tensor(h_cap))))
+        expected = torch.tensor([[2.0 / (1.0 + weight)], [2.0 * weight / (1.0 + weight)]])
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0)))
+        runs = {
+            "minimize": dict(method="minimize"),
+            "euler polarization": dict(method="euler", euler=EulerOptions(
+                tolerance_change=1.0e-13, adaptive_mixing=False, mixing=0.5)),
+            "euler alignment": dict(method="euler", euler=EulerOptions(
+                tolerance_change=1.0e-13, adaptive_mixing=False, mixing=0.5,
+                fixed_dipole_coordinate="alignment")),
+            "euler conjugate": dict(method="euler", euler=self.conjugate(mixing=1.0)),
+        }
+        for label, kwargs in runs.items():
+            with self.subTest(label):
+                result = solver.solve(
+                    data, **kwargs,
+                    convergence=ConvergenceOptions(max_iter=400, tolerance_residual=1.0e-10),
+                    constraints=Constraints(particle_numbers=[2.0], maximum_polarization_fraction=cap),
+                )
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                torch.testing.assert_close(result["rho"], expected, rtol=0, atol=1.0e-8)
+                self.assertAlmostEqual(float(result["maximum_alignment"]), cap, places=8)
+
+    def test_conjugate_field_uphill_step_stops_instead_of_being_accepted(self):
+        class Quadratic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.strength = torch.nn.Parameter(torch.tensor(12.))
+
+            def forward(self, data, **kwargs):
+                energy = 0.5*self.strength*data["grid_spacing"].prod()*(
+                    data["rho"].square().sum() + data["dipole_density"].square().sum())
+                out = self.ideal.evaluate(data, data["grid_spacing"].prod())
+                out.update(beta_F_exc=energy, beta_F=out["beta_F_id"]+energy)
+                if kwargs.get("compute_c1", True):
+                    out["c1"] = -self.strength * data["rho"]
+                    out["density_derivative"] = out["ideal_density_derivative"]-out["c1"]
+                if kwargs.get("compute_polarization_derivative", False):
+                    out["polarization_derivative_excess"] = self.strength * data["dipole_density"]
+                    out["polarization_derivative"] = out["ideal_polarization_derivative"]+out["polarization_derivative_excess"]
+                return out
+
+        # A fixed mixing far above the stability limit raises the free
+        # energy on the first step; the driver must keep its start and say so.
+        data = self.case()
+        numbers = torch.tensor([3.0, 4.0])
+        solver = GridSolver(with_ideal(Quadratic(), FixedDipoleIdeal([0.7, 1.9])))
+        result = solver.solve(
+            data, method="euler", euler=self.conjugate(mixing=1.0),
+            convergence=ConvergenceOptions(max_iter=50, tolerance_residual=1.0e-8),
+            constraints=Constraints(particle_numbers=numbers),
+        )
+        self.assertEqual(result["status"], "line_search_failed")
+        self.assertEqual(result["n_iter"], 0)
+        self.assertEqual(result["line_search_failures"], 1)
+        energies = [item["beta_A"] for item in result["history"]]
+        self.assertEqual(len(energies), 1)
+
+    def test_conjugate_field_reaches_strong_alignment_and_deep_potentials(self):
+        # Exact ideal equilibria with |u| = 0.995 and a 60 kT potential step
+        # must be reachable: nothing but representability limits the
+        # coordinates when no physical constraint is set.
+        numbers, moments = [3.0, 4.0], [0.7, 1.9]
+        data = self.case()
+        data["E_ext"] = torch.zeros_like(data["E_ext"])
+        data["E_ext"][:, 0, 0] = float(inverse_langevin(torch.tensor(0.995))) / (0.7 * 1.4)
+        data["V_ext"] = torch.zeros_like(data["V_ext"])
+        data["V_ext"][:12, 1] = 60.0 / 1.4
+        expected_rho, expected_p = exact_solution(data, numbers, moments)
+        result = GridSolver(with_ideal(None, FixedDipoleIdeal(moments))).solve(
+            data, method="euler",
+            euler=self.conjugate(mixing=1.0, max_conjugate_field_change=1000.0),
+            convergence=ConvergenceOptions(max_iter=60, tolerance_residual=1.0e-9),
+            constraints=Constraints(particle_numbers=numbers),
+        )
+        self.assertTrue(result["converged"], str(result["maximum_residual"]))
+        self.assertAlmostEqual(float(result["maximum_alignment"]), 0.995, places=9)
+        scale = expected_rho.mean(0)
+        torch.testing.assert_close(result["rho"] / scale, expected_rho / scale, rtol=0, atol=1e-7)
+        torch.testing.assert_close(
+            result["dipole_density"] / scale[..., None], expected_p / scale[..., None], rtol=0, atol=1e-7,
+        )
+
+    def test_conjugate_field_deep_potential_in_both_dtypes(self):
+        # The dilute voxel's exact density is about 1.75e-26, well inside
+        # float32's normal range. A numerical guard must not raise it.
+        for dtype, tolerance in ((torch.float32, 1.0e-4), (torch.float64, 1.0e-10)):
+            with self.subTest(dtype=dtype):
+                data = {
+                    "V_ext": torch.tensor([[0.0], [60.0]], dtype=dtype),
+                    "E_ext": torch.zeros(2, 1, 3, dtype=dtype),
+                    "beta": torch.tensor(1.0, dtype=dtype),
+                    "grid_spacing": torch.ones(3, dtype=dtype),
+                }
+                result = GridSolver(with_ideal(None, FixedDipoleIdeal(1.0))).solve(
+                    data, method="euler",
+                    # Resolve changes in the dilute voxel rather than
+                    # stopping on a tiny absolute density change.
+                    euler=self.conjugate(mixing=1.0, tolerance_change=1.0e-16),
+                    convergence=ConvergenceOptions(
+                        max_iter=100, tolerance_residual=tolerance,
+                    ),
+                    constraints=Constraints(particle_numbers=[2.0]),
+                )
+                expected = 2.0 * torch.softmax(-data["V_ext"].double(), dim=0)
+                self.assertTrue(result["converged"], str(result["maximum_residual"]))
+                self.assertLessEqual(float(result["maximum_residual"]), tolerance)
+                # No absolute tolerance: otherwise zero passes for the
+                # dilute voxel and the regression misses a wrong tail.
+                torch.testing.assert_close(
+                    result["rho"], expected.to(dtype), rtol=tolerance, atol=0.0,
+                )
+                torch.testing.assert_close(
+                    result["particle_numbers"],
+                    torch.tensor([2.0], dtype=dtype), rtol=tolerance, atol=0.0,
+                )
+
+    def test_conjugate_field_validation(self):
+        with self.assertRaisesRegex(ValueError, "max_conjugate_field_change"):
+            self.conjugate(max_conjugate_field_change=0.0)
+        with self.assertRaisesRegex(ValueError, "anderson_safeguard"):
+            AndersonOptions(safeguard=1.0)
+        data = self.case()
+        solver = GridSolver(with_ideal(None, FixedDipoleIdeal([0.7, 1.9])))
+        constraints = Constraints(particle_numbers=[3.0, 4.0])
+        with self.assertRaisesRegex(ValueError, "conjugate_field"):
+            solver.solve(
+                data, method="euler", constraints=constraints,
+                euler=EulerOptions(fixed_dipole_coordinate="alignment", anderson=AndersonOptions()),
+            )
+        from equicdft import IdealGas
+        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
+            GridSolver(with_ideal(None, IdealGas())).solve(
+                {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
+                 "grid_spacing": torch.ones(3)},
+                method="euler", euler=self.conjugate(),
+            )
 
     def test_excluded_voxels(self):
         data = self.case()

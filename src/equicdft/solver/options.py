@@ -47,16 +47,23 @@ def _set(instance: Any, name: str, value: Any) -> None:
 
 @dataclass(frozen=True)
 class AndersonOptions:
-    """Anderson acceleration of the Euler fixed point (log-density trials).
+    """Anderson acceleration of the Euler fixed point.
 
     ``history`` recent residual pairs form each trial (at least two),
     ``regularization`` is added to the least-squares normal matrix and
-    ``damping`` in ``(0, 1]`` scales the accelerated step.
+    ``damping`` in ``(0, 1]`` scales the accelerated step. The scalar driver
+    forms a log-density trial after every full history window and keeps it
+    only when it beats the mixed step. The fixed-dipole conjugate-field
+    driver instead accelerates every step with a sliding window and uses
+    ``safeguard`` (larger than one): an accelerated step after which the
+    fixed-point residual has grown by more than that factor discards the
+    history and is followed by a plain mixed step.
     """
 
     history: int = 5
     regularization: float = 1.0e-8
     damping: float = 1.0
+    safeguard: float = 5.0
 
     def __post_init__(self) -> None:
         _set(self, "history", positive_integer(self.history, "anderson_history"))
@@ -69,6 +76,9 @@ class AndersonOptions:
         _set(self, "damping", positive_scalar(self.damping, "anderson_damping"))
         if self.damping > 1.0:
             raise ValueError("anderson_damping must be no larger than one")
+        _set(self, "safeguard", positive_scalar(self.safeguard, "anderson_safeguard"))
+        if self.safeguard <= 1.0:
+            raise ValueError("anderson_safeguard must be larger than one")
 
 
 @dataclass(frozen=True)
@@ -81,10 +91,17 @@ class EulerOptions:
     maximum_mixing]``. ``tolerance_change`` stops the iteration when the
     relative density change falls below it; ``max_log_density_change``
     bounds one update in log density. ``anderson`` enables acceleration.
-    For fixed dipoles, ``fixed_dipole_coordinate`` selects whether the
-    interpolation uses dipole density ``P`` or physical molecular alignment
-    ``u=P/(m rho)``. The default ``"polarization"`` preserves the established
-    behavior; ``"alignment"`` reconstructs ``P=m rho u`` after mixing.
+    For fixed dipoles, ``fixed_dipole_coordinate`` selects the mixed
+    variables. The default ``"polarization"`` interpolates the density and
+    the dipole density ``P``; ``"alignment"`` interpolates the physical
+    molecular alignment ``u=P/(m rho)`` and reconstructs ``P=m rho u``;
+    ``"conjugate_field"`` iterates on ``log rho`` and the conjugate field
+    ``h`` with ``P = m rho L(h)``, both unconstrained, and is the only
+    coordinate that accepts ``anderson`` for fixed dipoles; its mixing
+    follows the same schedule but grows after a step that lowered the free
+    energy and shrinks when a step would raise it.
+    ``max_conjugate_field_change`` bounds one update of ``h``; the alignment
+    itself is bounded only by ``maximum_polarization_fraction``.
     """
 
     mixing: float = 0.05
@@ -97,6 +114,7 @@ class EulerOptions:
     max_log_density_change: float = 2.0
     anderson: Optional[AndersonOptions] = None
     fixed_dipole_coordinate: str = "polarization"
+    max_conjugate_field_change: float = 5.0
 
     def __post_init__(self) -> None:
         _set(self, "tolerance_change", positive_scalar(self.tolerance_change, "tolerance_change"))
@@ -132,17 +150,22 @@ class EulerOptions:
             raise TypeError("anderson must be an AndersonOptions or None")
         if not isinstance(self.fixed_dipole_coordinate, str):
             raise TypeError(
-                "fixed_dipole_coordinate must be 'polarization' or "
-                "'alignment'"
+                "fixed_dipole_coordinate must be 'polarization', "
+                "'alignment' or 'conjugate_field'"
             )
         if self.fixed_dipole_coordinate not in (
             "polarization",
             "alignment",
+            "conjugate_field",
         ):
             raise ValueError(
-                "fixed_dipole_coordinate must be 'polarization' or "
-                "'alignment'"
+                "fixed_dipole_coordinate must be 'polarization', "
+                "'alignment' or 'conjugate_field'"
             )
+        _set(
+            self, "max_conjugate_field_change",
+            positive_scalar(self.max_conjugate_field_change, "max_conjugate_field_change"),
+        )
 
 
 @dataclass(frozen=True)
@@ -233,16 +256,19 @@ class Constraints:
 
     ``particle_numbers`` (one per component) selects the canonical ensemble;
     ``None`` solves at the chemical potential ``data["mu"]``.
-    ``maximum_density`` caps every component, ``maximum_polarization_fraction``
-    bounds ``|P| <= q_max * m * rho`` for fixed-dipole solves,
-    ``homogeneous_axes`` makes the density constant along grid axes
-    (minimize only) and ``fixed_field`` holds ``"rho"`` or
+    ``maximum_density`` caps every component, ``minimum_density`` floors
+    every accessible voxel of a fixed-dipole solve (a voxel resting on the
+    floor with an outward residual counts as stationary, like a capped one),
+    ``maximum_polarization_fraction`` bounds ``|P| <= q_max * m * rho`` for
+    fixed-dipole solves, ``homogeneous_axes`` makes the density constant
+    along grid axes (minimize only) and ``fixed_field`` holds ``"rho"`` or
     ``"dipole_density"`` fixed in a fixed-dipole minimization. Shapes and
     feasibility are checked against the data by the solver.
     """
 
     particle_numbers: Optional[ComponentValues] = None
     maximum_density: Optional[ComponentValues] = None
+    minimum_density: Optional[ComponentValues] = None
     maximum_polarization_fraction: Optional[ComponentValues] = None
     homogeneous_axes: Optional[Union[str, Sequence[Union[int, str]]]] = None
     fixed_field: Optional[str] = None

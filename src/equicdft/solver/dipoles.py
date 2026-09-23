@@ -21,12 +21,14 @@ from .numerics import (
     _canonical_density_residual,
     _fixed_dipole_bound_kkt,
     _maximum_relative_change,
+    _orientational_log_weight,
     _polarization_residual_norms,
     _project_density_constraints,
     _project_vector_norm,
     _residuals_converged,
 )
 
+from .conjugate import solve_fixed_dipole_conjugate
 from .evaluation import fixed_dipole_inputs, _set_density_residuals
 from .reporting import finalize_result
 
@@ -46,6 +48,7 @@ def apply_fixed_dipole_bounds(
 
     if (
         maximum_density is None
+        and minimum_density is None
         and maximum_polarization_fraction is None
         and fixed_field is None
     ):
@@ -95,6 +98,7 @@ def apply_fixed_dipole_bounds(
             0.0,
             maximum_density,
             accessible,
+            minimum_density=minimum_density,
         )
     )
     _set_density_residuals(result, residual, chemical_potential, maximum, rms)
@@ -145,9 +149,14 @@ def solve_fixed_dipoles(solver, data, method, options):
         raise ValueError(
             "fixed-dipole solving currently requires particle_numbers"
         )
-    if euler.anderson is not None:
+    if (
+        method == "euler"
+        and euler.anderson is not None
+        and euler.fixed_dipole_coordinate != "conjugate_field"
+    ):
         raise ValueError(
-            "Anderson acceleration is not yet supported with fixed dipoles"
+            "Anderson acceleration with fixed dipoles requires "
+            "EulerOptions(fixed_dipole_coordinate='conjugate_field')"
         )
     if convergence.residual_density_threshold not in (None, 0, 0.0):
         raise ValueError(
@@ -206,6 +215,28 @@ def solve_fixed_dipoles(solver, data, method, options):
         if torch.any(numbers > maximum_numbers).item():
             raise ValueError(
                 "particle_numbers are infeasible under maximum_density"
+            )
+    density_floor = None
+    if constraints.minimum_density is not None:
+        density_floor = species_vector(
+            constraints.minimum_density,
+            potential.shape[-1],
+            potential,
+            "minimum_density",
+        )
+        if (
+            not torch.all(torch.isfinite(density_floor)).item()
+            or torch.any(density_floor <= 0.0).item()
+        ):
+            raise ValueError("minimum_density values must be finite and positive")
+        if density_cap is not None and torch.any(
+            density_floor >= density_cap
+        ).item():
+            raise ValueError("minimum_density must lie below maximum_density")
+        minimum_numbers = volume * accessible.sum() * density_floor
+        if torch.any(numbers <= minimum_numbers).item():
+            raise ValueError(
+                "particle_numbers are infeasible under minimum_density"
             )
     polarization_fraction_cap = None
     if maximum_polarization_fraction is not None:
@@ -301,17 +332,27 @@ def solve_fixed_dipoles(solver, data, method, options):
         raise ValueError(
             "initial_rho must have the requested particle_numbers"
         )
+    # One pointwise lower bound serves both a user floor and the fixed
+    # polarization's interior requirement |P| < m rho.
     minimum_density = None
+    if density_floor is not None:
+        minimum_density = torch.zeros_like(rho)
+        minimum_density[accessible] = density_floor
     if fixed_field == "dipole_density":
         interior_fraction = (
             polarization_fraction_cap
             if polarization_fraction_cap is not None
             else 1.0 - 16.0 * torch.finfo(rho.dtype).eps
         )
-        minimum_density = torch.zeros_like(rho)
-        minimum_density[accessible] = (
+        interior_density = torch.zeros_like(rho)
+        interior_density[accessible] = (
             polarization[accessible].norm(dim=-1)
             / (moment * interior_fraction)
+        )
+        minimum_density = (
+            interior_density
+            if minimum_density is None
+            else torch.maximum(minimum_density, interior_density)
         )
         rho = _project_density_constraints(
             rho,
@@ -328,6 +369,12 @@ def solve_fixed_dipoles(solver, data, method, options):
             raise ValueError(
                 "fixed initial density exceeds maximum_density"
             )
+        if minimum_density is not None and torch.any(
+            rho[accessible] < minimum_density[accessible]
+        ).item():
+            raise ValueError(
+                "fixed initial density lies below minimum_density"
+            )
     else:
         projected_rho = _project_density_constraints(
             rho,
@@ -335,6 +382,7 @@ def solve_fixed_dipoles(solver, data, method, options):
             volume,
             density_cap,
             accessible,
+            minimum_density=minimum_density,
         )
         polarization[accessible] *= (
             projected_rho[accessible] / rho[accessible]
@@ -394,6 +442,12 @@ def solve_fixed_dipoles(solver, data, method, options):
                 state = _minimize_fixed_dipoles_alignment(*arguments)
             else:
                 state = _minimize_fixed_dipoles_conjugate_field(*arguments)
+        elif euler_coordinate == "conjugate_field":
+            state = solve_fixed_dipole_conjugate(
+                solver, data, result, numbers, moment, beta, volume, accessible,
+                density_cap, polarization_fraction_cap, minimum_density,
+                convergence, euler,
+            )
         else:
             state = solve_fixed_dipole_euler(solver,
                 data,
@@ -405,6 +459,7 @@ def solve_fixed_dipoles(solver, data, method, options):
                 accessible,
                 density_cap,
                 polarization_fraction_cap,
+                minimum_density,
                 max_iter,
                 tolerance_residual,
                 tolerance_rms_residual,
@@ -429,6 +484,8 @@ def solve_fixed_dipoles(solver, data, method, options):
         solver_fixed_field=fixed_field,
         particle_number_error=result["particle_numbers"] - numbers,
     )
+    if density_floor is not None:
+        result["solver_minimum_density"] = density_floor.detach()
     if method == "minimize" and minimize_coordinate != "conjugate_field":
         result["solver_fixed_dipole_coordinate"] = minimize_coordinate
     if method == "euler" and euler_coordinate != "polarization":
@@ -540,6 +597,7 @@ def _minimize_fixed_dipoles_conjugate_field(
                         volume,
                         maximum_density,
                         accessible,
+                        minimum_density=minimum_density,
                     )
                 trial_p = torch.zeros_like(polarization)
                 trial_p[accessible] = (
@@ -654,6 +712,7 @@ def _alignment_density_residual(
     moment,
     maximum_density,
     accessible,
+    minimum_density=None,
 ):
     r"""Return the canonical density direction at fixed physical alignment.
 
@@ -677,6 +736,7 @@ def _alignment_density_residual(
         0.0,
         maximum_density,
         accessible,
+        minimum_density=minimum_density,
     )
     return residual
 
@@ -799,6 +859,7 @@ def _minimize_fixed_dipoles_alignment(
                     moment,
                     maximum_density,
                     accessible,
+                    minimum_density=minimum_density,
                 )
         # The alignment gradient diverges like ``1/(1-|u|)`` as the fluid
         # saturates, so near saturation every step down to an absolute
@@ -850,6 +911,7 @@ def _minimize_fixed_dipoles_alignment(
                         volume,
                         maximum_density,
                         accessible,
+                        minimum_density=minimum_density,
                     )
                 trial_p = torch.zeros_like(polarization)
                 trial_p[accessible] = (
@@ -972,6 +1034,7 @@ def solve_fixed_dipole_euler(
     accessible,
     maximum_density,
     maximum_polarization_fraction,
+    minimum_density,
     max_iter,
     tolerance_residual,
     tolerance_rms_residual,
@@ -1014,17 +1077,17 @@ def solve_fixed_dipole_euler(
             break
         rho = result["rho"]
         polarization = result["dipole_density"]
-        target_field = moment[..., None] * (
+        unconstrained_field = moment[..., None] * (
             beta * data["E_ext"]
             - result["polarization_derivative_excess"]
         )
         target_field = _project_vector_norm(
-            target_field, maximum_field
+            unconstrained_field, maximum_field
         )
         logits = (
             -beta * data["V_ext"]
             + result["c1"]
-            + log_sinhc(target_field.norm(dim=-1))
+            + _orientational_log_weight(unconstrained_field, target_field)
         )
         target_rho = torch.zeros_like(rho)
         target_rho[accessible] = (
@@ -1036,6 +1099,8 @@ def solve_fixed_dipole_euler(
             volume,
             maximum_density,
             accessible,
+            minimum_density=minimum_density,
+            proportional=True,
         )
         target_u = torch.zeros_like(polarization)
         target_u[accessible] = dipole_alignment(target_field[accessible])
@@ -1076,6 +1141,7 @@ def solve_fixed_dipole_euler(
                 maximum_polarization_fraction,
                 moment,
                 accessible,
+                minimum_density=minimum_density,
             )
             n_evaluations += 1
             if (

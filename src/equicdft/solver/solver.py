@@ -81,6 +81,10 @@ def _reject_fixed_dipole_only_options(constraints, initial):
             "maximum_polarization_fraction requires "
             "model.ideal=FixedDipoleIdeal(...)"
         )
+    if constraints.minimum_density is not None:
+        raise ValueError(
+            "minimum_density requires model.ideal=FixedDipoleIdeal(...)"
+        )
 
 
 class _ScalarProblem(NamedTuple):
@@ -347,7 +351,14 @@ class GridSolver:
     Euler expression with simultaneous adaptive mixing. Set
     ``EulerOptions(fixed_dipole_coordinate="alignment")`` to mix the physical
     molecular alignment ``u=P/(m rho)`` and reconstruct ``P=m rho u`` after
-    each density step; the default mixes ``P`` directly. The minimizer uses
+    each density step; the default mixes ``P`` directly.
+    ``fixed_dipole_coordinate="conjugate_field"`` iterates on ``log rho`` and
+    the conjugate field ``h`` with ``P=m rho L(h)``, accepts
+    ``anderson=AndersonOptions(...)``, and lets no step raise the free
+    energy: a mixed step that would is retried with a smaller mixing and an
+    accelerated one is discarded. ``Constraints(minimum_density=...)`` floors
+    the density of a fixed-dipole solve with the KKT convention of the cap.
+    The minimizer uses
     the fixed-dipole entropy mirror map and an Armijo line search by default,
     preserving ``rho > 0`` and ``|P| < m*rho``. Set
     ``MinimizeOptions(fixed_dipole_coordinate="alignment")`` to update the

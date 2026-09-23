@@ -101,6 +101,29 @@ def _maximum_relative_change(
     ).item()
 
 
+def _orientational_log_weight(
+    target_field: torch.Tensor,
+    projected_field: torch.Tensor,
+) -> torch.Tensor:
+    """Return the orientational term of the density Euler equation.
+
+    At the unconstrained alignment ``u = L(h_t)`` the term is
+    ``log sinhc(|h_t|)``. When a polarization-fraction cap holds the
+    alignment at ``u = L(|h_c|) h_t/|h_t|`` with ``|h_c| < |h_t|``, the
+    partition sum is replaced by the constrained value
+    ``u . h_t - [u . h_c - log sinhc(|h_c|)]``, which keeps the work done
+    by the part of the field the cap cannot follow.
+    """
+
+    from ..functional.polarization_ideal import langevin, log_sinhc
+
+    norm_target = target_field.norm(dim=-1)
+    norm_projected = projected_field.norm(dim=-1)
+    return log_sinhc(norm_projected) + langevin(norm_projected) * (
+        norm_target - norm_projected
+    )
+
+
 def _project_vector_norm(
     vector: torch.Tensor,
     maximum_norm: Optional[torch.Tensor],
@@ -200,8 +223,19 @@ def _normalize_particle_numbers(
     maximum_density: Optional[torch.Tensor] = None,
     accessible_mask: Optional[torch.Tensor] = None,
     minimum_density: Optional[torch.Tensor] = None,
+    proportional: bool = False,
 ) -> torch.Tensor:
-    """Normalize each component subject to optional pointwise density bounds."""
+    """Normalize each component subject to optional pointwise density bounds.
+
+    Two rules share the upper-bound handling and differ only when a lower
+    bound is present. The default removes the mandatory lower-bound density
+    first and distributes the remainder proportionally to the excess above
+    the floor, which avoids competing active sets when the floor is the
+    fixed polarization's ``|P| / m``. ``proportional=True`` instead scales
+    the free voxels by one common factor and pins the voxels that scaling
+    would carry past a bound; the Euler drivers need this, because it makes
+    the projected fixed point the constrained equilibrium itself.
+    """
 
     accumulation_dtype = _accumulation_dtype(rho.dtype)
     accessible = _accessible_density_mask(rho, accessible_mask)
@@ -256,33 +290,81 @@ def _normalize_particle_numbers(
         ):
             raise ValueError("particle_numbers are infeasible under density bounds")
 
-        # Remove the mandatory lower-bound density, then distribute the
-        # remaining population proportionally subject only to the residual
-        # upper capacities. This avoids competing lower/upper active sets in
-        # nearly empty interface voxels.
         remaining = torch.clamp(target_sums[component] - minimum_sum, min=0.0)
         if remaining <= tolerance:
             continue
+        if not proportional or minimum_density is None:
+            # Without a lower bound both rules coincide; this branch is the
+            # established one and stays bit-identical to the recorded goldens.
+            weights = torch.clamp(
+                rho_accumulated[:, component] - lower_component,
+                min=torch.finfo(accumulation_dtype).tiny,
+            )
+            free = active & (capacity > 0.0)
+            slack = torch.zeros_like(weights)
+            while torch.any(free).item():
+                scale = remaining / torch.sum(weights[free])
+                free_indices = torch.nonzero(free, as_tuple=False).reshape(-1)
+                free_values = scale * weights[free_indices]
+                saturated_local = free_values >= capacity[free_indices]
+                if not torch.any(saturated_local).item():
+                    slack[free_indices] = free_values
+                    remaining = remaining.new_zeros(())
+                    break
+                saturated_indices = free_indices[saturated_local]
+                slack[saturated_indices] = capacity[saturated_indices]
+                remaining = remaining - capacity[saturated_indices].sum()
+                free[saturated_indices] = False
+            if torch.abs(remaining).item() > 1.0e-10:
+                raise RuntimeError("failed to normalize density under density bounds")
+            normalized_accumulated[:, component] += slack
+            continue
+        # One common factor s scales the free voxels, sum_i clip(s w_i,
+        # lower_i, upper_i) is monotone in s, and the factor that restores
+        # the particle number is found by bisection in log s. Underflowed
+        # weights (targets of exp(-beta V) in vacuum) are handled exactly:
+        # they rest on the floor for any finite s.
         weights = torch.clamp(
-            rho_accumulated[:, component] - lower_component,
+            rho_accumulated[:, component],
             min=torch.finfo(accumulation_dtype).tiny,
         )
-        free = active & (capacity > 0.0)
+        lower_active = lower_component[active]
+        upper_active = upper[:, component][active]
+        weights_active = weights[active]
+        log_weights = torch.log(weights_active)
+        target = target_sums[component]
+
+        def clipped_sum(log_scale):
+            values = torch.exp(log_scale + log_weights)
+            return torch.minimum(torch.maximum(values, lower_active), upper_active).sum()
+
+        # The bracket spans every scale a double can represent relative to
+        # the unconstrained normalization; 64 halvings resolve it to the
+        # last bit.
+        center = torch.log(target / weights_active.sum())
+        low = center - 60.0
+        high = center + 800.0
+        for _ in range(64):
+            middle = 0.5 * (low + high)
+            if clipped_sum(middle) < target:
+                low = middle
+            else:
+                high = middle
+        log_scale = 0.5 * (low + high)
+        values = torch.exp(log_scale + log_weights)
+        values = torch.minimum(torch.maximum(values, lower_active), upper_active)
+        # Bisection leaves a rounding-level deficit; spread it over the
+        # voxels that are strictly inside their bounds.
+        interior = (values > lower_active) & (values < upper_active)
+        deficit = target - values.sum()
+        if torch.any(interior).item():
+            values = torch.where(
+                interior, values + deficit * values / values[interior].sum(), values,
+            )
         slack = torch.zeros_like(weights)
-        while torch.any(free).item():
-            scale = remaining / torch.sum(weights[free])
-            free_indices = torch.nonzero(free, as_tuple=False).reshape(-1)
-            free_values = scale * weights[free_indices]
-            saturated_local = free_values >= capacity[free_indices]
-            if not torch.any(saturated_local).item():
-                slack[free_indices] = free_values
-                remaining = remaining.new_zeros(())
-                break
-            saturated_indices = free_indices[saturated_local]
-            slack[saturated_indices] = capacity[saturated_indices]
-            remaining = remaining - capacity[saturated_indices].sum()
-            free[saturated_indices] = False
-        if torch.abs(remaining).item() > 1.0e-10:
+        slack[active] = values - lower_active
+        remaining = target - (lower_active.sum() + slack[active].sum())
+        if torch.abs(remaining).item() > 1.0e-10 * max(1.0, float(target.abs())):
             raise RuntimeError("failed to normalize density under density bounds")
         normalized_accumulated[:, component] += slack
 
@@ -334,8 +416,13 @@ def _project_density_constraints(
     maximum_density: Optional[torch.Tensor] = None,
     accessible_mask: Optional[torch.Tensor] = None,
     minimum_density: Optional[torch.Tensor] = None,
+    proportional: bool = False,
 ) -> torch.Tensor:
-    """Apply mask, particle-number, and optional pointwise density bounds."""
+    """Apply mask, particle-number, and optional pointwise density bounds.
+
+    ``proportional`` selects the lower-bound rule of
+    :func:`_normalize_particle_numbers`.
+    """
 
     accessible = _accessible_density_mask(rho, accessible_mask)
     projected = torch.where(accessible, rho, torch.zeros_like(rho))
@@ -347,6 +434,7 @@ def _project_density_constraints(
             maximum_density=maximum_density,
             accessible_mask=accessible_mask,
             minimum_density=minimum_density,
+            proportional=proportional,
         )
     if minimum_density is not None:
         projected = torch.maximum(
