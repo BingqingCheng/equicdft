@@ -93,14 +93,14 @@ class EulerOptions:
     relative density change falls below it; ``max_log_density_change``
     bounds one update in log density. ``anderson`` enables acceleration.
     For fixed dipoles, ``fixed_dipole_coordinate`` selects the mixed
-    variables. The default ``"polarization"`` interpolates the density and
-    the dipole density ``P``; ``"alignment"`` interpolates the physical
-    molecular alignment ``u=P/(m rho)`` and reconstructs ``P=m rho u``;
-    ``"conjugate_field"`` iterates on ``log rho`` and the conjugate field
-    ``h`` with ``P = m rho L(h)``, both unconstrained, and is the only
-    coordinate that accepts ``anderson`` for fixed dipoles; its mixing
-    follows the same schedule but grows after a step that lowered the free
-    energy and shrinks when a step would raise it.
+    variables. The default ``"conjugate_field"`` iterates on ``log rho`` and
+    the conjugate field ``h`` with ``P = m rho L(h)``, both unconstrained,
+    and is the only coordinate that accepts ``anderson`` for fixed dipoles;
+    its mixing follows the same schedule but grows after a step that lowered
+    the free energy and shrinks when a step would raise it.
+    ``"polarization"`` interpolates the density and dipole density ``P``
+    directly; ``"alignment"`` interpolates the physical molecular alignment
+    ``u=P/(m rho)`` and reconstructs ``P=m rho u``.
     ``max_conjugate_field_change`` bounds one update of ``h``; the alignment
     itself is bounded only by ``maximum_polarization_fraction``.
     """
@@ -114,7 +114,7 @@ class EulerOptions:
     tolerance_change: float = 1.0e-7
     max_log_density_change: float = 2.0
     anderson: Optional[AndersonOptions] = None
-    fixed_dipole_coordinate: str = "polarization"
+    fixed_dipole_coordinate: str = "conjugate_field"
     max_conjugate_field_change: float = 5.0
 
     def __post_init__(self) -> None:

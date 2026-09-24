@@ -59,31 +59,31 @@ ignoring it, so the option never silently does nothing. `"alignment"` works
 in the physical molecular alignment `u = P/(m rho)` and reconstructs
 `P = m rho u`, which keeps the update in the variable the saturation bound is
 written in.
-The alternative is the established behaviour of each method: Euler mixes `P`
-directly, and the minimizer steps the conjugate field of the entropy mirror
-map. Both choices keep the positivity-preserving canonical log-density step
-and the same physical KKT residual, so they are two routes to one stationary
-point rather than two problems.
+The default for both methods is the conjugate field of the orientational
+entropy. Euler can instead mix `P` directly. All choices keep the
+positivity-preserving canonical log-density step and the same physical KKT
+residual, so they are routes to one stationary point rather than different
+problems.
 
 The accepted values differ by group, because the established behaviour they
 name differs:
 
 | group | default | alternatives |
 |---|---|---|
-| `EulerOptions` | `"polarization"` | `"alignment"`, `"conjugate_field"` |
+| `EulerOptions` | `"conjugate_field"` | `"polarization"`, `"alignment"` |
 | `MinimizeOptions` | `"conjugate_field"` | `"alignment"` |
 
 A string valid for one group raises `ValueError` on the other, so
 `MinimizeOptions(fixed_dipole_coordinate="polarization")` is an error rather
-than a synonym for its default. A solve that used anything but its default
-reports the choice back as `solver_fixed_dipole_coordinate`, and an alignment
+than a synonym for its default. The conjugate-field Euler driver and
+non-default minimizer coordinates report the choice back as
+`solver_fixed_dipole_coordinate`, and an alignment
 solve also reports `final_relative_alignment_change`, the largest change in
 `u` over the last accepted step — the orientational counterpart to
 `final_relative_density_change`.
 
-`EulerOptions(fixed_dipole_coordinate="conjugate_field")` is the third Euler
-coordinate and the one to reach for when the coupled iteration is slow. It
-carries the density as `log rho` and the polarization as the conjugate field
+The default `EulerOptions(fixed_dipole_coordinate="conjugate_field")` carries
+the density as `log rho` and the polarization as the conjugate field
 `h = L^-1(u)` with `P = m rho L(h)`, so that any linear combination of
 iterates is a positive density with an interior polarization; particle
 numbers and the density bounds are imposed by projection. It is the only

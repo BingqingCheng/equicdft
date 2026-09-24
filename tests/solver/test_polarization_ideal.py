@@ -494,6 +494,9 @@ class TestGridSolverPolarization(unittest.TestCase):
         self.assertGreaterEqual(int(result["n_iter"]), 1)
 
     def test_fixed_dipole_coordinate_validation(self):
+        self.assertEqual(
+            EulerOptions().fixed_dipole_coordinate, "conjugate_field"
+        )
         with self.assertRaisesRegex(TypeError, "fixed_dipole_coordinate"):
             MinimizeOptions(fixed_dipole_coordinate=1)
         with self.assertRaisesRegex(ValueError, "fixed_dipole_coordinate"):
@@ -522,13 +525,16 @@ class TestGridSolverPolarization(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "requires particle_numbers"):
             solver.solve(data)
-        with self.assertRaisesRegex(ValueError, "Anderson"):
-            solver.solve(
-                data,
-                method="euler",
-                euler=EulerOptions(anderson=AndersonOptions()),
-                constraints=Constraints(particle_numbers=[3., 4.]),
-            )
+        accelerated = solver.solve(
+            data,
+            method="euler",
+            euler=EulerOptions(anderson=AndersonOptions()),
+            convergence=ConvergenceOptions(max_iter=1),
+            constraints=Constraints(particle_numbers=[3., 4.]),
+        )
+        self.assertEqual(
+            accelerated["solver_fixed_dipole_coordinate"], "conjugate_field"
+        )
 
     def test_density_cap_is_enforced_by_both_solvers(self):
         data = {
@@ -1576,13 +1582,16 @@ class TestGridSolverPolarization(unittest.TestCase):
                 data, method="euler", constraints=constraints,
                 euler=EulerOptions(fixed_dipole_coordinate="alignment", anderson=AndersonOptions()),
             )
+        # The shared EulerOptions default is accepted by scalar models, where
+        # the fixed-dipole coordinate is irrelevant and never reported.
         from equicdft import IdealGas
-        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
-            GridSolver(with_ideal(None, IdealGas())).solve(
-                {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
-                 "grid_spacing": torch.ones(3)},
-                method="euler", euler=self.conjugate(),
-            )
+        scalar = GridSolver(with_ideal(None, IdealGas())).solve(
+            {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1),
+             "beta": torch.tensor(1.0), "grid_spacing": torch.ones(3)},
+            method="euler", euler=EulerOptions(),
+            convergence=ConvergenceOptions(max_iter=1),
+        )
+        self.assertNotIn("solver_fixed_dipole_coordinate", scalar)
 
     def test_excluded_voxels(self):
         data = self.case()
