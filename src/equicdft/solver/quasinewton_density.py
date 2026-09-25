@@ -17,8 +17,9 @@ step, and a voxel resting on the cap with a gradient pointing outward is
 frozen for the step (its gradient component is zeroed and it is excluded
 from the curvature pairs). The chemical potential that decides whether a
 capped voxel is released is the same bound-compatible multiplier the
-reported residual uses. Homogeneous-axis projections keep the density on
-the projected subspace by projecting the gradient.
+reported residual uses. With homogeneous axes, coordinates, densities,
+gradients, directions and curvature pairs are all projected so roundoff
+cannot carry the quasi-Newton history out of the constrained subspace.
 
 Trials of the line search are evaluated without derivatives; only the
 accepted point is differentiated. The acceptance is Armijo against the
@@ -103,14 +104,30 @@ def minimize_density_lbfgs(
             return torch.zeros_like(rho_accessible, dtype=torch.bool)
         return rho_accessible >= (maximum_density[None, :] - cap_tolerance).expand_as(rho_accessible)
 
+    def project_accessible(values):
+        """Project accessible coordinates onto the homogeneous tangent space."""
+
+        if projection is None:
+            return values
+        full = torch.zeros_like(rho)
+        full[accessible] = values
+        return projection.average(full)[accessible]
+
     def fields_from(log_density):
         """Feasible density for the coordinates, and the consistent ``l``."""
 
+        log_density = project_accessible(log_density)
         full = torch.zeros_like(rho)
         full[accessible] = torch.exp(torch.maximum(log_density, log_floor))
         full = _project_density_constraints(
             full, fixed_N, voxel_volume, maximum_density, accessible_mask,
         )
+        if projection is not None:
+            # Fixed-N normalization may put a last-bit correction on one
+            # voxel. Average it over its homogeneous group before the trial
+            # is evaluated, preserving the sum and pointwise bounds to
+            # floating-point precision.
+            full = projection.average(full)
         log_density = torch.maximum(torch.log(full[accessible]), log_floor)
         log_density = torch.where(pinned(full[accessible]), log_density + margin, log_density)
         return full, log_density
@@ -160,6 +177,7 @@ def minimize_density_lbfgs(
             excess = local - mean[None, :]
         g = voxel_volume * rho_accessible * excess
         g = torch.where(free, g, torch.zeros_like(g))
+        g = project_accessible(g)
         return g, free, log_density
 
     def initial_inverse(density, g):
@@ -217,11 +235,13 @@ def minimize_density_lbfgs(
             beta_i = rho_i * float((y * r).sum())
             r = r + (alpha_i - beta_i) * s
         direction = torch.where(free, -r, torch.zeros_like(r))
+        direction = project_accessible(direction)
         slope = float((g * direction).sum())
         if slope >= 0.0:
             pairs_s, pairs_y = [], []
             gamma = 1.0
             direction = torch.where(free, -initial_inverse(density, g), torch.zeros_like(g))
+            direction = project_accessible(direction)
             slope = float((g * direction).sum())
         largest = float(direction.abs().max()) if direction.numel() else 0.0
         largest_trial_change = initial_step * largest
@@ -269,8 +289,8 @@ def minimize_density_lbfgs(
         n_evaluations += 1
         new_g, new_free, trial_log = gradient(evaluation, trial_density, trial_log)
         mask = (free & new_free).to(g.dtype)
-        s = (trial_log - log_density) * mask
-        y = (new_g - g) * mask
+        s = project_accessible((trial_log - log_density) * mask)
+        y = project_accessible((new_g - g) * mask)
         curvature = float((s * y).sum())
         if history_size > 0 and curvature > 1.0e-12 * float(s.norm()) * float(y.norm()):
             pairs_s.append(s)

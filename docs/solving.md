@@ -263,9 +263,12 @@ an absolute cap; it is unavailable for scalar solving.
 `homogeneous_axes="x"` or `["x", "y"]` makes the density constant along those
 grid axes for a density-only minimize; `full_max_density_residual` and
 `full_converged` then report unrestricted stationarity alongside the
-constrained ones. `fixed_field="rho"` or `"dipole_density"` holds one field of
-a fixed-dipole minimization fixed and relaxes only the other, with the coupled
-residual still available as `full_maximum_residual` and `full_rms_residual`.
+constrained ones. Projected L-BFGS evaluates every line-search trial on that
+homogeneous manifold and projects its gradients, directions and curvature
+pairs into the corresponding tangent space. `fixed_field="rho"` or
+`"dipole_density"` holds one field of a fixed-dipole minimization fixed and
+relaxes only the other, with the coupled residual still available as
+`full_maximum_residual` and `full_rms_residual`.
 
 `excluded_mask` in the data marks inaccessible voxels: their density stays
 exactly zero, particle numbers are normalized over the accessible points, and

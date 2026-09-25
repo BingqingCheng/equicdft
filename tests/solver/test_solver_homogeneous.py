@@ -6,13 +6,56 @@ import itertools
 import torch
 from tests.metal_helpers import _run
 
-from equicdft.solver import Constraints, ConvergenceOptions
+from equicdft.solver import Constraints, ConvergenceOptions, MinimizeOptions
 from equicdft import GridData, GridSolver, GridCACEModel, LDAReadout, MetalWall
 from tests.metal_helpers import liquid_coulomb
 from equicdft.solver.symmetry import _HomogeneousDensityProjection
 
 
 from tests.ideal_helpers import IdealOnly as IdealGas
+
+
+class _TransverseUnstable(IdealGas):
+    """Analytic excess term that rewards leaving the homogeneous subspace."""
+
+    def __init__(self, shape, local_curvature=10.0, transverse_curvature=1.0e16):
+        super().__init__()
+        self.shape = tuple(shape)
+        self.local_curvature = local_curvature
+        self.transverse_curvature = transverse_curvature
+        self.maximum_transverse_deviation = 0.0
+
+    def forward(self, data, compute_c1=True, compute_polarization_derivative=False,
+                compute_c2=False):
+        outputs = super().forward(
+            data, compute_c1, compute_polarization_derivative, compute_c2,
+        )
+        rho = data["rho"]
+        grid = rho.reshape(*self.shape, rho.shape[-1])
+        plane_average = grid.mean(dim=(0, 1), keepdim=True)
+        transverse = grid - plane_average
+        deviation = (grid - grid[:1, :1].expand_as(grid)).abs().max()
+        self.maximum_transverse_deviation = max(
+            self.maximum_transverse_deviation, float(deviation),
+        )
+        voxel_volume = data["grid_spacing"].prod()
+        beta_F_exc = 0.5 * voxel_volume * (
+            self.local_curvature * (rho * rho).sum()
+            - self.transverse_curvature * (transverse * transverse).sum()
+        )
+        outputs["beta_F_exc"] = beta_F_exc
+        outputs["beta_F"] = outputs["beta_F_id"] + beta_F_exc
+        if compute_c1:
+            c1 = (
+                -self.local_curvature * rho
+                + self.transverse_curvature * transverse.reshape_as(rho)
+            )
+            outputs["c1"] = c1
+            outputs["density_derivative_excess"] = -c1
+            outputs["density_derivative"] = (
+                outputs["ideal_density_derivative"] - c1
+            )
+        return outputs
 
 
 class TestHomogeneousSolver(unittest.TestCase):
@@ -88,7 +131,6 @@ class TestHomogeneousSolver(unittest.TestCase):
         self.assertTrue(all(a >= b for a, b in zip(result["objective_history"], result["objective_history"][1:])))
 
     def test_lbfgs_projects_gradient_and_keeps_cap_and_gauge(self):
-        from equicdft.solver import MinimizeOptions
         d = self.data()
         n = torch.tensor([1., 2., 3.])
         p = _HomogeneousDensityProjection(d, (0, 1), ~d["excluded_mask"])
@@ -121,10 +163,47 @@ class TestHomogeneousSolver(unittest.TestCase):
         torch.testing.assert_close(a["rho"], b["rho"], atol=1e-8, rtol=0)
         self.assertLessEqual(float(a["rho"].max()), .3+1e-12)
         self.assertAlmostEqual(float(a["rho"].sum()*.125), 2.)
+        self.assertEqual(
+            float(a["rho"][d1["excluded_mask"]].abs().max()), 0.0,
+        )
         grid = a["rho"].reshape(4, 4, 6, 1)
         # The rounding correction of the normalization lands on one voxel,
         # so the capped solution is homogeneous to roundoff, as for mirror descent.
         torch.testing.assert_close(grid, grid[:1, :1].expand_as(grid), atol=1e-12, rtol=0)
+
+    def test_lbfgs_cannot_escape_along_transverse_instability(self):
+        d = self.data(types=1)
+        model = _TransverseUnstable((4, 4, 6))
+        result = _run(
+            GridSolver(model).solve,
+            d,
+            method="minimize",
+            minimize=MinimizeOptions(lbfgs_history=10),
+            convergence=ConvergenceOptions(
+                tolerance_residual=1.0e-12, max_iter=100,
+            ),
+            constraints=Constraints(
+                particle_numbers=[0.1], homogeneous_axes=(0, 1),
+            ),
+        )
+        projection = _HomogeneousDensityProjection(
+            d, (0, 1), ~d["excluded_mask"],
+        )
+        self.assertTrue(result["converged"], result["status"])
+        self.assertEqual(result["line_search_failures"], 0)
+        self.assertLessEqual(model.maximum_transverse_deviation, 1.0e-14)
+        torch.testing.assert_close(
+            result["rho"], projection.average(result["rho"]),
+            atol=1.0e-14, rtol=0,
+        )
+        self.assertAlmostEqual(
+            float(result["particle_numbers"][0]), 0.1, places=13,
+        )
+        self.assertTrue(all(
+            b <= a + 1.0e-14 for a, b in zip(
+                result["objective_history"], result["objective_history"][1:],
+            )
+        ))
 
     def test_grand_canonical_and_permuted_rows(self):
         d = self.data(types=1)
@@ -162,20 +241,27 @@ class TestHomogeneousSolver(unittest.TestCase):
     def test_empty_axes_preserve_default_exactly(self):
         d = self.data(types=1)
         s = GridSolver(IdealGas())
-        a = _run(
-            s.solve,
-            d,
-            method="minimize",
-            constraints=Constraints(particle_numbers=[2.]),
-        )
-        b = _run(
-            s.solve,
-            d,
-            method="minimize",
-            constraints=Constraints(particle_numbers=[2.], homogeneous_axes=()),
-        )
-        self.assertTrue(torch.equal(a["rho"], b["rho"]))
-        self.assertEqual(a["objective_history"], b["objective_history"])
+        for minimize in (None, MinimizeOptions(lbfgs_history=10)):
+            options = {} if minimize is None else {"minimize": minimize}
+            with self.subTest(lbfgs=minimize is not None):
+                a = _run(
+                    s.solve,
+                    d,
+                    method="minimize",
+                    constraints=Constraints(particle_numbers=[2.]),
+                    **options,
+                )
+                b = _run(
+                    s.solve,
+                    d,
+                    method="minimize",
+                    constraints=Constraints(
+                        particle_numbers=[2.], homogeneous_axes=(),
+                    ),
+                    **options,
+                )
+                self.assertTrue(torch.equal(a["rho"], b["rho"]))
+                self.assertEqual(a["objective_history"], b["objective_history"])
 
     def test_named_restrictions_match_integer_axes_and_ideal_gas(self):
         d = self.data()
