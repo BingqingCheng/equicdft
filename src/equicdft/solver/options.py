@@ -183,11 +183,12 @@ class MinimizeOptions:
     ``u=P/(m rho)`` directly. Both choices retain the positivity-preserving
     canonical log-density update.
 
-    ``lbfgs_history`` larger than zero switches a fixed-dipole minimization
-    (``"conjugate_field"`` coordinate, no ``fixed_field``) to projected
+    ``lbfgs_history`` larger than zero switches a minimization to projected
     L-BFGS with that many curvature pairs, the mirror-descent step as the
     initial inverse Hessian, energy-only line-search trials and the bounds
-    handled as an active set. ``nonmonotone_window`` is the number of recent
+    handled as an active set: in ``(log rho, h)`` for fixed dipoles
+    (``"conjugate_field"`` coordinate, no ``fixed_field``) and in ``log rho``
+    for a density-only solve, canonical or grand canonical. ``nonmonotone_window`` is the number of recent
     objectives whose maximum the Armijo test is taken against; one is the
     strict monotone test.
     """

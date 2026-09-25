@@ -1532,9 +1532,13 @@ class TestGridSolverPolarization(unittest.TestCase):
 
     def test_lbfgs_line_search_starts_from_step_size(self):
         # step_size scales the quasi-Newton direction: a step that reaches
-        # the exchange in one trial, and one too short to move the state.
+        # the exchange in one trial when the independent log-change limit is
+        # inactive, and one too short to move the state.
         result = self.two_voxel_exchange(
-            0.0, MinimizeOptions(lbfgs_history=10, step_size=2.0, minimum_step_size=1.5),
+            0.0, MinimizeOptions(
+                lbfgs_history=10, step_size=2.0, minimum_step_size=1.5,
+                max_log_density_change=4.0,
+            ),
         )
         self.assertTrue(result["converged"], result["status"])
         self.assertEqual(result["n_iter"], 1)
@@ -1545,6 +1549,40 @@ class TestGridSolverPolarization(unittest.TestCase):
         )
         self.assertEqual(result["history"][0]["accepted_step"], 1.0e-6)
         self.assertLess(abs(result["rho"][0, 0].item() - 0.1), 1.0e-2)
+
+    def test_lbfgs_step_size_cannot_bypass_log_density_change_limit(self):
+        data = {
+            "V_ext": torch.tensor([[10.0], [-10.0]], dtype=torch.float64),
+            "E_ext": torch.zeros(2, 1, 3, dtype=torch.float64),
+            "beta": torch.tensor(1.0, dtype=torch.float64),
+            "grid_spacing": torch.ones(3, dtype=torch.float64),
+        }
+        initial = torch.ones(2, 1, dtype=torch.float64)
+        for step_size in (5.0, 1000.0):
+            with self.subTest(step_size=step_size):
+                result = GridSolver(
+                    with_ideal(None, FixedDipoleIdeal(1.0))
+                ).solve(
+                    data,
+                    method="minimize",
+                    minimize=MinimizeOptions(
+                        lbfgs_history=5, step_size=step_size,
+                        max_log_density_change=0.1,
+                    ),
+                    constraints=Constraints(particle_numbers=[2.0]),
+                    initial=Initialization(
+                        rho=initial, polarization=torch.zeros(2, 1, 3),
+                    ),
+                    convergence=ConvergenceOptions(
+                        max_iter=1, tolerance_residual=1.0e-15,
+                    ),
+                )
+                # Canonical normalization adds a common log-density shift;
+                # for the symmetric trial it is below 0.006.
+                change = torch.log(result["rho"] / initial).abs().max()
+                self.assertLessEqual(float(change), 0.106)
+                self.assertTrue(torch.isfinite(result["rho"]).all())
+                self.assertTrue(torch.all(result["rho"] > 0.0))
 
     def test_lbfgs_minimizer_validation(self):
         with self.assertRaisesRegex(ValueError, "lbfgs_history"):
@@ -1561,13 +1599,15 @@ class TestGridSolverPolarization(unittest.TestCase):
                 constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="rho"),
                 initial=Initialization(rho=torch.full((24, 2), 0.5) * torch.tensor([3.0, 4.0]) / (0.125 * 12.0)),
             )
+        # A density-only model takes the option too: it selects the scalar
+        # projected L-BFGS driver (tests/solver/test_solver.py covers it).
         from equicdft import IdealGas
-        with self.assertRaisesRegex(ValueError, "FixedDipoleIdeal"):
-            GridSolver(with_ideal(None, IdealGas())).solve(
-                {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
-                 "grid_spacing": torch.ones(3)},
-                method="minimize", minimize=MinimizeOptions(lbfgs_history=5),
-            )
+        result = GridSolver(with_ideal(None, IdealGas())).solve(
+            {"V_ext": torch.zeros(4, 1), "mu": torch.zeros(1), "beta": torch.tensor(1.0),
+             "grid_spacing": torch.ones(3)},
+            method="minimize", minimize=MinimizeOptions(lbfgs_history=5),
+        )
+        self.assertEqual(result["solver_lbfgs_history"], 5)
 
     def test_conjugate_field_validation(self):
         with self.assertRaisesRegex(ValueError, "max_conjugate_field_change"):

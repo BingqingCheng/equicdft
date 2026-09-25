@@ -189,7 +189,7 @@ fallback, so it cannot make a step worse. `anderson_attempts`,
 fared; all-rejected means the history window is not informative and the
 acceleration is only costing evaluations.
 
-### Quasi-Newton minimization for fixed dipoles
+### Quasi-Newton minimization
 
 `MinimizeOptions(lbfgs_history=50)` replaces the mirror-descent update of a
 fixed-dipole minimization by projected L-BFGS in the same `(log rho, h)`
@@ -221,6 +221,24 @@ step; only a failure of that step ends the solve with
 `status="line_search_failed"`. The option requires the `"conjugate_field"`
 coordinate and no `fixed_field`; `lbfgs_pairs` reports the pairs in memory
 at the end.
+
+The same option selects projected L-BFGS in `log rho` for a density-only
+solve, canonical or grand canonical, with the same construction: the mirror
+step `g / (V rho)` as the initial inverse Hessian, energy-only trials, the
+density cap as the active set with the free-voxel chemical potential (or the
+KKT bracket when no voxel is free) deciding releases, and homogeneous axes
+handled by projecting the gradient. Convergence is judged by the same
+residual as the other scalar drivers, so the tolerances carry over unchanged.
+On the LJ regression frame (4096 voxels, one species, `maximum_density`
+inactive) it reaches a residual of `1e-4` in about 25 full evaluations where
+Anderson-accelerated Euler needs about 70 and mirror descent stalls in its
+line search near `1e-2`; with an active cap (about 200 voxels pinned) the
+count is 20. The quasi-Newton path is preferable whenever the excess
+functional is stiff relative to the ideal term, which is the usual case for
+a dense liquid; on a nearly ideal gas the plain mirror step converges in a
+few iterations and the curvature pairs only add bookkeeping. The result
+carries `solver_lbfgs_history`, `n_energy_evaluations` and `lbfgs_pairs` as
+for the fixed-dipole driver.
 
 ## Constraints
 

@@ -303,9 +303,11 @@ def minimize_fixed_dipoles_lbfgs(
             slope = float((g * direction).sum())
         d_l, d_h = unpack(direction)
         largest = float(d_l.abs().max()) if d_l.numel() else 0.0
-        if largest > max_log_change:
-            direction = direction * (max_log_change / largest)
-            slope *= max_log_change / largest
+        largest_trial_change = initial_step * largest
+        if largest_trial_change > max_log_change:
+            scale = max_log_change / largest_trial_change
+            direction = direction * scale
+            slope *= scale
 
         reference = max(recent[-window:])
         roundoff = 32.0 * torch.finfo(rho.dtype).eps * max(1.0, abs(objective))

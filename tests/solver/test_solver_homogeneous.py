@@ -87,6 +87,45 @@ class TestHomogeneousSolver(unittest.TestCase):
         self.assertTrue(torch.equal(grid, grid[:1, :1].expand_as(grid)))
         self.assertTrue(all(a >= b for a, b in zip(result["objective_history"], result["objective_history"][1:])))
 
+    def test_lbfgs_projects_gradient_and_keeps_cap_and_gauge(self):
+        from equicdft.solver import MinimizeOptions
+        d = self.data()
+        n = torch.tensor([1., 2., 3.])
+        p = _HomogeneousDensityProjection(d, (0, 1), ~d["excluded_mask"])
+        expected = torch.exp(-p.average(d["V_ext"]))
+        expected[d["excluded_mask"]] = 0
+        expected *= n/(expected.sum(0)*.125)
+        result = _run(
+            GridSolver(IdealGas()).solve,
+            d,
+            method="minimize",
+            minimize=MinimizeOptions(lbfgs_history=10),
+            convergence=ConvergenceOptions(tolerance_residual=1e-9, max_iter=200),
+            constraints=Constraints(particle_numbers=n, homogeneous_axes=(0, 1)),
+        )
+        torch.testing.assert_close(result["rho"], expected, atol=1e-9, rtol=0)
+        self.assertTrue(result["converged"])
+        self.assertEqual(result["solver_lbfgs_history"], 10)
+        grid = result["rho"].reshape(4, 4, 6, 3)
+        self.assertTrue(torch.equal(grid, grid[:1, :1].expand_as(grid)))
+        # With an active cap the solution is gauge invariant, as for mirror descent.
+        d1 = self.data(types=1)
+        d1["V_ext"] *= 10
+        kw = dict(method="minimize", minimize=MinimizeOptions(lbfgs_history=10),
+                  constraints=Constraints(particle_numbers=[2.], homogeneous_axes=(0, 1), maximum_density=.3),
+                  convergence=ConvergenceOptions(tolerance_residual=1e-8, max_iter=300))
+        s = GridSolver(IdealGas())
+        a = _run(s.solve, d1, **kw)
+        b = _run(s.solve, dict(d1, V_ext=d1["V_ext"]+7.), **kw)
+        self.assertTrue(a["converged"])
+        torch.testing.assert_close(a["rho"], b["rho"], atol=1e-8, rtol=0)
+        self.assertLessEqual(float(a["rho"].max()), .3+1e-12)
+        self.assertAlmostEqual(float(a["rho"].sum()*.125), 2.)
+        grid = a["rho"].reshape(4, 4, 6, 1)
+        # The rounding correction of the normalization lands on one voxel,
+        # so the capped solution is homogeneous to roundoff, as for mirror descent.
+        torch.testing.assert_close(grid, grid[:1, :1].expand_as(grid), atol=1e-12, rtol=0)
+
     def test_grand_canonical_and_permuted_rows(self):
         d = self.data(types=1)
         d["mu"] = torch.tensor([.3])

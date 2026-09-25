@@ -63,7 +63,7 @@ class _DensityReadout(LocalReadout):
 from tests.ideal_helpers import IdealOnly as _IdealGasModel
 
 
-class TestGridSolver(unittest.TestCase):
+class _SolverFixtures:
     def assert_objective_history_nonincreasing(self, history):
         """Check that every accepted minimization step lowers the objective."""
 
@@ -105,6 +105,8 @@ class TestGridSolver(unittest.TestCase):
             data["mu"] = mu
         return data
 
+
+class TestGridSolver(_SolverFixtures, unittest.TestCase):
     def test_constraint_projection_is_shared_by_solver_updates(self):
         rho = torch.tensor(
             [[4.0, 1.0], [9.0, 9.0], [1.0, 4.0]],
@@ -694,6 +696,212 @@ class TestGridSolver(unittest.TestCase):
         self.assertTrue(_residuals_converged(0.02, 0.005, 0.03, 0.01))
         self.assertFalse(_residuals_converged(0.04, 0.005, 0.03, 0.01))
         self.assertFalse(_residuals_converged(0.02, 0.02, 0.03, 0.01))
+
+
+class TestDensityLBFGS(_SolverFixtures, unittest.TestCase):
+    """Projected L-BFGS in ``log rho`` for density-only solves."""
+
+    def _lbfgs(self, history=10, **extra):
+        return MinimizeOptions(lbfgs_history=history, **extra)
+
+    def _both(self, data, **kwargs):
+        """Solve by mirror descent and by L-BFGS with the same settings."""
+
+        solver = GridSolver(self._make_model())
+        mirror = solver.solve(data, method="minimize", **kwargs)
+        lbfgs = solver.solve(
+            data, method="minimize", minimize=self._lbfgs(), **kwargs,
+        )
+        return mirror, lbfgs
+
+    def test_grand_canonical_lbfgs_matches_mirror_descent(self):
+        target_rho = torch.tensor(
+            [[0.2], [0.3], [0.4], [0.5]], dtype=torch.float64,
+        )
+        convergence = ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10)
+        mirror, lbfgs = self._both(self._make_data(target_rho), convergence=convergence)
+
+        self.assertTrue(lbfgs["converged"])
+        self.assertEqual(lbfgs["status"], "converged")
+        self.assertEqual(lbfgs["solver_method"], "minimize")
+        self.assertEqual(lbfgs["solver_lbfgs_history"], 10)
+        self.assertNotIn("solver_lbfgs_history", mirror)
+        self.assertTrue(torch.allclose(lbfgs["rho"], target_rho, atol=1.0e-9, rtol=0.0))
+        self.assertTrue(torch.allclose(lbfgs["rho"], mirror["rho"], atol=1.0e-8, rtol=0.0))
+        self.assertLess(lbfgs["max_density_residual"], 1.0e-10)
+        # Line-search trials are energy-only; every accepted point is
+        # differentiated once, so the two counters are reported separately.
+        self.assertGreaterEqual(lbfgs["n_energy_evaluations"], lbfgs["n_iter"])
+        self.assertEqual(lbfgs["n_evaluations"], lbfgs["n_iter"] + 1)
+        self.assertGreater(lbfgs["lbfgs_pairs"], 0)
+        self.assertEqual(lbfgs["line_search_failures"], 0)
+        self.assert_objective_history_nonincreasing(lbfgs["objective_history"])
+
+    def test_canonical_lbfgs_enforces_particle_number_and_cap(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"] = torch.tensor(
+            [[-10.0], [0.0], [0.5], [1.0]], dtype=torch.float64,
+        )
+        convergence = ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-10)
+        constraints = Constraints(particle_numbers=[2.0], maximum_density=0.6)
+        mirror, lbfgs = self._both(data, convergence=convergence, constraints=constraints)
+
+        self.assertTrue(lbfgs["converged"])
+        self.assertLessEqual(lbfgs["rho"].max().item(), 0.6 + 1.0e-12)
+        self.assertAlmostEqual(lbfgs["rho"].sum().item(), 2.0, places=12)
+        self.assertAlmostEqual(lbfgs["rho"][0, 0].item(), 0.6, places=10)
+        self.assertLess(lbfgs["max_density_residual"], 1.0e-10)
+        # Mirror descent stalls in its line search a few 1e-8 short of this
+        # tolerance on the capped problem; the two agree to that accuracy
+        # and L-BFGS reaches the lower objective.
+        self.assertTrue(torch.allclose(lbfgs["rho"], mirror["rho"], atol=1.0e-6, rtol=0.0))
+        self.assertLessEqual(lbfgs["objective_history"][-1], mirror["objective_history"][-1])
+        # The free voxels satisfy the Euler-Lagrange equation with one
+        # common multiplier; the capped voxel sits above it.
+        local = torch.log(lbfgs["rho"]) + 2.0 * lbfgs["rho"] + data["V_ext"]
+        self.assertLess(float((local[1:] - local[1:].mean()).abs().max()), 1.0e-9)
+        self.assertLess(float(local[0]), float(local[1:].mean()))
+        self.assert_objective_history_nonincreasing(lbfgs["objective_history"])
+
+    def test_canonical_lbfgs_is_gauge_invariant_with_active_cap(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"] = torch.tensor(
+            [[-10.0], [0.0], [0.5], [1.0]], dtype=torch.float64,
+        )
+        shifted = dict(data)
+        shifted["V_ext"] = data["V_ext"] + 7.0
+        kwargs = dict(
+            method="minimize",
+            minimize=self._lbfgs(),
+            convergence=ConvergenceOptions(max_iter=500, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[2.0], maximum_density=0.6),
+        )
+        solver = GridSolver(self._make_model())
+        a = solver.solve(data, **kwargs)
+        b = solver.solve(shifted, **kwargs)
+        self.assertTrue(a["converged"] and b["converged"])
+        self.assertTrue(torch.allclose(a["rho"], b["rho"], atol=1.0e-9, rtol=0.0))
+        self.assertEqual(a["n_iter"], b["n_iter"])
+
+    def test_grand_canonical_cap_releases_and_pins_voxels(self):
+        # Ideal gas with mu above the cap on two voxels: those rest on the
+        # cap, the others are Boltzmann. The start has every voxel on the
+        # cap so that the active set has to release the two free ones.
+        data = self._make_data()
+        data["V_ext"] = torch.tensor(
+            [[-3.0], [-2.0], [0.5], [1.5]], dtype=torch.float64,
+        )
+        data["mu"] = torch.tensor([0.0], dtype=torch.float64)
+        result = GridSolver(_IdealGasModel()).solve(
+            data,
+            method="minimize",
+            minimize=self._lbfgs(),
+            convergence=ConvergenceOptions(max_iter=100, tolerance_residual=1.0e-10),
+            constraints=Constraints(maximum_density=2.0),
+            initial=Initialization(rho=torch.full((4, 1), 2.0, dtype=torch.float64)),
+        )
+        expected = torch.minimum(torch.exp(-data["V_ext"]), torch.tensor(2.0, dtype=torch.float64))
+        self.assertTrue(result["converged"])
+        self.assertTrue(torch.allclose(result["rho"], expected, atol=1.0e-10, rtol=0.0))
+
+    def test_hard_wall_lbfgs_keeps_excluded_voxels_empty(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"].zero_()
+        data["excluded_mask"] = torch.tensor([True, False, False, True])
+        result = GridSolver(self._make_model()).solve(
+            data,
+            method="minimize",
+            minimize=self._lbfgs(),
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[1.0]),
+            initial=Initialization(rho=torch.ones_like(data["V_ext"])),
+        )
+        expected = torch.tensor([[0.0], [0.5], [0.5], [0.0]], dtype=torch.float64)
+        self.assertTrue(result["converged"])
+        self.assertTrue(torch.allclose(result["rho"], expected, atol=1.0e-10, rtol=0.0))
+        self.assertTrue(torch.all(result["density_residual"][data["excluded_mask"]] == 0.0))
+
+    def test_lbfgs_recovers_from_concentrated_initial_density(self):
+        data = self._make_data(include_mu=False)
+        data["V_ext"].zero_()
+        concentrated = torch.tensor(
+            [[1.99], [0.005], [0.003], [0.002]], dtype=torch.float64,
+        )
+        result = GridSolver(self._make_model()).solve(
+            data,
+            method="minimize",
+            minimize=self._lbfgs(),
+            convergence=ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10),
+            constraints=Constraints(particle_numbers=[2.0]),
+            initial=Initialization(rho=concentrated),
+        )
+        self.assertTrue(result["converged"])
+        self.assertTrue(torch.allclose(result["rho"], torch.full((4, 1), 0.5, dtype=torch.float64), atol=1.0e-10, rtol=0.0))
+
+    def test_lbfgs_step_size_and_pairs_are_honoured(self):
+        data = self._make_data()
+        convergence = ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10)
+        solver = GridSolver(self._make_model())
+        # A single pair is stored when history is one.
+        one = solver.solve(
+            data, method="minimize", minimize=self._lbfgs(history=1), convergence=convergence,
+        )
+        self.assertTrue(one["converged"])
+        self.assertLessEqual(one["lbfgs_pairs"], 1)
+        # A tiny step_size scales the direction, so the first iteration
+        # barely moves and convergence needs more iterations.
+        small = solver.solve(
+            data, method="minimize",
+            minimize=self._lbfgs(step_size=1.0e-3), convergence=convergence,
+        )
+        default = solver.solve(
+            data, method="minimize", minimize=self._lbfgs(), convergence=convergence,
+        )
+        self.assertGreater(
+            abs(small["objective_history"][1] - small["objective_history"][0]),
+            0.0,
+        )
+        self.assertLess(
+            abs(small["objective_history"][1] - small["objective_history"][0]),
+            abs(default["objective_history"][1] - default["objective_history"][0]),
+        )
+
+    def test_lbfgs_step_size_cannot_bypass_log_density_change_limit(self):
+        data = {
+            "V_ext": torch.tensor([[10.0], [-10.0]], dtype=torch.float64),
+            "mu": torch.tensor([0.0], dtype=torch.float64),
+            "beta": torch.tensor(1.0, dtype=torch.float64),
+            "grid_spacing": torch.ones(3, dtype=torch.float64),
+        }
+        initial = torch.ones(2, 1, dtype=torch.float64)
+        for step_size in (5.0, 1000.0):
+            with self.subTest(step_size=step_size):
+                result = GridSolver(_IdealGasModel()).solve(
+                    data,
+                    method="minimize",
+                    minimize=self._lbfgs(
+                        step_size=step_size, max_log_density_change=0.1,
+                    ),
+                    initial=Initialization(rho=initial),
+                    convergence=ConvergenceOptions(
+                        max_iter=1, tolerance_residual=1.0e-15,
+                    ),
+                )
+                change = torch.log(result["rho"] / initial).abs().max()
+                self.assertLessEqual(float(change), 0.1 + 1.0e-12)
+                self.assertTrue(torch.isfinite(result["rho"]).all())
+                self.assertTrue(torch.all(result["rho"] > 0.0))
+
+    def test_lbfgs_max_iter_status(self):
+        result = GridSolver(self._make_model()).solve(
+            self._make_data(),
+            method="minimize",
+            minimize=self._lbfgs(),
+            convergence=ConvergenceOptions(max_iter=1, tolerance_residual=1.0e-12),
+        )
+        self.assertEqual(result["status"], "max_iter")
+        self.assertEqual(result["n_iter"], 1)
+        self.assertFalse(result["converged"])
 
 
 if __name__ == "__main__":

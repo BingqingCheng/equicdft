@@ -22,6 +22,7 @@ from .evaluation import evaluate, _set_density_residuals
 from .reporting import finalize_result
 from .euler import solve_euler
 from .minimize import minimize_density
+from .quasinewton_density import minimize_density_lbfgs
 from .options import (
     Constraints,
     ConvergenceOptions,
@@ -366,9 +367,11 @@ class GridSolver:
     field while retaining the canonical log-density step, or
     ``MinimizeOptions(lbfgs_history=...)`` for projected L-BFGS in the
     conjugate-field coordinates with the mirror step as its initial inverse
-    Hessian, energy-only trials and the bounds as an active set. When ``method`` is
-    omitted, scalar solving defaults to Euler and fixed-dipole solving to
-    minimization.
+    Hessian, energy-only trials and the bounds as an active set. The same
+    option selects projected L-BFGS in ``log rho`` for a density-only solve,
+    canonical or grand canonical, with the density cap as its active set.
+    When ``method`` is omitted, scalar solving defaults to Euler and
+    fixed-dipole solving to minimization.
 
     For fixed-dipole minimization, ``fixed_field="dipole_density"`` holds
     the supplied initial polarization fixed and minimizes only over
@@ -463,10 +466,6 @@ class GridSolver:
                 "fixed-dipole coordinate options are available only with "
                 "model.ideal=FixedDipoleIdeal(...)"
             )
-        if minimize.lbfgs_history > 0:
-            raise ValueError(
-                "lbfgs_history is available only with model.ideal=FixedDipoleIdeal(...)"
-            )
         _reject_fixed_dipole_only_options(constraints, initial)
 
         problem = _prepare_scalar_problem(
@@ -490,7 +489,13 @@ class GridSolver:
         was_training = self.model.training
         self.model.eval()
         try:
-            if method == "minimize":
+            if method == "minimize" and minimize.lbfgs_history > 0:
+                state = minimize_density_lbfgs(
+                    self, data, rho, V_ext, thermal_wavelength, mu, fixed_N,
+                    volume_element, density_cap, accessible_mask, projection,
+                    convergence, minimize,
+                )
+            elif method == "minimize":
                 state = minimize_density(
                     self, data, rho, V_ext, thermal_wavelength, mu, fixed_N,
                     volume_element, density_cap, accessible_mask, projection,
@@ -540,6 +545,8 @@ class GridSolver:
         # these names; for a density-only solve they are the density ones.
         result["maximum_residual"] = max_residual
         result["rms_residual"] = rms_residual
+        if method == "minimize" and minimize.lbfgs_history > 0:
+            result["solver_lbfgs_history"] = minimize.lbfgs_history
         return finalize_result(
             result, state, method=method, beta_multiplier=beta_multiplier,
             converged=converged,
