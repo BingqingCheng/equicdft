@@ -434,6 +434,11 @@ def solve_fixed_dipoles(solver, data, method, options):
         if method == "minimize" and minimize.lbfgs_history > 0:
             if fixed_field is not None:
                 raise ValueError("lbfgs_history is not supported with fixed_field")
+            if minimize.lbfgs_curvature_density_threshold is not None:
+                raise ValueError(
+                    "lbfgs_curvature_density_threshold is currently supported "
+                    "only for density-only solves"
+                )
             state = minimize_fixed_dipoles_lbfgs(
                 solver, data, result, numbers, moment, volume, accessible,
                 density_cap, polarization_fraction_cap, minimum_density,

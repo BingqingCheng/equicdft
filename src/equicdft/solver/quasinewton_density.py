@@ -50,6 +50,66 @@ def _log_floor(dtype, device):
     return torch.tensor(math.log(torch.finfo(dtype).tiny), dtype=dtype, device=device)
 
 
+def _curvature_active(density, threshold):
+    """Coordinates on which stored quasi-Newton curvature may act."""
+
+    if threshold is None:
+        return torch.ones_like(density, dtype=torch.bool)
+    return density > threshold
+
+
+def _dilute_safe_direction(quasi_newton, mirror, density, threshold):
+    """Keep the local mirror direction outside the curvature-active set."""
+
+    if threshold is None:
+        return quasi_newton
+    return torch.where(_curvature_active(density, threshold), quasi_newton, mirror)
+
+
+def _limit_dilute_safe_direction(
+    direction, curvature_active, step_size, max_log_change,
+):
+    """Limit populated and dilute log-density updates independently.
+
+    The populated quasi-Newton block retains its usual single global scale.
+    Dilute mirror-descent coordinates are clipped locally, so a large soft-wall
+    residual cannot reduce the quasi-Newton step everywhere else.
+    """
+
+    maximum_direction = max_log_change / step_size
+    populated = torch.where(
+        curvature_active, direction, torch.zeros_like(direction),
+    )
+    dilute = torch.where(
+        curvature_active, torch.zeros_like(direction), direction,
+    )
+    largest_populated = (
+        float(populated.abs().max()) if populated.numel() else 0.0
+    )
+    if largest_populated > maximum_direction:
+        populated = populated * (maximum_direction / largest_populated)
+    dilute = torch.clamp(dilute, -maximum_direction, maximum_direction)
+    return populated + dilute
+
+
+def _active_curvature_pairs(pairs_s, pairs_y, active, project=None):
+    """Return positive-curvature pairs restricted to current active entries."""
+
+    if project is None:
+        def project(values):
+            return values
+    mask = active.to(pairs_s[0].dtype) if pairs_s else None
+    pairs = []
+    for stored_s, stored_y in zip(pairs_s, pairs_y):
+        current_s = project(stored_s * mask)
+        current_y = project(stored_y * mask)
+        curvature = float((current_s * current_y).sum())
+        norm_product = float(current_s.norm()) * float(current_y.norm())
+        if curvature > 1.0e-12 * norm_product:
+            pairs.append((current_s, current_y))
+    return pairs
+
+
 def minimize_density_lbfgs(
     solver,
     data: Dict[str, Any],
@@ -78,6 +138,11 @@ def minimize_density_lbfgs(
     tolerance_rms_residual = convergence.tolerance_rms_residual
     residual_density_threshold = convergence.residual_density_threshold or 0.0
     history_size = options.lbfgs_history
+    curvature_density_threshold = options.lbfgs_curvature_density_threshold
+    use_dilute_safeguard = (
+        curvature_density_threshold is not None
+        and curvature_density_threshold > 0.0
+    )
     window = options.nonmonotone_window
     armijo = options.armijo_factor
     shrink = options.line_search_factor
@@ -222,33 +287,91 @@ def minimize_density_lbfgs(
             status = "stalled"
             break
 
+        # A pair stored at a populated point may later overlap a coordinate
+        # that has drained into the dilute region. Re-mask every historical
+        # pair at the current point so stale curvature cannot repopulate it.
+        # The default path deliberately uses the stored tensors and persistent
+        # scale exactly as before.
+        if not use_dilute_safeguard:
+            current_pairs = list(zip(pairs_s, pairs_y))
+            current_gamma = gamma
+        else:
+            current_active = (
+                free
+                & _curvature_active(
+                    density[accessible], curvature_density_threshold,
+                )
+            )
+            current_pairs = _active_curvature_pairs(
+                pairs_s, pairs_y, current_active, project_accessible,
+            )
+            current_gamma = 1.0
+            if current_pairs:
+                active_s, active_y = current_pairs[-1]
+                curvature = float((active_s * active_y).sum())
+                denominator = float(
+                    (active_y * initial_inverse(density, active_y)).sum()
+                )
+                if denominator > 0.0:
+                    current_gamma = min(
+                        max(curvature / denominator, 1.0e-3), 1.0e3,
+                    )
+
         # Two-loop recursion with the mirror step (scaled by gamma) as H0.
         q = g.clone()
         alphas = []
-        for s, y in zip(reversed(pairs_s), reversed(pairs_y)):
+        for s, y in reversed(current_pairs):
             rho_i = 1.0 / float((y * s).sum())
             alpha_i = rho_i * float((s * q).sum())
             q = q - alpha_i * y
             alphas.append((alpha_i, rho_i))
-        r = gamma * initial_inverse(density, q)
-        for (s, y), (alpha_i, rho_i) in zip(zip(pairs_s, pairs_y), reversed(alphas)):
+        r = current_gamma * initial_inverse(density, q)
+        for (s, y), (alpha_i, rho_i) in zip(current_pairs, reversed(alphas)):
             beta_i = rho_i * float((y * r).sum())
             r = r + (alpha_i - beta_i) * s
+        mirror_direction = torch.where(
+            free, -initial_inverse(density, g), torch.zeros_like(g),
+        )
         direction = torch.where(free, -r, torch.zeros_like(r))
+        direction = _dilute_safe_direction(
+            direction, mirror_direction, density[accessible],
+            curvature_density_threshold if use_dilute_safeguard else None,
+        )
         direction = project_accessible(direction)
         slope = float((g * direction).sum())
         if slope >= 0.0:
             pairs_s, pairs_y = [], []
             gamma = 1.0
-            direction = torch.where(free, -initial_inverse(density, g), torch.zeros_like(g))
+            current_pairs = []
+            direction = mirror_direction
             direction = project_accessible(direction)
             slope = float((g * direction).sum())
-        largest = float(direction.abs().max()) if direction.numel() else 0.0
-        largest_trial_change = initial_step * largest
-        if largest_trial_change > max_log_change:
-            scale = max_log_change / largest_trial_change
-            direction = direction * scale
-            slope *= scale
+        if not use_dilute_safeguard:
+            largest = float(direction.abs().max()) if direction.numel() else 0.0
+            largest_trial_change = initial_step * largest
+            if largest_trial_change > max_log_change:
+                scale = max_log_change / largest_trial_change
+                direction = direction * scale
+                slope *= scale
+        else:
+            current_active = free & _curvature_active(
+                density[accessible], curvature_density_threshold,
+            )
+            direction = _limit_dilute_safe_direction(
+                direction, current_active, initial_step, max_log_change,
+            )
+            direction = project_accessible(direction)
+            slope = float((g * direction).sum())
+            if slope >= 0.0:
+                pairs_s, pairs_y = [], []
+                gamma = 1.0
+                current_pairs = []
+                direction = project_accessible(mirror_direction)
+                direction = _limit_dilute_safe_direction(
+                    direction, current_active, initial_step, max_log_change,
+                )
+                direction = project_accessible(direction)
+                slope = float((g * direction).sum())
 
         reference = max(recent[-window:])
         roundoff = 32.0 * torch.finfo(rho.dtype).eps * max(1.0, abs(objective))
@@ -258,7 +381,10 @@ def minimize_density_lbfgs(
         # means the model is wrong, not that the scale is; the search gives
         # up early and the memory is rebuilt. The plain mirror step may
         # shrink all the way to minimum_step_size.
-        shortest = max(minimum_step, 1.0e-4 * initial_step) if pairs_s else minimum_step
+        shortest = (
+            max(minimum_step, 1.0e-4 * initial_step)
+            if current_pairs else minimum_step
+        )
         while step >= shortest:
             trial_density, trial_log = fields_from(log_density + step * direction)
             try:
@@ -273,7 +399,7 @@ def minimize_density_lbfgs(
                 break
             step *= shrink
         if accepted is None:
-            if pairs_s:
+            if current_pairs:
                 # The curvature model misled the search: forget it and let
                 # the next iteration try the plain mirror step.
                 pairs_s, pairs_y = [], []
@@ -288,7 +414,14 @@ def minimize_density_lbfgs(
         evaluation = evaluate_at(trial_density, True)
         n_evaluations += 1
         new_g, new_free, trial_log = gradient(evaluation, trial_density, trial_log)
-        mask = (free & new_free).to(g.dtype)
+        pair_active = free & new_free
+        if use_dilute_safeguard:
+            pair_active = (
+                pair_active
+                & _curvature_active(density[accessible], curvature_density_threshold)
+                & _curvature_active(trial_density[accessible], curvature_density_threshold)
+            )
+        mask = pair_active.to(g.dtype)
         s = project_accessible((trial_log - log_density) * mask)
         y = project_accessible((new_g - g) * mask)
         curvature = float((s * y).sum())

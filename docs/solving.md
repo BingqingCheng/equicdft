@@ -229,6 +229,16 @@ density cap as the active set with the free-voxel chemical potential (or the
 KKT bracket when no voxel is free) deciding releases, and homogeneous axes
 handled by projecting the gradient. Convergence is judged by the same
 residual as the other scalar drivers, so the tolerances carry over unchanged.
+For a soft wall or another problem spanning many orders of magnitude in
+density, `lbfgs_curvature_density_threshold` can restrict the quasi-Newton
+curvature correction to populated density components. The threshold uses the
+same component-density units as `rho`. Components at or below it still move
+and retain the local mirror-descent direction; they are not frozen or floored.
+They neither contribute to nor receive the quasi-Newton curvature correction,
+although canonical normalization still couples all coordinates. The default
+`None` (and the no-op value zero) keeps the original all-density L-BFGS
+behavior. This option is separate from `residual_density_threshold`, which
+affects diagnostics rather than steps.
 On the LJ regression frame (4096 voxels, one species, `maximum_density`
 inactive) it reaches a residual of `1e-4` in about 25 full evaluations where
 Anderson-accelerated Euler needs about 70 and mirror descent stalls in its

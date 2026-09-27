@@ -1599,6 +1599,20 @@ class TestGridSolverPolarization(unittest.TestCase):
                 constraints=Constraints(particle_numbers=[3.0, 4.0], fixed_field="rho"),
                 initial=Initialization(rho=torch.full((24, 2), 0.5) * torch.tensor([3.0, 4.0]) / (0.125 * 12.0)),
             )
+        with self.assertRaisesRegex(ValueError, "density-only"):
+            solver.solve(
+                data,
+                method="minimize",
+                minimize=MinimizeOptions(
+                    lbfgs_history=5,
+                    lbfgs_curvature_density_threshold=0.01,
+                ),
+                constraints=Constraints(particle_numbers=[3.0, 4.0]),
+                initial=Initialization(
+                    rho=torch.full((24, 2), 0.5)
+                    * torch.tensor([3.0, 4.0]) / (0.125 * 12.0)
+                ),
+            )
         # A density-only model takes the option too: it selects the scalar
         # projected L-BFGS driver (tests/solver/test_solver.py covers it).
         from equicdft import IdealGas

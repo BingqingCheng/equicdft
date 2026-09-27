@@ -547,6 +547,10 @@ class GridSolver:
         result["rms_residual"] = rms_residual
         if method == "minimize" and minimize.lbfgs_history > 0:
             result["solver_lbfgs_history"] = minimize.lbfgs_history
+            if minimize.lbfgs_curvature_density_threshold is not None:
+                result["solver_lbfgs_curvature_density_threshold"] = (
+                    minimize.lbfgs_curvature_density_threshold
+                )
         return finalize_result(
             result, state, method=method, beta_multiplier=beta_multiplier,
             converged=converged,

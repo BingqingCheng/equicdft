@@ -188,9 +188,14 @@ class MinimizeOptions:
     initial inverse Hessian, energy-only line-search trials and the bounds
     handled as an active set: in ``(log rho, h)`` for fixed dipoles
     (``"conjugate_field"`` coordinate, no ``fixed_field``) and in ``log rho``
-    for a density-only solve, canonical or grand canonical. ``nonmonotone_window`` is the number of recent
-    objectives whose maximum the Armijo test is taken against; one is the
-    strict monotone test.
+    for a density-only solve, canonical or grand canonical.
+    ``lbfgs_curvature_density_threshold`` keeps the plain mirror direction
+    on density components at or below that value and excludes them from the
+    curvature pairs; ``None`` applies L-BFGS everywhere and preserves the
+    original behavior. It is currently available only for density-only
+    solves. ``nonmonotone_window`` is the number of recent objectives whose
+    maximum the Armijo test is taken against; one is the strict monotone
+    test.
     """
 
     step_size: float = 1.0
@@ -201,6 +206,7 @@ class MinimizeOptions:
     fixed_dipole_coordinate: str = "conjugate_field"
     lbfgs_history: int = 0
     nonmonotone_window: int = 1
+    lbfgs_curvature_density_threshold: Optional[float] = None
 
     def __post_init__(self) -> None:
         _set(self, "step_size", positive_scalar(self.step_size, "step_size"))
@@ -225,10 +231,22 @@ class MinimizeOptions:
                 "'alignment'"
             )
         _set(self, "lbfgs_history", nonnegative_integer(self.lbfgs_history, "lbfgs_history"))
+        if self.lbfgs_curvature_density_threshold is not None:
+            _set(
+                self, "lbfgs_curvature_density_threshold",
+                nonnegative_scalar(
+                    self.lbfgs_curvature_density_threshold,
+                    "lbfgs_curvature_density_threshold",
+                ),
+            )
         _set(self, "nonmonotone_window", positive_integer(self.nonmonotone_window, "nonmonotone_window"))
         if self.lbfgs_history > 0 and self.fixed_dipole_coordinate != "conjugate_field":
             raise ValueError(
                 "lbfgs_history requires fixed_dipole_coordinate='conjugate_field'"
+            )
+        if self.lbfgs_curvature_density_threshold is not None and self.lbfgs_history == 0:
+            raise ValueError(
+                "lbfgs_curvature_density_threshold requires lbfgs_history > 0"
             )
         if self.minimum_step_size > self.step_size:
             raise ValueError("minimum_step_size must be no larger than step_size")

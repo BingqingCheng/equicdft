@@ -21,6 +21,12 @@ from equicdft.solver.numerics import (
     _project_density_constraints,
     _residuals_converged,
 )
+from equicdft.solver.quasinewton_density import (
+    _active_curvature_pairs,
+    _curvature_active,
+    _dilute_safe_direction,
+    _limit_dilute_safe_direction,
+)
 
 
 class _DensityFeatures(nn.Module):
@@ -713,6 +719,179 @@ class TestDensityLBFGS(_SolverFixtures, unittest.TestCase):
             data, method="minimize", minimize=self._lbfgs(), **kwargs,
         )
         return mirror, lbfgs
+
+    def test_dilute_safeguard_keeps_the_mirror_direction(self):
+        density = torch.tensor([[0.001], [0.01], [0.2]], dtype=torch.float64)
+        quasi_newton = torch.tensor([[7.0], [8.0], [9.0]], dtype=torch.float64)
+        mirror = torch.tensor([[-1.0], [-2.0], [-3.0]], dtype=torch.float64)
+
+        active = _curvature_active(density, 0.01)
+        direction = _dilute_safe_direction(
+            quasi_newton, mirror, density, 0.01,
+        )
+
+        self.assertTrue(torch.equal(active[:, 0], torch.tensor([False, False, True])))
+        self.assertTrue(
+            torch.equal(direction, torch.tensor([[-1.0], [-2.0], [9.0]], dtype=torch.float64))
+        )
+        self.assertIs(
+            _dilute_safe_direction(quasi_newton, mirror, density, None),
+            quasi_newton,
+        )
+
+    def test_dilute_safeguard_masks_history_and_limits_locally(self):
+        active = torch.tensor([[True], [False]])
+        pairs = _active_curvature_pairs(
+            [torch.tensor([[1.0], [1.0e6]], dtype=torch.float64)],
+            [torch.tensor([[2.0], [3.0e6]], dtype=torch.float64)],
+            active,
+        )
+        self.assertEqual(len(pairs), 1)
+        self.assertTrue(
+            torch.equal(
+                pairs[0][0],
+                torch.tensor([[1.0], [0.0]], dtype=torch.float64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                pairs[0][1],
+                torch.tensor([[2.0], [0.0]], dtype=torch.float64),
+            )
+        )
+
+        limited = _limit_dilute_safe_direction(
+            torch.tensor([[1.0], [100.0]], dtype=torch.float64),
+            active,
+            step_size=1.0,
+            max_log_change=2.0,
+        )
+        self.assertTrue(
+            torch.equal(
+                limited,
+                torch.tensor([[1.0], [2.0]], dtype=torch.float64),
+            )
+        )
+
+    def test_dilute_safeguard_is_opt_in_and_reported(self):
+        old_positional = MinimizeOptions(
+            1.0, 0.1, 0.5, 1.0e-4, 2.0, "conjugate_field", 5, 3,
+        )
+        self.assertEqual(old_positional.nonmonotone_window, 3)
+        self.assertIsNone(old_positional.lbfgs_curvature_density_threshold)
+        with self.assertRaisesRegex(ValueError, "lbfgs_history"):
+            MinimizeOptions(lbfgs_curvature_density_threshold=0.01)
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            MinimizeOptions(
+                lbfgs_history=5, lbfgs_curvature_density_threshold=-0.01,
+            )
+
+        data = self._make_data()
+        convergence = ConvergenceOptions(max_iter=200, tolerance_residual=1.0e-10)
+        solver = GridSolver(self._make_model())
+        original = solver.solve(
+            data, method="minimize", minimize=self._lbfgs(),
+            convergence=convergence,
+        )
+        zero = solver.solve(
+            data, method="minimize",
+            minimize=self._lbfgs(lbfgs_curvature_density_threshold=0.0),
+            convergence=convergence,
+        )
+
+        self.assertNotIn("solver_lbfgs_curvature_density_threshold", original)
+        self.assertEqual(zero["solver_lbfgs_curvature_density_threshold"], 0.0)
+        self.assertTrue(torch.equal(zero["rho"], original["rho"]))
+        self.assertEqual(zero["objective_history"], original["objective_history"])
+
+    def test_dilute_safeguard_drains_ideal_soft_wall_without_a_floor(self):
+        V_ext = torch.tensor(
+            [[100.0], [0.0], [0.2], [-0.1], [0.1], [100.0]],
+            dtype=torch.float64,
+        )
+        data = {
+            "V_ext": V_ext,
+            "beta": torch.tensor(1.0, dtype=torch.float64),
+            "grid_spacing": torch.ones(3, dtype=torch.float64),
+        }
+        result = GridSolver(_IdealGasModel()).solve(
+            data,
+            method="minimize",
+            minimize=self._lbfgs(
+                lbfgs_curvature_density_threshold=0.01,
+            ),
+            convergence=ConvergenceOptions(
+                max_iter=300, tolerance_residual=1.0e-10,
+            ),
+            constraints=Constraints(particle_numbers=[1.0]),
+            initial=Initialization(
+                rho=torch.full((6, 1), 1.0 / 6.0, dtype=torch.float64),
+            ),
+        )
+        expected = torch.exp(-V_ext)
+        expected = expected / expected.sum()
+
+        self.assertTrue(result["converged"])
+        self.assertTrue(
+            torch.allclose(result["rho"], expected, atol=1.0e-10, rtol=0.0)
+        )
+        self.assertAlmostEqual(float(result["rho"].sum()), 1.0, places=12)
+        self.assertTrue(torch.all(result["rho"] > 0.0))
+        self.assertLess(float(result["rho"][[0, 5]].max()), 1.0e-30)
+        self.assert_objective_history_nonincreasing(result["objective_history"])
+
+    def test_dilute_safeguard_handles_a_coupled_soft_wall(self):
+        data = GridData.from_dict(
+            {
+                "grid_size": [6, 1, 1],
+                "n_types": 1,
+                "grid_spacing": 1.0,
+                "temperature": 1.0,
+            },
+            cutoff_grid=0,
+            boltzmann_constant=1.0,
+        )
+        data["V_ext"] = torch.tensor(
+            [[100.0], [0.0], [0.2], [-0.1], [0.1], [100.0]],
+            dtype=torch.float64,
+        )
+        settings = dict(
+            convergence=ConvergenceOptions(
+                max_iter=300,
+                tolerance_residual=1.0e-8,
+                residual_density_threshold=0.01,
+            ),
+            constraints=Constraints(particle_numbers=[1.0]),
+            initial=Initialization(
+                rho=torch.full((6, 1), 1.0 / 6.0, dtype=torch.float64),
+            ),
+        )
+        solver = GridSolver(self._make_model())
+        mirror = solver.solve(data, method="minimize", **settings)
+        safeguarded = solver.solve(
+            data,
+            method="minimize",
+            minimize=self._lbfgs(
+                lbfgs_curvature_density_threshold=0.01,
+            ),
+            **settings,
+        )
+
+        self.assertTrue(mirror["converged"] and safeguarded["converged"])
+        self.assertTrue(
+            torch.allclose(
+                safeguarded["rho"], mirror["rho"], atol=1.0e-8, rtol=0.0,
+            )
+        )
+        self.assertAlmostEqual(
+            float(safeguarded["rho"].sum()), 1.0, places=12,
+        )
+        self.assertTrue(torch.all(safeguarded["rho"] > 0.0))
+        self.assertLess(float(safeguarded["rho"][[0, 5]].max()), 0.01)
+        self.assertGreater(safeguarded["lbfgs_pairs"], 0)
+        self.assert_objective_history_nonincreasing(
+            safeguarded["objective_history"],
+        )
 
     def test_grand_canonical_lbfgs_matches_mirror_descent(self):
         target_rho = torch.tensor(
