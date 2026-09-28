@@ -928,6 +928,53 @@ spatial-constancy objective above, not a new custom loss. Solver chemical
 potentials use their own physical constraints and are independent of this
 fitting mask.
 
+### Smoothing the polarization residual
+
+The sampled polarization of a reference trajectory carries per-voxel noise
+whose contribution to $\mathcal{L}_P$ is flat in wavevector, whereas the
+signal of a smooth external field lives at low $k$. A fixed Gaussian in the
+long-range Coulomb kernel used to hide that noise as a side effect; with an
+unsmeared kernel the same suppression belongs in the objective. Passing
+`residual_smoothing=sigma` (a standard deviation in the length units of
+`grid_spacing`) smooths the masked residual on the periodic grid before it is
+squared:
+
+```python
+TensorLoss(
+    "polarization", "polarization_derivative", "beta_E_target",
+    residual_scale=moment, weights_key="voxel_weights",
+    residual_smoothing=2.0, weight=polarization_weight,
+)
+```
+
+With $G_\sigma$ the periodic convolution whose transfer function is
+$e^{-\sigma^2 k^2/2}$, $M(\mathbf r)\in\{0,1\}$ the hard voxel mask, and
+
+$$
+r_a(\mathbf r)=M(\mathbf r)\,m
+\left[D_{P,a}(\mathbf r)-\beta E_{\mathrm{ext},a}(\mathbf r)\right],
+$$
+
+$$
+\mathcal{L}_P=\lambda_P
+\frac{\sum_{a=1}^3\sum_{\mathbf r}M(\mathbf r)
+\,[G_\sigma r_a](\mathbf r)^2}
+{3\sum_{\mathbf r}M(\mathbf r)}.
+$$
+
+Voxels outside the mask do not supply residual values to the convolution.
+The periodic convolution itself produces values at every voxel, but values
+outside the mask are excluded from the final loss reduction. Selected
+residuals can therefore influence other selected voxels through the Gaussian
+convolution. The smoothing is a property of the objective: the functional,
+its Coulomb kernel and every metric are unchanged, while validation evaluates
+the same smoothed objective, so checkpoint selection follows it.
+`residual_smoothing=0` or `None` reproduces the unsmoothed loss exactly. The
+batch must carry `grid_size` and `grid_spacing`, which the data loaders always
+provide. When `weights_key` is used, its values must be a hard zero/one mask;
+continuous statistical weights are intentionally rejected because their
+placement relative to a nonlocal filter requires a separate definition.
+
 ### Excess-only evaluation and old models
 
 Use `model(data, compute_ideal=False, compute_local_mu=False)` when only the excess functional is

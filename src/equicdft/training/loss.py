@@ -1,11 +1,13 @@
 """Composable objectives for training grid density-functional models."""
 
+import math
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
-from .._validation import nonempty_string
+from .._validation import nonempty_string, nonnegative_scalar
+from ..geometry.grid import common_grid_size, grid_spacing_tensor
 from ..objectives import LossTerm
 from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
 
@@ -33,6 +35,20 @@ class TensorLoss(LossTerm):
     fields). ``target_scale`` multiplies the target before projection;
     ``residual_scale`` multiplies both tensors before the criterion, hence
     enters squared in MSE. ``weight`` multiplies the reduced loss afterward.
+
+    ``residual_smoothing`` convolves both scaled tensors with a periodic
+    Gaussian of that standard deviation (in the length units of the batch
+    ``grid_spacing``) on the regular grid before the criterion, so the
+    criterion compares smoothed fields; for the default mean-squared error
+    that is the squared smoothed residual, ``exp(-sigma^2 k^2 / 2)`` times the
+    residual in reciprocal space. It requires ``grid_size`` and
+    ``grid_spacing`` in the batch and fields shaped ``[n_fields, n_grid, ...]``
+    in canonical grid order. With ``weights_key``, smoothing requires hard
+    zero/one weights. Unselected residual sources are zeroed before the
+    convolution and filtered values outside the selection are omitted from
+    the mean. Centering precedes smoothing. ``None`` or ``0`` leaves the
+    criterion unsmoothed. The smoothing belongs to the objective only: no
+    metric, model output or functional term is affected.
     """
 
     def __init__(
@@ -46,6 +62,7 @@ class TensorLoss(LossTerm):
         center_axis: Optional[int] = None,
         residual_scale=1.0,
         target_scale=1.0,
+        residual_smoothing: Optional[float] = None,
         weight: float = 1.0,
     ) -> None:
         super().__init__(name, weight)
@@ -57,6 +74,15 @@ class TensorLoss(LossTerm):
         self.center_axis = center_axis
         if center_axis is not None and (isinstance(center_axis, bool) or not isinstance(center_axis, int)):
             raise TypeError("center_axis must be an integer axis or None")
+        if residual_smoothing is not None:
+            residual_smoothing = nonnegative_scalar(
+                residual_smoothing, "residual_smoothing",
+            )
+            if residual_smoothing == 0.0:
+                residual_smoothing = None
+        self.residual_smoothing = residual_smoothing
+        # Derived runtime data only: transfers are absent from state_dict.
+        self._smoothing_transfer_cache = {}
         for name, value in (("residual_scale", residual_scale), ("target_scale", target_scale)):
             tensor = torch.as_tensor(value)
             if tensor.is_complex() or not torch.isfinite(tensor).all():
@@ -104,7 +130,8 @@ class TensorLoss(LossTerm):
             outputs=outputs,
             batch=batch,
         )
-        if (self.center_axis is None and torch.all(self.target_scale == 1)
+        if (self.center_axis is None and self.residual_smoothing is None
+                and torch.all(self.target_scale == 1)
                 and torch.all(self.residual_scale == 1)):
             value = self.loss_fn(prediction, target)
         else:
@@ -113,15 +140,71 @@ class TensorLoss(LossTerm):
 
     def _transformed_loss(self, prediction, target, outputs, batch):
         target = target * self.target_scale.to(prediction)
+        weights = None
+        if self.weights_key is not None and (
+                self.center_axis is not None or self.residual_smoothing is not None):
+            weights = _resolve_weights(self.weights_key, outputs, batch, prediction)
         if self.center_axis is not None:
-            weights = (None if self.weights_key is None else
-                       _resolve_weights(self.weights_key, outputs, batch, prediction))
             prediction, target = center_fields(
                 prediction, target, weights, self.center_axis,
             )
         scale = self.residual_scale.to(prediction)
-        value = self.loss_fn(prediction * scale, target * scale)
-        return value
+        prediction = prediction * scale
+        target = target * scale
+        if self.residual_smoothing is not None:
+            prediction, target = self._smoothed_fields(
+                prediction, target, weights, batch,
+            )
+        return self.loss_fn(prediction, target)
+
+    def _smoothed_fields(self, prediction, target, weights, batch):
+        """Zero unselected entries, then smooth both fields on the grid."""
+
+        grid_size, grid_spacing = _shared_grid_geometry(batch, prediction)
+        if weights is not None:
+            if weights.shape != prediction.shape:
+                raise ValueError("weights and prediction must have same shape")
+            selected = _hard_selection(weights, prediction)
+            zeros = torch.zeros((), dtype=prediction.dtype, device=prediction.device)
+            prediction = torch.where(selected, prediction, zeros)
+            target = torch.where(selected, target, zeros)
+        transfer = self._smoothing_transfer(
+            grid_size, grid_spacing, prediction,
+        )
+        return (
+            _smooth_on_grid(prediction, grid_size, transfer),
+            _smooth_on_grid(target, grid_size, transfer),
+        )
+
+    def _smoothing_transfer(self, grid_size, grid_spacing, reference):
+        """Return one lazily cached transfer for this geometry and tensor type."""
+
+        key = (
+            grid_size,
+            tuple(float(value) for value in grid_spacing),
+            self.residual_smoothing,
+            reference.device.type,
+            reference.device.index,
+            reference.dtype,
+        )
+        transfer = self._smoothing_transfer_cache.get(key)
+        if transfer is None:
+            # One entry covers the ordinary fixed-grid training stream and
+            # avoids retaining device tensors for every geometry ever seen.
+            self._smoothing_transfer_cache.clear()
+            transfer = _gaussian_transfer(
+                grid_size, grid_spacing, self.residual_smoothing,
+                device=reference.device, dtype=reference.dtype,
+            )
+            self._smoothing_transfer_cache[key] = transfer
+        return transfer
+
+    def _apply(self, fn, recurse=True):
+        """Move registered state and discard device-specific derived tensors."""
+
+        result = super()._apply(fn, recurse=recurse)
+        self._smoothing_transfer_cache.clear()
+        return result
 
     def _reduce_loss(self, value, prediction, outputs, batch):
         if self.weights_key is None:
@@ -237,3 +320,88 @@ def _resolve_weights(
     if weights.shape == prediction.shape[:-1]:
         weights = weights.unsqueeze(-1).expand_as(prediction)
     return weights
+
+
+def _hard_selection(
+    weights: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Return a Boolean support mask, rejecting ambiguous soft weights."""
+
+    weights = weights.detach().to(reference)
+    if not torch.isfinite(weights).all().item():
+        raise ValueError("residual smoothing weights must be finite")
+    if not torch.all((weights == 0) | (weights == 1)).item():
+        raise ValueError("residual smoothing requires hard zero/one weights")
+    return weights.bool()
+
+
+def _shared_grid_geometry(
+    batch: Dict[str, torch.Tensor],
+    field: torch.Tensor,
+) -> Tuple[Tuple[int, int, int], torch.Tensor]:
+    """Return the one grid size and spacing shared by every field in a batch.
+
+    The field must be shaped ``[n_fields, n_grid, ...]`` with ``n_grid`` the
+    product of ``grid_size``; the flattened grid axis is assumed to follow
+    the canonical C order that the data loaders produce.
+    """
+
+    for key in ("grid_size", "grid_spacing"):
+        if key not in batch:
+            raise KeyError(
+                "batch is missing '{}', required for residual smoothing".format(key)
+            )
+    if field.ndim < 3:
+        raise ValueError(
+            "residual smoothing requires fields shaped [n_fields, n_grid, ...]"
+        )
+    grid_size = common_grid_size(batch["grid_size"], field.shape[:1])
+    if math.prod(grid_size) != field.shape[1]:
+        raise ValueError("grid_size product must match the number of grid points")
+    spacing = torch.as_tensor(batch["grid_spacing"]).detach().cpu()
+    if spacing.dtype == torch.bool or spacing.is_complex():
+        raise TypeError("grid_spacing must contain real values")
+    spacing = spacing.to(torch.float64).reshape(-1, 3)
+    if spacing.shape[0] not in (1, field.shape[0]):
+        raise ValueError("grid_spacing leading shape must match the fields")
+    if not torch.all(spacing == spacing[0]).item():
+        raise ValueError("all fields in one batch must share grid_spacing")
+    return grid_size, grid_spacing_tensor(spacing[0], dtype=torch.float64)
+
+
+def _gaussian_transfer(
+    grid_size: Tuple[int, int, int],
+    grid_spacing: torch.Tensor,
+    sigma: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return ``exp(-sigma^2 k^2 / 2)`` on the real-FFT wavevector grid."""
+
+    axes = [
+        2.0 * math.pi * torch.fft.fftfreq(
+            n, d=float(grid_spacing[axis]), dtype=torch.float64,
+        )
+        for axis, n in enumerate(grid_size)
+    ]
+    axes[-1] = axes[-1][: grid_size[-1] // 2 + 1]
+    kx, ky, kz = torch.meshgrid(*axes, indexing="ij")
+    transfer = torch.exp(-0.5 * sigma ** 2 * (kx.square() + ky.square() + kz.square()))
+    return transfer.to(device=device, dtype=dtype)
+
+
+def _smooth_on_grid(
+    field: torch.Tensor,
+    grid_size: Tuple[int, int, int],
+    transfer: torch.Tensor,
+) -> torch.Tensor:
+    """Convolve ``[n_fields, n_grid, ...]`` with the periodic transfer function."""
+
+    shape = field.shape
+    grid = field.reshape(shape[0], *grid_size, *shape[2:])
+    spectrum = torch.fft.rfftn(grid, dim=(1, 2, 3))
+    spectrum = spectrum * transfer.reshape(1, *transfer.shape, *([1] * (field.ndim - 2)))
+    smoothed = torch.fft.irfftn(spectrum, s=grid_size, dim=(1, 2, 3))
+    return smoothed.reshape(shape)

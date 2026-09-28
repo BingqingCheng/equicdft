@@ -117,7 +117,11 @@ losses using output `voxel_weights`. Supported nonvacuum voxels may enter or
 leave the selection on each visit; validation uses the clean density.
 `TensorLoss(weights_key="voxel_weights")` also works for polarization:
 weights are expanded over the final vector-component axis and the weighted
-mean includes all components.
+mean includes all components. With hard zero/one weights,
+`residual_smoothing` Gaussian-smooths the masked residual on the grid before
+the criterion (see the polarization guide); continuous weights are rejected
+for this nonlocal objective. Smoothing changes the objective only, never the
+model or the metrics.
 
 For this protocol, `valid` must be a **cutoff-independent support mask**.
 Do not cache clean-cutoff `voxel_weights` or separate `polarization_weights`

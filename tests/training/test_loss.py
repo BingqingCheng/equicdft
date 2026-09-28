@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+import equicdft.training.loss as loss_module
 from equicdft import (
     FixedDipoleIdeal,
     FourierResponse,
@@ -306,6 +307,215 @@ class TestWeightedTensorLoss(unittest.TestCase):
         prediction = torch.ones(2, 5, 2, 3)
         with self.assertRaisesRegex(ValueError, 'weights and prediction'):
             term(dict(P=prediction, voxel_weights=torch.ones(2, 5)), dict(target=prediction))
+
+
+class TestSmoothedTensorLoss(unittest.TestCase):
+    """``residual_smoothing`` filters the masked residual on the grid."""
+
+    GRID = (6, 5, 4)
+    SPACING = (2.0, 1.0, 0.5)
+
+    @classmethod
+    def _batch(cls, target, n_fields=1):
+        return {
+            "target": target,
+            "grid_size": torch.tensor([list(cls.GRID)] * n_fields),
+            "grid_spacing": torch.tensor([list(cls.SPACING)] * n_fields, dtype=torch.float64),
+        }
+
+    @staticmethod
+    def _term(sigma, **kwargs):
+        return TensorLoss(
+            "P", "P", "target", weights_key="voxel_weights",
+            residual_smoothing=sigma, **kwargs,
+        )
+
+    @classmethod
+    def _axis_wave(cls, axis, harmonic, n_species=2):
+        """A pure cosine of the given harmonic along one grid axis."""
+
+        index = torch.arange(cls.GRID[axis], dtype=torch.float64)
+        wave = torch.cos(2.0 * torch.pi * harmonic * index / cls.GRID[axis])
+        shape = [1, 1, 1]
+        shape[axis] = cls.GRID[axis]
+        wave = wave.reshape(shape).expand(cls.GRID).reshape(1, -1, 1, 1)
+        return wave.expand(1, -1, n_species, 3).contiguous()
+
+    def test_zero_or_absent_smoothing_is_the_unsmoothed_loss(self):
+        torch.manual_seed(3)
+        prediction = torch.randn(1, prod(self.GRID), 2, 3, dtype=torch.float64, requires_grad=True)
+        target = torch.randn_like(prediction)
+        weights = (torch.rand(1, prod(self.GRID), 2, dtype=torch.float64) > 0.3).double()
+        outputs = dict(P=prediction, voxel_weights=weights)
+        scale = torch.tensor([[0.5], [0.8]], dtype=torch.float64)
+        reference = self._term(None, residual_scale=scale)(outputs, self._batch(target))
+        for sigma in (0, 0.0):
+            with self.subTest(sigma=sigma):
+                term = self._term(sigma, residual_scale=scale)
+                self.assertIsNone(term.residual_smoothing)
+                value = term(outputs, self._batch(target))
+                self.assertTrue(torch.equal(value, reference))
+        # Smoothing works without any grid geometry when it is off.
+        self.assertTrue(torch.equal(
+            self._term(0.0, residual_scale=scale)(outputs, {"target": target}), reference,
+        ))
+
+    def test_smoothing_is_the_reciprocal_gaussian_of_the_residual(self):
+        sigma = 1.5
+        n_species = 2
+        target = torch.zeros(1, prod(self.GRID), n_species, 3, dtype=torch.float64)
+        weights = torch.ones(1, prod(self.GRID), n_species, dtype=torch.float64)
+        smoothed = self._term(sigma)
+        plain = self._term(None)
+        # A constant residual is not attenuated at all.
+        outputs = dict(P=torch.ones_like(target), voxel_weights=weights)
+        torch.testing.assert_close(smoothed(outputs, self._batch(target)), plain(outputs, self._batch(target)))
+        # One cosine along each axis is attenuated by exp(-sigma^2 k^2) in the
+        # squared residual, with k from that axis's own spacing (Nyquist on x).
+        for axis, harmonic in ((0, 3), (1, 1), (2, 1)):
+            with self.subTest(axis=axis, harmonic=harmonic):
+                outputs = dict(P=self._axis_wave(axis, harmonic, n_species), voxel_weights=weights)
+                wavenumber = 2.0 * torch.pi * harmonic / (self.GRID[axis] * self.SPACING[axis])
+                ratio = smoothed(outputs, self._batch(target)) / plain(outputs, self._batch(target))
+                torch.testing.assert_close(
+                    ratio, torch.exp(torch.tensor(-sigma ** 2 * wavenumber ** 2, dtype=torch.float64)),
+                )
+
+    def test_smoothing_matches_explicit_fourier_filter_and_backpropagates(self):
+        torch.manual_seed(5)
+        sigma = 2.0
+        n = prod(self.GRID)
+        prediction = torch.randn(1, n, 2, 3, dtype=torch.float64, requires_grad=True)
+        target = torch.randn_like(prediction)
+        weights = (torch.rand(1, n, 2, dtype=torch.float64) > 0.3).double()
+        scale = torch.tensor([[0.5], [0.8]], dtype=torch.float64)
+        term = self._term(sigma, residual_scale=scale, weight=0.36)
+        value = term(dict(P=prediction, voxel_weights=weights), self._batch(target))
+
+        residual = scale * (prediction - target)
+        selected = weights[..., None].expand_as(residual) > 0
+        residual = torch.where(selected, residual, torch.zeros_like(residual))
+        axes = [
+            2.0 * torch.pi * torch.fft.fftfreq(size, d=spacing, dtype=torch.float64)
+            for size, spacing in zip(self.GRID, self.SPACING)
+        ]
+        kx, ky, kz = torch.meshgrid(*axes, indexing="ij")
+        transfer = torch.exp(-0.5 * sigma ** 2 * (kx ** 2 + ky ** 2 + kz ** 2))
+        grid = residual.reshape(1, *self.GRID, 2, 3)
+        filtered = torch.fft.ifftn(
+            torch.fft.fftn(grid, dim=(1, 2, 3)) * transfer[None, ..., None, None], dim=(1, 2, 3),
+        ).real.reshape_as(residual)
+        expected = 0.36 * (filtered.square() * selected).sum() / selected.sum()
+        torch.testing.assert_close(value, expected)
+
+        actual_grad, = torch.autograd.grad(value, prediction, retain_graph=True)
+        expected_grad, = torch.autograd.grad(expected, prediction)
+        torch.testing.assert_close(actual_grad, expected_grad)
+        self.assertTrue(torch.all(actual_grad[~selected] == 0))
+
+    def test_unselected_voxels_do_not_supply_or_score_residual(self):
+        n = prod(self.GRID)
+        weights = torch.ones(1, n, 1, dtype=torch.float64)
+        weights[0, :5, 0] = 0.0
+        target = torch.zeros(1, n, 1, 3, dtype=torch.float64)
+        term = self._term(1.0)
+        # Residual only on unselected voxels: nothing reaches the selected ones.
+        prediction = torch.zeros_like(target)
+        prediction[0, :5] = 7.0
+        self.assertEqual(term(dict(P=prediction, voxel_weights=weights), self._batch(target)).item(), 0.0)
+        # Changing an unselected voxel never changes the loss.
+        torch.manual_seed(1)
+        prediction = torch.randn_like(target)
+        value = term(dict(P=prediction, voxel_weights=weights), self._batch(target))
+        prediction[0, :5] += 3.0
+        torch.testing.assert_close(term(dict(P=prediction, voxel_weights=weights), self._batch(target)), value)
+
+    def test_smoothing_requires_finite_hard_weights(self):
+        n = prod(self.GRID)
+        prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
+        target = torch.zeros_like(prediction)
+        term = self._term(1.0)
+        for value, message in (
+            (0.4, "hard zero/one"),
+            (-1.0, "hard zero/one"),
+            (float("nan"), "finite"),
+            (float("inf"), "finite"),
+        ):
+            with self.subTest(value=value):
+                weights = torch.ones(1, n, 1, dtype=torch.float64)
+                weights[0, 0, 0] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    term(dict(P=prediction, voxel_weights=weights), self._batch(target))
+
+    def test_smoothing_transfer_is_cached_by_geometry_and_tensor_type(self):
+        n = prod(self.GRID)
+        prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
+        target = torch.zeros_like(prediction)
+        weights = torch.ones(1, n, 1, dtype=torch.float64)
+        outputs = dict(P=prediction, voxel_weights=weights)
+        term = self._term(1.0)
+        with patch(
+            "equicdft.training.loss._gaussian_transfer",
+            wraps=loss_module._gaussian_transfer,
+        ) as transfer:
+            term(outputs, self._batch(target))
+            term(outputs, self._batch(target))
+            self.assertEqual(transfer.call_count, 1)
+
+            changed = self._batch(target)
+            changed["grid_spacing"] = 2.0 * changed["grid_spacing"]
+            term(outputs, changed)
+            self.assertEqual(transfer.call_count, 2)
+            self.assertEqual(len(term._smoothing_transfer_cache), 1)
+
+            term.to(dtype=torch.float32)
+            self.assertEqual(len(term._smoothing_transfer_cache), 0)
+
+    def test_smoothing_supports_scalar_fields_and_several_fields(self):
+        torch.manual_seed(7)
+        n = prod(self.GRID)
+        prediction = torch.randn(2, n, 2, dtype=torch.float64)
+        target = torch.randn_like(prediction)
+        weights = torch.ones(2, n, 2, dtype=torch.float64)
+        term = self._term(1.0)
+        batched = term(dict(P=prediction, voxel_weights=weights), self._batch(target, n_fields=2))
+        separate = [
+            term(dict(P=prediction[[field]], voxel_weights=weights[[field]]), self._batch(target[[field]]))
+            for field in range(2)
+        ]
+        torch.testing.assert_close(batched, 0.5 * (separate[0] + separate[1]))
+        # A single shared grid row serves every field, as for common_grid_size.
+        shared = self._batch(target)
+        shared["target"] = target
+        torch.testing.assert_close(term(dict(P=prediction, voxel_weights=weights), shared), batched)
+
+    def test_smoothing_configuration_and_geometry_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "residual_smoothing"):
+            self._term(-1.0)
+        with self.assertRaisesRegex(TypeError, "residual_smoothing"):
+            self._term(True)
+        n = prod(self.GRID)
+        prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
+        weights = torch.ones(1, n, 1, dtype=torch.float64)
+        target = torch.zeros_like(prediction)
+        term = self._term(1.0)
+        outputs = dict(P=prediction, voxel_weights=weights)
+        with self.assertRaisesRegex(KeyError, "grid_size"):
+            term(outputs, {"target": target, "grid_spacing": torch.ones(1, 3)})
+        with self.assertRaisesRegex(KeyError, "grid_spacing"):
+            term(outputs, {"target": target, "grid_size": torch.tensor([list(self.GRID)])})
+        batch = self._batch(target)
+        batch["grid_size"] = torch.tensor([[6, 5, 5]])
+        with self.assertRaisesRegex(ValueError, "grid_size product"):
+            term(outputs, batch)
+        batch = self._batch(target, n_fields=2)
+        batch["grid_spacing"][1, 0] = 3.0
+        with self.assertRaisesRegex(ValueError, "share grid_spacing"):
+            term(dict(P=prediction.expand(2, n, 1, 3), voxel_weights=weights.expand(2, n, 1)),
+                 dict(batch, target=target.expand(2, n, 1, 3)))
+        scalar = torch.ones(n, 1, dtype=torch.float64)
+        with self.assertRaisesRegex(ValueError, r"\[n_fields, n_grid"):
+            term(dict(P=scalar, voxel_weights=scalar), dict(self._batch(target), target=scalar))
 
 
 class TestFourierStabilityLoss(unittest.TestCase):
