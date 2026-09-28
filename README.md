@@ -409,8 +409,8 @@ python -m tests.regression.lj_paper_v1.solve
 ## Scope
 
 Implemented capabilities include multicomponent density tensors, optional LDA,
-GGA, finite-range pairwise, and reciprocal-space readouts, first direct
-correlations, selected rows of the second direct correlation, supervised or
+GGA, finite-range pairwise, reciprocal-space and fixed MSA-reference readouts,
+first direct correlations, selected rows of the second direct correlation, supervised or
 latent chemical-potential training, and fixed $N$/fixed $\mu$ equilibrium
 solves. The compact example uses the validated short-range LDA +
 Cartesian-invariant model and does not enable GGA, pairwise, reciprocal-space,

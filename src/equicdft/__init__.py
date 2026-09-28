@@ -7,6 +7,7 @@ from .functional.base import EnergyReadout
 from .functional.cace import CACEBranch
 from .functional.ideal import IdealGas, IdealReference
 from .functional.metalwall import MetalWall
+from .functional.msa import MSAReferenceReadout
 from .functional.pairwise import PairwiseReadout
 from .functional.polarization_ideal import FixedDipoleIdeal
 from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
@@ -65,6 +66,7 @@ __all__ = [
     "MetricCollection",
     "Metrics",
     "MetalWall",
+    "MSAReferenceReadout",
     "NoiseOptions",
     "PairwiseReadout",
     "FixedDipoleIdeal",

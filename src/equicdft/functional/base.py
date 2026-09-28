@@ -387,6 +387,16 @@ class EnergyReadout(nn.Module):
 
         return ()
 
+    def validate_readout_graph(self, readouts: Sequence["EnergyReadout"]) -> None:
+        """Check this readout's requirements on a model's complete readout list.
+
+        The model calls this once per top-level readout at construction with
+        every top-level readout, so a readout that depends on, or must not
+        coexist with, another one can inspect the whole graph, including
+        readouts reached through :meth:`wrapped_readouts`. The default accepts
+        everything.
+        """
+
     def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return one scalar energy per complete density field."""
 

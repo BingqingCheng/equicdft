@@ -15,6 +15,7 @@ from equicdft import (
     LocalReadout,
     LongRangeReadout,
     PairwiseReadout,
+    MSAReferenceReadout,
     ReciprocalFeatures,
 )
 from equicdft._config import (
@@ -48,6 +49,7 @@ class TestConfigRegistry(unittest.TestCase):
             LDAReadout,
             GGAReadout,
             PairwiseReadout,
+            MSAReferenceReadout,
             GridCACEModel,
         ):
             self.assertIs(registered[cls.__name__], cls)

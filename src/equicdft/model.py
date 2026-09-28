@@ -184,6 +184,13 @@ def _check_cutoff_and_feature_requirements(
         )
 
 
+def _validate_readout_graph(readouts: Sequence[EnergyReadout]) -> None:
+    """Let every top-level readout check the complete readout list."""
+
+    for item in readouts:
+        item.validate_readout_graph(readouts)
+
+
 def _resolve_n_types(
     a_features: Optional[nn.Module],
     readouts: Sequence[EnergyReadout],
@@ -355,6 +362,7 @@ class GridCACEModel(nn.Module, Configurable):
             ideal, a_features, readouts, compute_polarization_derivative,
         )
         _check_cutoff_and_feature_requirements(a_features, readouts)
+        _validate_readout_graph(readouts)
         n_types = _resolve_n_types(a_features, readouts, n_types)
         polarization_scale = (None if polarization_scale is None else
                               positive_scalar_tensor(polarization_scale, "polarization_scale"))

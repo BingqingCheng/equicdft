@@ -358,6 +358,127 @@ For `kernel="coulomb"`, the implemented kernel is
 Coulomb kernel, so choosing `alpha` also defines an LR/SR partition and is not
 merely a numerical setting.
 
+## Fixed MSA reference for the restricted primitive model
+
+`MSAReferenceReadout` adds a parameter-free functional built from the
+analytic direct correlation functions of the restricted primitive model,
+so that a learned excess only has to represent correlations beyond the
+mean-spherical closure:
+
+```python
+reference = MSAReferenceReadout(
+    n_types,
+    charges=charges,
+    diameter=diameter,
+    coulomb_amplitude=amplitude,
+    long_range_alpha=alpha,
+)
+```
+
+The functional is $\beta F_{\rm ref} = \tfrac12\sum_{ij}\iint \rho_i K_{ij} \rho_j$
+with $K_{ij} = -c_{ij}$ and
+
+$$
+c_{ij}(r) = c^{\rm PY}_{\rm HS}(r) + z_i z_j\, c^{\rm MSA}_{\rm el}(r),
+\qquad
+c^{\rm MSA}_{\rm el}(r) =
+\begin{cases}
+-\dfrac{A}{\sigma}\left[2B - B^2\, r/\sigma\right], & r<\sigma,\\[6pt]
+-\dfrac{A}{r}, & r>\sigma,
+\end{cases}
+\qquad
+B = \frac{x}{x+1+\sqrt{1+2x}},\ x = \kappa_D\sigma,
+$$
+
+the Percus-Yevick hard-sphere function for the number channel and the
+Waisman-Lebowitz solution for the charge channel ($B$ is the
+cancellation-free form of $(x+1-\sqrt{1+2x})/x$). `coulomb_amplitude` is the
+Bjerrum length $A$ in coordinate units of the beta free energy; the readout
+is defined for `free_energy_mode="beta"` at the reference temperature and
+rejects other modes or temperatures.
+
+**Coulomb branch.** The bare tail $-A z_i z_j/r$ is carried by a
+charge-factorized damped Coulomb `LongRangeReadout` with kernel
+$4\pi e^{-\alpha k^2}/k^2$, and the reference subtracts the matching
+$A\,\mathrm{erf}(r/2\sqrt{\alpha})/r$ from its charge kernel, leaving the
+short-ranged $A\,\mathrm{erfc}(r/2\sqrt{\alpha})/r$ outside the core and the
+polynomial correction inside it, so that the pair is exactly the MSA whatever
+`alpha` is (`0` for the exact kernel). By default
+(`include_long_range=True`) the readout owns that branch, built from the same
+charges, amplitude and exponent and reported through `wrapped_readouts()`,
+and rejects any other charged Coulomb `LongRangeReadout` in the model, at top
+level or wrapped (by a `MetalWall`, say). With `include_long_range=False` the
+model must contain exactly one such readout, at top level or wrapped, with
+the same charges, a fixed equal `coulomb_amplitude`, one Coulomb kernel with
+exponent `long_range_alpha` and no polarization source; this is the
+composition for electrode calculations, `MetalWall(liquid_coulomb=...)`
+beside the reference. The check is the readout's own
+`validate_readout_graph`, which `GridCACEModel` calls for every top-level
+readout at construction; a mismatch would silently give something other
+than the MSA.
+
+**Reference state.** The bulk state enters only through
+$\kappa_D^2 = 4\pi A\sum_i z_i^2\rho_i$ and the packing fraction, and by
+default it is each field's own: the mean density of every component over
+the accessible voxels (`excluded_mask` false, or all voxels), a
+differentiable functional of the density. The bulk reference must be
+electroneutral. This permits arbitrary local charge separation at fixed
+global neutrality. A finite liquid carrying net charge compensated by
+electrodes must instead supply an explicit neutral `reference_density`.
+The readout is then the Ramakrishnan–Yussouff expansion about that state,
+
+$$
+\beta F_{\rm ref}[\rho] = V_{\rm acc}\,\beta f_{\rm bulk}(\bar\rho)
++ \tfrac12\sum_{ij}\iint \delta\rho_i\,K_{ij}(|\mathbf r-\mathbf r'|;\bar\rho)\,\delta\rho_j ,
+\qquad \delta\rho = \rho - \bar\rho \ \text{on accessible voxels},
+$$
+
+with $\beta f_{\rm bulk}$ the bulk excess free energy density whose Hessian
+is $-\hat c_{ij}(0)$: the scaled-particle (PY-compressibility) hard-sphere
+free energy $\rho[-\ln(1-\eta) + 3\eta/(1-\eta) + 3\eta^2/2(1-\eta)^2]$ plus
+$\tfrac12\hat K_Z(0)\rho_Z^2$ for the charge channel. The homogeneous mode is
+carried by the integrated bulk free energy and the state-dependent kernel
+acts on mean-zero fluctuations only, so this is one variational functional:
+at a homogeneous state the uniform ($k=0$) curvature is exactly the MSA/PY
+$-\hat c(0)$, continuous with the $k\to0$ limit of the kernel, the autograd
+derivative equals the finite-difference slope along a uniform density
+change, and energies of different densities and compositions are mutually
+consistent. A set of fields at different densities gets the MSA of each
+density and a wall field that of its accessible region;
+`reference_density=(rho_1, ...)` fixes one state for every field instead and
+makes the readout the plain quadratic form $\tfrac12\rho K(\rho_{\rm ref})\rho$
+including its homogeneous mode. With a mask the expansion is about the flat
+accessible profile: the reference does not describe the excluded region
+itself, and wall structure beyond quadratic order is left to other terms. A
+field whose reference packing fraction reaches one is rejected. Vacuum and
+zero Coulomb amplitude use the exact zero-screening limit, without an
+artificial density or screening floor.
+
+**Evaluation.** The kernels are applied in reciprocal space on the canonical
+grid order (rows are reordered through `grid_positions` when they are not
+canonical). Inside the core both functions are polynomials in $r/\sigma$, so
+their transforms are state-dependent coefficients times the
+density-independent transforms of $1$, $r/\sigma$ and $(r/\sigma)^3$ on the
+core (plus the fixed erf/erfc part), integrated once per distinct grid
+wavenumber and cached per grid geometry; per-field states therefore cost
+nothing, and contact discontinuities enter as band-limited transforms rather
+than shell samples.
+
+A model made of the ideal gas and this reference has the MSA response,
+$1/S_{ZZ}(k) = 1 - \rho\,\hat c_{\rm el}(k)$ and
+$1/S_{NN}(k) = 1 - \rho\,\hat c^{\rm PY}_{\rm HS}(k)$, which is positive at
+every wavevector; `FourierResponse` on a homogeneous batch reproduces both to
+better than $10^{-3}$, and the uniform curvature reproduces the PY
+compressibility $(1+2\eta)^2/(1-\eta)^4$. `include_hard_sphere=False` keeps
+only the electrostatic correction (kernel and bulk term), for use under a
+separate hard-sphere functional. This is a state-conditioned
+quadratic reference that reproduces the bulk second derivative, not a
+nonlinear hard-sphere functional: packing and confinement structure beyond
+quadratic order are left to other terms. The closure linearizes the Coulomb
+coupling outside the core, so at strong coupling it underestimates ion
+pairing; that residual, not the ordering peak itself, is what a learned
+readout on top of it has to supply.
+
 ## Shared Fourier-response evaluator
 
 `FourierResponse` evaluates projected curvature of the total intrinsic
@@ -747,6 +868,8 @@ Paths are relative to `src/equicdft/`.
   validation
 - `functional/reciprocal.py`, `functional/readout.py`: reciprocal kernels and
   coefficient controls
+- `functional/msa.py`: the fixed MSA / Percus-Yevick reference of the
+  restricted primitive model
 
 The [README's package map](../README.md) describes the layout as a whole.
 
