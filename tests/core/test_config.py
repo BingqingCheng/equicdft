@@ -9,6 +9,7 @@ from equicdft import (
     BulkReadout,
     CartesianAFeatures,
     CartesianBFeatures,
+    FMTReadout,
     GGAReadout,
     GridCACEModel,
     LDAReadout,
@@ -50,6 +51,7 @@ class TestConfigRegistry(unittest.TestCase):
             GGAReadout,
             PairwiseReadout,
             MSAReferenceReadout,
+            FMTReadout,
             GridCACEModel,
         ):
             self.assertIs(registered[cls.__name__], cls)

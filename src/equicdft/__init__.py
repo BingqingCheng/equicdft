@@ -5,6 +5,7 @@ from .data.grid_data import GridData, GridDataset, default_data_key, read_metal_
 from .data.loaders import make_dataloaders
 from .functional.base import EnergyReadout
 from .functional.cace import CACEBranch
+from .functional.fmt import FMTReadout
 from .functional.ideal import IdealGas, IdealReference
 from .functional.metalwall import MetalWall
 from .functional.msa import MSAReferenceReadout
@@ -70,6 +71,7 @@ __all__ = [
     "NoiseOptions",
     "PairwiseReadout",
     "FixedDipoleIdeal",
+    "FMTReadout",
     "ReciprocalFeatures",
     "regularized_reduced_polarization",
     "TensorLoss",

@@ -479,6 +479,169 @@ coupling outside the core, so at strong coupling it underestimates ion
 pairing; that residual, not the ordering peak itself, is what a learned
 readout on top of it has to supply.
 
+## Fundamental measure theory for hard spheres
+
+`FMTReadout` adds fundamental measure theory as a fixed, parameter-free
+hard-sphere functional, evaluated with analytic weight spectra on the FFT
+grid:
+
+```python
+hard_spheres = FMTReadout(
+    n_types,
+    radii=radii,
+    version="white_bear_i",
+    third_term="q3",
+)
+```
+
+The excess free energy is a local function of weighted densities,
+
+$$
+\beta F_{\rm HS}[\rho] = \int \Phi\big(\{n_\alpha(\mathbf r)\}\big)\,d\mathbf r,
+\qquad
+n_\alpha(\mathbf r) = \sum_i \int \rho_i(\mathbf r')\,\omega^{(i)}_\alpha(\mathbf r-\mathbf r')\,d\mathbf r',
+$$
+
+with the weights of a sphere of radius $R_i$: $\omega_3 = \Theta(R-r)$,
+$\omega_2 = \delta(R-r)$, $\omega_1 = \omega_2/4\pi R$, $\omega_0 =
+\omega_2/4\pi R^2$, $\boldsymbol\omega_2 = \hat{\mathbf r}\,\delta(R-r) =
+-\nabla\omega_3$, $\boldsymbol\omega_1 = \boldsymbol\omega_2/4\pi R$, the
+tensor weight $\overleftrightarrow{\omega}_2 = \hat{\mathbf r}\hat{\mathbf
+r}\,\delta(R-r)$ when the tensor third term is selected, and
+
+$$
+\Phi = -\,n_0\ln(1-n_3)
++ \frac{n_1 n_2 - \mathbf n_1\!\cdot\mathbf n_2}{1-n_3}
++ P\big(n_2,\mathbf n_2,\overleftrightarrow{n}_2\big)\,\phi_3(n_3),
+\qquad
+\phi_3 = \begin{cases}
+\dfrac{1}{24\pi(1-n_3)^2} & \text{Rosenfeld},\\[8pt]
+\dfrac{n_3 + (1-n_3)^2\ln(1-n_3)}{36\pi\,n_3^2\,(1-n_3)^2} & \text{White Bear mark I}.
+\end{cases}
+$$
+
+`version` selects $\phi_3$: `"rosenfeld"` reproduces the scaled-particle
+(Percus-Yevick compressibility) equation of state in the bulk, `"white_bear_i"`
+(default; `"white_bear"` is accepted as the same thing) is the factor of the
+White Bear functional of Roth, Evans, Lang and Kahl (2002), the mark I form
+rather than the later mark II, with the Carnahan–Starling bulk equation of
+state. `third_term` selects the polynomial $P$, which equals $n_2^3$ in any
+homogeneous fluid, so that the three choices share the bulk free energy and
+the bulk second derivative and differ only away from homogeneity. The two
+are independent choices and only some combinations are published
+functionals — (`rosenfeld`, `original`) is Rosenfeld 1989, (`rosenfeld`,
+`q3`) the 1997 antisymmetrized functional, (`rosenfeld`, `tensor`) Tarazona
+2000, (`white_bear_i`, `original`) White Bear mark I as published,
+(`white_bear_i`, `tensor`) the White Bear tensor functional used for
+freezing; the default (`white_bear_i`, `q3`) is the White Bear I bulk
+factor with the q3 closure, chosen for its bounded third term and its
+equation of state, and is not itself a named functional:
+
+- `"q3"` (default): $P = n_2^3\,(1-\xi^2)^3$ with $\xi = |\mathbf n_2|/n_2$,
+  the "antisymmetrized" third term of Rosenfeld, Schmidt, Löwen and Tarazona
+  (1997). The exponent 3 keeps the original term through order $\xi^2$, so
+  the Percus-Yevick pair correlations are unchanged; the factor vanishes
+  where $|\mathbf n_2| = n_2$, which makes a single zero-dimensional cavity
+  exact; and $P \ge 0$ wherever $n_2 \ge 0$. The authors presented it as a
+  provisional interpolation (its crystal density peaks come out too narrow),
+  not as a stability device.
+- `"tensor"`: $P = \tfrac92\big[\mathbf n_2\!\cdot\overleftrightarrow{n}_2\!\cdot\mathbf n_2
+  - n_2\,\mathbf n_2\!\cdot\mathbf n_2 - \mathrm{Tr}\,\overleftrightarrow{n}_2^{\,3}
+  + n_2\,\mathrm{Tr}\,\overleftrightarrow{n}_2^{\,2}\big]$, Tarazona's
+  tensorial form (2000), whose dimensional crossover extends to overlapping
+  cavities and lost dimensions; it is the usual choice for freezing but has
+  no global lower bound (Lutsko 2020), so it is the second choice rather
+  than the default.
+- `"original"`: $P = n_2^3 - 3\,n_2\,\mathbf n_2\!\cdot\mathbf n_2$,
+  Rosenfeld's 1989 scalar-vector form. It has no lower bound (a single
+  sphere-sized density peak drives $\beta F_{\rm HS}$ to $-\infty$ as the
+  peak narrows) and it does not reproduce the zero-dimensional limit; it is
+  kept for comparison with the literature, not for production.
+
+None of this is a statement about the grid. The weights are sharp, so for a
+density the grid resolves the weighted densities are exactly translation
+covariant, and the energy of a peak at least one spacing wide is the same
+to a percent on a grid point and between grid points, at $0.25\sigma$ and
+$0.125\sigma$ spacing alike and for every third term. A peak narrower than
+the spacing is a different matter: it is not represented on the grid at
+all — its samples change with its position, and the ideal-gas term alone
+changes by $N\ln 8$ between the two alignments — and its FMT energy
+depends on the alignment as well (a $0.05\sigma$ peak of 0.95 particles at
+$0.25\sigma$ spacing: 0.8 between grid points, 6.5 on a grid point with
+`"q3"`), because the sharp weights ring around it. Ringing produces
+weighted densities no density could have, and those are what let $\Phi$
+change sign; the readout therefore enforces the continuum bounds $n_3^{(i)}
+\ge 0$, $n_2^{(i)} \ge 0$, $|\mathbf n_2^{(i)}| \le n_2^{(i)}$ on the
+per-species weighted densities, exactly where they are violated and nowhere
+else (a smooth field is untouched to the bit): $n_3^{(i)}$ is clamped at
+zero, where $n_2^{(i)} < 0$ the whole shell family of that species — scalar,
+vector and tensor — is set to zero, as every moment of a shell of no mass
+is, so that $\mathrm{Tr}\,\overleftrightarrow{n}_2 = n_2$ survives, and
+elsewhere $\mathbf n_2^{(i)}$ is shortened to length $n_2^{(i)}$. With them $\Phi \ge 0$
+pointwise for `"q3"` on any grid, so an unresolved peak costs energy at
+either alignment and cannot open a direction of descent for a minimizer.
+The bounds are active at the few-percent level next to a hard wall too
+(the Gibbs overshoot of the sharp weights at a density step), which
+changes the slab energy by $10^{-4}$ and is why they are enforced in both
+`packing_guard` modes rather than treated as an error. A negative input
+density is rejected, as the ideal-gas and MSA readouts reject it, rather
+than being absorbed by the bounds. Reference densities should be smoothed
+to at least the grid spacing, as the Gaussian-binned data are.
+
+The weights are applied through their analytic transforms,
+$\hat\omega_3 = 4\pi(\sin kR - kR\cos kR)/k^3$, $\hat\omega_2 = 4\pi R
+\sin(kR)/k$, $\hat{\boldsymbol\omega}_2 = -i\mathbf k\,\hat\omega_3$,
+$\hat{\overleftrightarrow{\omega}}_2 = 4\pi R^2\big[\delta_{ij}\,j_1(kR)/kR -
+\hat k_i\hat k_j\,j_2(kR)\big]$, so they are exactly isotropic and exactly
+normalized (their $k\to0$ values are the fundamental measures, the tensor
+weight's $\tfrac13\,n_2\,\delta_{ij}$) and involve no stencil; the vector
+weights use the real spectral derivative that zeroes each even-axis Nyquist
+component, as the Coulomb source does. Grid rows are reordered through
+`grid_positions` when they are not canonical. The functional is entropic: in
+`free_energy_mode="beta"` the readout returns $\beta F_{\rm HS}$, in
+`"physical"` mode $\beta F_{\rm HS}\,T/T_{\rm ref}$ so that the model's
+conversion recovers the same $\beta F_{\rm HS}$ at every temperature.
+
+What the tests pin down: a homogeneous field gives the scaled-particle
+free energy for Rosenfeld and the Carnahan–Starling one for White Bear
+mark I to machine precision for every third term, with $c_1 =
+-\beta\mu_{\rm ex}$; the weighted densities of a uniform mixture are the
+fundamental measures; the Rosenfeld second derivative on the number
+direction is the Percus-Yevick $1-\rho\hat c(k)$ at every grid wavevector
+below Nyquist, at every density and for every third term (the density
+dependence is automatic, unlike a quadratic reference), and the uniform
+($k=0$) curvature is each version's compressibility; the low-density limit
+is the second virial coefficient; a Gaussian peak one and one-and-a-half
+spacings wide gives the same energy on a grid point and between grid
+points to 1 % at both spacings for every third term; peaks of 0.4 and 0.2
+spacings keep $\Phi \ge 0$ pointwise and $\beta F_{\rm HS} \ge 0$ with
+`"q3"` at both alignments while `"original"` goes negative and keeps
+falling; the guard leaves a smooth random field bit-identical, tensor
+included, and keeps $\mathrm{Tr}\,\overleftrightarrow{n}_2 = n_2$ to
+$10^{-12}$ where it is active; the packing clamp returns $n_3$ itself in
+single precision down to $10^{-8}$;
+and a slab between hard walls solved at fixed $\mu$ shows the
+contact enhancement, the depletion minimum and the bulk density mid-slab,
+with the extrapolated contact density within a few percent of $\beta P$ at
+$0.125\sigma$ spacing. At the Nyquist wavevector the vector terms vanish by
+the derivative convention, so the response there is not the PY value; at
+$0.25\sigma$ spacing the delta-shell weight is two cells wide and contact
+quantities are a few percent less accurate than at $0.125\sigma$.
+
+`maximum_packing` (default 0.95) regularizes the free-volume terms: with
+`packing_guard="clamp"` the local $n_3$ is replaced by the smooth
+$n_3 - s\,\mathrm{softplus}((n_3-n_{\max})/s)$, $s = 0.01$, which is
+$n_3$ itself (exactly, in single precision too) more than a few $s$ below
+$n_{\max}$ and saturates at $n_{\max}$ above it, so
+that a noisy reference density or an early solver iterate cannot reach the
+singularity; `"raise"` rejects such a field instead. The readout is
+charge-blind and owns packing only; beside an `MSAReferenceReadout` the
+latter must be built with `include_hard_sphere=False`, which the readout's
+`validate_readout_graph` enforces, and a model may hold one `FMTReadout`.
+Excluded (wall) voxels need no special treatment: the density is zero
+there, $\Phi$ is integrated over the whole grid, and the weighted densities
+reaching into the wall from the fluid are how the functional feels it.
+
 ## Shared Fourier-response evaluator
 
 `FourierResponse` evaluates projected curvature of the total intrinsic
@@ -870,6 +1033,8 @@ Paths are relative to `src/equicdft/`.
   coefficient controls
 - `functional/msa.py`: the fixed MSA / Percus-Yevick reference of the
   restricted primitive model
+- `functional/fmt.py`: fundamental measure theory with analytic weight
+  spectra
 
 The [README's package map](../README.md) describes the layout as a whole.
 
