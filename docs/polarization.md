@@ -559,19 +559,68 @@ temperature and mean species densities by the existing state MLP; derivatives
 through the mean density are retained. The default zero initialization leaves
 an existing model unchanged until this branch is trained.
 
-The physical Coulomb branch still uses the source
-$q_a\widehat{\rho}_a-i\mathbf{k}_D\cdot\widehat{\mathbf{P}}_a$ through
-`include_polarization=True` with Coulomb features and explicit charges.
-It remains separate and its zero-mode convention is unchanged. The Gaussian
-branch also acts longitudinally: it is a learned residual response fitted
-jointly with the fixed Coulomb contribution, not another fixed electrostatic
-term. Density and polarization Gaussian readouts have independent coefficients.
+### A longitudinal/transverse-resolved dielectric kernel
 
-The exact ideal orientational term remains necessary. Gaussian coefficients
-are signed, like the existing density LR coefficients; neither this branch nor
-its presence alongside the ideal term guarantees positive total curvature.
-Broad Gaussians weaken at high wavevectors. Widths, regularization and any
-stability constraints remain application choices, not implicit API defaults.
+With `include_divergence=True` the coefficients of the two blocks give the
+tensor kernel $A(k)\,\mathbf I + B(k)\,\mathbf k_D\mathbf k_D$, so that the
+transverse stiffness is $A(k)$ and the longitudinal one $A(k) + k^2 B(k)$.
+This is what a dense dipolar liquid needs and what no local or semilocal
+term of the polarization can express: the learned excess of a local
+$|\mathbf P|^2$ term is the same number for both polarizations at every $k$,
+whereas water's transverse stiffness rises from $4\pi\beta C/(\varepsilon-1)$
+at $k\to0$ to the ideal value by $k\sim1$ Å$^{-1}$ while its longitudinal
+stiffness dips below the bare Coulomb value there (overscreening). Fitting
+such a functional with only a local polarization term drives the learned
+curvature negative in the transverse direction and the homogeneous liquid
+becomes unstable against transverse polarization waves.
+
+Two constructor arguments make the kernel practical. The features are
+$O(10^{-2})$ for real fields while the coefficients the physics requires are
+of order the ideal alignment stiffness $K_{\rm id} = 3/(\rho m^2)$, hundreds
+to thousands in length/charge$^2$, which a zero-initialised head never
+reaches at ordinary learning rates; `coefficient_scale` (one positive value
+per kernel channel, or one scalar) multiplies the network output so that the
+network works in ideal-stiffness units. `initial_coefficients` (one value per
+channel, or per channel and species pair, in the features' physical units)
+is a fixed reference added to the scaled output: with `zero_init` the readout
+starts exactly there and learns the remainder, so a kernel taken from a
+dielectric constant or from polarization structure factors is a reference
+functional in the same sense as the MSA charge kernel of the primitive model.
+Both are configuration, not state, so checkpoints written before they
+existed keep loading.
+
+```python
+K_IDEAL = 3.0 / (RHO_REF * MOMENT**2)
+dielectric = LongRangeReadout(
+    n_types=1,
+    hidden_sizes=(16, 8),
+    features=ReciprocalFeatures(
+        radial_exponents=(1.0, 2.5, 8.0),      # squared lengths; k-scales 1.0, 0.63, 0.35 1/length
+        kernel="gaussian",
+        n_types=1,
+        variable="dipole_density",
+        include_divergence=True,
+    ),
+    coefficient_scale=(K_IDEAL,) * 6,          # three vector, then three divergence channels
+    initial_coefficients=tuple(
+        K_IDEAL * c for c in (-0.258, -0.739, 0.227, -8.073, 6.586, 16.429)
+    ),
+)
+```
+
+The reference above is the water-like example of
+`tests/functional/test_dielectric_kernel.py`: the least-squares projection
+on these three exponents of a transverse excess of $-0.74\,K_{\rm id}$
+($\varepsilon = 71$) up to $k \approx 0.5$ Å$^{-1}$ decaying to zero by
+$k \approx 1.2$, and a longitudinal excess that follows the measured
+screening at small $k$ and dips to about $-2.6\,K_{\rm id}$ near
+$k = 1$ Å$^{-1}$. With the exact Coulomb term the bulk transverse stiffness
+then rises from $0.23$ to $0.98$ and the longitudinal one dips from $19.0$
+to $17.1$, below the bare $18.74$, and the test checks the model against
+that kernel to two decimals at every probed wavevector. The transverse and
+longitudinal probes of `FourierStabilityLoss` (below and in
+`experimental.md`) read the two stiffnesses back and are the natural guard
+while such a kernel is trained.
 
 ### Distinct longitudinal and transverse response
 
@@ -973,7 +1022,17 @@ the same smoothed objective, so checkpoint selection follows it.
 batch must carry `grid_size` and `grid_spacing`, which the data loaders always
 provide. When `weights_key` is used, its values must be a hard zero/one mask;
 continuous statistical weights are intentionally rejected because their
-placement relative to a nonlocal filter requires a separate definition.
+placement relative to a nonlocal filter requires a separate definition. The
+fields may be `[n_fields, n_grid]`, `[n_fields, n_grid, n_types]` or carry a
+trailing component axis.
+
+Reading `grid_size` and `grid_spacing` from a GPU batch is a host
+synchronization on every step. `TensorLoss(..., fixed_grid=True)` reads and
+validates them once, on the first evaluation, and reuses them afterwards;
+only the number of grid points is re-checked, so a stream that changes the
+spacing on the same grid must not use it. It is meant for loaders that
+serve one grid, as the water campaigns do. The hard-mask checks and the
+weight total then share a single transfer per evaluation.
 
 ### Excess-only evaluation and old models
 

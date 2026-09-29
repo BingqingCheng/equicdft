@@ -67,9 +67,18 @@ class FourierStabilityLoss(LossTerm):
     small finite-difference amplitudes susceptible to floating-point
     cancellation.
 
-    ``variable="dipole_density"`` instead holds density fixed and probes the
-    one randomly selected polarization direction ``u`` per field, drawn
-    uniformly on the unit sphere. Its shared species displacement is
+    ``variable="dipole_density"`` instead holds density fixed and probes a
+    polarization direction ``u``: by default one per field, drawn uniformly
+    on the unit sphere and shared by every wave; with
+    ``polarization_direction="transverse"`` or ``"longitudinal"`` one per
+    wave, perpendicular or parallel to that wave's wavevector. A random
+    direction almost never resolves the transverse stiffness of a dipolar
+    fluid, whose longitudinal stiffness is the Coulomb ``4 pi beta C``, tens
+    of times the ideal value: the projected curvature is dominated by the
+    longitudinal part unless ``u`` is nearly perpendicular to ``k``, so a
+    functional unstable against transverse polarization waves passes a
+    random probe. The transverse probe is the one that tests it. Its shared
+    species displacement is
 
     ``delta_P_a = epsilon * m_a * rho_a * wave * u``,
 
@@ -158,6 +167,13 @@ class FourierStabilityLoss(LossTerm):
         Whether to add the uniform polarization wavevector. It defaults to
         true for polarization and false for density. Density cannot include
         the zero wavevector because its perturbations preserve particle number.
+    polarization_direction
+        ``"random"`` (default) draws one direction per field on the unit
+        sphere. ``"transverse"`` draws, for every wave, a random direction in
+        the plane perpendicular to its wavevector; ``"longitudinal"`` uses the
+        wavevector's own direction. Both use the ordinary wavevector
+        ``2 pi n / L``; the uniform wave keeps a random direction. Only for
+        ``variable="dipole_density"``.
     """
 
     def __init__(
@@ -180,6 +196,7 @@ class FourierStabilityLoss(LossTerm):
         wavevector_domain: str = "sphere",
         variable: str = "rho",
         include_zero_wavevector: Optional[bool] = None,
+        polarization_direction: str = "random",
     ) -> None:
         super().__init__(name, weight)
 
@@ -197,6 +214,19 @@ class FourierStabilityLoss(LossTerm):
             raise ValueError(
                 "density stability cannot include the zero wavevector"
             )
+        polarization_direction = nonempty_string(
+            polarization_direction, "polarization_direction",
+        )
+        if polarization_direction not in ("random", "transverse", "longitudinal"):
+            raise ValueError(
+                "polarization_direction must be 'random', 'transverse' or "
+                "'longitudinal'"
+            )
+        if variable == "rho" and polarization_direction != "random":
+            raise ValueError(
+                "polarization_direction applies to variable='dipole_density'"
+            )
+        self.polarization_direction = polarization_direction
         wavevector_treatment = nonempty_string(
             wavevector_treatment,
             "wavevector_treatment",
@@ -379,8 +409,8 @@ class FourierStabilityLoss(LossTerm):
                 else "translational_ideal_gas")
 
     def extra_repr(self) -> str:
-        return "variable={!r}, ideal_reference={!r}".format(
-            self.variable, self.ideal_reference,
+        return "variable={!r}, ideal_reference={!r}, polarization_direction={!r}".format(
+            self.variable, self.ideal_reference, self.polarization_direction,
         )
 
     def evaluate(
@@ -469,15 +499,68 @@ class FourierStabilityLoss(LossTerm):
             "batch contains no valid component direction",
         )
 
+    @staticmethod
+    def _random_unit_directions(rho, n_wavevectors):
+        """Return random unit vectors ``[field, n_wavevectors, 3]``."""
+
+        directions = torch.randn(
+            (rho.shape[0], n_wavevectors, 3), dtype=rho.dtype, device=rho.device,
+        )
+        return directions / torch.linalg.vector_norm(directions, dim=-1, keepdim=True)
+
+    def _polarization_directions(self, batch, rho, wavevector_indices):
+        """Return the probe direction of every wave, ``[field, n_wavevectors, 3]``.
+
+        ``"random"`` shares one direction per field across its waves, as the
+        original probe did. ``"transverse"`` projects an independent random
+        direction of every wave onto the plane perpendicular to its
+        wavevector ``2 pi n / L``; ``"longitudinal"`` uses the wavevector
+        itself. A zero wavevector keeps the random direction.
+        """
+
+        n_fields, n_wavevectors = wavevector_indices.shape[:2]
+        if self.polarization_direction == "random":
+            shared = torch.randn((n_fields, 3), dtype=rho.dtype, device=rho.device)
+            shared = shared / torch.linalg.vector_norm(shared, dim=-1, keepdim=True)
+            return shared[:, None, :].expand(n_fields, n_wavevectors, 3)
+        length = batch["grid_size"].to(rho) * batch["grid_spacing"].to(rho)
+        wavevector = (
+            2.0 * torch.pi * wavevector_indices.to(rho) / length[:, None, :]
+        )
+        norm = torch.linalg.vector_norm(wavevector, dim=-1, keepdim=True)
+        nonzero = norm > 0.0
+        unit_wavevector = wavevector / torch.where(nonzero, norm, torch.ones_like(norm))
+        random = self._random_unit_directions(rho, n_wavevectors)
+        if self.polarization_direction == "longitudinal":
+            return torch.where(nonzero, unit_wavevector, random)
+        transverse = random - unit_wavevector * torch.sum(
+            random * unit_wavevector, dim=-1, keepdim=True,
+        )
+        transverse_norm = torch.linalg.vector_norm(transverse, dim=-1, keepdim=True)
+        # A draw parallel to k has measure zero; fall back to any perpendicular.
+        degenerate = transverse_norm < 1.0e-6
+        if torch.any(degenerate).item():
+            fallback = torch.cross(
+                unit_wavevector,
+                torch.tensor([0.3, 0.5, 0.8], dtype=rho.dtype, device=rho.device).expand_as(unit_wavevector),
+                dim=-1,
+            )
+            transverse = torch.where(degenerate, fallback, transverse)
+            transverse_norm = torch.linalg.vector_norm(transverse, dim=-1, keepdim=True)
+        transverse = transverse / torch.where(
+            transverse_norm > 0.0, transverse_norm, torch.ones_like(transverse_norm),
+        )
+        return torch.where(nonzero, transverse, random)
+
     def _polarization_loss(self, model, outputs, batch, rho, wavevector_indices):
         """Return the fixed-density polarization stability penalty."""
 
-        directions = torch.randn(
-            (rho.shape[0], 3), dtype=rho.dtype, device=rho.device,
-        )
-        directions /= torch.linalg.vector_norm(
-            directions, dim=-1, keepdim=True,
-        )
+        if self.include_zero_wavevector and self.wavevector_treatment == "independent":
+            wavevector_indices = torch.cat(
+                (torch.zeros_like(wavevector_indices[:, :1]), wavevector_indices),
+                dim=1,
+            )
+        directions = self._polarization_directions(batch, rho, wavevector_indices)
         common = {
             "model": model,
             "outputs": outputs,
@@ -487,14 +570,6 @@ class FourierStabilityLoss(LossTerm):
             "perturbations_per_forward": self.response.perturbations_per_forward,
         }
         if self.wavevector_treatment == "independent":
-            if self.include_zero_wavevector:
-                wavevector_indices = torch.cat(
-                    (
-                        torch.zeros_like(wavevector_indices[:, :1]),
-                        wavevector_indices,
-                    ),
-                    dim=1,
-                )
             _, amplitude = self._sample_wavevector_probe(
                 wavevector_indices,
                 rho,
@@ -517,12 +592,18 @@ class FourierStabilityLoss(LossTerm):
             )
             if self.include_zero_wavevector:
                 zero_indices = torch.zeros_like(wavevector_indices[:, :1])
+                zero_common = dict(
+                    common,
+                    polarization_directions=self._polarization_directions(
+                        batch, rho, zero_indices,
+                    ),
+                )
                 zero_curvature, zero_valid = polarization_fourier_curvature(
                     wavevector_indices=zero_indices,
                     relative_amplitude=self._sample_amplitude(
                         zero_indices.shape[:2], rho
                     ),
-                    **common,
+                    **zero_common,
                 )
                 curvature = torch.cat(
                     (zero_curvature.flatten(1), curvature.flatten(1)), dim=1

@@ -447,6 +447,31 @@ class TestSmoothedTensorLoss(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     term(dict(P=prediction, voxel_weights=weights), self._batch(target))
 
+    def test_smoothing_weight_checks_are_local_to_reentrant_evaluations(self):
+        n = prod(self.GRID)
+        prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
+        target = torch.zeros_like(prediction)
+        valid_weights = torch.ones(1, n, 1, dtype=torch.float64)
+        invalid_weights = valid_weights.clone()
+        invalid_weights[0, 0, 0] = 0.4
+        term = self._term(1.0)
+        batch = self._batch(target)
+
+        class ReentrantMSE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.entered = False
+
+            def forward(self, first, second):
+                if not self.entered:
+                    self.entered = True
+                    term(dict(P=prediction, voxel_weights=valid_weights), batch)
+                return (first - second).square()
+
+        term.loss_fn = ReentrantMSE()
+        with self.assertRaisesRegex(ValueError, "hard zero/one"):
+            term(dict(P=prediction, voxel_weights=invalid_weights), batch)
+
     def test_smoothing_transfer_is_cached_by_geometry_and_tensor_type(self):
         n = prod(self.GRID)
         prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
@@ -471,7 +496,74 @@ class TestSmoothedTensorLoss(unittest.TestCase):
             term.to(dtype=torch.float32)
             self.assertEqual(len(term._smoothing_transfer_cache), 0)
 
-    def test_smoothing_supports_scalar_fields_and_several_fields(self):
+    def test_smoothing_supports_scalar_grid_fields(self):
+        """A genuine ``[n_fields, n_grid]`` field smooths like its one-species form."""
+
+        torch.manual_seed(11)
+        n = prod(self.GRID)
+        prediction = torch.randn(2, n, dtype=torch.float64)
+        target = torch.randn_like(prediction)
+        weights = (torch.rand(2, n, dtype=torch.float64) > 0.3).double()
+        term = self._term(1.0)
+        scalar = term(dict(P=prediction, voxel_weights=weights), self._batch(target, n_fields=2))
+        one_species = term(
+            dict(P=prediction[..., None], voxel_weights=weights[..., None]),
+            self._batch(target[..., None], n_fields=2),
+        )
+        torch.testing.assert_close(scalar, one_species)
+        self.assertGreater(scalar.item(), 0.0)
+        # Unsmoothed, the same fields give the plain masked mean-squared error.
+        plain = self._term(None)(dict(P=prediction, voxel_weights=weights), self._batch(target, n_fields=2))
+        expected = ((prediction - target).square() * weights).sum() / weights.sum()
+        torch.testing.assert_close(plain, expected)
+
+    def test_fixed_grid_reads_the_geometry_once_and_shares_one_host_transfer(self):
+        n = prod(self.GRID)
+        prediction = torch.ones(1, n, 1, 3, dtype=torch.float64)
+        target = torch.zeros_like(prediction)
+        weights = torch.ones(1, n, 1, dtype=torch.float64)
+        outputs = dict(P=prediction, voxel_weights=weights)
+        fixed = self._term(1.0, fixed_grid=True)
+        checked = self._term(1.0)
+        with patch(
+            "equicdft.training.loss._shared_grid_geometry",
+            wraps=loss_module._shared_grid_geometry,
+        ) as geometry:
+            first = fixed(outputs, self._batch(target))
+            second = fixed(outputs, self._batch(target))
+            self.assertEqual(geometry.call_count, 1)
+            checked(outputs, self._batch(target))
+            checked(outputs, self._batch(target))
+            self.assertEqual(geometry.call_count, 3)
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first, checked(outputs, self._batch(target)))
+        # After the first evaluation the smoothing path makes one
+        # device-to-host transfer per evaluation, the shared weight checks and
+        # weight total; the geometry is no longer read. (The remaining
+        # ``item`` is ``resolve_target``'s finite-target check, common to
+        # every TensorLoss.)
+        transfers = []
+        original = {name: getattr(torch.Tensor, name) for name in ("item", "tolist", "cpu")}
+        def counting(name):
+            def wrapper(tensor, *args, **kwargs):
+                transfers.append(name)
+                return original[name](tensor, *args, **kwargs)
+            return wrapper
+        with patch.object(torch.Tensor, "item", counting("item")), \
+                patch.object(torch.Tensor, "tolist", counting("tolist")), \
+                patch.object(torch.Tensor, "cpu", counting("cpu")):
+            fixed(outputs, self._batch(target))
+        self.assertEqual(transfers, ["item", "tolist"])
+        # The number of grid points is still checked; a different grid is rejected.
+        other = torch.ones(1, 2 * n, 1, 3, dtype=torch.float64)
+        batch = self._batch(torch.zeros_like(other))
+        batch["grid_size"] = torch.tensor([[12, 5, 4]])
+        with self.assertRaisesRegex(ValueError, "fixed_grid"):
+            fixed(dict(P=other, voxel_weights=torch.ones(1, 2 * n, 1, dtype=torch.float64)), batch)
+        with self.assertRaisesRegex(TypeError, "fixed_grid"):
+            self._term(1.0, fixed_grid="yes")
+
+    def test_smoothing_supports_scalar_species_fields_and_several_fields(self):
         torch.manual_seed(7)
         n = prod(self.GRID)
         prediction = torch.randn(2, n, 2, dtype=torch.float64)
@@ -513,9 +605,9 @@ class TestSmoothedTensorLoss(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "share grid_spacing"):
             term(dict(P=prediction.expand(2, n, 1, 3), voxel_weights=weights.expand(2, n, 1)),
                  dict(batch, target=target.expand(2, n, 1, 3)))
-        scalar = torch.ones(n, 1, dtype=torch.float64)
+        flat = torch.ones(n, dtype=torch.float64)
         with self.assertRaisesRegex(ValueError, r"\[n_fields, n_grid"):
-            term(dict(P=scalar, voxel_weights=scalar), dict(self._batch(target), target=scalar))
+            term(dict(P=flat, voxel_weights=flat), dict(self._batch(target), target=flat))
 
 
 class TestFourierStabilityLoss(unittest.TestCase):

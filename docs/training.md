@@ -121,7 +121,8 @@ mean includes all components. With hard zero/one weights,
 `residual_smoothing` Gaussian-smooths the masked residual on the grid before
 the criterion (see the polarization guide); continuous weights are rejected
 for this nonlocal objective. Smoothing changes the objective only, never the
-model or the metrics.
+model or the metrics. On a fixed grid, `fixed_grid=True` reads the batch
+geometry once instead of synchronizing with the GPU on every step.
 
 For this protocol, `valid` must be a **cutoff-independent support mask**.
 Do not cache clean-cutoff `voxel_weights` or separate `polarization_weights`

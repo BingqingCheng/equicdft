@@ -1,6 +1,6 @@
 """Energy readouts for grid features."""
 
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Union
 
 import torch
 
@@ -292,6 +292,24 @@ class LongRangeReadout(EnergyReadout, Configurable):
         units at fixed temperature. For variable temperatures, use the
         model's physical mode with A=C/(k_B*T_ref). No dielectric scaling,
         dipole-magnitude factor, or particle self subtraction is implicit.
+    coefficient_scale
+        Optional fixed positive factor per kernel channel (one scalar is
+        broadcast) multiplying the state network's output, so that the
+        network works in convenient units while the contraction keeps the
+        physical ones of the features. Direct polarization features of a
+        dense dipolar fluid need coefficients of order the ideal alignment
+        stiffness ``3 / (rho m^2)``, hundreds to thousands in ``length /
+        charge^2``; a zero-initialized head trained at ordinary learning
+        rates never reaches such values unless the scale is supplied.
+        Unavailable in the charge-factorized and fixed-amplitude modes.
+    initial_coefficients
+        Optional fixed reference coefficients per kernel channel (or per
+        kernel and type pair), in the features' physical units and added to
+        the scaled network output. With ``zero_init`` the readout starts
+        exactly at these values and the network learns the remainder, which
+        turns a known linear response, such as a dielectric kernel fitted
+        to polarization structure factors, into a fixed reference.
+        Unavailable in the charge-factorized and fixed-amplitude modes.
     """
 
     @property
@@ -313,6 +331,8 @@ class LongRangeReadout(EnergyReadout, Configurable):
         coulomb_amplitude: Optional[float] = None,
         features: Optional[ReciprocalFeatures] = None,
         include_polarization: bool = False,
+        coefficient_scale: Optional[Union[float, Sequence[float]]] = None,
+        initial_coefficients: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -394,6 +414,51 @@ class LongRangeReadout(EnergyReadout, Configurable):
                 raise ValueError("direct polarization features do not use charges")
         self.features = features
 
+        if (coefficient_scale is not None or initial_coefficients is not None) and (
+            charges is not None or coulomb_amplitude is not None
+        ):
+            raise ValueError(
+                "coefficient_scale and initial_coefficients require the free "
+                "kernel-coefficient mode (no charges or coulomb_amplitude)"
+            )
+        scale_tensor = None
+        if coefficient_scale is not None:
+            scale_tensor = torch.as_tensor(
+                coefficient_scale, dtype=torch.get_default_dtype(),
+            ).detach().clone().reshape(-1)
+            if scale_tensor.numel() == 1:
+                scale_tensor = scale_tensor.expand(self.n_kernels).clone()
+            if (
+                scale_tensor.shape != (self.n_kernels,)
+                or not torch.all(torch.isfinite(scale_tensor)).item()
+                or torch.any(scale_tensor <= 0.0).item()
+            ):
+                raise ValueError(
+                    "coefficient_scale must be one finite positive value or one "
+                    "per kernel channel"
+                )
+        initial_tensor = None
+        if initial_coefficients is not None:
+            initial_tensor = torch.as_tensor(
+                initial_coefficients, dtype=torch.get_default_dtype(),
+            ).detach().clone()
+            if initial_tensor.numel() == self.n_kernels:
+                initial_tensor = initial_tensor.reshape(self.n_kernels, 1).expand(
+                    self.n_kernels, self.n_type_pairs,
+                ).clone()
+            if (
+                initial_tensor.shape != (self.n_kernels, self.n_type_pairs)
+                or not torch.all(torch.isfinite(initial_tensor)).item()
+            ):
+                raise ValueError(
+                    "initial_coefficients must contain one finite value per kernel "
+                    "channel or one per kernel channel and type pair"
+                )
+        # Non-persistent: both live in the config, and checkpoints written
+        # before they existed keep loading strictly.
+        self.register_buffer("coefficient_scale", scale_tensor, persistent=False)
+        self.register_buffer("initial_coefficients", initial_tensor, persistent=False)
+
         if coulomb_amplitude is not None:
             self.mlp = None
         else:
@@ -422,6 +487,8 @@ class LongRangeReadout(EnergyReadout, Configurable):
             coulomb_amplitude=optional_buffer_value(self.coulomb_amplitude),
             features=optional_config(self.features),
             include_polarization=self.include_polarization,
+            coefficient_scale=optional_buffer_value(self.coefficient_scale),
+            initial_coefficients=optional_buffer_value(self.initial_coefficients),
         )
 
     @classmethod
@@ -441,11 +508,20 @@ class LongRangeReadout(EnergyReadout, Configurable):
                 "one mean density per type"
             )
         if self.charges is None:
-            return self.mlp(state_features).reshape(
+            coefficients = self.mlp(state_features).reshape(
                 *state_features.shape[:-1],
                 self.n_kernels,
                 self.n_type_pairs,
             )
+            if self.coefficient_scale is not None:
+                coefficients = coefficients * self.coefficient_scale.to(
+                    coefficients
+                )[:, None]
+            if self.initial_coefficients is not None:
+                coefficients = coefficients + self.initial_coefficients.to(
+                    coefficients
+                )
+            return coefficients
 
         amplitude = self.amplitude(state_features)[..., None, None]
         pair_weights = self.pair_charge_products.to(state_features)

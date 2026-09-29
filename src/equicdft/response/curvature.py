@@ -258,6 +258,13 @@ def polarization_fourier_curvature(
     ``wavevector_phases`` supplied, all selected waves are summed into one
     pattern and the result has shape ``[field, 1, 1]``. Density is held fixed,
     including for the zero wavevector.
+
+    ``polarization_directions`` is either one unit vector per field,
+    ``[field, 3]``, shared by every wave, or one per field and wavevector,
+    ``[field, n_wavevectors, 3]``, so that each wave can be polarized
+    relative to its own wavevector (transverse or longitudinal probes). In
+    the summed pattern each wave carries its own direction, so a sum of
+    transverse waves stays divergence-free.
     """
 
     if "dipole_density" not in batch:
@@ -280,23 +287,28 @@ def polarization_fourier_curvature(
     if moment.numel() not in (1, rho.shape[-1]):
         raise ValueError("dipole_magnitude must contain one value per density type")
 
-    waves, valid_wave = _real_fourier_waves(
+    n_wavevectors = wavevector_indices.shape[1]
+    selected_direction = _unit_polarization_directions(
+        polarization_directions, rho, n_wavevectors,
+    )
+    vector_waves, valid_wave = _real_fourier_vector_waves(
         batch,
         rho,
         wavevector_indices,
+        selected_direction,
         wavevector_phases=wavevector_phases,
     )
-    wave_norm = torch.amax(torch.abs(waves), dim=-1)
-    waves = waves / torch.clamp(wave_norm[..., None], min=1.0e-12)
-    selected_direction = _unit_polarization_directions(
-        polarization_directions, rho,
+    wave_norm = torch.amax(
+        torch.linalg.vector_norm(vector_waves, dim=-1), dim=-1,
+    )
+    vector_waves = vector_waves / torch.clamp(
+        wave_norm[..., None, None], min=1.0e-12,
     )
 
     alignment_scale = rho * moment
     directions = (
-        waves[:, :, :, None, None]
+        vector_waves[:, :, :, None, :]
         * alignment_scale[:, None, :, :, None]
-        * selected_direction[:, None, None, None, :]
     )
 
     n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
@@ -326,11 +338,14 @@ def polarization_fourier_curvature(
         perturbations_per_forward=perturbations_per_forward,
     )
     volume = voxel_volume(batch["grid_spacing"].to(rho))
-    alignment_change = used_amplitude[..., None, None] * waves[..., None]
+    alignment_change = used_amplitude[..., None, None] * vector_waves
     ideal_second = (
         3.0
         * volume[:, None]
-        * torch.sum(rho[:, None] * alignment_change.square(), dim=(-2, -1))
+        * torch.sum(
+            rho.sum(dim=-1)[:, None] * alignment_change.square().sum(dim=-1),
+            dim=-1,
+        )
     )
     total_second = ideal_second + excess_second
     ideal_denominator = ideal_second.detach()
@@ -352,24 +367,56 @@ def polarization_fourier_curvature(
     )
 
 
-def _unit_polarization_directions(directions, reference):
-    """Validate and normalize one Cartesian direction per field."""
+def _unit_polarization_directions(directions, reference, n_wavevectors):
+    """Validate and normalize directions to ``[field, n_wavevectors, 3]``."""
 
     directions = torch.as_tensor(directions, device=reference.device)
+    n_fields = reference.shape[0]
     if (
         directions.dtype == torch.bool
         or torch.is_complex(directions)
-        or directions.shape != (reference.shape[0], 3)
+        or directions.shape not in ((n_fields, 3), (n_fields, n_wavevectors, 3))
         or not torch.all(torch.isfinite(directions)).item()
     ):
         raise ValueError(
-            "polarization_directions must be finite with shape [field, 3]"
+            "polarization_directions must be finite with shape [field, 3] "
+            "or [field, n_wavevectors, 3]"
         )
     directions = directions.to(reference)
+    if directions.ndim == 2:
+        directions = directions[:, None, :].expand(n_fields, n_wavevectors, 3)
     norm = torch.linalg.vector_norm(directions, dim=-1, keepdim=True)
     if torch.any(norm == 0.0).item():
         raise ValueError("polarization_directions must be nonzero")
     return directions / norm
+
+
+def _real_fourier_vector_waves(
+    batch, reference, wavevector_indices, directions, wavevector_phases=None,
+):
+    """Return vector wave patterns ``[field, n_probe, n_grid, 3]`` and validity.
+
+    Every wave is multiplied by its own unit direction. Without phases the
+    probes are the cosine and sine of every wavevector in turn; with phases
+    the shifted waves are summed into one pattern per field before any
+    normalization, so a sum of transverse waves remains transverse.
+    """
+
+    if wavevector_phases is None:
+        waves, valid = _real_fourier_waves(batch, reference, wavevector_indices)
+        per_probe = directions.repeat_interleave(2, dim=1)
+        return waves[..., None] * per_probe[:, :, None, :], valid
+    n_waves = wavevector_indices.shape[1]
+    patterns = []
+    for index in range(n_waves):
+        single, _ = _real_fourier_waves(
+            batch, reference, wavevector_indices[:, index : index + 1],
+            wavevector_phases=wavevector_phases[:, index : index + 1],
+        )
+        patterns.append(single[..., None] * directions[:, index : index + 1, None, :])
+    summed = torch.stack(patterns, dim=0).sum(dim=0)
+    valid = torch.amax(torch.linalg.vector_norm(summed, dim=-1), dim=-1) > 1.0e-5
+    return summed, valid
 
 
 def _polarization_excess_energy_difference(

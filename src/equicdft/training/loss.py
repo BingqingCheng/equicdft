@@ -6,7 +6,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from .._validation import nonempty_string, nonnegative_scalar
+from .._validation import boolean, nonempty_string, nonnegative_scalar
 from ..geometry.grid import common_grid_size, grid_spacing_tensor
 from ..objectives import LossTerm
 from ._targets import TargetKeys, normalize_target_keys, resolve_target, center_fields
@@ -49,6 +49,15 @@ class TensorLoss(LossTerm):
     the mean. Centering precedes smoothing. ``None`` or ``0`` leaves the
     criterion unsmoothed. The smoothing belongs to the objective only: no
     metric, model output or functional term is affected.
+
+    Smoothing reads the batch geometry, which on a GPU batch is a host
+    synchronization per evaluation. ``fixed_grid=True`` reads and validates
+    ``grid_size`` and ``grid_spacing`` once, on the first evaluation, and
+    reuses them for every later batch; only the number of grid points is
+    re-checked (a batch with a different grid spacing on the same grid is
+    not detected). Use it for a training stream whose loader serves one
+    grid, such as the fixed-grid water campaigns. The hard-weight checks and
+    the weight total share one host transfer per evaluation.
     """
 
     def __init__(
@@ -63,6 +72,7 @@ class TensorLoss(LossTerm):
         residual_scale=1.0,
         target_scale=1.0,
         residual_smoothing: Optional[float] = None,
+        fixed_grid: bool = False,
         weight: float = 1.0,
     ) -> None:
         super().__init__(name, weight)
@@ -81,8 +91,11 @@ class TensorLoss(LossTerm):
             if residual_smoothing == 0.0:
                 residual_smoothing = None
         self.residual_smoothing = residual_smoothing
-        # Derived runtime data only: transfers are absent from state_dict.
+        self.fixed_grid = boolean(fixed_grid, "fixed_grid")
+        # Derived runtime data only: transfers and the once-validated geometry
+        # are absent from state_dict.
         self._smoothing_transfer_cache = {}
+        self._smoothing_geometry = None
         for name, value in (("residual_scale", residual_scale), ("target_scale", target_scale)):
             tensor = torch.as_tensor(value)
             if tensor.is_complex() or not torch.isfinite(tensor).all():
@@ -130,13 +143,18 @@ class TensorLoss(LossTerm):
             outputs=outputs,
             batch=batch,
         )
+        weight_checks = None
         if (self.center_axis is None and self.residual_smoothing is None
                 and torch.all(self.target_scale == 1)
                 and torch.all(self.residual_scale == 1)):
             value = self.loss_fn(prediction, target)
         else:
-            value = self._transformed_loss(prediction, target, outputs, batch)
-        return self._reduce_loss(value, prediction, outputs, batch)
+            value, weight_checks = self._transformed_loss(
+                prediction, target, outputs, batch,
+            )
+        return self._reduce_loss(
+            value, prediction, outputs, batch, weight_checks,
+        )
 
     def _transformed_loss(self, prediction, target, outputs, batch):
         target = target * self.target_scale.to(prediction)
@@ -151,20 +169,22 @@ class TensorLoss(LossTerm):
         scale = self.residual_scale.to(prediction)
         prediction = prediction * scale
         target = target * scale
+        weight_checks = None
         if self.residual_smoothing is not None:
-            prediction, target = self._smoothed_fields(
+            prediction, target, weight_checks = self._smoothed_fields(
                 prediction, target, weights, batch,
             )
-        return self.loss_fn(prediction, target)
+        return self.loss_fn(prediction, target), weight_checks
 
     def _smoothed_fields(self, prediction, target, weights, batch):
         """Zero unselected entries, then smooth both fields on the grid."""
 
-        grid_size, grid_spacing = _shared_grid_geometry(batch, prediction)
+        grid_size, grid_spacing = self._smoothing_geometry_for(batch, prediction)
+        weight_checks = None
         if weights is not None:
             if weights.shape != prediction.shape:
                 raise ValueError("weights and prediction must have same shape")
-            selected = _hard_selection(weights, prediction)
+            selected, weight_checks = _hard_selection(weights, prediction)
             zeros = torch.zeros((), dtype=prediction.dtype, device=prediction.device)
             prediction = torch.where(selected, prediction, zeros)
             target = torch.where(selected, target, zeros)
@@ -174,7 +194,24 @@ class TensorLoss(LossTerm):
         return (
             _smooth_on_grid(prediction, grid_size, transfer),
             _smooth_on_grid(target, grid_size, transfer),
+            weight_checks,
         )
+
+    def _smoothing_geometry_for(self, batch, field):
+        """Return the batch geometry, validated once when ``fixed_grid`` is set."""
+
+        if not self.fixed_grid:
+            return _shared_grid_geometry(batch, field)
+        cached = self._smoothing_geometry
+        if cached is None:
+            cached = _shared_grid_geometry(batch, field)
+            self._smoothing_geometry = cached
+        elif field.ndim < 2 or math.prod(cached[0]) != field.shape[1]:
+            raise ValueError(
+                "fixed_grid smoothing received a field whose number of grid "
+                "points differs from the validated grid"
+            )
+        return cached
 
     def _smoothing_transfer(self, grid_size, grid_spacing, reference):
         """Return one lazily cached transfer for this geometry and tensor type."""
@@ -206,7 +243,9 @@ class TensorLoss(LossTerm):
         self._smoothing_transfer_cache.clear()
         return result
 
-    def _reduce_loss(self, value, prediction, outputs, batch):
+    def _reduce_loss(
+        self, value, prediction, outputs, batch, weight_checks=None,
+    ):
         if self.weights_key is None:
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError("loss_fn must return one scalar tensor")
@@ -220,7 +259,19 @@ class TensorLoss(LossTerm):
                 )
             weights = weights.detach().to(prediction)
             total_weight = weights.sum()
-            if total_weight.item() <= 0.0:
+            if weight_checks is None:
+                positive = total_weight.item() > 0.0
+            else:
+                # One device-to-host transfer serves the smoothing weight
+                # checks and the weight total together.
+                finite, hard, positive = torch.stack(
+                    (weight_checks[0], weight_checks[1], total_weight > 0.0),
+                ).tolist()
+                if not finite:
+                    raise ValueError("residual smoothing weights must be finite")
+                if not hard:
+                    raise ValueError("residual smoothing requires hard zero/one weights")
+            if not positive:
                 raise ValueError("weights must have a positive sum")
             value = torch.sum(weights * value) / total_weight
         return {"loss": self.weight * value}
@@ -325,15 +376,20 @@ def _resolve_weights(
 def _hard_selection(
     weights: torch.Tensor,
     reference: torch.Tensor,
-) -> torch.Tensor:
-    """Return a Boolean support mask, rejecting ambiguous soft weights."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return a Boolean support mask and its device-side validity checks.
+
+    The checks, ``[all finite, all zero or one]``, stay on the device so the
+    caller can read them together with its other host transfer; an
+    ambiguous soft weight is rejected there rather than silently selected.
+    """
 
     weights = weights.detach().to(reference)
-    if not torch.isfinite(weights).all().item():
-        raise ValueError("residual smoothing weights must be finite")
-    if not torch.all((weights == 0) | (weights == 1)).item():
-        raise ValueError("residual smoothing requires hard zero/one weights")
-    return weights.bool()
+    checks = torch.stack((
+        torch.isfinite(weights).all(),
+        torch.all((weights == 0) | (weights == 1)),
+    ))
+    return weights != 0, checks
 
 
 def _shared_grid_geometry(
@@ -352,7 +408,7 @@ def _shared_grid_geometry(
             raise KeyError(
                 "batch is missing '{}', required for residual smoothing".format(key)
             )
-    if field.ndim < 3:
+    if field.ndim < 2:
         raise ValueError(
             "residual smoothing requires fields shaped [n_fields, n_grid, ...]"
         )

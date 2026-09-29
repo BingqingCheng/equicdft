@@ -886,6 +886,31 @@ direction per field also does not prove that every Cartesian direction is
 positive on a particular call; it is a stochastic stability regularizer whose
 spherical coverage accumulates during training.
 
+For a dipolar liquid the random direction is not enough. Its longitudinal
+stiffness is dominated by the Coulomb term, $4\pi\beta C \approx 19$ ideal
+units for water, so the curvature projected on a random direction is positive
+unless that direction is within a few degrees of transverse, and a functional
+whose transverse stiffness has gone negative passes the random probe.
+`polarization_direction="transverse"` draws, for every wave, a random
+direction in the plane perpendicular to its own wavevector $2\pi\mathbf n/L$
+(the uniform wave keeps a random direction), and `"longitudinal"` uses the
+wavevector itself; both work with independent and superposed waves, a sum of
+transverse waves staying divergence-free. A floor of 0.1--0.2 on the
+transverse probe is the guard to train a learned dielectric kernel under
+(`polarization.md`, section 7).
+
+```python
+FourierStabilityLoss(
+    variable="dipole_density",
+    random_wavevectors_per_field=2,
+    polarization_direction="transverse",
+    relative_amplitude=0.02,
+    minimum_curvature=0.15,
+    weight=w_T_stability,
+    name="transverse_polarization_stability",
+)
+```
+
 ## Supervised homogeneous Fourier response
 
 `FourierResponseLoss` compares projected homogeneous curvature with explicit
