@@ -206,6 +206,10 @@ normalization; inconsistent settings raise at model construction. The single
 model `polarization_scale` is passed to every polarized branch and LDA. Only
 gather-based pipelines need explicit neighbor indices. Local readouts are
 bound to their own feature widths at construction, before making an optimizer.
+A `LocalReadout(feature_scale=..., feature_offset=...)` subtracts one value
+and divides by one positive value per input feature before the network; the fitting guide's
+[standardization section](training.md#standardizing-local-readout-inputs)
+derives that scale from the training data.
 
 The original `GridCACEModel(a_features=..., b_features=..., readout=[...])`
 syntax remains supported, including its state-dictionary paths. Its ordinary

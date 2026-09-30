@@ -103,6 +103,74 @@ selected ideal, LDA and CACE-centered energy while an ordinary
 that should be fitted against the full functional sets
 `model_kwargs={"use_voxel_mask": False}`.
 
+## Standardizing local readout inputs
+
+The invariants a CACE pipeline feeds its `LocalReadout` are not of one size.
+For a polarized `p = 2, nu = 2` branch on water, the smeared density and the
+polarization centre channel have a spread of order $10^{-2}$ over the
+training voxels while the gradient-type moments of the same fields, the
+invariants that tell a divergence from a curl, sit two to three orders of
+magnitude below; on a four-shell branch the spread covers five decades. A
+network with default initialization fits along the large inputs first and
+reaches the small ones only slowly, so a fit can leave whole families of
+invariants unused.
+
+`standardize_local_features` measures the population standard deviation
+$\sqrt{\langle(x-\langle x\rangle)^2\rangle}$ of every readout input, with
+the variance divided by the voxel count. It covers the whole vector the
+readout sees: an optional separate centre density, the invariants and the
+temperature feature. It installs the result as the readout's
+`feature_scale`, so each varying input enters the network with unit spread.
+Mean subtraction in the forward transform is independently controlled by
+`center`:
+
+```python
+from torch.utils.data import ConcatDataset, DataLoader
+from equicdft import standardize_local_features
+
+def standardize_model(model, train_dataset, validation_dataset):
+    """Standardize a freshly initialized model before constructing Trainer."""
+    normalization_data = ConcatDataset([train_dataset, validation_dataset])
+    normalization_loader = DataLoader(normalization_data, batch_size=1)
+    transforms = standardize_local_features(
+        model, normalization_loader, center=True,
+    )
+    return transforms, model.to_config()
+```
+
+`transforms` maps each local readout's module name (as in
+`model.named_modules()`, e.g. `readout.1.readout`) to the `scale` and
+`offset` it now carries; nothing else has to be done before `Trainer`.
+`center=True` also subtracts each feature's population mean
+(`feature_offset`). A constant shift is absorbed exactly by the first
+layer's bias, so centring changes conditioning only: without it, an input
+with a large mean-to-spread ratio (the smeared density channels sit at
+ρ/ρ_ref ≈ 1 with a spread of a few tenths in bulk cases) enters every
+hidden unit with the same large offset, far from the SiLU knee. Features
+excluded by the relative-spread floor keep a unit scale and zero offset.
+
+Use the same membership as the other data-derived normalizations (train plus
+validation, never test). The statistics depend on the feature modules'
+initial parameters, so compute them on the model that will be fitted, before
+the fit; the scale is then a fixed diagonal preconditioner. Features whose
+spread is below `relative_floor` (default $10^{-4}$) of the largest spread of
+the same readout keep a scale of one, so a constant input, such as the
+temperature feature at the reference temperature, is not amplified into
+noise. `local_feature_statistics` and `local_feature_scale` expose the two
+steps separately.
+
+The scale and offset belong to the fitted weights: they are persistent
+buffers of the readout, so every checkpoint and state dict carries them, and a scaled state
+refuses to load into an unscaled readout instead of silently computing a
+different function. `model.to_config()` records it as well, so a model rebuilt
+from its configuration alone is already scaled. Models without a scale have
+no state entry and load exactly as before. The scale lives in the dtype of
+the readout's weights. To standardize an already fitted model without
+changing it, pass `keep_function=True` (or call
+`readout.set_feature_scale(scale, offset, keep_function=True)`): the first
+linear layer's weights absorb the ratio of the scales, its bias the shift of
+the offsets, and the outputs are unchanged to round-off.
+
 ## Noise augmentation
 
 `Trainer(noise=NoiseOptions(density=True, density_floor=0.0))` perturbs each

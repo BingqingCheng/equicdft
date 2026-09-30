@@ -203,6 +203,101 @@ class TestLocalReadout(unittest.TestCase):
         output = readout(local_features)
         self.assertEqual(output.item(), 6.0)
 
+    def test_feature_scale_divides_inputs_binds_width_and_round_trips(self):
+        readout = LocalReadout(n_types=1, hidden_sizes=(), feature_scale=(2.0, 4.0))
+        self.assertTrue(readout.is_bound)
+        self.assertEqual(readout.n_features, 2)
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
+            readout.mlp[0].bias.zero_()
+        self.assertEqual(readout(torch.tensor([[2.0, 4.0]])).item(), 2.0)
+        # The scale belongs to the weights: it is in the state dict and in
+        # the config, a scaled state refuses to load into an unscaled
+        # readout, and an unscaled readout has no state entry at all.
+        config = readout.to_config()
+        self.assertEqual(config["feature_scale"], [2.0, 4.0])
+        self.assertEqual(readout.state_dict()["feature_scale"].tolist(), [2.0, 4.0])
+        rebuilt = LocalReadout.from_config(config)
+        rebuilt.load_state_dict(readout.state_dict(), strict=True)
+        self.assertEqual(rebuilt(torch.tensor([[2.0, 4.0]])).item(), 2.0)
+        legacy = LocalReadout.from_config({k: v for k, v in config.items() if k != "feature_scale"})
+        self.assertIsNone(legacy.feature_scale)
+        self.assertNotIn("feature_scale", legacy.state_dict())
+        with self.assertRaisesRegex(RuntimeError, "feature_scale"):
+            legacy.load_state_dict(readout.state_dict(), strict=True)
+        # A scaled readout loading a state with a different scale takes the
+        # state's scale, so weights and scale stay a pair.
+        other = LocalReadout(n_types=1, hidden_sizes=(), feature_scale=(1.0, 1.0))
+        other.load_state_dict(readout.state_dict(), strict=True)
+        self.assertEqual(other(torch.tensor([[2.0, 4.0]])).item(), 2.0)
+        # Width mismatches and invalid values are rejected at construction and
+        # at binding.
+        with self.assertRaisesRegex(ValueError, "one value per input feature"):
+            LocalReadout(n_features=3, feature_scale=(1.0, 2.0))
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            LocalReadout(feature_scale=(1.0, 0.0))
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            LocalReadout(feature_scale=(1.0, float("nan")))
+        unbound = LocalReadout(hidden_sizes=(3,))
+        self.assertIsNone(unbound.feature_scale)
+        with self.assertRaisesRegex(RuntimeError, "bind it before"):
+            unbound.set_feature_scale((1.0, 2.0))
+
+    def test_set_feature_scale_keeps_or_changes_the_function(self):
+        torch.manual_seed(5)
+        readout = LocalReadout(n_types=2, hidden_sizes=(6,), n_features=4).to(torch.float64)
+        inputs = torch.randn(3, 7, 4, dtype=torch.float64)
+        before = readout(inputs).detach().clone()
+        readout.set_feature_scale((0.5, 2.0, 10.0, 1.0e-3), keep_function=True)
+        # The scale takes the weights' dtype (float64 here under a float32
+        # default), so the reparametrization is exact to round-off and the
+        # config reports the values the network uses.
+        self.assertEqual(readout.feature_scale.dtype, torch.float64)
+        torch.testing.assert_close(readout(inputs), before, rtol=1e-12, atol=1e-12)
+        self.assertEqual(readout.to_config()["feature_scale"], [0.5, 2.0, 10.0, 1.0e-3])
+        readout.set_feature_scale((1.0, 1.0, 5.0, 1.0), keep_function=True)
+        torch.testing.assert_close(readout(inputs), before)
+        readout.set_feature_scale(None, keep_function=True)
+        self.assertIsNone(readout.feature_scale)
+        self.assertIsNone(readout.to_config()["feature_scale"])
+        torch.testing.assert_close(readout(inputs), before)
+        readout.set_feature_scale((0.5, 2.0, 10.0, 1.0e-3))
+        self.assertFalse(torch.allclose(readout(inputs), before))
+        with self.assertRaisesRegex(ValueError, "one value per input feature"):
+            readout.set_feature_scale((1.0, 2.0))
+
+    def test_feature_offset_centres_inputs_and_is_absorbed_by_the_bias(self):
+        readout = LocalReadout(n_types=1, hidden_sizes=(), feature_scale=(2.0, 4.0), feature_offset=(1.0, -4.0))
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
+            readout.mlp[0].bias.zero_()
+        # (2 - 1)/2 + (4 + 4)/4 = 2.5
+        self.assertEqual(readout(torch.tensor([[2.0, 4.0]])).item(), 2.5)
+        config = readout.to_config()
+        self.assertEqual(config["feature_offset"], [1.0, -4.0])
+        self.assertEqual(readout.state_dict()["feature_offset"].tolist(), [1.0, -4.0])
+        rebuilt = LocalReadout.from_config(config)
+        rebuilt.load_state_dict(readout.state_dict(), strict=True)
+        self.assertEqual(rebuilt(torch.tensor([[2.0, 4.0]])).item(), 2.5)
+        with self.assertRaisesRegex(ValueError, "requires a feature_scale"):
+            LocalReadout(feature_offset=(1.0, 2.0))
+        with self.assertRaisesRegex(ValueError, "one finite value per feature_scale"):
+            LocalReadout(feature_scale=(1.0, 2.0), feature_offset=(1.0,))
+        # keep_function through every combination of scale and offset changes.
+        torch.manual_seed(9)
+        fitted = LocalReadout(n_types=2, hidden_sizes=(6,), n_features=3).to(torch.float64)
+        inputs = torch.randn(4, 5, 3, dtype=torch.float64)
+        before = fitted(inputs).detach().clone()
+        for scale, offset in (((2.0, 0.5, 3.0), (0.3, -1.0, 2.0)), ((1.0, 1.0, 1.0), (5.0, 5.0, 5.0)),
+                              ((0.1, 0.2, 0.3), None), (None, None)):
+            fitted.set_feature_scale(scale, offset, keep_function=True)
+            torch.testing.assert_close(fitted(inputs), before, rtol=1e-11, atol=1e-11)
+        self.assertIsNone(fitted.feature_offset)
+        fitted.set_feature_scale((2.0, 0.5, 3.0), (0.3, -1.0, 2.0))
+        self.assertFalse(torch.allclose(fitted(inputs), before))
+        with self.assertRaisesRegex(ValueError, "requires a feature_scale"):
+            fitted.set_feature_scale(None, (1.0, 2.0, 3.0))
+
     def test_full_autograd_and_finite_difference(self):
         torch.manual_seed(7)
         rho = torch.linspace(

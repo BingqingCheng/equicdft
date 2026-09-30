@@ -32,6 +32,10 @@ from .serialization import (
     save_model,
 )
 from .solver.solver import GridSolver
+from .training.features import (
+    local_feature_offset, local_feature_scale, local_feature_statistics,
+    standardize_local_features,
+)
 from .training.loss import Loss, LossTerm, TensorLoss
 from .training.metrics import MetricCollection, Metrics
 from .training.noise import NoiseOptions
@@ -77,6 +81,10 @@ __all__ = [
     "TensorLoss",
     "Trainer",
     "TrainingStream",
+    "local_feature_offset",
+    "local_feature_scale",
+    "local_feature_statistics",
+    "standardize_local_features",
     "default_data_key",
     "load_model",
     "make_dataloaders",

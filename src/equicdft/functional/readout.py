@@ -1,6 +1,6 @@
 """Energy readouts for grid features."""
 
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -20,6 +20,7 @@ from .._config import (
     optional_config,
     register,
 )
+from .._device import module_device
 from .._nn import build_mlp, validate_hidden_sizes
 from .base import EnergyReadout, ReadoutContext
 from .reciprocal import ReciprocalFeatures
@@ -67,6 +68,29 @@ class LocalReadout(EnergyReadout, Configurable):
         Number of physical density components and per-particle outputs.
     hidden_sizes
         Width of each hidden layer. An empty sequence gives a linear readout.
+    feature_scale
+        Optional positive divisor per input feature. The network then sees
+        ``local_features / feature_scale``. Set it to the population standard
+        deviation of each feature over the training voxels
+        (:func:`equicdft.training.local_feature_scale` computes it) to give
+        every invariant unit spread: the Cartesian invariants of one
+        pipeline span orders of magnitude (the smeared density and the
+        centre channel dominate the gradient-type moments), so an unscaled
+        network first fits along the largest ones. The scale is a fixed
+        diagonal preconditioner that belongs to the fitted weights: it is a
+        persistent buffer, so the state dict carries it and a scaled state
+        refuses to load into an unscaled readout; the configuration records
+        it as well. Its length must equal the bound input width, and it
+        binds an unbound readout to that width.
+    feature_offset
+        Optional value per input feature subtracted before the division,
+        ``(local_features - feature_offset) / feature_scale``; the population
+        mean centres every feature. Requires ``feature_scale``. A constant
+        shift is absorbed exactly by the first layer's bias, so centring
+        changes conditioning, not what the readout can represent: it keeps
+        inputs with a large mean-to-spread ratio (the smeared density
+        channels) from entering every hidden unit with the same large
+        offset.
 
     Notes
     -----
@@ -81,6 +105,8 @@ class LocalReadout(EnergyReadout, Configurable):
         *,
         hidden_sizes: Sequence[int] = (32, 16),
         n_features: Optional[int] = None,
+        feature_scale: Optional[Sequence[float]] = None,
+        feature_offset: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -88,9 +114,74 @@ class LocalReadout(EnergyReadout, Configurable):
         self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.n_features = None
         self.mlp = None
+        # Persistent: the weights are only meaningful together with the
+        # scale, so it travels with them. A None buffer has no state entry,
+        # which keeps unscaled readouts and their checkpoints as they were.
+        self.register_buffer("feature_scale", None)
+        self.register_buffer("feature_offset", None)
         n_features = optional_positive_integer(n_features, "n_features")
+        if feature_offset is not None and feature_scale is None:
+            raise ValueError("feature_offset requires a feature_scale")
+        if feature_scale is not None:
+            scale, offset = self._validated_transform(feature_scale, feature_offset)
+            if n_features is None:
+                n_features = scale.numel()
+            elif scale.numel() != n_features:
+                raise ValueError(
+                    "feature_scale must contain one value per input feature "
+                    "({}), got {}".format(n_features, scale.numel())
+                )
+            self._store_transform(scale, offset)
         if n_features is not None:
             self.bind_input_size(n_features)
+
+    @property
+    def _scale_buffer(self) -> Optional[torch.Tensor]:
+        # Legacy whole-object pickles predate the buffer; treat them as unscaled.
+        return self._buffers.get("feature_scale")
+
+    @property
+    def _offset_buffer(self) -> Optional[torch.Tensor]:
+        return self._buffers.get("feature_offset")
+
+    @staticmethod
+    def _validated_transform(
+        feature_scale: Any,
+        feature_offset: Any,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        scale = torch.as_tensor(feature_scale, dtype=torch.float64)
+        scale = scale.detach().cpu().reshape(-1).clone()
+        if scale.numel() == 0 or not bool(
+            torch.isfinite(scale).all() and (scale > 0).all()
+        ):
+            raise ValueError("feature_scale must contain finite positive values")
+        if feature_offset is None:
+            return scale, None
+        offset = torch.as_tensor(feature_offset, dtype=torch.float64)
+        offset = offset.detach().cpu().reshape(-1).clone()
+        if offset.numel() != scale.numel() or not bool(torch.isfinite(offset).all()):
+            raise ValueError(
+                "feature_offset must contain one finite value per feature_scale entry"
+            )
+        return scale, offset
+
+    def _store_transform(
+        self,
+        scale: Optional[torch.Tensor],
+        offset: Optional[torch.Tensor],
+    ) -> None:
+        if scale is None:
+            self.feature_scale = None
+            self.feature_offset = None
+            return
+        # Same dtype and device as the weights they belong to (the default
+        # dtype before binding; bind_input_size builds the network in that
+        # dtype too), so the function and the recorded values agree exactly.
+        weight = self.mlp[0].weight if self.is_bound else None
+        dtype = torch.get_default_dtype() if weight is None else weight.dtype
+        device = module_device(self)
+        self.feature_scale = scale.to(device=device, dtype=dtype)
+        self.feature_offset = None if offset is None else offset.to(device=device, dtype=dtype)
 
     @property
     def is_bound(self) -> bool:
@@ -112,8 +203,67 @@ class LocalReadout(EnergyReadout, Configurable):
                     )
                 )
             return
+        scale = self._scale_buffer
+        if scale is not None and scale.numel() != n_features:
+            raise ValueError(
+                "{} carries a feature_scale for {} input features, not {}".format(
+                    type(self).__name__, scale.numel(), n_features,
+                )
+            )
         self.n_features = n_features
         self.mlp = build_mlp(n_features, self.hidden_sizes, self.n_types)
+
+    def set_feature_scale(
+        self,
+        feature_scale: Optional[Sequence[float]],
+        feature_offset: Optional[Sequence[float]] = None,
+        *,
+        keep_function: bool = False,
+    ) -> None:
+        """Replace the input scale (and offset) of a bound readout.
+
+        With ``keep_function=True`` the first linear layer is reparametrized
+        so the readout computes the same function as before: the weights
+        absorb the ratio of the new and the old scale and the bias absorbs
+        the shift of the offset. This standardizes a fitted readout without
+        changing the model. Otherwise the weights are left alone and the
+        function changes, which is the intended use before a fit: a freshly
+        initialized network then starts from unit-spread (and, with an
+        offset, zero-mean) inputs. ``None`` removes scale and offset.
+        """
+
+        if not self.is_bound:
+            raise RuntimeError(
+                "{} has no input width yet; bind it before setting a "
+                "feature_scale".format(type(self).__name__)
+            )
+        keep_function = boolean(keep_function, "keep_function")
+        if feature_scale is None:
+            if feature_offset is not None:
+                raise ValueError("feature_offset requires a feature_scale")
+            new_scale = new_offset = None
+        else:
+            new_scale, new_offset = self._validated_transform(feature_scale, feature_offset)
+            if new_scale.numel() != self.n_features:
+                raise ValueError(
+                    "feature_scale must contain one value per input feature "
+                    "({}), got {}".format(self.n_features, new_scale.numel())
+                )
+        if keep_function:
+            first = self.mlp[0]
+            weight = first.weight
+            ones = torch.ones(self.n_features, dtype=weight.dtype, device=weight.device)
+            zeros = torch.zeros_like(ones)
+            old_scale = ones if self._scale_buffer is None else self._scale_buffer.to(weight)
+            old_offset = zeros if self._offset_buffer is None else self._offset_buffer.to(weight)
+            scale = ones if new_scale is None else new_scale.to(weight)
+            offset = zeros if new_offset is None else new_offset.to(weight)
+            # W (x - o)/s + b == W' (x - o')/s' + b'  with  W' = W s'/s and
+            # b' = b + W (o' - o)/s.
+            with torch.no_grad():
+                first.bias.add_(weight @ ((offset - old_offset) / old_scale))
+                weight.mul_((scale / old_scale)[None, :])
+        self._store_transform(new_scale, new_offset)
 
     def to_config(self) -> Dict[str, Any]:
         """Return the constructor arguments describing this readout.
@@ -126,6 +276,8 @@ class LocalReadout(EnergyReadout, Configurable):
             n_types=self.n_types,
             hidden_sizes=self.hidden_sizes,
             n_features=self.n_features,
+            feature_scale=optional_buffer_value(self._scale_buffer),
+            feature_offset=optional_buffer_value(self._offset_buffer),
         )
 
     def forward(
@@ -139,6 +291,12 @@ class LocalReadout(EnergyReadout, Configurable):
                 "{} has no input width yet; pass n_features or let "
                 "GridCACEModel bind it".format(type(self).__name__)
             )
+        scale = self._scale_buffer
+        if scale is not None:
+            offset = self._offset_buffer
+            if offset is not None:
+                local_features = local_features - offset.to(local_features)
+            local_features = local_features / scale.to(local_features)
         return self.mlp(local_features)
 
     def energy(self, context: ReadoutContext) -> torch.Tensor:
