@@ -911,6 +911,19 @@ FourierStabilityLoss(
 )
 ```
 
+The probe's curvature is a ratio of total to ideal second variation over
+the whole field, so a box-wide wave can pass the floor while a dense
+region, a contact layer or a dense slab, is locally unstable: the bulk
+dominates the average. `probe_density_power=p` weights every probe wave by
+$(\rho/\max\rho)^p$ per field, concentrating it in the densest voxels. On a
+2 Å grid `p = 2` is a good choice: much larger powers localize the wave
+below the widths of smooth kernels, which then no longer act on it, and
+hide the softening again. The weighted wave is divergence-free only where
+the density gradient is perpendicular to the wave's polarization, as for
+layers normal to the wavevector; elsewhere it picks up some longitudinal
+stiffness. It is a detector for dense-layer instability, to be combined
+with a density-scaled dielectric kernel (`polarization.md`, section 7).
+
 ## Supervised homogeneous Fourier response
 
 `FourierResponseLoss` compares projected homogeneous curvature with explicit

@@ -6,7 +6,7 @@ from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple, Union
 import torch
 from torch import nn
 
-from .._validation import boolean, positive_integer
+from .._validation import boolean, finite_scalar, positive_integer
 from ._pairs import symmetric_component_pairs
 from .._config import Configurable, make_config, register
 from ._sites import FourierSites
@@ -216,6 +216,28 @@ class ReciprocalFeatures(nn.Module, Configurable):
         The same real spectral derivative as Coulomb is used, including its
         zero even-axis Nyquist components. Uniform and pure Nyquist modes
         therefore receive only the vector-dot-product contribution.
+    density_exponent
+        Direct polarization only. With ``gamma > 0`` the kernels act on the
+        density-scaled field ``Q_a = P_a (rho_ref / rho~_a)^gamma`` instead
+        of ``P_a``, where ``rho~ = sqrt(rho^2 + rho_floor^2)``. At
+        ``gamma = 1/2`` a kernel coefficient contributes a local
+        polarization stiffness proportional to ``rho_ref / rho``, the same
+        density scaling as the orientational ideal term and a per-molecule
+        (alignment-based) excess; with ``gamma = 0`` (default) the
+        contribution is independent of the local density, so a negative
+        kernel that softens bulk water softens a dense layer more than its
+        ideal restoring force allows. At ``rho = rho_ref`` both give the same
+        features, so coefficients keep their meaning. The features then
+        depend on ``rho`` as well and contribute to the density derivative.
+    reference_density
+        ``rho_ref`` for ``density_exponent``; one positive value (shared by
+        every component) or one per component. Required when
+        ``density_exponent > 0``.
+    density_floor
+        Nonnegative ``rho_floor`` regularizing ``rho~`` in dilute voxels
+        (``Q`` vanishes there with ``P``; the floor only keeps the weight and
+        its derivative finite). Required to be positive when
+        ``density_exponent > 0``.
     """
 
     _KERNELS = (
@@ -233,6 +255,9 @@ class ReciprocalFeatures(nn.Module, Configurable):
         n_types: int = 1,
         variable: str = "rho",
         include_divergence: bool = False,
+        density_exponent: float = 0.0,
+        reference_density: Optional[Union[float, Sequence[float]]] = None,
+        density_floor: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -290,6 +315,40 @@ class ReciprocalFeatures(nn.Module, Configurable):
         self.register_buffer("radial_exponents", exponents)
         self.register_buffer("screening", screening_values)
 
+        density_exponent = finite_scalar(density_exponent, "density_exponent")
+        density_floor = finite_scalar(density_floor, "density_floor")
+        if density_exponent < 0.0:
+            raise ValueError("density_exponent must be nonnegative")
+        if density_floor < 0.0:
+            raise ValueError("density_floor must be nonnegative")
+        reference = None
+        if density_exponent > 0.0:
+            if variable != "dipole_density":
+                raise ValueError("density_exponent requires direct polarization features")
+            if reference_density is None or density_floor <= 0.0:
+                raise ValueError(
+                    "density_exponent > 0 requires reference_density and a "
+                    "positive density_floor"
+                )
+            reference = torch.as_tensor(
+                reference_density, dtype=torch.get_default_dtype(),
+            ).detach().clone().reshape(-1)
+            if reference.numel() == 1:
+                reference = reference.repeat(n_types)
+            if reference.numel() != n_types or not bool(
+                torch.isfinite(reference).all() and (reference > 0).all()
+            ):
+                raise ValueError(
+                    "reference_density must contain one positive value or one per type"
+                )
+        elif reference_density is not None:
+            raise ValueError("reference_density requires density_exponent > 0")
+        self.density_exponent = density_exponent
+        self.density_floor = density_floor
+        # Configuration constants, not fitted state: kept out of the state
+        # dict so existing checkpoints load unchanged.
+        self.register_buffer("reference_density", reference, persistent=False)
+
     @property
     def requires_dipole_density(self) -> bool:
         return self.variable == "dipole_density"
@@ -305,6 +364,12 @@ class ReciprocalFeatures(nn.Module, Configurable):
             n_types=self.n_types,
             variable=self.variable,
             include_divergence=self.include_divergence,
+            density_exponent=self.density_exponent,
+            reference_density=(
+                None if self.reference_density is None
+                else self.reference_density
+            ),
+            density_floor=self.density_floor,
         )
 
     def forward(
@@ -361,6 +426,8 @@ class ReciprocalFeatures(nn.Module, Configurable):
         volume = volume_element * float(nx * ny * nz)
         polarization_hat = None
         if dipole_density is not None:
+            if direct_polarization and self.density_exponent > 0.0:
+                dipole_density = dipole_density * self.density_weight(rho)[..., None]
             p_grid = dipole_density.reshape(
                 *leading_shape, nx, ny, nz, self.n_types, 3,
             )
@@ -400,6 +467,15 @@ class ReciprocalFeatures(nn.Module, Configurable):
             )
             features = torch.cat((features, divergence_features), dim=-2)
         return features
+
+    def density_weight(self, rho: torch.Tensor) -> torch.Tensor:
+        """Return ``(rho_ref / sqrt(rho^2 + rho_floor^2))^gamma`` per voxel and type."""
+
+        if self.density_exponent == 0.0:
+            return torch.ones_like(rho)
+        reference = self.reference_density.to(rho)
+        regularized = torch.sqrt(rho.square() + self.density_floor ** 2)
+        return (reference / regularized) ** self.density_exponent
 
     def _pair_features(self, fourier_source, kernels, volume):
         """Contract ``[..., nx, ny, nz, n_types, n_vector]`` pair spectra."""

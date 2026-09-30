@@ -174,6 +174,17 @@ class FourierStabilityLoss(LossTerm):
         wavevector's own direction. Both use the ordinary wavevector
         ``2 pi n / L``; the uniform wave keeps a random direction. Only for
         ``variable="dipole_density"``.
+    probe_density_power
+        Polarization only. ``p > 0`` weights every probe wave by
+        ``(rho / max rho)^p`` per field, so the curvature measures the
+        densest regions of the field (contact layers, dense slabs) instead of
+        its volume average; see :func:`polarization_fourier_curvature`. A
+        box-wide wave can pass a floor while a dense layer is locally
+        unstable. Default 0 keeps the unweighted probe (whose alignment
+        displacement already scales with rho). ``p = 2`` is a good choice on
+        a 2 A grid: much larger powers localize the wave below the kernel
+        widths, where a smooth kernel no longer acts, and hide the softening
+        again.
     """
 
     def __init__(
@@ -197,6 +208,7 @@ class FourierStabilityLoss(LossTerm):
         variable: str = "rho",
         include_zero_wavevector: Optional[bool] = None,
         polarization_direction: str = "random",
+        probe_density_power: float = 0.0,
     ) -> None:
         super().__init__(name, weight)
 
@@ -227,6 +239,12 @@ class FourierStabilityLoss(LossTerm):
                 "polarization_direction applies to variable='dipole_density'"
             )
         self.polarization_direction = polarization_direction
+        probe_density_power = finite_scalar(probe_density_power, "probe_density_power")
+        if probe_density_power < 0.0:
+            raise ValueError("probe_density_power must be nonnegative")
+        if variable == "rho" and probe_density_power != 0.0:
+            raise ValueError("probe_density_power applies to variable='dipole_density'")
+        self.probe_density_power = probe_density_power
         wavevector_treatment = nonempty_string(
             wavevector_treatment,
             "wavevector_treatment",
@@ -409,8 +427,8 @@ class FourierStabilityLoss(LossTerm):
                 else "translational_ideal_gas")
 
     def extra_repr(self) -> str:
-        return "variable={!r}, ideal_reference={!r}, polarization_direction={!r}".format(
-            self.variable, self.ideal_reference, self.polarization_direction,
+        return "variable={!r}, ideal_reference={!r}, polarization_direction={!r}, probe_density_power={!r}".format(
+            self.variable, self.ideal_reference, self.polarization_direction, self.probe_density_power,
         )
 
     def evaluate(
@@ -568,6 +586,7 @@ class FourierStabilityLoss(LossTerm):
             "rho": rho,
             "polarization_directions": directions,
             "perturbations_per_forward": self.response.perturbations_per_forward,
+            "density_power": self.probe_density_power,
         }
         if self.wavevector_treatment == "independent":
             _, amplitude = self._sample_wavevector_probe(

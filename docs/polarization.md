@@ -667,6 +667,44 @@ unique species pairs and off-diagonal factor of two as A. The default
 `include_divergence=False` preserves existing Gaussian-P, density and Coulomb
 models; this option is only available for direct Gaussian polarization.
 
+#### Local density scaling
+
+With the kernels acting on $\mathbf P$ itself, a coefficient adds the same
+local polarization stiffness at every density, while the orientational
+ideal stiffness $3/(\rho m^2)$ falls as $1/\rho$. A negative transverse
+coefficient that correctly softens bulk water at $\rho_{\mathrm{ref}}$ then
+over-softens a denser contact layer: on the 2 Å water fits the transverse
+stiffness crossed zero at about $1.2\,\rho_{\mathrm{ref}}$ and the reverse
+solves grew spontaneous polarization in dense interfacial voxels, although
+bulk and the box-averaged stability probe were stable. `density_exponent`
+applies the kernels to
+
+$$
+\mathbf Q_a=\mathbf P_a\left(\frac{\rho_{\mathrm{ref},a}}{\tilde\rho_a}\right)^{\gamma},
+\qquad \tilde\rho_a=\sqrt{\rho_a^2+\rho_{\mathrm{floor}}^2}
+$$
+
+instead. At $\gamma=1/2$ each coefficient contributes a local stiffness
+proportional to $\rho_{\mathrm{ref}}/\rho$, the scaling of the ideal term and
+of a per-molecule (alignment) excess, so a coefficient fitted to bulk keeps
+the same fraction of the ideal restoring force in a dense layer. At
+$\rho=\rho_{\mathrm{ref}}$ the features are unchanged, so coefficients in
+ideal units keep their meaning. The weight depends on $\rho$, so these
+features also contribute to the density derivative. $\rho_{\mathrm{floor}}$
+only regularizes dilute voxels, where $\mathbf Q$ vanishes with
+$\mathbf P\le m\rho$.
+
+```python
+ReciprocalFeatures(
+    radial_exponents=(1.0, 2.5, 8.0), kernel="gaussian", n_types=1,
+    variable="dipole_density", include_divergence=True,
+    density_exponent=0.5, reference_density=rho_ref, density_floor=1.0e-3,
+)
+```
+
+The default `density_exponent=0` keeps the density-independent kernel and
+every existing model.
+
 ### Density-only use of the same API
 
 This independent helper accepts the same physical Gaussian widths and species

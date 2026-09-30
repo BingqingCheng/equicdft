@@ -8,6 +8,7 @@ from typing import (
 )
 import torch
 from torch import nn
+from .._validation import finite_scalar
 from ..geometry.grid import voxel_volume
 from ..functional.thermodynamics import ideal_free_energy
 from ..functional.polarization_ideal import FixedDipoleIdeal
@@ -246,6 +247,7 @@ def polarization_fourier_curvature(
     polarization_directions: torch.Tensor,
     perturbations_per_forward: Optional[int] = None,
     wavevector_phases: Optional[torch.Tensor] = None,
+    density_power: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return excess plus quadratic-alignment ideal curvature per field.
 
@@ -265,6 +267,15 @@ def polarization_fourier_curvature(
     relative to its own wavevector (transverse or longitudinal probes). In
     the summed pattern each wave carries its own direction, so a sum of
     transverse waves stays divergence-free.
+
+    ``density_power = p > 0`` multiplies every alignment wave by
+    ``(rho_total / max rho_total)^p`` per field before normalization, which
+    localizes the probe in the densest voxels. The returned curvature is
+    still total over ideal second variation, so it measures the stiffness of
+    the dense regions instead of the field average (a box-wide wave passes a
+    floor while a dense layer is locally unstable). The weighting is not
+    divergence-free where the density gradient has a component along the
+    wave's polarization; it is exact for layers normal to the wavevector.
     """
 
     if "dipole_density" not in batch:
@@ -298,6 +309,15 @@ def polarization_fourier_curvature(
         selected_direction,
         wavevector_phases=wavevector_phases,
     )
+    density_power = finite_scalar(density_power, "density_power")
+    if density_power < 0.0:
+        raise ValueError("density_power must be nonnegative")
+    if density_power > 0.0:
+        total = rho.sum(dim=-1)
+        relative = total / torch.clamp(
+            torch.amax(total, dim=-1, keepdim=True), min=torch.finfo(rho.dtype).tiny,
+        )
+        vector_waves = vector_waves * (relative ** density_power)[:, None, :, None]
     wave_norm = torch.amax(
         torch.linalg.vector_norm(vector_waves, dim=-1), dim=-1,
     )
