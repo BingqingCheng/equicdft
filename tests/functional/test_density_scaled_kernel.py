@@ -205,8 +205,10 @@ class TestDensityScaledKernel(unittest.TestCase):
         self.assertEqual(penalties[0.5, 2.0], 0.0)
         with self.assertRaisesRegex(ValueError, "probe_density_power"):
             FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="dipole_density", probe_density_power=-1.0)
-        with self.assertRaisesRegex(ValueError, "probe_density_power"):
-            FourierStabilityLoss(wavevector_indices=((1, 0, 0),), probe_density_power=2.0)
+        # Density probes accept the weighting too (tests/response/test_density_weighted_probe.py).
+        self.assertEqual(
+            FourierStabilityLoss(wavevector_indices=((1, 0, 0),), probe_density_power=2.0).probe_density_power, 2.0,
+        )
 
     def test_configuration_and_validation(self):
         features = ReciprocalFeatures(

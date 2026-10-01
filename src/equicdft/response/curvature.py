@@ -137,6 +137,7 @@ def fourier_curvature_matrix(
     relative_amplitude: Union[float, torch.Tensor],
     perturbations_per_forward: Optional[int] = None,
     wavevector_phases: Optional[torch.Tensor] = None,
+    density_power: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return the ideal-metric component Hessian for every real probe.
 
@@ -150,6 +151,10 @@ def fourier_curvature_matrix(
     contributions but does not reconstruct the complete spatial Hessian. Pair
     polarization adds numerical cancellation, so matrix applications should
     check convergence with respect to ``relative_amplitude``.
+    ``density_power = p > 0`` weights every component wave by
+    ``(rho_total / max rho_total)^p`` (see
+    :func:`~equicdft.response.modes.component_fourier_directions`); the
+    ideal-metric normalization is unchanged, so 1 remains the ideal gas.
     """
 
     component_directions, active = component_fourier_directions(
@@ -157,6 +162,7 @@ def fourier_curvature_matrix(
         rho,
         wavevector_indices,
         wavevector_phases=wavevector_phases,
+        density_power=density_power,
     )
     n_fields, n_real_probes, _, n_types = component_directions.shape
     identity = torch.eye(n_types, device=rho.device, dtype=rho.dtype)

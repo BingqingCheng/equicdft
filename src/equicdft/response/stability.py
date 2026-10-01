@@ -175,16 +175,32 @@ class FourierStabilityLoss(LossTerm):
         ``2 pi n / L``; the uniform wave keeps a random direction. Only for
         ``variable="dipole_density"``.
     probe_density_power
-        Polarization only. ``p > 0`` weights every probe wave by
-        ``(rho / max rho)^p`` per field, so the curvature measures the
-        densest regions of the field (contact layers, dense slabs) instead of
-        its volume average; see :func:`polarization_fourier_curvature`. A
-        box-wide wave can pass a floor while a dense layer is locally
-        unstable. Default 0 keeps the unweighted probe (whose alignment
-        displacement already scales with rho). ``p = 2`` is a good choice on
-        a 2 A grid: much larger powers localize the wave below the kernel
-        widths, where a smooth kernel no longer acts, and hide the softening
-        again.
+        ``p > 0`` weights every probe wave by ``(rho / max rho)^p`` per field
+        (``rho`` the total density), so the curvature measures the densest
+        regions of the field (contact layers, dense slabs) instead of its
+        volume average. A box-wide wave can pass a floor while a dense layer
+        is locally unstable. Default 0 keeps the original unweighted probes.
+
+        Polarization: see :func:`polarization_fourier_curvature`; the
+        unweighted alignment displacement already scales with rho. ``p = 2``
+        is a good choice on a 2 A grid: much larger powers localize the wave
+        below the kernel widths, where a smooth kernel no longer acts, and
+        hide the softening again.
+
+        Density: component ``a`` is displaced by
+        ``rho_a * g * (wave - c_a)`` with ``g = (rho / max rho)^p`` and
+        ``c_a`` the ``rho_a * g``-weighted mean of the wave, so particle
+        numbers stay exact. The curvature is then normalized in the ideal
+        metric of that displacement, ``delta^2(beta F) / (DeltaV *
+        sum(delta_rho**2 / rho))`` (one for an ideal gas anywhere in the
+        field; equal to the default normalization in a homogeneous field), as
+        ``"full_matrix"`` already is. Weighting also moves the probe away
+        from liquid-vapor interfaces, where a box-wide density wave partly
+        translates the interface, a physical near-zero mode. It tests the
+        local compressibility near the sampled states only: it does not see
+        a free-energy well far above the sampled densities (a single voxel
+        driven to the solver's upper density bound), which needs a
+        finite-excursion test or a fixed high-density reference.
     """
 
     def __init__(
@@ -242,8 +258,6 @@ class FourierStabilityLoss(LossTerm):
         probe_density_power = finite_scalar(probe_density_power, "probe_density_power")
         if probe_density_power < 0.0:
             raise ValueError("probe_density_power must be nonnegative")
-        if variable == "rho" and probe_density_power != 0.0:
-            raise ValueError("probe_density_power applies to variable='dipole_density'")
         self.probe_density_power = probe_density_power
         wavevector_treatment = nonempty_string(
             wavevector_treatment,
@@ -498,6 +512,7 @@ class FourierStabilityLoss(LossTerm):
                 outputs=outputs,
                 relative_amplitude=amplitude,
                 wavevector_phases=wavevector_phases,
+                density_power=self.probe_density_power,
             )
             return self._matrix_loss(matrix, active)
 
@@ -510,6 +525,7 @@ class FourierStabilityLoss(LossTerm):
             outputs=outputs,
             relative_amplitude=amplitude,
             wavevector_phases=wavevector_phases,
+            density_power=self.probe_density_power,
         )
         return self._directional_loss(
             normalized_curvature,

@@ -128,21 +128,44 @@ def probe_shape(wavevector_indices, wavevector_phases):
     return 1, 1
 
 
+def _density_power(value) -> float:
+    """Validate a nonnegative probe density power."""
+
+    value = finite_scalar(value, "density_power")
+    if value < 0.0:
+        raise ValueError("density_power must be nonnegative")
+    return value
+
+
 def fourier_directions(
     batch: Dict[str, torch.Tensor],
     rho: torch.Tensor,
     wavevector_indices: torch.Tensor,
     component_weights: torch.Tensor,
     wavevector_phases: Optional[torch.Tensor] = None,
+    density_power: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return fixed-number Fourier directions, validity, and density scale."""
+    """Return fixed-number Fourier directions, validity, and density scale.
 
+    The density scale converts ``second difference / sum(delta_rho**2)`` into
+    ideal units. With ``density_power = 0`` it is the component-mean density,
+    exact for a homogeneous field (the original normalization). With
+    ``density_power > 0`` the weighted waves concentrate in the densest
+    regions, where the mean density is no longer representative, so the
+    scale is ``sum(delta_rho**2) / sum(delta_rho**2 / rho)`` of each
+    direction: the curvature is then measured in the ideal-gas metric of the
+    displacement itself, as in :func:`fourier_curvature_matrix`. Both agree
+    for a homogeneous field.
+    """
+
+    density_power = _density_power(density_power)
     n_fields, n_grid, n_types = rho.shape
     component_directions, valid_component = component_fourier_directions(
         batch,
         rho,
         wavevector_indices,
         wavevector_phases=wavevector_phases,
+        density_power=density_power,
     )
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12
@@ -154,7 +177,13 @@ def fourier_directions(
         )
     active_components = torch.abs(component_weights) > 0.0
     n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
-    valid_by_wavevector = valid_component.reshape(
+    # Only true aliasing of the plain wave is an error. A weighted probe can
+    # also leave a present component without support (its density lies where
+    # the weight underflows); that component is simply inactive.
+    alias_valid = valid_component if density_power == 0.0 else component_fourier_directions(
+        batch, rho, wavevector_indices, wavevector_phases=wavevector_phases,
+    )[1]
+    valid_by_wavevector = alias_valid.reshape(
         n_fields,
         n_patterns,
         n_phases,
@@ -179,6 +208,29 @@ def fourier_directions(
         valid_component[:, :, None, :]
         & active_components[None, None, :, :]
     ).any(dim=-1).flatten(start_dim=1, end_dim=2)
+
+    if density_power > 0.0:
+        # Inactive component directions are exactly zero here, so a direction
+        # with no active component has a zero norm; give it a zero scale (its
+        # curvature is masked by ``valid``) rather than 0/0. The guard uses
+        # the dtype's own smallest normal number, so it holds in float32.
+        squared = directions.square()
+        tiny = torch.finfo(rho.dtype).tiny
+        ideal_norm = torch.where(
+            rho[:, None, :, :] > 0.0,
+            squared / torch.clamp(rho[:, None, :, :], min=tiny),
+            torch.zeros_like(squared),
+        ).sum(dim=(-2, -1))
+        has_norm = ideal_norm > tiny
+        mean_densities = torch.where(
+            has_norm,
+            squared.sum(dim=(-2, -1)) / torch.where(
+                has_norm, ideal_norm, torch.ones_like(ideal_norm),
+            ),
+            torch.zeros_like(ideal_norm),
+        )
+        valid = valid & has_norm
+        return directions.detach(), valid, mean_densities.detach()
 
     component_mean_densities = total_density / n_grid
     squared_weights = component_weights.square()
@@ -207,9 +259,20 @@ def component_fourier_directions(
     rho: torch.Tensor,
     wavevector_indices: torch.Tensor,
     wavevector_phases: Optional[torch.Tensor] = None,
+    density_power: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return one fixed-number real Fourier direction per component."""
+    """Return one fixed-number real Fourier direction per component.
 
+    Component ``a`` is displaced by ``rho_a * g * (wave - c_a)``, normalized
+    so its largest relative change ``|delta_rho_a / rho_a|`` is one. The
+    weight is ``g = 1`` by default; ``density_power = p > 0`` uses
+    ``g = (rho_total / max rho_total)^p`` per field, which concentrates the
+    probe in the densest regions. ``c_a`` is the ``rho_a * g``-weighted mean
+    of the wave, so every component's particle number is conserved exactly
+    for any ``p``.
+    """
+
+    density_power = _density_power(density_power)
     n_fields, n_grid, n_types = rho.shape
     waves, _ = _real_fourier_waves(
         batch,
@@ -220,6 +283,10 @@ def component_fourier_directions(
 
     total_density = torch.sum(rho, dim=-2)
     component_present = total_density > 1.0e-12
+    if density_power > 0.0:
+        return _weighted_component_directions(
+            rho, waves, component_present, density_power,
+        )
     weighted_mean = torch.sum(
         rho[:, None, :, :] * waves[..., None],
         dim=-2,
@@ -234,6 +301,45 @@ def component_fourier_directions(
         min=1.0e-12,
     )
     component_directions = rho[:, None, :, :] * relative_direction
+    return component_directions.detach(), valid_component
+
+
+def _weighted_component_directions(rho, waves, component_present, density_power):
+    """Density-weighted fixed-number directions (``density_power > 0``).
+
+    The mean ``c_a`` is divided by the component's actual weighted mass
+    ``sum(rho_a * g)``, never by a clamp, so the displacement sums to zero
+    for every component whatever its concentration. A component whose
+    weighted mass is not a positive normal number of the dtype (absent, or
+    entirely in voxels where ``g`` underflows) is inactive: its direction is
+    exactly zero and it is marked invalid.
+    """
+
+    tiny = torch.finfo(rho.dtype).tiny
+    local_total = torch.sum(rho, dim=-1)
+    largest = torch.amax(local_total, dim=-1, keepdim=True)
+    weight = (local_total / torch.clamp(largest, min=tiny)) ** density_power
+    weighted_rho = rho * weight[..., None]
+    mass = torch.sum(weighted_rho, dim=-2)
+    supported = component_present & (mass > tiny)
+    safe_mass = torch.where(supported, mass, torch.ones_like(mass))
+    weighted_mean = torch.sum(
+        weighted_rho[:, None, :, :] * waves[..., None],
+        dim=-2,
+    ) / safe_mass[:, None, :]
+    relative_direction = (
+        waves[..., None] - weighted_mean[:, :, None, :]
+    ) * weight[:, None, :, None]
+    relative_norm = torch.amax(torch.abs(relative_direction), dim=-2)
+    valid_component = (relative_norm > 1.0e-5) & supported[:, None, :]
+    relative_direction = relative_direction / torch.where(
+        valid_component, relative_norm, torch.ones_like(relative_norm),
+    )[:, :, None, :]
+    component_directions = torch.where(
+        valid_component[:, :, None, :],
+        rho[:, None, :, :] * relative_direction,
+        torch.zeros_like(relative_direction),
+    )
     return component_directions.detach(), valid_component
 
 

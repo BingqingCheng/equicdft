@@ -69,6 +69,7 @@ class FourierResponse(nn.Module):
         *,
         relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
         wavevector_phases: Optional[torch.Tensor] = None,
+        density_power: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return curvature and validity by field, wavevector, and direction.
 
@@ -78,7 +79,11 @@ class FourierResponse(nn.Module):
         this call only. With ``wavevector_phases`` supplied in radians as
         ``[field, wavevector]``, the waves are summed before projection and
         normalization. The output becomes ``[field, 1, 1, direction]`` and
-        amplitude tensors use ``[field, 1]``.
+        amplitude tensors use ``[field, 1]``. ``density_power = p > 0``
+        weights every wave by ``(rho_total / max rho_total)^p`` per field
+        and measures the curvature in the ideal-gas metric of the weighted
+        displacement; the default 0 is the unweighted probe with the
+        mean-density normalization.
         """
 
         if outputs is None:
@@ -102,6 +107,7 @@ class FourierResponse(nn.Module):
             wavevector_indices,
             directions,
             wavevector_phases=wavevector_phases,
+            density_power=density_power,
         )
         n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
         curvature, valid = projected_fourier_curvature(
@@ -135,6 +141,7 @@ class FourierResponse(nn.Module):
         *,
         relative_amplitude: Optional[Union[float, torch.Tensor]] = None,
         wavevector_phases: Optional[torch.Tensor] = None,
+        density_power: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return the phase-resolved physical-component curvature matrix.
 
@@ -149,7 +156,8 @@ class FourierResponse(nn.Module):
         as ``[field, wavevector]``, all component probes share one wave
         superposition; the output is ``[field, 1, 1, type, type]`` and
         amplitudes are scalar or ``[field, 1]``. This is a projected composite
-        Hessian, not S(k) at any single wavevector.
+        Hessian, not S(k) at any single wavevector. ``density_power``
+        weights the component waves as in :meth:`forward`.
         """
 
         if outputs is None:
@@ -188,4 +196,5 @@ class FourierResponse(nn.Module):
             ),
             perturbations_per_forward=self.perturbations_per_forward,
             wavevector_phases=wavevector_phases,
+            density_power=density_power,
         )

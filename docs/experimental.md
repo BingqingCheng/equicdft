@@ -778,6 +778,49 @@ directions.
 Stability loss prevents selected negative curvatures; it does not determine
 the correct positive response and is not direct structure-factor training.
 
+### Density-weighted density probes
+
+A box-wide density wave measures the compressibility averaged over the
+field, so a functional that is unstable inside a dense layer can pass the
+floor while the rest of the field dominates the average. With
+`probe_density_power=p > 0` every component is displaced by
+$\rho_a\,g\,(w - c_a)$ with $g = (\rho/\max\rho)^p$ ($\rho$ the total
+density, per field) and $c_a$ the $\rho_a g$-weighted mean of the wave $w$,
+so every particle number stays exact and the largest relative change is
+still `relative_amplitude`. The mean is divided by the component's actual
+weighted mass, so this holds for dilute components too; a component with no
+weighted mass in the field's dtype (absent, or only where the weight
+underflows) is inactive for that probe rather than an error. The directional curvature is then measured in the
+ideal metric of the displacement,
+
+$$
+K = \frac{\delta^2(\beta F)}{\Delta V \sum_i \delta\rho_i^2/\rho_i},
+$$
+
+one for an ideal gas anywhere in the field (the default normalization by the
+mean density is exact only for a homogeneous field; both agree there).
+`"full_matrix"` already uses this metric and takes the same weighting. The
+default `p = 0` is the original probe and normalization.
+
+```python
+FourierStabilityLoss(
+    random_wavevectors_per_field=2,
+    relative_amplitude=0.01,
+    minimum_curvature=0.0,
+    probe_density_power=2.0,
+    weight=w_rho_stability,
+    name="dense_layer_density_stability",
+)
+```
+
+Weighting also moves the probe away from liquid-vapor interfaces, where a
+box-wide wave partly translates the interface, a physical near-zero mode
+that a floor would wrongly penalize. It tests the local curvature near the
+sampled states only. A free-energy well far above the sampled densities, such
+as a single voxel that a reverse solve drives to its upper density bound, is
+invisible to any small-amplitude probe at the data; that needs a
+finite-excursion check or a fixed high-density reference.
+
 ### Fixed-dipole polarization stability
 
 Density and polarization stability are separate loss terms. The density term
