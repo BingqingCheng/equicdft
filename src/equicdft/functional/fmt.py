@@ -496,10 +496,17 @@ class FMTReadout(EnergyReadout, Configurable):
         n3_species = n3_species.clamp_min(0.0)
         no_shell = n2_species < 0.0
         n2_species = n2_species.clamp_min(0.0)
-        norm = torch.linalg.vector_norm(n2v_species, dim=-1)
-        overlong = norm > n2_species
+        # A uniform fluid has n2v = 0. Its norm is not twice differentiable
+        # there, even when the overlong branch is inactive; c2 differentiates
+        # through this guard twice. Test squared lengths first and take the
+        # square root only after substituting a positive inactive value.
+        norm_squared = n2v_species.square().sum(dim=-1)
+        overlong = norm_squared > n2_species.square()
+        safe_norm = torch.sqrt(torch.where(
+            overlong, norm_squared, torch.ones_like(norm_squared),
+        ))
         scale = torch.where(
-            overlong, n2_species / torch.where(overlong, norm, torch.ones_like(norm)), torch.ones_like(norm),
+            overlong, n2_species / safe_norm, torch.ones_like(safe_norm),
         )
         n2v_species = n2v_species * scale[..., None]
         if n2t_species is not None:

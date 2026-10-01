@@ -282,6 +282,31 @@ class TestFMTReadout(unittest.TestCase):
                 curvature = (slope(1 + step) - slope(1 - step)) / (2 * step)
                 self.assertAlmostEqual(1 + curvature / (volume * rho), value, places=4)
 
+    def test_uniform_c2_is_finite_and_matches_finite_difference(self):
+        """The inactive vector guard must admit the exact second derivative."""
+
+        grid = 8
+        model = _model([_fmt()])
+        batch = _homogeneous_batch([0.2], grid=grid)
+        c2 = model(batch, compute_c2=True, c2_reference=(0, 0))["c2"]
+        self.assertTrue(torch.isfinite(c2).all())
+
+        step = 1.0e-5
+        voxel_volume = SPACING ** 3
+        for grid_index, type_index in ((0, 0), (0, 1), (1, 0), (grid + 1, 1)):
+            with self.subTest(grid_index=grid_index, type_index=type_index):
+                plus = batch["rho"].clone()
+                minus = batch["rho"].clone()
+                plus[0, grid_index, type_index] += step
+                minus[0, grid_index, type_index] -= step
+                c1_plus = model({**batch, "rho": plus}, compute_c1=True)["c1"][0, 0, 0]
+                c1_minus = model({**batch, "rho": minus}, compute_c1=True)["c1"][0, 0, 0]
+                finite_difference = (c1_plus - c1_minus) / (2.0 * step * voxel_volume)
+                torch.testing.assert_close(
+                    c2[0, grid_index, type_index], finite_difference,
+                    rtol=1.0e-4, atol=1.0e-5,
+                )
+
     def test_hard_wall_contact_theorem(self):
         """A slab between hard walls: contact density ~ beta P, bulk recovered mid-slab."""
 
