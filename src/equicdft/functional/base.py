@@ -110,9 +110,9 @@ class ReadoutContext:
     grid_positions: Optional[torch.Tensor] = None
     grid_center: Optional[torch.Tensor] = None
     excluded_mask: Optional[torch.Tensor] = None
+    local_energy_mask: Optional[torch.Tensor] = None
     msa_reference_region_mask: Optional[torch.Tensor] = None
     msa_reference_composition: Optional[torch.Tensor] = None
-    local_energy_mask: Optional[torch.Tensor] = None
     _cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, init=False, repr=False,
     )
