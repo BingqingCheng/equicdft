@@ -392,6 +392,12 @@ class TestMSAReferenceReadout(unittest.TestCase):
         self.assertTrue(torch.isfinite(output["beta_F_exc"]).all())
         self.assertTrue(torch.isfinite(output["c1"]).all())
 
+        # Small float32 accumulation errors are not physical net charge.
+        msa = _msa()
+        msa.bulk_state(torch.tensor([0.2000001, 0.2], dtype=torch.float32))
+        with self.assertRaisesRegex(ValueError, "electroneutral"):
+            msa.bulk_state(torch.tensor([0.200001, 0.2], dtype=torch.float32))
+
         charged = _homogeneous_batch(grid=8)
         charged["rho"][..., 0] += 0.01
         with self.assertRaisesRegex(ValueError, "electroneutral"):

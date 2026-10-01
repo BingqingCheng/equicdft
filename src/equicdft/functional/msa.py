@@ -439,7 +439,7 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
         )
         net_charge = (charges * densities).sum(dim=-1)
         charge_scale = (charges.abs() * densities).sum(dim=-1)
-        neutral = net_charge.abs() <= 1.0e-12 + 1.0e-8 * charge_scale
+        neutral = net_charge.abs() <= 1.0e-12 + 1.0e-6 * charge_scale
         if not torch.all(neutral).item():
             raise ValueError(
                 "the MSA reference state must be electroneutral; for a finite "
