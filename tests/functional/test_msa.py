@@ -200,6 +200,43 @@ class TestMSAReferenceReadout(unittest.TestCase):
         torch.testing.assert_close(readout.field_densities(rho, excluded), torch.full((1, 2), RHO_SPECIES, dtype=torch.float64))
         torch.testing.assert_close(readout.field_densities(rho, None), torch.full((1, 2), RHO_SPECIES / 2, dtype=torch.float64))
 
+    def test_soft_wall_reference_region_does_not_exclude_density(self):
+        batch = _homogeneous_batch(grid=8)
+        region = torch.ones(1, 8 ** 3, dtype=torch.bool)
+        region[:, : 8 ** 3 // 4] = False
+        batch["rho"][:, region[0]] = torch.tensor([0.26, 0.24], dtype=torch.float64)
+        batch["rho"][:, ~region[0]] = torch.tensor([0.07, 0.13], dtype=torch.float64)
+        # The full canonical field is neutral, but its liquid-side regional
+        # species means are not. Keep the regional total while supplying a
+        # neutral reference composition, without changing the field itself.
+        torch.testing.assert_close(batch["rho"].mean(dim=1), torch.full((1, 2), 0.2125, dtype=torch.float64))
+        readout = _msa()
+        with self.assertRaisesRegex(ValueError, "electroneutral"):
+            _model([readout])({**batch, "msa_reference_region_mask": region}, compute_ideal=False)
+        batch["msa_reference_region_mask"] = region
+        batch["msa_reference_composition"] = torch.tensor([0.5, 0.5], dtype=torch.float64)
+        state = readout.field_densities(batch["rho"], None, region, batch["msa_reference_composition"])
+        torch.testing.assert_close(state, torch.full((1, 2), 0.25, dtype=torch.float64))
+        result = _model([readout])(batch, compute_c1=True, compute_ideal=False)
+        self.assertTrue(torch.isfinite(result["beta_F_exc"]).all())
+        self.assertTrue(torch.isfinite(result["c1"]).all())
+        self.assertGreater(result["c1"][:, ~region[0]].abs().max().item(), 0.0)
+        self.assertTrue(torch.all(batch["rho"][:, ~region[0]] > 0))
+
+    def test_soft_wall_reference_inputs_are_checked_independently_of_hard_mask(self):
+        batch = _homogeneous_batch(grid=8)
+        model = _model([_msa()])
+        bad_region = torch.ones(1, 8 ** 3, dtype=torch.int64)
+        with self.assertRaisesRegex(ValueError, "msa_reference_region_mask"):
+            model({**batch, "msa_reference_region_mask": bad_region}, compute_ideal=False)
+        with self.assertRaisesRegex(ValueError, "msa_reference_composition"):
+            model({**batch, "msa_reference_composition": torch.tensor([0.6, 0.4])}, compute_ideal=False)
+        region = torch.ones(1, 8 ** 3, dtype=torch.bool)
+        hard = torch.zeros_like(region)
+        hard[:, 0] = True
+        with self.assertRaisesRegex(ValueError, "cannot include hard-excluded"):
+            model({**batch, "excluded_mask": hard, "msa_reference_region_mask": region}, compute_ideal=False)
+
     def test_uniform_curvature_is_the_msa_py_compressibility(self):
         """The k = 0 Hessian of the variational reference is -c(0), as at k -> 0."""
 

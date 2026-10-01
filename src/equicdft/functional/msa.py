@@ -245,6 +245,13 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
         and ``eta`` for every field. It must be electroneutral. ``None``
         (default) uses each field's accessible-region mean densities and
         requires those means to be electroneutral.
+        A caller may instead supply ``msa_reference_region_mask`` in the
+        input batch to select a soft-wall reference region without excluding
+        any voxels from the functional or solver. Where regional composition
+        is not neutral, ``msa_reference_composition`` can supply a fixed
+        normalized, electroneutral component vector. The regional total
+        density is then partitioned according to that vector; the physical
+        density field and canonical particle numbers are unchanged.
     include_hard_sphere
         Add the Percus-Yevick number-channel kernel and the scaled-particle
         bulk free energy (default). Disable to keep only the electrostatic
@@ -452,7 +459,13 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
         B = msa_screening_parameter(self._debye_wavenumber(densities), self.diameter)
         return eta, B
 
-    def field_densities(self, rho: torch.Tensor, excluded_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def field_densities(
+        self,
+        rho: torch.Tensor,
+        excluded_mask: Optional[torch.Tensor],
+        reference_region_mask: Optional[torch.Tensor] = None,
+        reference_composition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Return the reference densities ``[n_fields, n_types]`` of a batch.
 
         ``rho`` is ``[n_fields, n_grid, n_types]``. The per-field accessible
@@ -462,13 +475,46 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
 
         n_fields = rho.shape[0]
         if self.reference_density is not None:
+            if reference_region_mask is not None or reference_composition is not None:
+                raise ValueError("MSA reference-region inputs require dynamic reference_density=None")
             fixed = torch.as_tensor(self.reference_density, dtype=rho.dtype, device=rho.device)
             return fixed.expand(n_fields, self.n_types).clone()
-        accessible = self._accessible(rho, excluded_mask)
-        counts = accessible.sum(dim=-1)
+        region = self._reference_region(rho, excluded_mask, reference_region_mask)
+        counts = region.sum(dim=-1)
         if torch.any(counts <= 0).item():
-            raise ValueError("every field needs accessible voxels for its reference density")
-        return (rho * accessible[..., None]).sum(dim=-2) / counts[:, None]
+            raise ValueError("every field needs reference-region voxels for its reference density")
+        densities = (rho * region[..., None]).sum(dim=-2) / counts[:, None]
+        if reference_composition is not None:
+            composition = torch.as_tensor(reference_composition, dtype=rho.dtype, device=rho.device)
+            charges = torch.as_tensor(self.charges, dtype=rho.dtype, device=rho.device)
+            if (
+                composition.shape != (self.n_types,)
+                or not torch.isfinite(composition).all().item()
+                or torch.any(composition < 0).item()
+                or not torch.isclose(composition.sum(), composition.new_tensor(1.0), atol=1e-6, rtol=0).item()
+                or not torch.isclose((composition * charges).sum(), composition.new_tensor(0.0), atol=1e-6, rtol=0).item()
+            ):
+                raise ValueError("msa_reference_composition must be nonnegative, normalized, and electroneutral")
+            densities = densities.sum(dim=-1, keepdim=True) * composition
+        return densities
+
+    def _reference_region(
+        self,
+        rho: torch.Tensor,
+        excluded_mask: Optional[torch.Tensor],
+        reference_region_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if reference_region_mask is None:
+            return self._accessible(rho, excluded_mask)
+        if (
+            not torch.is_tensor(reference_region_mask)
+            or reference_region_mask.dtype != torch.bool
+            or reference_region_mask.shape != rho.shape[:2]
+        ):
+            raise ValueError("msa_reference_region_mask must be Boolean with shape [n_fields, n_grid]")
+        if excluded_mask is not None and torch.any(reference_region_mask & excluded_mask).item():
+            raise ValueError("msa_reference_region_mask cannot include hard-excluded voxels")
+        return reference_region_mask.detach().to(rho)
 
     @staticmethod
     def _accessible(rho: torch.Tensor, excluded_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -685,7 +731,14 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
                     "excluded_mask must be Boolean with shape rho.shape[:-1]"
                 )
             excluded = excluded.reshape(n_fields, n_grid)
-        densities = self.field_densities(rho_flat, excluded)
+        reference_region = context.msa_reference_region_mask
+        if reference_region is not None:
+            if not torch.is_tensor(reference_region) or reference_region.shape != rho.shape[:-1]:
+                raise ValueError("msa_reference_region_mask must have shape rho.shape[:-1]")
+            reference_region = reference_region.reshape(n_fields, n_grid)
+        densities = self.field_densities(
+            rho_flat, excluded, reference_region, context.msa_reference_composition,
+        )
         eta, B = self.bulk_state(densities)
         number_hat, charge_hat = self._assemble(basis, eta, B)  # [n_fields, kx, ky, kz2]
 
@@ -697,14 +750,14 @@ class MSAReferenceReadout(EnergyReadout, Configurable):
             )
         volume_element = context.voxel_volume.to(rho)
         if self.reference_density is None:
-            # Ramakrishnan-Yussouff about the accessible mean: the bulk free
-            # energy carries the homogeneous mode, the kernel the fluctuations.
-            accessible = self._accessible(canonical, None if excluded is None else excluded)
-            if not rows_are_canonical and excluded is not None:
-                accessible = torch.zeros_like(accessible).scatter(1, flat_positions, accessible)
-            source = canonical - densities[:, None, :] * accessible[..., None]
-            accessible_volume = accessible.sum(dim=-1) * volume_element
-            bulk = accessible_volume * self.bulk_free_energy_density(densities)
+            # The reference region sets the bulk state and background, but
+            # does not hard-exclude density or potential outside that region.
+            region = self._reference_region(rho_flat, excluded, reference_region)
+            if not rows_are_canonical:
+                region = torch.zeros_like(region).scatter(1, flat_positions, region)
+            source = canonical - densities[:, None, :] * region[..., None]
+            reference_volume = region.sum(dim=-1) * volume_element
+            bulk = reference_volume * self.bulk_free_energy_density(densities)
         else:
             source = canonical
             bulk = torch.zeros(n_fields, dtype=rho.dtype, device=rho.device)
