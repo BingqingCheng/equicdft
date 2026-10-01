@@ -85,6 +85,9 @@ class ReadoutContext:
         energy centers, never descriptor inputs or long-range source fields.
     local_density_index, grid_positions, grid_center, excluded_mask
         Grid geometry passed through from the batch when available.
+    msa_reference_region_mask, msa_reference_composition
+        Optional MSA-only reference region and neutral composition. They do
+        not exclude voxels from the model or solver.
     """
 
     rho: torch.Tensor
@@ -107,6 +110,8 @@ class ReadoutContext:
     grid_positions: Optional[torch.Tensor] = None
     grid_center: Optional[torch.Tensor] = None
     excluded_mask: Optional[torch.Tensor] = None
+    msa_reference_region_mask: Optional[torch.Tensor] = None
+    msa_reference_composition: Optional[torch.Tensor] = None
     local_energy_mask: Optional[torch.Tensor] = None
     _cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, init=False, repr=False,
@@ -178,7 +183,8 @@ class ReadoutContext:
         ``data`` supplies ``rho`` and ``temperature`` (scalar for one field or
         with rho's leading batch shape) and, optionally, the geometry fields
         ``grid_size``, ``dipole_density``, ``local_density_index``,
-        ``grid_positions``, ``grid_center`` and ``excluded_mask``. The fixed
+        ``grid_positions``, ``grid_center``, ``excluded_mask``,
+        ``msa_reference_region_mask`` and ``msa_reference_composition``. The fixed
         model geometry and thermodynamic scales are passed explicitly; this
         is what :class:`equicdft.model.GridCACEModel` does on every forward
         pass and what a standalone readout evaluation needs.
@@ -218,6 +224,8 @@ class ReadoutContext:
             grid_positions=data.get("grid_positions"),
             grid_center=data.get("grid_center"),
             excluded_mask=data.get("excluded_mask"),
+            msa_reference_region_mask=data.get("msa_reference_region_mask"),
+            msa_reference_composition=data.get("msa_reference_composition"),
         )
 
     def require(self, name: str) -> torch.Tensor:
