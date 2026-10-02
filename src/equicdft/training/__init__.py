@@ -1,5 +1,6 @@
 """Training: loss terms, streaming metrics, the trainer and its noise/IO helpers."""
 
+from .case_weights import case_loss_statistics, case_loss_weights
 from .features import (
     local_feature_offset, local_feature_scale, local_feature_statistics,
     standardize_local_features,
@@ -18,6 +19,8 @@ __all__ = [
     "TensorLoss",
     "Trainer",
     "TrainingStream",
+    "case_loss_statistics",
+    "case_loss_weights",
     "local_feature_offset",
     "local_feature_scale",
     "local_feature_statistics",

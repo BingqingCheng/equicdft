@@ -236,10 +236,12 @@ class TensorLoss(LossTerm):
             self._smoothing_transfer_cache[key] = transfer
         return transfer
 
-    def _apply(self, fn, recurse=True):
+    def _apply(self, fn, *args, **kwargs):
         """Move registered state and discard device-specific derived tensors."""
 
-        result = super()._apply(fn, recurse=recurse)
+        # Forward whatever this PyTorch's Module._apply accepts (``recurse``
+        # exists only in newer releases).
+        result = super()._apply(fn, *args, **kwargs)
         self._smoothing_transfer_cache.clear()
         return result
 
@@ -278,9 +280,26 @@ class TensorLoss(LossTerm):
 
 
 class Loss(nn.Module):
-    """Aggregate uniquely named :class:`LossTerm` objects into one objective."""
+    """Aggregate uniquely named :class:`LossTerm` objects into one objective.
 
-    def __init__(self, terms: Sequence[LossTerm]) -> None:
+    ``case_weight_keys`` maps term names to batch keys holding one weight per
+    case (e.g. from :func:`equicdft.training.case_weights.case_loss_weights`);
+    each such term's weighted loss is multiplied by its case weight. A term
+    reduces its batch to one scalar, so case weights require one case per
+    batch; a batched ``rho`` with more than one case raises even if the
+    supplied weight is scalar. Terms without a key,
+    and every term when ``case_weight_keys`` is ``None`` (the default), are
+    unchanged. The weight is detached, must be finite and nonnegative
+    (checked on every evaluation, one host read per weighted term), and is
+    reported as ``case_weight`` in the term's details.
+    """
+
+    def __init__(
+        self,
+        terms: Sequence[LossTerm],
+        *,
+        case_weight_keys: Optional[Mapping[str, str]] = None,
+    ) -> None:
         super().__init__()
 
         terms = list(terms)
@@ -300,6 +319,17 @@ class Loss(nn.Module):
                 raise ValueError("loss term names must be unique")
             names.append(term.name)
         self.terms = nn.ModuleList(terms)
+        if case_weight_keys is None:
+            case_weight_keys = {}
+        if not isinstance(case_weight_keys, Mapping):
+            raise TypeError("case_weight_keys must map term names to batch keys")
+        unknown = [name for name in case_weight_keys if name not in names]
+        if unknown:
+            raise ValueError("case_weight_keys names unknown terms {}".format(unknown))
+        self.case_weight_keys = {
+            name: nonempty_string(key, "case weight key")
+            for name, key in case_weight_keys.items()
+        }
 
     def forward(
         self,
@@ -340,6 +370,12 @@ class Loss(nn.Module):
                 )
             value = term_details["loss"]
             details[term.name] = dict(term_details)
+            key = self.case_weight_keys.get(term.name)
+            if key is not None:
+                case_weight = self._case_weight(key, term.name, batch, value)
+                value = value * case_weight
+                details[term.name]["loss"] = value
+                details[term.name]["case_weight"] = case_weight
             if not isinstance(value, torch.Tensor) or value.ndim != 0:
                 raise ValueError(
                     "loss term '{}' must return one scalar tensor".format(
@@ -350,6 +386,36 @@ class Loss(nn.Module):
             total = value if total is None else total + value
         values["total"] = total
         return values, details
+
+    @staticmethod
+    def _case_weight(key, name, batch, value):
+        if key not in batch:
+            raise KeyError(
+                "batch is missing case weight '{}' of term '{}'".format(key, name)
+            )
+        rho = batch.get("rho")
+        if isinstance(rho, torch.Tensor) and rho.ndim >= 3 and rho.shape[0] != 1:
+            raise ValueError(
+                "case weights require one case per batch; rho holds {} cases".format(
+                    rho.shape[0]
+                )
+            )
+        weight = torch.as_tensor(batch[key])
+        if weight.numel() != 1:
+            raise ValueError(
+                "case weights require one case per batch; '{}' holds {} "
+                "values".format(key, weight.numel())
+            )
+        weight = weight.detach().reshape(()).to(value)
+        # A weight may come from anywhere (a cache, a hand-built batch); a
+        # negative or nonfinite one would corrupt the objective silently.
+        # The trainer reads every term on the host each batch anyway.
+        if not bool(torch.isfinite(weight) & (weight >= 0)):
+            raise ValueError(
+                "case weight '{}' of term '{}' must be finite and nonnegative, "
+                "got {}".format(key, name, float(weight))
+            )
+        return weight
 
 
 def _resolve_weights(

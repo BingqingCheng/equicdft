@@ -33,6 +33,7 @@ from .serialization import (
     save_model,
 )
 from .solver.solver import GridSolver
+from .training.case_weights import case_loss_statistics, case_loss_weights
 from .training.features import (
     local_feature_offset, local_feature_scale, local_feature_statistics,
     standardize_local_features,
@@ -87,6 +88,8 @@ __all__ = [
     "local_feature_scale",
     "local_feature_statistics",
     "standardize_local_features",
+    "case_loss_statistics",
+    "case_loss_weights",
     "default_data_key",
     "load_model",
     "make_dataloaders",

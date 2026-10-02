@@ -206,6 +206,108 @@ support. Standalone augmentation callers use the same order: augment, then
 This changes the noisy training objective from the former frozen-mask
 behavior. Do not silently resume an existing frozen-mask campaign.
 
+## Per-case loss weights from signal and noise
+
+An equal-case field loss averages squared residuals whose size follows the
+strength of each case's external field: a strongly driven case leaves a
+residual orders of magnitude above a weakly driven one, so the strong cases
+set the fit and the weak ones are fitted only in absolute terms. Two scales
+describe each case in the units of a loss term:
+
+- the **signal** `S`: the term at a fixed reference functional, normally the
+  freshly initialised model, i.e. what the learned terms have to supply;
+- the **noise** `N`: the term evaluated on the model's linear response to
+  the sampling error of the input fields, with the targets set to zero. For a
+  draw `xi` scaled by `rho_std` (and `dipole_density_std`), every floating
+  output is replaced by its central difference
+  `[o(x + h xi) - o(x - h xi)] / (2h)`; for a quadratic term that is
+  `|J xi|^2`, the residual a functional without model error would still
+  leave on these fields, in the term's own metric (masks, gauges, residual
+  filters and long-range kernels included).
+
+`case_loss_weights` turns them into frozen weights
+`w = c (noise_scale * N + eta * S)^(-power)`. `eta`
+(`relative_model_error`) is the fraction of the signal a good fit is still
+expected to miss: small values approach chi-squared weighting by the noise
+alone, large values relative-error weighting by the signal. `power` in
+(0, 1] tempers the spread (0.5 takes the square root). With
+`normalization="mean"` the weights of the given cases average to one;
+`"reference_loss"` keeps the objective at the reference unchanged. The
+weights enter the loss through `Loss(case_weight_keys=...)`, which multiplies
+each listed term by its batch weight; case weights need one case per batch.
+
+```python
+from equicdft import Loss, case_loss_statistics, case_loss_weights
+
+loss = Loss(terms, case_weight_keys={"density": "density_case_weight",
+                                     "polarization": "polarization_case_weight"})
+reference = case_loss_statistics(
+    model, loss, DataLoader(train_frames, batch_size=1),   # training cases only
+    terms=["density", "polarization"],
+    target_keys=["beta_E_target"],   # batch targets of custom terms
+    case_key="case_id",              # every frame carries its identity
+    noise_samples=4, noise_step=0.1,
+)
+train = case_loss_weights(reference, relative_model_error=0.1, power=0.5)
+for frame in train_frames:
+    weights = train["by_case"][frame["case_id"]]
+    frame["density_case_weight"] = torch.tensor(weights["density"])
+    frame["polarization_case_weight"] = torch.tensor(weights["polarization"])
+validation = case_loss_weights(
+    case_loss_statistics(model, loss, validation_loader, terms=[...], case_key="case_id", ...),
+    relative_model_error=0.1, power=0.5,
+    noise_scale=train["noise_scale"],       # same chosen noise scale
+    normalization=train["normalization"],   # same scale as training
+)
+```
+
+Assign weights by `by_case`, never by position: rows follow the batch order,
+and without `case_key` a shuffled `DataLoader` is refused. `Loss` checks
+every case weight it reads (finite and nonnegative) on each evaluation, so a
+weight loaded from a cache or built by hand cannot turn the objective
+negative or nonfinite.
+
+Compute the statistics once, on the model before the fit, and record the
+weights with the run (like the feature standardization); recomputing them on
+resume would change the objective. Test cases never enter. Batch targets of
+`TensorLoss` terms are zeroed automatically; a custom term's batch targets
+are listed in `target_keys`, and every term is checked to vanish for zero
+outputs, so an undeclared target raises.
+
+Every Gaussian draw is kept, so the propagated distribution is the one the
+SEM states. Only the finite-difference step adapts: it starts at
+`noise_step` and is halved for that draw until `x ± h xi` stays inside
+`rho > 0`, `|P| < m rho` and leaves every selection unchanged (the
+`frozen_outputs`, by default `voxel_weights`, and every Boolean output such
+as the energy-centre mask). The response is then the derivative on the
+clean selection branch. `selection_changes` and `selection_activations`
+count the voxels that flipped, and that entered the selection, at the first
+step of each draw; `step_reductions` and `minimum_step` show how often and
+how far the step had to shrink. Many activations mean the case sits close to
+the density cutoff, where the training noise augmentation would also move
+voxels across it; the linear estimate does not include that jump.
+The noise of a non-quadratic criterion (smooth L1) is the quadratic estimate.
+
+The noise model is diagonal: independent errors per voxel and component, as
+`rho_std` and `dipole_density_std` state them. Real sampling errors can be
+spatially correlated. Such correlations can increase or decrease the
+propagated noise, particularly where the functional weights wavelengths or
+directions differently (for example, the longitudinal Coulomb response of
+polarization). The default `noise_scale=1` is therefore a working choice, not
+a bound on the true noise. `noise_scale="signal_quantile"` is an optional
+exploratory heuristic: it uses the `signal_quantile` (default 0.05) of `S/N`
+over cases with measured noise. An individual squared residual can be below
+its expected noise even for an exact reference functional, so this quantile
+does not estimate or bound the true correlated-noise scale. Estimating that
+scale requires independent MD blocks/replicas or covariance-aware noise draws.
+Pass any chosen `noise_scale` to the other splits.
+
+A weight scales a case's gradient, not its information: a case whose
+residual already sits near its estimated noise level contributes noise-fitting gradient
+in proportion to its weight. Prefer `power < 1` or a larger `eta` when many
+cases are noise-dominated, and compare against the unweighted control as one
+switch.
+
 ## Joint training over several datasets
 
 `fit_streams` optimizes several `TrainingStream`s together, each with its own

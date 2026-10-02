@@ -164,6 +164,18 @@ functional. It exists to verify data loading, functional differentiation,
 training, checkpoint restart, and GPU/CPU execution. See
 [`examples/lj_nvt/DATASET.md`](examples/lj_nvt/DATASET.md) for provenance.
 
+`examples/lj_nvt/train_case_weighted.py` trains the same model with
+noise-aware per-case loss weights (see `docs/training.md`): it measures each
+case's signal and noise on the fresh model, records the frozen weights in
+`case_weights.json` (reused on resume), and prints every case's final loss
+against its signal. `--weighting none` runs the unweighted control with the
+same split and seed:
+
+```bash
+python examples/lj_nvt/train_case_weighted.py
+python examples/lj_nvt/train_case_weighted.py --weighting none --output examples/lj_nvt/fit-control
+```
+
 ## Current training recipe
 
 The annotated example exposes the important options while using these defaults:
