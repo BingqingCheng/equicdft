@@ -19,7 +19,7 @@ from .modes import (
     wavevector_index_triplets,
     wavevector_magnitude as _wavevector_magnitude,
 )
-from .curvature import polarization_fourier_curvature
+from .curvature import coupled_fourier_curvature_matrix, polarization_fourier_curvature
 from ..objectives import LossTerm
 from .response import FourierResponse
 
@@ -162,14 +162,26 @@ class FourierStabilityLoss(LossTerm):
     variable
         ``"rho"`` (default) preserves the fixed-particle-number density loss.
         ``"dipole_density"`` probes one random unit-vector polarization
-        curvature per field at fixed density.
+        curvature per field at fixed density. ``"coupled"`` evaluates, for
+        every wave, the joint Hessian of the density and polarization
+        channels of every species
+        (:func:`~equicdft.response.curvature.coupled_fourier_curvature_matrix`)
+        in the ideal metric and penalizes every eigenvalue below
+        ``minimum_curvature``. It finds joint density-polarization
+        instabilities of polarized states that pass both single-variable
+        probes. ``component_treatment="independent"`` uses one 2 x 2 block per
+        species, ``"full_matrix"`` the complete 2n x 2n matrix (as the
+        density ``"full_matrix"`` treatment); the zero wavevector is excluded.
     include_zero_wavevector
         Whether to add the uniform polarization wavevector. It defaults to
         true for polarization and false for density. Density cannot include
         the zero wavevector because its perturbations preserve particle number.
     polarization_direction
         ``"random"`` (default) draws one direction per field on the unit
-        sphere. ``"transverse"`` draws, for every wave, a random direction in
+        sphere. ``"parallel"`` (coupled only) displaces polarization along the
+        local base polarization of each species, the alignment-magnitude
+        mode that couples to density; unpolarized voxels use a random
+        direction. ``"transverse"`` draws, for every wave, a random direction in
         the plane perpendicular to its wavevector; ``"longitudinal"`` uses the
         wavevector's own direction. Both use the ordinary wavevector
         ``2 pi n / L``; the uniform wave keeps a random direction. Only for
@@ -201,6 +213,19 @@ class FourierStabilityLoss(LossTerm):
         a free-energy well far above the sampled densities (a single voxel
         driven to the solver's upper density bound), which needs a
         finite-excursion test or a fixed high-density reference.
+
+        Coupled: both channels of every species are weighted the same way.
+    alignment_reference
+        Coupled only. The reference enters as its analytic Hessian at the
+        base state, one regime per voxel for every probe row, so it is convex
+        and an ideal gas is never penalized. ``"exact"`` (default) uses the
+        Langevin orientational entropy of :class:`~equicdft.FixedDipoleIdeal`,
+        with its coefficients held at their value at alignment
+        ``1 - sqrt(eps)`` beyond it (continuous, never weaker near
+        saturation);
+        ``"quadratic"`` uses the weak-alignment form ``3|P|^2/(2 m^2 rho)``
+        everywhere, which underestimates the stiffness of strongly aligned
+        states and so flags stable polarized bulk.
     """
 
     def __init__(
@@ -225,12 +250,13 @@ class FourierStabilityLoss(LossTerm):
         include_zero_wavevector: Optional[bool] = None,
         polarization_direction: str = "random",
         probe_density_power: float = 0.0,
+        alignment_reference: Optional[str] = None,
     ) -> None:
         super().__init__(name, weight)
 
         variable = nonempty_string(variable, "variable")
-        if variable not in ("rho", "dipole_density"):
-            raise ValueError("variable must be 'rho' or 'dipole_density'")
+        if variable not in ("rho", "dipole_density", "coupled"):
+            raise ValueError("variable must be 'rho', 'dipole_density' or 'coupled'")
         self.variable = variable
         if include_zero_wavevector is None:
             include_zero_wavevector = variable == "dipole_density"
@@ -238,23 +264,33 @@ class FourierStabilityLoss(LossTerm):
             include_zero_wavevector,
             "include_zero_wavevector",
         )
-        if variable == "rho" and self.include_zero_wavevector:
+        if variable in ("rho", "coupled") and self.include_zero_wavevector:
             raise ValueError(
                 "density stability cannot include the zero wavevector"
             )
         polarization_direction = nonempty_string(
             polarization_direction, "polarization_direction",
         )
-        if polarization_direction not in ("random", "transverse", "longitudinal"):
+        if polarization_direction not in ("random", "transverse", "longitudinal", "parallel"):
             raise ValueError(
-                "polarization_direction must be 'random', 'transverse' or "
-                "'longitudinal'"
+                "polarization_direction must be 'random', 'transverse', "
+                "'longitudinal' or 'parallel'"
             )
         if variable == "rho" and polarization_direction != "random":
             raise ValueError(
-                "polarization_direction applies to variable='dipole_density'"
+                "polarization_direction applies to variable='dipole_density' "
+                "or 'coupled'"
             )
+        if polarization_direction == "parallel" and variable != "coupled":
+            raise ValueError("polarization_direction='parallel' applies to variable='coupled'")
         self.polarization_direction = polarization_direction
+        if alignment_reference is None:
+            alignment_reference = "exact" if variable == "coupled" else None
+        elif variable != "coupled":
+            raise ValueError("alignment_reference applies to variable='coupled'")
+        elif alignment_reference not in ("exact", "quadratic"):
+            raise ValueError("alignment_reference must be 'exact' or 'quadratic'")
+        self.alignment_reference = alignment_reference
         probe_density_power = finite_scalar(probe_density_power, "probe_density_power")
         if probe_density_power < 0.0:
             raise ValueError("probe_density_power must be nonnegative")
@@ -371,6 +407,11 @@ class FourierStabilityLoss(LossTerm):
                 "dipole-density stability currently requires "
                 "component_treatment='independent'"
             )
+        if variable == "coupled" and component_treatment not in ("independent", "full_matrix"):
+            raise ValueError(
+                "coupled stability requires component_treatment='independent' "
+                "(one density-polarization block per species) or 'full_matrix'"
+            )
         if component_treatment == "charge":
             if charges is None:
                 raise ValueError(
@@ -437,6 +478,10 @@ class FourierStabilityLoss(LossTerm):
     @property
     def ideal_reference(self) -> str:
         """Name of the fixed ideal approximation used by this regularizer."""
+        if self.variable == "coupled":
+            return "translational_ideal_gas_plus_{}_alignment".format(
+                "langevin" if self.alignment_reference == "exact" else "quadratic"
+            )
         return ("quadratic_alignment" if self.variable == "dipole_density"
                 else "translational_ideal_gas")
 
@@ -491,6 +536,8 @@ class FourierStabilityLoss(LossTerm):
             raise ValueError("beta_F_exc must contain one value per field")
 
         wavevector_indices = self._select_wavevector_indices(batch, rho)
+        if self.variable == "coupled":
+            return self._coupled_loss(model, outputs, batch, rho, wavevector_indices)
         if self.variable == "dipole_density":
             return self._polarization_loss(
                 model,
@@ -553,7 +600,7 @@ class FourierStabilityLoss(LossTerm):
         """
 
         n_fields, n_wavevectors = wavevector_indices.shape[:2]
-        if self.polarization_direction == "random":
+        if self.polarization_direction in ("random", "parallel"):
             shared = torch.randn((n_fields, 3), dtype=rho.dtype, device=rho.device)
             shared = shared / torch.linalg.vector_norm(shared, dim=-1, keepdim=True)
             return shared[:, None, :].expand(n_fields, n_wavevectors, 3)
@@ -651,6 +698,29 @@ class FourierStabilityLoss(LossTerm):
             valid,
             "batch contains no valid polarization direction",
         )
+
+    def _coupled_loss(self, model, outputs, batch, rho, wavevector_indices):
+        """Return the spectral hinge of the joint density-polarization Hessian."""
+
+        phases, amplitude = self._sample_wavevector_probe(wavevector_indices, rho)
+        matrix, active = coupled_fourier_curvature_matrix(
+            model=model,
+            outputs=outputs,
+            batch=batch,
+            rho=rho,
+            wavevector_indices=wavevector_indices,
+            relative_amplitude=amplitude,
+            # "parallel" uses the local base polarization; this random
+            # direction is only its fallback where the base is unpolarized.
+            polarization_directions=self._polarization_directions(batch, rho, wavevector_indices),
+            couple_species=self.component_treatment == "full_matrix",
+            parallel_to_polarization=self.polarization_direction == "parallel",
+            alignment_reference=self.alignment_reference,
+            perturbations_per_forward=self.response.perturbations_per_forward,
+            wavevector_phases=phases,
+            density_power=self.probe_density_power,
+        )
+        return self._matrix_loss(matrix, active)
 
     def _sample_wavevector_probe(self, wavevector_indices, reference):
         """Return phases and amplitudes for the selected probe treatment."""

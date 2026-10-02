@@ -808,7 +808,7 @@ FourierStabilityLoss(
     relative_amplitude=0.01,
     minimum_curvature=0.0,
     probe_density_power=2.0,
-    weight=w_rho_stability,
+    weight=1.0,  # relative to the data loss; tune per campaign
     name="dense_layer_density_stability",
 )
 ```
@@ -899,6 +899,7 @@ a separate probe when nonzero waves are superposed. Density stability excludes
 the zero wavevector because each species particle number is fixed.
 
 ```python
+w_rho_stability, w_P_stability = 1.0, 1.0  # relative to the data loss
 loss = Loss([
     FourierStabilityLoss(
         variable="rho",
@@ -949,7 +950,7 @@ FourierStabilityLoss(
     polarization_direction="transverse",
     relative_amplitude=0.02,
     minimum_curvature=0.15,
-    weight=w_T_stability,
+    weight=1.0,  # relative to the data loss (the water campaigns use 20)
     name="transverse_polarization_stability",
 )
 ```
@@ -966,6 +967,70 @@ the density gradient is perpendicular to the wave's polarization, as for
 layers normal to the wavevector; elsewhere it picks up some longitudinal
 stiffness. It is a detector for dense-layer instability, to be combined
 with a density-scaled dielectric kernel (`polarization.md`, section 7).
+
+### Coupled density-polarization probes
+
+In a polarized state the two single-variable probes can both pass while a
+wave that moves density and polarization together lowers the free energy:
+the Hessian blocks are positive but the density-polarization cross term is
+large enough to make the joint matrix indefinite. `variable="coupled"`
+evaluates that matrix. For every real wave each species $a$ contributes a
+density channel, the fixed-number displacement of the density probe, and a
+polarization channel $\delta\mathbf P_a = m_a\rho_a\,w\,\mathbf n$. The
+second variation of excess plus ideal reference is assembled from diagonal
+and pair differences, exactly as the density `"full_matrix"` treatment, and
+each channel is normalized by its unpolarized ideal metric
+($\sum\delta\rho^2/\rho$ and $3\sum|\delta\mathbf P|^2/(m^2\rho)$), so an
+unpolarized ideal gas gives the identity. Every eigenvalue below
+`minimum_curvature` is penalized.
+
+```python
+FourierStabilityLoss(
+    variable="coupled",
+    random_wavevectors_per_field=2,
+    polarization_direction="parallel",
+    relative_amplitude=0.01,
+    minimum_curvature=0.0,
+    probe_density_power=0.0,
+    weight=1.0,  # relative to the data loss; tune per campaign
+    name="coupled_density_polarization_stability",
+)
+```
+
+- `component_treatment="independent"` keeps one 2×2 block per species;
+  `"full_matrix"` keeps every cross-species block (2n×2n). Charge and
+  total-density treatments are not defined here.
+- `polarization_direction="parallel"` displaces polarization along the local
+  base polarization of each species, the alignment-magnitude mode through
+  which density couples; `"random"`, `"transverse"` and `"longitudinal"` are
+  as for the polarization probe. The zero wavevector is excluded because the
+  density channels conserve particle number.
+- The ideal reference enters as its analytic Hessian at the base state
+  (translational $\delta\rho^2/\rho$ plus orientational
+  $A(\hat{\mathbf P}\cdot\delta\mathbf P - m p\,\delta\rho)^2 + B|\delta\mathbf P_\perp|^2$
+  with $A = s''(p)/(m^2\rho)$, $B = s'(p)/(p\,m^2\rho)$), one regime per
+  voxel shared by every probe row. It is therefore convex and independent of
+  the probe amplitude; only the excess is finite-differenced.
+- `alignment_reference="exact"` (default) uses the Langevin orientational
+  entropy of `FixedDipoleIdeal`. Its coefficients diverge at saturation
+  ($A \sim (1-p)^{-2}$, $B \sim (1-p)^{-1}$); they are evaluated at
+  $\min(p, 1-\sqrt{\epsilon})$ of the dtype ($p \approx 0.99966$ in float32,
+  $1 - 1.5\times10^{-8}$ in float64), so they stay continuous and
+  nondecreasing and are held at their boundary value in voxels at or beyond
+  saturation, which gridded fields can reach.
+  Polarization is required to vanish where density does. `"quadratic"` uses
+  $3|\mathbf P|^2/(2m^2\rho)$ everywhere, the polarization probe's reference;
+  it underestimates the stiffness of strongly aligned states and flags
+  stable bulk (in uniform water at alignment 0.8 its lowest eigenvalue was
+  −0.96 where the exact entropy gives +4.0), so use it only for weakly
+  polarized fields.
+- `probe_density_power` weights both channels as in the single-variable
+  probes.
+
+Every real probe (the cosine and the sine of each wavevector) costs $6n$
+energy evaluations with independent blocks and $2n(2n+1)$ with the full
+matrix, six for one species either way; `perturbations_per_forward` limits
+memory.
 
 ## Supervised homogeneous Fourier response
 

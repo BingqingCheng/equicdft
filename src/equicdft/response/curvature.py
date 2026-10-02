@@ -1,5 +1,6 @@
 """Excess finite-difference curvature plus declared ideal stability references."""
 
+import math
 from typing import (
     Dict,
     Optional,
@@ -11,8 +12,9 @@ from torch import nn
 from .._validation import finite_scalar
 from ..geometry.grid import voxel_volume
 from ..functional.thermodynamics import ideal_free_energy
-from ..functional.polarization_ideal import FixedDipoleIdeal
+from ..functional.polarization_ideal import FixedDipoleIdeal, _langevin_prime, inverse_langevin
 from .modes import (
+    _density_power,
     _real_fourier_waves,
     _validated_probe_amplitudes,
     component_fourier_directions,
@@ -24,6 +26,7 @@ __all__ = [
     "projected_fourier_curvature",
     "fourier_curvature_matrix",
     "polarization_fourier_curvature",
+    "coupled_fourier_curvature_matrix",
 ]
 
 
@@ -391,6 +394,307 @@ def polarization_fourier_curvature(
         curvature.reshape(rho.shape[0], n_patterns, n_phases),
         valid.reshape(rho.shape[0], n_patterns, n_phases),
     )
+
+
+def coupled_fourier_curvature_matrix(
+    model: nn.Module,
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    rho: torch.Tensor,
+    wavevector_indices: torch.Tensor,
+    relative_amplitude: Union[float, torch.Tensor],
+    polarization_directions: torch.Tensor,
+    *,
+    couple_species: bool = True,
+    parallel_to_polarization: bool = False,
+    alignment_reference: str = "exact",
+    perturbations_per_forward: Optional[int] = None,
+    wavevector_phases: Optional[torch.Tensor] = None,
+    density_power: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Return the joint density-polarization Hessian for every real probe.
+
+    Every species ``a`` contributes two channels on the same wave: its
+    fixed-number density displacement ``delta rho_a`` (exactly as in
+    :func:`fourier_curvature_matrix`) and a polarization displacement
+    ``delta P_a = m_a * rho_a * wave * n``. The result has shape
+    ``[field, wavevector, phase, 2 n_types, 2 n_types]`` with channel order
+    (density of every species, then polarization of every species), and an
+    active mask ``[field, wavevector, phase, 2 n_types]``.
+
+    The energy is the excess functional ``beta_F_exc`` plus the ideal
+    reference of every species: the translational ideal gas
+    ``rho (ln rho - 1)`` (exact second variation ``delta rho^2 / rho``) and the
+    orientational entropy ``rho s(|P| / (m rho))`` of fixed dipoles, both as
+    their analytic Hessian at the base state (one set of coefficients per
+    voxel for every row, so the reference is convex and the ideal gas is
+    never flagged). With ``alignment_reference="exact"`` (default) ``s`` is
+    the Langevin entropy of :class:`~equicdft.FixedDipoleIdeal`, its
+    coefficients held at their value at ``1 - sqrt(eps)`` for alignments at
+    or beyond it (gridded fields can reach ``|P| >= m rho``). ``"quadratic"`` uses the weak-alignment form
+    ``3 |P|^2 / (2 m^2 rho)`` everywhere, the reference of
+    :func:`polarization_fourier_curvature`, whose second variation is
+    ``3 / (m^2 rho) |delta P - P delta rho / rho|^2``. It underestimates the
+    stiffness of strongly aligned states (it flags uniform bulk at alignment
+    0.8 that the exact entropy stabilizes), so it is a conservative choice
+    only for weakly polarized fields. The orientational reference couples
+    density and polarization wherever the base state is polarized. Each channel is normalized by
+    its unpolarized ideal metric (``sum delta rho^2 / rho`` and
+    ``3 sum |delta P|^2 / (m^2 rho)``), so a weakly polarized ideal gas has the
+    identity matrix. Eigenvalues below zero are directions in which a joint
+    density-polarization wave lowers the free energy even when the
+    density-only and polarization-only curvatures are both positive.
+
+    ``couple_species=False`` keeps only the two channels of each species and
+    their mutual coupling (block-diagonal across species); ``True`` keeps
+    every cross-species block. ``n`` is one unit vector per field or per
+    field and wavevector (``polarization_directions``) or, with
+    ``parallel_to_polarization=True``, the local direction of each species'
+    base polarization, which probes modulation of the alignment magnitude
+    (the mode that couples to density); voxels without polarization fall
+    back to the supplied direction. ``density_power = p > 0`` weights both
+    channels by ``(rho_total / max rho_total)^p`` per field, as in the
+    density and polarization probes.
+    """
+
+    density_power = _density_power(density_power)
+    if alignment_reference not in ("exact", "quadratic"):
+        raise ValueError("alignment_reference must be 'exact' or 'quadratic'")
+    if "dipole_density" not in batch:
+        raise KeyError("batch is missing 'dipole_density'")
+    polarization = batch["dipole_density"]
+    if polarization.shape != rho.shape + (3,):
+        raise ValueError("dipole_density must have shape rho.shape + (3,)")
+    if polarization.dtype != rho.dtype or polarization.device != rho.device:
+        raise ValueError("rho and dipole_density must share dtype and device")
+    if not torch.all(torch.isfinite(polarization)).item():
+        raise ValueError("dipole_density must be finite")
+    if torch.any((rho == 0.0)[..., None] & (polarization != 0.0)).item():
+        raise ValueError("dipole_density must be zero where rho is zero")
+    ideal = getattr(model, "ideal", None)
+    if not isinstance(ideal, FixedDipoleIdeal):
+        raise TypeError("coupled stability requires model.ideal=FixedDipoleIdeal(...)")
+    n_fields, n_grid, n_types = rho.shape
+    moment = ideal.dipole_magnitude.to(rho).reshape(-1)
+    if moment.numel() == 1:
+        moment = moment.expand(n_types)
+    elif moment.numel() != n_types:
+        raise ValueError("dipole_magnitude must contain one value per density type")
+    tiny = torch.finfo(rho.dtype).tiny
+
+    # Density channels: [field, probe, grid, type], species a only in column a.
+    density_directions, density_valid = component_fourier_directions(
+        batch, rho, wavevector_indices,
+        wavevector_phases=wavevector_phases, density_power=density_power,
+    )
+    n_probes = density_directions.shape[1]
+
+    # Polarization channels: one weighted, peak-normalized vector wave.
+    n_wavevectors = wavevector_indices.shape[1]
+    selected = _unit_polarization_directions(polarization_directions, rho, n_wavevectors)
+    if parallel_to_polarization:
+        scalar, wave_valid = _real_fourier_waves(
+            batch, rho, wavevector_indices, wavevector_phases=wavevector_phases,
+        )
+        fallback = (
+            selected.repeat_interleave(2, dim=1) if wavevector_phases is None
+            else selected[:, :1]
+        )
+        magnitude = torch.linalg.vector_norm(polarization, dim=-1, keepdim=True)
+        has_direction = magnitude > tiny
+        local = polarization / torch.where(has_direction, magnitude, torch.ones_like(magnitude))
+        # [field, probe, grid, type, 3]
+        unit = torch.where(
+            has_direction[:, None],
+            local[:, None],
+            fallback[:, :, None, None, :].expand(-1, -1, n_grid, n_types, -1),
+        )
+        wave = scalar
+    else:
+        vector, wave_valid = _real_fourier_vector_waves(
+            batch, rho, wavevector_indices, selected, wavevector_phases=wavevector_phases,
+        )
+        wave = torch.linalg.vector_norm(vector, dim=-1)
+        sign_free_unit = vector / torch.where(wave[..., None] > 0, wave[..., None], torch.ones_like(vector))
+        unit = sign_free_unit[:, :, :, None, :].expand(-1, -1, -1, n_types, -1)
+        # Keep the wave's sign in the direction, magnitude in ``wave``.
+    if density_power > 0.0:
+        total = rho.sum(dim=-1)
+        weight = (total / torch.clamp(torch.amax(total, dim=-1, keepdim=True), min=tiny)) ** density_power
+        wave = wave * weight[:, None, :]
+    peak = torch.amax(wave.abs(), dim=-1, keepdim=True)
+    has_wave = peak[..., 0] > 1.0e-5
+    wave = wave / torch.where(peak > tiny, peak, torch.ones_like(peak))
+    polarization_directions_field = (
+        (moment * rho)[:, None, :, :, None] * wave[:, :, :, None, None] * unit
+    )  # [field, probe, grid, type, 3]
+
+    volume = voxel_volume(batch["grid_spacing"].to(rho))
+    present = rho > 0.0
+    safe_rho = torch.where(present, rho, torch.ones_like(rho))
+    density_norm = volume[:, None, None] * torch.where(
+        present[:, None], density_directions.square() / safe_rho[:, None], torch.zeros_like(density_directions),
+    ).sum(dim=-2)                                                     # [field, probe, type]
+    polarization_norm = volume[:, None, None] * torch.where(
+        present[:, None],
+        3.0 * polarization_directions_field.square().sum(dim=-1) / (moment.square() * safe_rho)[:, None],
+        torch.zeros_like(density_directions),
+    ).sum(dim=-2)                                                     # [field, probe, type]
+    channel_norm = torch.cat((density_norm, polarization_norm), dim=-1)
+    channel_valid = torch.cat(
+        (density_valid, (wave_valid & has_wave)[..., None] & present.any(dim=-2)[:, None, :]),
+        dim=-1,
+    ) & (channel_norm > tiny)
+
+    # Channel displacements [field, probe, channel, grid, type(,3)].
+    n_channels = 2 * n_types
+    eye = torch.eye(n_types, dtype=rho.dtype, device=rho.device)
+    zeros_rho = torch.zeros((n_fields, n_probes, n_types, n_grid, n_types), dtype=rho.dtype, device=rho.device)
+    zeros_pol = torch.zeros((n_fields, n_probes, n_types, n_grid, n_types, 3), dtype=rho.dtype, device=rho.device)
+    rho_channels = torch.cat((
+        density_directions.permute(0, 1, 3, 2)[..., None] * eye[None, None, :, None, :],
+        zeros_rho,
+    ), dim=2)
+    pol_channels = torch.cat((
+        zeros_pol,
+        polarization_directions_field.permute(0, 1, 3, 2, 4)[:, :, :, :, None, :]
+        * eye[None, None, :, None, :, None],
+    ), dim=2)
+
+    # Diagonal rows, then the requested pair rows.
+    pairs = []
+    for i in range(n_channels):
+        for j in range(i + 1, n_channels):
+            same_species = (i % n_types) == (j % n_types)
+            if couple_species or same_species:
+                pairs.append((i, j))
+    rows = torch.zeros((n_channels + len(pairs), n_channels), dtype=rho.dtype, device=rho.device)
+    rows[:n_channels] = torch.eye(n_channels, dtype=rho.dtype, device=rho.device)
+    for index, (i, j) in enumerate(pairs):
+        rows[n_channels + index, i] = rows[n_channels + index, j] = 1.0
+    d_rho = torch.einsum("rc,fpcgt->fprgt", rows, rho_channels)
+    d_pol = torch.einsum("rc,fpcgtx->fprgtx", rows, pol_channels)
+    n_rows = rows.shape[0]
+
+    n_patterns, n_phases = probe_shape(wavevector_indices, wavevector_phases)
+    amplitude = expand_probe_amplitudes(
+        relative_amplitude, rho, wavevector_indices[:, :n_patterns], n_rows, n_phases,
+    )
+    scale = (
+        amplitude.reshape(n_fields, n_probes, n_rows)[..., None, None]
+        if torch.is_tensor(amplitude) else amplitude
+    )
+    delta_rho = (scale * d_rho).flatten(1, 2)
+    delta_pol = (
+        (scale[..., None] if torch.is_tensor(scale) else scale) * d_pol
+    ).flatten(1, 2)
+    if torch.any(rho[:, None] - delta_rho.abs() < -1.0e-7).item():
+        raise RuntimeError("coupled Fourier perturbation produced negative density")
+
+    if "local_energy_mask" in outputs:
+        outputs = _energy_only_model(model, dict(batch, rho=rho, dipole_density=polarization))
+    reference = outputs["beta_F_exc"]
+    perturbed_rho = torch.stack((rho[:, None] + delta_rho, rho[:, None] - delta_rho), dim=2).flatten(1, 2)
+    perturbed_pol = torch.stack(
+        (polarization[:, None] + delta_pol, polarization[:, None] - delta_pol), dim=2,
+    ).flatten(1, 2)
+    chunk_size = perturbations_per_forward or perturbed_rho.shape[1]
+    chunks = []
+    for start in range(0, perturbed_rho.shape[1], chunk_size):
+        expanded = _expand_batch(batch, perturbed_rho[:, start:start + chunk_size])
+        expanded["dipole_density"] = perturbed_pol[:, start:start + chunk_size]
+        result = _energy_only_model(model, expanded)
+        if "beta_F_exc" not in result:
+            raise KeyError("model outputs are missing 'beta_F_exc'")
+        chunks.append(result["beta_F_exc"])
+    perturbed = torch.cat(chunks, dim=1).reshape(n_fields, n_probes, n_rows, 2)
+    amplitude_squared = (
+        amplitude.reshape(n_fields, n_probes, n_rows).square()
+        if torch.is_tensor(amplitude) else amplitude ** 2
+    )
+    excess_form = (perturbed.sum(dim=-1) - 2.0 * reference[:, None, None]) / amplitude_squared
+
+    # Reference second variation of every row direction (unit amplitude),
+    # from the analytic Hessian of the ideal reference at the BASE state: one
+    # set of coefficients per voxel, shared by every diagonal and pair row,
+    # so the assembled matrix is the Hessian of a single reference.
+    translational = torch.where(
+        present[:, None, None], d_rho.square() / safe_rho[:, None, None], torch.zeros_like(d_rho),
+    )
+    along_coefficient, across_coefficient, unit_polarization, alignment = _orientational_hessian(
+        rho, polarization, moment, exact=alignment_reference == "exact",
+    )
+    along = (d_pol * unit_polarization[:, None, None]).sum(dim=-1)            # P_hat . delta P
+    across = d_pol.square().sum(dim=-1) - along.square()                      # |delta P_perp|^2
+    longitudinal = along - (moment * alignment)[:, None, None] * d_rho        # P_hat . delta P - m p delta rho
+    orientational = torch.where(
+        present[:, None, None],
+        along_coefficient[:, None, None] * longitudinal.square()
+        + across_coefficient[:, None, None] * across,
+        torch.zeros_like(d_rho),
+    )                                                                         # [field, probe, row, grid, type]
+    reference_form = volume[:, None, None] * (translational + orientational).sum(dim=(-2, -1))
+    forms = excess_form + reference_form                                # [field, probe, row]
+
+    matrix = torch.diag_embed(forms[..., :n_channels])
+    for index, (i, j) in enumerate(pairs):
+        value = 0.5 * (forms[..., n_channels + index] - forms[..., i] - forms[..., j])
+        matrix[..., i, j] = value
+        matrix[..., j, i] = value
+    norm = torch.where(channel_valid, channel_norm, torch.ones_like(channel_norm))
+    matrix = matrix / torch.sqrt(norm[..., :, None] * norm[..., None, :])
+    active = channel_valid[..., :, None] & channel_valid[..., None, :]
+    matrix = torch.where(active, matrix, torch.zeros_like(matrix))
+    shape = (n_fields, n_patterns, n_phases)
+    return matrix.reshape(*shape, n_channels, n_channels), channel_valid.reshape(*shape, n_channels)
+
+
+
+def _orientational_hessian(rho, polarization, moment, exact=True):
+    r"""Return the base-state Hessian coefficients of ``rho * s(|P| / (m rho))``.
+
+    With ``p = |P| / (m rho)`` and unit ``P_hat``, the second variation is
+
+    ``A (P_hat . dP - m p d rho)^2 + B |dP_perp|^2``,
+
+    ``A = s''(p) / (m^2 rho)``, ``B = s'(p) / (p m^2 rho)``. For the Langevin
+    entropy ``s'(p) = L^{-1}(p)`` and ``s''(p) = 1 / L'(L^{-1}(p))``; both tend
+    to 3 at zero alignment, the weak-alignment form ``A = B = 3 / (m^2 rho)``
+    used everywhere with ``exact=False``. With ``exact=True`` the coefficients
+    are evaluated at ``min(p, 1 - sqrt(eps))`` of the dtype: continuous and
+    nondecreasing in ``p`` (they diverge as ``1/(1-p)^2`` and ``1/(1-p)`` at
+    saturation), held at their boundary value beyond it, never dropped to
+    the weak-alignment form. The cap is where the inverse Langevin function
+    loses relative precision ``eps / (1 - p)``; it lies at ``p`` of about
+    0.99966 in float32 and 1 - 1.5e-8 in float64. The reference is convex in
+    ``(rho, P)``, so the ideal gas alone is never unstable. Returns
+    ``A, B, P_hat, p`` (zero where rho = 0).
+    """
+
+    tiny = torch.finfo(rho.dtype).tiny
+    present = rho > 0.0
+    safe_rho = torch.where(present, rho, torch.ones_like(rho))
+    magnitude = torch.linalg.vector_norm(polarization, dim=-1)
+    alignment = torch.where(present, magnitude / (moment * safe_rho), torch.zeros_like(rho))
+    unit = polarization / torch.where(magnitude > tiny, magnitude, torch.ones_like(magnitude))[..., None]
+    weak = torch.full_like(rho, 3.0)
+    along, across = weak, weak
+    if exact:
+        cap = 1.0 - math.sqrt(torch.finfo(rho.dtype).eps)
+        p = torch.where(present, alignment.clamp(max=cap), torch.zeros_like(alignment))
+        small = p < 1.0e-2
+        safe_p = torch.where(small, torch.full_like(p, 0.5), p)
+        xi = inverse_langevin(safe_p)
+        p2 = p.square()
+        # Series from s'(p) = 3p + 9/5 p^3 + 297/175 p^5 + 1539/875 p^7.
+        ratio_series = 3 + 9 / 5 * p2 + 297 / 175 * p2**2 + 1539 / 875 * p2**3
+        second_series = 3 + 27 / 5 * p2 + 297 / 35 * p2**2 + 1539 / 125 * p2**3
+        ratio = torch.where(small, ratio_series, xi / safe_p)
+        second = torch.where(small, second_series, 1.0 / _langevin_prime(xi))
+        along = torch.where(present, second, weak)
+        across = torch.where(present, ratio, weak)
+    scale = torch.where(present, 1.0 / (moment.square() * safe_rho), torch.zeros_like(rho))
+    return along * scale, across * scale, unit, alignment
 
 
 def _unit_polarization_directions(directions, reference, n_wavevectors):
