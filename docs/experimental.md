@@ -1084,6 +1084,94 @@ reports curvature RMSE, scaled curvature RMSE, nonpositive counts, and
 diagonal `S=1/K` diagnostics. The latter are not a substitute for inverting a
 coupled response matrix.
 
+## Bulk density-polarization response
+
+`BulkResponseLoss` fits the complete second variation of a homogeneous,
+unpolarized state to equilibrium spectra: number `S(k)`, longitudinal and
+transverse dipole spectra and the density-dipole cross spectrum, plus the
+total-dipole fluctuation at `k = 0`. Where `FourierResponseLoss` projects
+finite-difference curvatures onto fixed component directions,
+`BulkResponseLoss` uses the exact Hessian symbol
+(`equicdft.response.bulk.bulk_response_symbol`): the gradient of `beta_F_exc`
+is differentiated once more at one voxel per channel, the rows are Fourier
+summed, and the ideal gas contributes the identity in the normalized
+coordinates
+
+$$
+\frac{\delta\rho_a}{\sqrt{\rho_a/\Delta V}},\qquad
+\frac{\sqrt3\,\delta\mathbf P_a}{m_a\sqrt{\rho_a/\Delta V}},
+$$
+
+in which the covariance of Fourier modes $e^{-i\mathbf k\cdot\mathbf r}$ is
+$K(\mathbf k)^{-1}$. The symbol stays differentiable with respect to the model
+parameters; on a 16³ grid one evaluation with about a hundred wavevectors
+costs a few seconds on a CPU. The model must have
+`ideal=FixedDipoleIdeal(...)`.
+
+For an isotropic, inversion-symmetric fluid each wavevector reduces
+(`reduce_bulk_symbol`) to four curvature blocks per species pair: density
+$K_{\rho\rho}$, longitudinal $K_{LL}$, transverse $K_{TT}$ (mean of the two
+transverse directions) and the imaginary cross block $\mathrm{Im}\,K_{\rho L}$.
+The largest coupling that this reduction drops (density or longitudinal with
+transverse, which a grid functional can produce off the axes) is reported as
+`anisotropy`.
+
+A bin's reference is the arithmetic mean of the member spectra, which for
+members at different $|\mathbf k|$ is not the inverse of the mean curvature.
+With `bin_average="covariance"` (default) the member blocks are inverted to
+covariances, averaged over the bin and inverted back, so the prediction is
+the same statistic as the reference for any spread of $|\mathbf k|$ within a
+bin. A bin with any non-positive-definite member has no covariance; it falls
+back to the arithmetic curvature mean and is listed in the
+`unstable_bins` entry of the result (the curvature loss still drives it
+toward stability). `bin_average="curvature"` always averages curvatures;
+for bins that are a cubic orbit of one lattice vector the two modes agree
+exactly. Bins of one cubic orbit, or one vector each, are recommended.
+
+Members are padded with `member_mask = False`; padded entries never enter the
+symbol or the average. An unmasked member at $\mathbf k = 0$ is an error:
+$k = 0$ enters only through the zero-wavevector term. Models with no learned
+excess term, or with excess terms that do not couple to polarization, give
+the ideal identity for the missing blocks.
+
+Reference spectra follow the simulation definitions
+($S_{ab} = \langle n_a n_b^*\rangle/\sqrt{N_aN_b}$,
+$G_{L,T} = 3\langle p p^*\rangle/(\sqrt{N_aN_b}\,m_am_b)$ per component,
+$C_{ab} = \mathrm{Im}\langle n_a p_{L,b}^*\rangle/(\sqrt{N_aN_b}\,m_b)$) and are
+converted to the same blocks by inverting the longitudinal covariance
+$[[S, i\sqrt3 C], [-i\sqrt3 C^T, G_L]]$ and $G_T$ (`spectra_to_curvature`;
+`curvature_to_spectra` is its inverse). The comparison is in curvature,
+$K = S^{-1}$: it is defined for an unstable model and is what the solver sees.
+Per element, prediction and target are divided by the reference SEM
+propagated linearly to that element, combined in quadrature with
+`relative_floor` times the element's size, and passed to `loss_fn` (smooth L1
+by default), as in `FourierResponseLoss`.
+
+At `k = 0` a canonical reference has no number fluctuation, so only the
+polarization block enters: its isotropic average is compared with the inverse
+of the total-dipole fluctuation $g_K$ (for one species
+$\varepsilon - 1 = 4\pi\beta\rho m^2 g_K / 3$ in tin-foil boundary conditions).
+
+```python
+bulk_response = BulkResponseLoss(
+    wavevector_indices_key="response_wavevector_indices",  # [field, bin, member, 3]
+    member_mask_key="response_member_mask",                # [field, bin, member]
+    spectra_key="response_spectra",                        # [field, bin, 4, n, n]: S, G_L, G_T, C
+    spectra_sem_key="response_spectra_sem",                # same shape (optional)
+    zero_wavevector_key="response_gk",                     # [field, n, n] (optional)
+    zero_wavevector_sem_key="response_gk_sem",
+    relative_floor=0.02,
+    weight=1.0,  # relative to the data loss; tune per campaign
+)
+```
+
+The reference should be computed from simulation frames binned exactly as
+the training fields are: a voxel functional reproduces the spectra of
+voxel-averaged fields, including the assignment window and aliasing, not the
+point-particle spectra. Without that, use only wavevectors well below the
+grid's Nyquist limit. Bulk response constrains the homogeneous unpolarized
+state only; polarized and dense states still need the stability probes.
+
 ## Joint field and response training
 
 `TrainingStream` keeps different datasets, losses, metrics, and model-forward

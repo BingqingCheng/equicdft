@@ -21,6 +21,7 @@ from .representation.invariants import CartesianBFeatures
 from .representation.message import BChiMessage
 from .response.data import FourierResponseData
 from .response.loss import FourierResponseLoss
+from .response.bulk import BulkResponseLoss
 from .response.metrics import FourierResponseMetrics
 from .response.response import FourierResponse
 from .response.stability import FourierStabilityLoss
@@ -57,6 +58,7 @@ __all__ = [
     "IdealGas",
     "IdealReference",
     "FourierResponseLoss",
+    "BulkResponseLoss",
     "FourierResponse",
     "FourierResponseData",
     "FourierResponseMetrics",
