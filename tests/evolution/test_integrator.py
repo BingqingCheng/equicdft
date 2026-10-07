@@ -1,11 +1,13 @@
 import math
 import unittest
 
+import numpy as np
 import torch
 from torch import nn
 
-from equicdft import GridCACEModel
-from equicdft.evolution import ConstantMobility, LocalMobility, EulerIntegrator, SemiImplicitIntegrator
+from equicdft import GridCACEModel, GridSolver
+from equicdft.evolution import ConstantMobility, Dynamics, LocalMobility, EulerIntegrator, SemiImplicitIntegrator
+from equicdft.solver.options import Constraints, ConvergenceOptions
 from tests.model_fixtures import example_model, grid_data, long_range_model
 
 
@@ -127,6 +129,150 @@ class TestIntegrator(unittest.TestCase):
         for cls in (EulerIntegrator, SemiImplicitIntegrator):
             expected = cls(self.model, self.mobility, .001).step(self.data)[order]
             torch.testing.assert_close(cls(self.model, self.mobility, .001).step(permuted), expected)
+
+    def test_permuted_rows_with_excluded_mask(self):
+        data = field(shape=(8, 2, 2))
+        x = data["grid_positions"][:, 0]
+        excluded = (x == 0) | (x == 4)
+        data["excluded_mask"] = excluded
+        data["rho"][excluded] = 0
+        order = torch.randperm(len(data["rho"]), generator=torch.Generator().manual_seed(3))
+        permuted = dict(data, rho=data["rho"][order], grid_positions=data["grid_positions"][order],
+                        excluded_mask=excluded[order])
+        expected = EulerIntegrator(self.model, self.mobility, .001).step(data)[order]
+        torch.testing.assert_close(EulerIntegrator(self.model, self.mobility, .001).step(permuted), expected, rtol=0, atol=0)
+
+    def test_relaxation_rates_and_stability_limit(self):
+        integrator = EulerIntegrator(self.model, self.mobility, .001)
+        rates = integrator.relaxation_rates(self.data)
+        self.assertEqual(tuple(rates.shape), (8, 3, 2, 2))
+        torch.testing.assert_close(rates[0, 0, 0], torch.zeros(2, dtype=torch.float64), rtol=0, atol=1e-12)
+        coupling = torch.linalg.eigvals(self.m @ self.h).real.sort().values / self.data["beta"]
+        q2 = torch.zeros(8, 3, 2, dtype=torch.float64)
+        for axis, (size, spacing) in enumerate(zip((8, 3, 2), (0.4, 0.7, 1.1))):
+            modes = 4 * torch.sin(math.pi * torch.arange(size, dtype=torch.float64) / size) ** 2 / spacing ** 2
+            q2 += modes.reshape([size if i == axis else 1 for i in range(3)])
+        torch.testing.assert_close(rates.sort(-1).values, q2[..., None] * coupling, rtol=1e-12, atol=1e-12)
+        self.assertAlmostEqual(integrator.stability_limit(self.data), float(2 / (q2.max() * coupling.max())), places=12)
+        with self.assertRaisesRegex(ValueError, "fully accessible"):
+            integrator.relaxation_rates(dict(self.data, excluded_mask=torch.zeros(48, dtype=torch.bool).index_fill(0, torch.tensor([0]), True),
+                                             rho=self.data["rho"].index_fill(0, torch.tensor([0]), 0.)))
+
+    def test_reference_density_change_is_rejected(self):
+        integrator = SemiImplicitIntegrator(self.model, self.mobility, .001)
+        updated = integrator.step(self.data)
+        integrator.step(dict(self.data, rho=updated))
+        with self.assertRaisesRegex(ValueError, "reference density"):
+            integrator.step(dict(self.data, rho=3 * self.data["rho"]))
+
+    def test_changed_timestep_rebuilds_only_propagator(self):
+        integrator = SemiImplicitIntegrator(self.model, self.mobility, .001)
+        state = dict(self.data, rho=integrator.step(self.data))
+        operator = integrator._operator
+        propagator = integrator._propagator
+        integrator.step(state)
+        self.assertIs(integrator._propagator, propagator)
+        for dt in (.02, .0005):
+            integrator.dt = dt
+            fresh = SemiImplicitIntegrator(self.model, self.mobility, dt)
+            torch.testing.assert_close(integrator.step(state), fresh.step(state), rtol=1e-13, atol=1e-13)
+            self.assertIs(integrator._operator, operator)
+            self.assertIsNot(integrator._propagator, propagator)
+            propagator = integrator._propagator
+
+    def test_timestep_assignment_rejects_invalid_values(self):
+        for cls in (EulerIntegrator, SemiImplicitIntegrator):
+            integrator = cls(self.model, self.mobility, .001)
+            for dt in (0., -1., float('nan'), float('inf'), True, [1., 2.], 1j):
+                with self.subTest(method=cls.__name__, dt=dt), self.assertRaises(ValueError):
+                    integrator.dt = dt
+                self.assertEqual(integrator.dt, .001)
+
+    def test_long_time_limit_is_boltzmann_for_ideal_gas(self):
+        data = {key: value.double() if value.is_floating_point() else value for key, value in grid_data(shape=(4, 4, 4)).items()}
+        data["rho"] = torch.full_like(data["rho"], .5)
+        data["V_ext"] = (.6 * torch.cos(2 * math.pi * data["grid_positions"][:, 0].double() / 4))[:, None]
+        model = GridCACEModel(a_features=None, b_features=None, readout=[], n_types=1, grid_spacing=1., boltzmann_constant=1.).double()
+        boltzmann = torch.exp(-data["beta"] * data["V_ext"])
+        boltzmann *= data["rho"].sum() / boltzmann.sum()
+        for cls, dt in ((EulerIntegrator, .1), (SemiImplicitIntegrator, .25)):
+            trajectory = Dynamics(cls(model, ConstantMobility(1.), dt)).run(data, n_steps=300, save_every=300)
+            torch.testing.assert_close(trajectory["rho"][-1], boltzmann, rtol=0, atol=1e-8)
+
+    def test_long_time_limit_matches_equilibrium_solver(self):
+        torch.manual_seed(0)
+        model = example_model().double().eval()
+        data = {key: value.double() if value.is_floating_point() else value for key, value in grid_data(shape=(4, 4, 4)).items()}
+        data["rho"] = torch.full_like(data["rho"], .5)
+        data["V_ext"] = (.3 * torch.cos(2 * math.pi * data["grid_positions"][:, 0].double() / 4))[:, None]
+        solution = GridSolver(model).solve(dict(data), constraints=Constraints(particle_numbers=[float(data["rho"].sum())]),
+                                           convergence=ConvergenceOptions(max_iter=3000, tolerance_residual=1e-10))
+        integrator = EulerIntegrator(model, ConstantMobility(1.), .01)
+        rates = integrator.relaxation_rates(data)
+        self.assertGreater(float(rates.flatten()[1:].min()), 0)
+        for cls, dt in ((EulerIntegrator, .8 * integrator.stability_limit(data)), (SemiImplicitIntegrator, .25)):
+            trajectory = Dynamics(cls(model, ConstantMobility(1.), dt)).run(data, n_steps=300, save_every=30)
+            torch.testing.assert_close(trajectory["rho"][-1], solution["rho"], rtol=0, atol=1e-5)
+            self.assertTrue(torch.all(torch.diff(trajectory["beta_A"]) <= 1e-10))
+
+    def test_geometry_cache_tracks_replaced_and_mutated_inputs(self):
+        integrator = EulerIntegrator(self.model, self.mobility, .001)
+        first = integrator.step(self.data)
+        potential = torch.zeros_like(self.data["rho"])
+        data = dict(self.data, V_ext=potential)
+        torch.testing.assert_close(integrator.step(data), first, rtol=0, atol=0)
+        potential[:, 0] = torch.linspace(0., 1., len(potential))      # in-place change must be seen
+        changed = integrator.step(data)
+        self.assertFalse(torch.allclose(changed, first))
+        torch.testing.assert_close(changed, EulerIntegrator(self.model, self.mobility, .001).step(data), rtol=0, atol=0)
+        walled = dict(self.data, excluded_mask=torch.zeros(48, dtype=torch.bool).index_fill(0, torch.tensor([5]), True),
+                      rho=self.data["rho"].index_fill(0, torch.tensor([5]), 0.))
+        torch.testing.assert_close(integrator.step(walled), EulerIntegrator(self.model, self.mobility, .001).step(walled), rtol=0, atol=0)
+        torch.testing.assert_close(integrator.step(self.data), first, rtol=0, atol=0)
+
+    def test_geometry_cache_rebuilds_for_mutable_non_tensor_inputs(self):
+        for convert in (lambda value: value.tolist(), lambda value: value.numpy().copy()):
+            data = dict(self.data, V_ext=convert(torch.zeros_like(self.data['rho'])))
+            integrator = EulerIntegrator(self.model, self.mobility, .001)
+            initial = integrator.rhs(data)
+            data['V_ext'][0][0] = 1.
+            changed = integrator.rhs(data)
+            self.assertFalse(torch.allclose(changed, initial))
+            fresh = EulerIntegrator(self.model, self.mobility, .001)
+            torch.testing.assert_close(changed, fresh.rhs(data), rtol=0, atol=0)
+            # Replacing arrays must not trigger ambiguous NumPy comparisons.
+            data['V_ext'] = convert(torch.ones_like(self.data['rho']))
+            torch.testing.assert_close(integrator.rhs(data), fresh.rhs(data), rtol=0, atol=0)
+        data = dict(self.data, grid_spacing=np.array([.4, .7, 1.1]))
+        integrator = EulerIntegrator(self.model, self.mobility, .001)
+        integrator.rhs(data)
+        data['grid_spacing'][0] = .8
+        torch.testing.assert_close(integrator.rhs(data),
+                                   EulerIntegrator(self.model, self.mobility, .001).rhs(data), rtol=0, atol=0)
+
+    def test_changed_geometry_rechecks_previously_returned_density(self):
+        integrator = EulerIntegrator(self.model, self.mobility, .001)
+        state = dict(self.data, rho=integrator.step(self.data))
+        state['excluded_mask'] = torch.zeros(48, dtype=torch.bool)
+        state['excluded_mask'][0] = True
+        with self.assertRaisesRegex(ValueError, 'Excluded voxels'):
+            integrator.rhs(state)
+
+    def test_own_output_is_trusted_until_modified(self):
+        integrator = EulerIntegrator(self.model, self.mobility, .001)
+        state = dict(self.data, rho=integrator.step(self.data))
+        integrator.step(state)
+        state["rho"][3, 1] = -1.0
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            integrator.step(state)
+
+    def test_last_beta_A_matches_direct_evaluation(self):
+        for cls in (EulerIntegrator, SemiImplicitIntegrator):
+            integrator = cls(self.model, self.mobility, .001)
+            data = dict(self.data, V_ext=torch.linspace(-1., 1., 96, dtype=torch.float64).reshape(48, 2))
+            expected = integrator.beta_A(data)
+            integrator.step(data)
+            torch.testing.assert_close(integrator.last_beta_A, expected, rtol=1e-13, atol=1e-10)
 
     def test_excluded_faces_and_compartment_conservation(self):
         data = field(shape=(8, 2, 2))

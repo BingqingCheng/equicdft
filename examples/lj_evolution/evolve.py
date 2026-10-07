@@ -50,6 +50,10 @@ def main():
 
     method = {"euler": EulerIntegrator, "semi-implicit": SemiImplicitIntegrator}[args.method]
     integrator = method(model, ConstantMobility(MOBILITY), dt=DT)
+    rates = integrator.relaxation_rates(data)
+    print("explicit stability limit {:.3f}; slowest linear relaxation time {:.1f}; run covers {:.1%} of it".format(
+        integrator.stability_limit(data), 1 / float(rates.flatten()[1:].min()),
+        DT * N_STEPS * float(rates.flatten()[1:].min())))
     trajectory = Dynamics(integrator).run(data, n_steps=N_STEPS, save_every=1)
     trajectory["metadata"].update(
         model_path=str(MODEL_PATH),

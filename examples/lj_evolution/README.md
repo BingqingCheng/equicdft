@@ -20,7 +20,11 @@ Settings are together at the top of the script:
 
 Mobility sets the time scale. These numerical settings are an example, not
 a measured LJ mobility or calibrated MD kinetics. The default semi-implicit
-method and optional Euler method are both first order in time.
+method and optional Euler method are both first order in time. The script
+first prints the explicit stability limit (0.83 here) and the slowest linear
+relaxation time (31): the ten steps of 0.01 are a mechanics check covering
+0.3 % of that relaxation, so raise `N_STEPS` or `DT` (semi-implicit) to watch
+the wave decay.
 
 The output is a PyTorch file containing all eleven density frames, their
 times, free energies, particle numbers, minimum densities, and metadata

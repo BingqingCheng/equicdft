@@ -16,7 +16,12 @@ class Dynamics:
         self.integrator = integrator
 
     def run(self, data, n_steps, save_every=1):
-        """Record the initial state, sampling intervals, and the final state."""
+        """Record the initial state, sampling intervals, and the final state.
+
+        If a step is rejected, the frames recorded so far plus the last valid
+        state are attached to the raised error as ``error.trajectory`` (with
+        ``metadata["completed"] = False``), so a long run is not lost.
+        """
         if isinstance(n_steps, bool) or not isinstance(n_steps, Integral) or n_steps < 0:
             raise ValueError("n_steps must be a nonnegative integer.")
         if isinstance(save_every, bool) or not isinstance(save_every, Integral) or save_every <= 0:
@@ -24,33 +29,62 @@ class Dynamics:
         state = dict(data, rho=data["rho"].detach().clone())
         grid = _Grid(state)
         records = {key: [] for key in ("time", "rho", "beta_A", "particle_numbers", "min_density")}
+        progress = {"done": 0, "recorded": 0, "pending": None}
 
         def record(step):
+            # The free energy of this state comes free with the next step's
+            # derivative pass (integrator.last_beta_A); fill it in then.
             rho = state["rho"].detach()
-            records["time"].append(step * self.integrator.dt)
-            records["rho"].append(rho.cpu().clone())
-            records["beta_A"].append(self.integrator.beta_A(state).cpu())
-            records["particle_numbers"].append((grid.volume * rho.sum(0)).cpu())
-            records["min_density"].append(rho[~grid.excluded].min().cpu())
+            values = (step * self.integrator.dt, rho.cpu().clone(), None,
+                      (grid.volume * rho.sum(0)).cpu(), rho[~grid.excluded].min().cpu())
+            for key, value in zip(records, values):
+                records[key].append(value)
+            progress["recorded"] = progress["pending"] = step
+
+        def settle(energy):
+            records["beta_A"][-1] = energy.detach().cpu()
+            progress["pending"] = None
+
+        def assemble(completed):
+            result = {key: torch.stack(values) for key, values in records.items() if key != "time"}
+            result["time"] = torch.tensor(records["time"], dtype=torch.float64)
+            result["metadata"] = {
+                "dt": self.integrator.dt, "n_steps": n_steps, "save_every": save_every,
+                "method": type(self.integrator).__name__, "deterministic": True,
+                "completed": completed, "steps_completed": progress["done"],
+                "mobility": {"class": type(self.integrator.mobility).__name__},
+            }
+            for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "temperature", "beta", "V_ext"):
+                if key in data:
+                    result["metadata"][key] = torch.as_tensor(data[key]).detach().cpu().clone()
+            if isinstance(self.integrator.mobility, ConstantMobility):
+                result["metadata"]["mobility"]["value"] = self.integrator.mobility.value.detach().cpu().clone()
+            return result
 
         record(0)
-        for step in range(1, n_steps + 1):
-            state["rho"] = self.integrator.step(state)
-            if step % save_every == 0 or step == n_steps:
-                record(step)
-        result = {key: torch.stack(values) for key, values in records.items() if key != "time"}
-        result["time"] = torch.tensor(records["time"], dtype=torch.float64)
-        result["metadata"] = {
-            "dt": self.integrator.dt, "n_steps": n_steps, "save_every": save_every,
-            "method": type(self.integrator).__name__, "deterministic": True,
-            "mobility": {"class": type(self.integrator.mobility).__name__},
-        }
-        for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "temperature", "beta", "V_ext"):
-            if key in data:
-                result["metadata"][key] = torch.as_tensor(data[key]).detach().cpu().clone()
-        if isinstance(self.integrator.mobility, ConstantMobility):
-            result["metadata"]["mobility"]["value"] = self.integrator.mobility.value.detach().cpu().clone()
-        return result
+        try:
+            for step in range(1, n_steps + 1):
+                state["rho"] = self.integrator.step(state)
+                if progress["pending"] == step - 1:
+                    settle(self.integrator.last_beta_A)
+                progress["done"] = step
+                if step % save_every == 0 or step == n_steps:
+                    record(step)
+        except ValueError as error:
+            if progress["recorded"] != progress["done"]:
+                record(progress["done"])
+            if progress["pending"] is not None:
+                try:
+                    settle(self.integrator.beta_A(state))
+                except ValueError:
+                    # Preserve the failed trajectory even when its last
+                    # energy cannot be evaluated; never mark it completed.
+                    settle(state["rho"].new_tensor(float("nan")))
+            error.trajectory = assemble(completed=False)
+            raise
+        if progress["pending"] is not None:
+            settle(self.integrator.beta_A(state))
+        return assemble(completed=True)
 
     @staticmethod
     def save(trajectory, path):

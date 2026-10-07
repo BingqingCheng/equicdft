@@ -5,6 +5,7 @@ a matrix at every voxel, with shape ``rho.shape + (n_species,)``.
 """
 
 from abc import ABC, abstractmethod
+import math
 
 import torch
 from torch import nn
@@ -66,7 +67,14 @@ def _shared_matrix(value, rho):
 
 
 class Mobility(nn.Module, ABC):
-    """Return physical species mobility matrices from the current field data."""
+    """Return physical species mobility matrices from the current field data.
+
+    ``validated`` declares that ``forward`` already guarantees finite,
+    symmetric, positive semidefinite matrices; the integrators then skip
+    their own per-step eigenvalue check. Custom modules leave it ``False``.
+    """
+
+    validated = False
 
     @abstractmethod
     def forward(self, data):
@@ -82,6 +90,8 @@ class ConstantMobility(Mobility):
     coupling between species; its off-diagonal entries may be negative.
     """
 
+    validated = True
+
     def __init__(self, value):
         super().__init__()
         value = _as_float(value).detach().clone()
@@ -94,6 +104,32 @@ class ConstantMobility(Mobility):
         else:
             raise ValueError("Constant mobility must be a scalar, vector, or square matrix.")
         self.register_buffer("value", value)
+
+    @classmethod
+    def from_estimate(cls, value, *, tolerance=1e-6):
+        """Build from a measured matrix: symmetrize and project onto PSD matrices.
+
+        A mobility matrix estimated from simulation data is symmetric and
+        positive semidefinite only up to statistical noise, which the strict
+        constructor rejects. The adjustment is bounded by ``tolerance`` times
+        the largest entry, so a genuinely asymmetric or indefinite estimate
+        still raises instead of being silently repaired.
+        """
+        scalar = torch.as_tensor(tolerance)
+        if scalar.numel() != 1 or scalar.is_complex() or scalar.dtype == torch.bool:
+            raise ValueError("tolerance must be a finite nonnegative scalar.")
+        tolerance = float(torch.as_tensor(tolerance, dtype=torch.float64).detach())
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("tolerance must be a finite nonnegative scalar.")
+        estimate = _as_float(value).detach().clone()
+        if estimate.ndim != 2 or estimate.shape[0] != estimate.shape[1] or not estimate.numel():
+            return cls(estimate)
+        eigenvalues, vectors = torch.linalg.eigh((estimate + estimate.T) / 2)
+        projected = (vectors * eigenvalues.clamp_min(0)) @ vectors.T
+        projected = (projected + projected.T) / 2
+        if (projected - estimate).abs().max() > tolerance * estimate.abs().max():
+            raise ValueError("Estimate is not a symmetric positive semidefinite matrix within the tolerance.")
+        return cls(projected)
 
     def forward(self, data):
         rho = _density(data)
@@ -110,6 +146,8 @@ class LocalMobility(Mobility):
     Local shapes take precedence when a shape also matches a shared matrix.
     An ``nn.Module`` function is registered as a child module normally.
     """
+
+    validated = True
 
     def __init__(self, function):
         super().__init__()

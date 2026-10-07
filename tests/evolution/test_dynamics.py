@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from equicdft.evolution import ConstantMobility, Dynamics, EulerIntegrator, SemiImplicitIntegrator
+from equicdft.evolution import ConstantMobility, Dynamics, EulerIntegrator, LocalMobility, SemiImplicitIntegrator
 
 
 class QuadraticModel(nn.Module):
@@ -84,6 +84,9 @@ class TestDynamics(unittest.TestCase):
                 counts = trajectory["particle_numbers"]
                 torch.testing.assert_close(counts, counts[0].expand_as(counts), rtol=0, atol=1e-12)
                 self.assertTrue(torch.all(torch.diff(trajectory["beta_A"]) <= 1e-12))
+                # Recorded energies are those of the recorded frames, not of their neighbours.
+                for frame, rho in zip(trajectory["beta_A"], trajectory["rho"]):
+                    torch.testing.assert_close(frame, integrator.beta_A(dict(data, rho=rho)), rtol=1e-13, atol=1e-10)
                 self.assertTrue(torch.all(trajectory["min_density"] > 0))
                 for key, value in trajectory.items():
                     if isinstance(value, torch.Tensor):
@@ -108,6 +111,8 @@ class TestDynamics(unittest.TestCase):
         self.assertEqual(metadata["save_every"], 7)
         self.assertEqual(metadata["method"], "EulerIntegrator")
         self.assertIs(metadata["deterministic"], True)
+        self.assertIs(metadata["completed"], True)
+        self.assertEqual(metadata["steps_completed"], 1)
         self.assertEqual(metadata["mobility"]["class"], "ConstantMobility")
         torch.testing.assert_close(metadata["mobility"]["value"], torch.tensor([0.4, 0.2]))
         for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "temperature", "beta", "V_ext"):
@@ -129,6 +134,69 @@ class TestDynamics(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 Dynamics.save(trajectory, path)
             self.assertEqual(path.read_bytes(), saved_bytes)
+
+    def test_failed_step_attaches_partial_trajectory(self):
+        steps_seen = []
+
+        def mobility_function(rho, temperature):
+            steps_seen.append(len(steps_seen))
+            return (1e6 if len(steps_seen) > 3 else .4) * torch.ones_like(rho)
+
+        model = QuadraticModel()
+        integrator = EulerIntegrator(model, LocalMobility(mobility_function), dt=.02)
+        data = field_data()
+        with self.assertRaisesRegex(ValueError, "reduce the timestep") as caught:
+            Dynamics(integrator).run(data, n_steps=10, save_every=2)
+        partial = caught.exception.trajectory
+        self.assertIs(partial["metadata"]["completed"], False)
+        self.assertEqual(partial["metadata"]["steps_completed"], 3)
+        torch.testing.assert_close(partial["time"], torch.tensor([0., .04, .06], dtype=torch.float64))
+        self.assertEqual(partial["rho"].shape, (3, 24, 2))
+        self.assertTrue(torch.all(partial["min_density"] > 0))
+        # The last frame is the last valid state, usable as a restart point.
+        restart = dict(data, rho=partial["rho"][-1])
+        torch.testing.assert_close(EulerIntegrator(model, ConstantMobility(.4), dt=.02).rhs(restart).sum(0),
+                                   torch.zeros(2, dtype=torch.float64), rtol=0, atol=1e-12)
+
+    def test_nonfinite_cached_energy_rejects_trajectory(self):
+        class NonfiniteEnergy(QuadraticModel):
+            def forward(self, data, **kwargs):
+                output = super().forward(data, **kwargs)
+                if data['rho'][0, 0] > 1.1499:
+                    output['beta_F'] = output['beta_F'] + float('inf')
+                return output
+
+        for method in (EulerIntegrator, SemiImplicitIntegrator):
+            integrator = method(NonfiniteEnergy(), ConstantMobility([.4, .2]), .02)
+            # Supply the known curvature so the test targets the per-step
+            # energy cache rather than Hessian construction at the reference.
+            if method is SemiImplicitIntegrator:
+                integrator.reference_curvature = integrator.model.curvature
+            with self.subTest(method=method.__name__):
+                with self.assertRaisesRegex(ValueError, 'free energy must be finite') as caught:
+                    Dynamics(integrator).run(field_data(), n_steps=1)
+                self.assertIsNone(integrator.last_beta_A)
+                self.assertFalse(caught.exception.trajectory['metadata']['completed'])
+                self.assertEqual(caught.exception.trajectory['metadata']['steps_completed'], 0)
+
+    def test_late_nonfinite_energy_preserves_partial_trajectory(self):
+        class NonfiniteEnergy(QuadraticModel):
+            def forward(self, data, **kwargs):
+                output = super().forward(data, **kwargs)
+                if data['rho'][0, 0] < 1.1499:
+                    output['beta_F'] = output['beta_F'] + float('nan')
+                return output
+
+        integrator = EulerIntegrator(NonfiniteEnergy(), ConstantMobility([.4, .2]), .02)
+        with self.assertRaisesRegex(ValueError, 'free energy must be finite') as caught:
+            Dynamics(integrator).run(field_data(), n_steps=3)
+        partial = caught.exception.trajectory
+        self.assertFalse(partial['metadata']['completed'])
+        self.assertEqual(partial['metadata']['steps_completed'], 1)
+        self.assertEqual(partial['rho'].shape[0], 2)
+        self.assertTrue(torch.isfinite(partial['beta_A'][0]))
+        self.assertTrue(torch.isnan(partial['beta_A'][-1]))
+        self.assertTrue(torch.all(partial['rho'] > 0))
 
     def test_model_modes_restored_after_evaluation_failure(self):
         integrator = self.integrator()

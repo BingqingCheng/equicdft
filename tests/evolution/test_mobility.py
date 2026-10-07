@@ -39,6 +39,32 @@ class TestMobility(unittest.TestCase):
         # A zero eigenvalue perturbed only at floating-point roundoff is valid.
         ConstantMobility(torch.tensor([[1.0, 1.0], [1.0, 1.0 - 1e-15]], dtype=torch.float64))
 
+    def test_from_estimate_repairs_noise_within_tolerance(self):
+        noisy = torch.tensor([[1.0, 0.3 + 2e-9], [0.3, 2.0]], dtype=torch.float64)
+        with self.assertRaises(ValueError):
+            ConstantMobility(noisy)
+        repaired = ConstantMobility.from_estimate(noisy).value
+        torch.testing.assert_close(repaired, repaired.T, rtol=0, atol=0)
+        torch.testing.assert_close(repaired, torch.tensor([[1.0, 0.3], [0.3, 2.0]], dtype=torch.float64), rtol=0, atol=2e-9)
+        indefinite = torch.tensor([[1.0, 0.999999], [0.999999, 1.0 - 1e-5]], dtype=torch.float64)
+        with self.assertRaisesRegex(ValueError, "tolerance"):
+            ConstantMobility.from_estimate(indefinite)
+        projected = ConstantMobility.from_estimate(indefinite, tolerance=1e-5).value
+        self.assertGreaterEqual(float(torch.linalg.eigvalsh(projected).min()), -1e-15)
+        with self.assertRaisesRegex(ValueError, "tolerance"):
+            ConstantMobility.from_estimate([[1.0, 0.5], [0.0, 1.0]])
+        with self.assertRaises(ValueError):
+            ConstantMobility.from_estimate(-1.0)
+        torch.testing.assert_close(ConstantMobility.from_estimate([1.0, 2.0]).value, torch.tensor([1.0, 2.0]))
+
+    def test_from_estimate_rejects_invalid_tolerance(self):
+        for value in (1., [[1., 0.], [0., 2.]]):
+            for tolerance in (float('nan'), float('inf'), -1., True, 1j, [1., 2.]):
+                with self.subTest(value=value, tolerance=tolerance), self.assertRaises(ValueError):
+                    ConstantMobility.from_estimate(value, tolerance=tolerance)
+        exact = torch.diag(torch.tensor([1., 2.], dtype=torch.float64))
+        torch.testing.assert_close(ConstantMobility.from_estimate(exact, tolerance=0.).value, exact)
+
     def test_constant_copies_source_and_allows_rank_deficiency(self):
         source = torch.tensor([[1.0, -1.0], [-1.0, 1.0]], dtype=torch.float64)
         mobility = ConstantMobility(source)
