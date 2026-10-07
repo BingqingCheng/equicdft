@@ -169,16 +169,23 @@ class TestIntegrator(unittest.TestCase):
         integrator = SemiImplicitIntegrator(self.model, self.mobility, .001)
         state = dict(self.data, rho=integrator.step(self.data))
         operator = integrator._operator
-        propagator = integrator._propagator
+        propagator = integrator._propagator_for(.001)
         integrator.step(state)
-        self.assertIs(integrator._propagator, propagator)
+        self.assertIs(integrator._propagator_for(.001), propagator)
         for dt in (.02, .0005):
             integrator.dt = dt
             fresh = SemiImplicitIntegrator(self.model, self.mobility, dt)
             torch.testing.assert_close(integrator.step(state), fresh.step(state), rtol=1e-13, atol=1e-13)
             self.assertIs(integrator._operator, operator)
-            self.assertIsNot(integrator._propagator, propagator)
-            propagator = integrator._propagator
+            self.assertIsNot(integrator._propagator_for(dt), propagator)
+            propagator = integrator._propagator_for(dt)
+        # The two most recent step sizes stay cached, so a step and its half alternate for free.
+        self.assertEqual(set(integrator._propagators), {.02, .0005})
+        half = integrator._propagator_for(.01)
+        self.assertEqual(set(integrator._propagators), {.0005, .01})
+        self.assertIs(integrator._propagator_for(.01), half)
+        torch.testing.assert_close(half, 1 / (1 + .01 * operator) if operator.shape[-1] == 1 else
+                                   torch.linalg.inv(torch.eye(2, dtype=operator.dtype) + .01 * operator), rtol=0, atol=0)
 
     def test_timestep_assignment_rejects_invalid_values(self):
         for cls in (EulerIntegrator, SemiImplicitIntegrator):

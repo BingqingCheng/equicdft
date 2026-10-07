@@ -9,6 +9,21 @@ from .integrator import _Grid
 from .mobility import ConstantMobility
 
 
+def _metadata(integrator, data, **extra):
+    """Describe a run: integrator, mobility, geometry and the caller's extras."""
+    metadata = {
+        "dt": integrator.dt, "method": type(integrator).__name__, "deterministic": True,
+        "mobility": {"class": type(integrator.mobility).__name__},
+    }
+    metadata.update(extra)
+    for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "temperature", "beta", "V_ext"):
+        if key in data:
+            metadata[key] = torch.as_tensor(data[key]).detach().cpu().clone()
+    if isinstance(integrator.mobility, ConstantMobility):
+        metadata["mobility"]["value"] = integrator.mobility.value.detach().cpu().clone()
+    return metadata
+
+
 class Dynamics:
     """Advance a density field and record compact CPU snapshots and diagnostics."""
 
@@ -30,12 +45,13 @@ class Dynamics:
         grid = _Grid(state)
         records = {key: [] for key in ("time", "rho", "beta_A", "particle_numbers", "min_density")}
         progress = {"done": 0, "recorded": 0, "pending": None}
+        dt = self.integrator.dt
 
         def record(step):
             # The free energy of this state comes free with the next step's
             # derivative pass (integrator.last_beta_A); fill it in then.
             rho = state["rho"].detach()
-            values = (step * self.integrator.dt, rho.cpu().clone(), None,
+            values = (step * dt, rho.cpu().clone(), None,
                       (grid.volume * rho.sum(0)).cpu(), rho[~grid.excluded].min().cpu())
             for key, value in zip(records, values):
                 records[key].append(value)
@@ -48,22 +64,15 @@ class Dynamics:
         def assemble(completed):
             result = {key: torch.stack(values) for key, values in records.items() if key != "time"}
             result["time"] = torch.tensor(records["time"], dtype=torch.float64)
-            result["metadata"] = {
-                "dt": self.integrator.dt, "n_steps": n_steps, "save_every": save_every,
-                "method": type(self.integrator).__name__, "deterministic": True,
-                "completed": completed, "steps_completed": progress["done"],
-                "mobility": {"class": type(self.integrator.mobility).__name__},
-            }
-            for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "temperature", "beta", "V_ext"):
-                if key in data:
-                    result["metadata"][key] = torch.as_tensor(data[key]).detach().cpu().clone()
-            if isinstance(self.integrator.mobility, ConstantMobility):
-                result["metadata"]["mobility"]["value"] = self.integrator.mobility.value.detach().cpu().clone()
+            result["metadata"] = _metadata(self.integrator, data, n_steps=n_steps, save_every=save_every,
+                                           completed=completed, steps_completed=progress["done"])
             return result
 
         record(0)
         try:
             for step in range(1, n_steps + 1):
+                if self.integrator.dt != dt:
+                    raise ValueError("dt changed during Dynamics.run; use AdaptiveDynamics for variable steps.")
                 state["rho"] = self.integrator.step(state)
                 if progress["pending"] == step - 1:
                     settle(self.integrator.last_beta_A)

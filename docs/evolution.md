@@ -90,7 +90,11 @@ separate justification before being used as a local function.
 ## One timestep
 
 Both integrators expose `step(data)`, which returns the new density tensor,
-and `rhs(data)`, which evaluates its instantaneous time derivative.
+`rhs(data)`, which evaluates its instantaneous time derivative, and
+`advance(data, rate, dt=None)`, which applies a rate from `rhs` over a step
+without evaluating the model again. `integrator.dt` may be reassigned
+between steps; `Dynamics.run` takes a fixed step and rejects a change made
+during a run, while `AdaptiveDynamics` below varies the step itself.
 The equilibrium model returns a dimensionless chemical-potential derivative,
 so the driving field is
 
@@ -196,6 +200,93 @@ fully accessible periodic grid; nonempty `excluded_mask` is rejected.
 The implicit part relaxes a stiffness constraint but does not guarantee
 positivity or energy decrease at arbitrary timesteps.
 
+## Adaptive timesteps
+
+`AdaptiveDynamics(integrator, control).run(data, t_end, save_every=1)` takes
+every step twice from the same stored rate, as one full step and as two half
+steps with one model evaluation at the midpoint, and keeps the half-step
+result. With `StepControl(dt_min, dt_max, ...)` the step is bounded before it
+is tried by `dt_max`, by `max_relative_change` $\delta$ through
+$\Delta t\le\delta\min_g\rho_g/|R_g|$ over accessible voxels (which keeps an
+explicit step positive by construction), and for an explicit integrator by
+`stability_safety` times the linear stability bound; on a grid with excluded
+voxels that bound is evaluated for the periodic reference at the mean
+accessible density, which blocked faces cannot raise. Two estimates of the
+local error relative to the density are then formed from the integrator's own
+updates, and the larger must not exceed `error_tolerance` $\epsilon$:
+
+$$
+e_1=\max_g\frac{|\rho^{\rm full}_g-\rho^{\rm half}_g|}{\rho^{\rm half}_g},\qquad
+e_2=\max_g\frac{1}{\rho^{\rm half}_g}\sum_{s=1}^{2}
+\Bigl|\tfrac{\Delta t}{2}R(\boldsymbol\rho^{(s)})_g-\bigl(\rho^{(s)}_g-\rho^{(s-1)}_g\bigr)\Bigr| .
+$$
+
+$e_1$ is the step-doubling difference, the error of the half-step result for
+a first-order method (the full step errs by about twice as much); it includes
+the backward-Euler damping error of the semi-implicit step on stiff modes, so
+it responds whenever halving the step changes the result. $e_2$ sums the
+defect of each half step, $s=1,2$ with $\boldsymbol\rho^{(0)}$ the starting
+state: the displacement the half step produced against the one its endpoint
+rate implies. It vanishes for a linear problem whose stabilizer matches its
+curvature, and it catches the case $e_1$ misses: a mode whose stabilizer is
+much stiffer than its physics is frozen alike by both step sizes, so the two
+results agree while the mode moves far more slowly than it should. On a
+linear test with the stabilizer set to 100 times the true curvature the
+former rate-difference estimate was 90-160 times below the exact one-step
+error; the estimate above is within a factor 0.7-4 of it in every stiffness
+regime tested (`tests/evolution/test_adaptive.py`), and the trajectory error
+of that over-stabilized problem now falls with the tolerance where it
+previously did not.
+
+After an accepted step the next step is scaled by
+$0.9\sqrt{\epsilon/e}$, at most by `growth`; after a rejection for accuracy
+by the same factor but at least by one tenth; after a rejection for
+positivity or free energy by `shrink`. An accepted step's next proposal is
+floored at `dt_min` before the independent stability and relative-change
+bounds are applied; this does not override either bound or allow a rejected
+step at `dt_min`. The free energy must not rise across either half step or
+the whole step by more than
+`energy_increase` + `energy_roundoff` $\cdot|\beta A|$: the first is an
+absolute tolerance in $k_BT$, independent of the zero of the free energy
+(default zero); the second is a roundoff allowance, relative because the
+rounding error of a summed free energy scales with its magnitude (default
+$10^{-12}$, a few thousand float64 ulps; float32 models need about
+$10^{-5}$). Set `energy_roundoff=0` for acceptance decisions that are exactly
+independent of the zero of the free energy. A step that would have to fall
+below `dt_min` to satisfy the bounds, or that is still rejected at `dt_min`,
+stops the run with the last accepted state attached as `error.trajectory`;
+only the final step is shortened freely to land exactly on `t_end`.
+
+The model evaluation at the accepted state starts the next step, so an
+accepted step costs two model evaluations, twice the fixed-step cost; a step
+rejected for positivity costs none or one, for accuracy or free energy one or
+two. The result has the `Dynamics` fields plus `dt` and the error estimate
+`error` per frame, the counts of accepted steps, rejections by cause and
+model evaluations, and the step cap `dt_cap` in the metadata.
+
+```python
+control = StepControl(dt_min=1e-4, dt_max=50.0, max_relative_change=0.05, error_tolerance=1e-3)
+trajectory = AdaptiveDynamics(SemiImplicitIntegrator(model, mobility, dt=0.01), control).run(data, t_end=300.0, save_every=10)
+```
+
+Where it pays: approaching equilibrium, or across transients with widely
+different rates, the semi-implicit integrator reaches a given time with a
+controlled local error in a fraction of the fixed-step evaluations (an LJ
+relaxation to ten relaxation times takes 100-130 model evaluations with the
+error estimate held at $10^{-2}$-$10^{-3}$, against 150-600 at fixed steps
+without any error control). For a time-accurate trajectory over a single
+relaxation time a well-chosen fixed step is as efficient or better, because
+the local error of a first-order method is then roughly uniform in time and
+every adaptive step costs two evaluations (an LJ square-wave transient to
+$t=60$ reached the accuracy of 120 fixed semi-implicit steps with 260
+adaptive evaluations); the explicit integrator gains nothing, since its
+stability bound already fixes its step and the doubled cost remains.
+With a loose tolerance the controller is still bounded by `max_relative_change`,
+so it reaches equilibrium quickly but with the slowed kinetics of the
+over-stabilized modes; a tight tolerance holds those modes to their physical
+rates at the cost of smaller steps. The remaining lever for time accuracy is
+a second-order step, not a different step controller.
+
 ## Trajectories
 
 `Dynamics(integrator).run(data, n_steps, save_every=1)` records the initial
@@ -231,7 +322,9 @@ dissipates free energy; a finite numerical timestep still needs validation.
 One explicit step is one model evaluation with its density derivative plus a
 few tens of elementwise kernels on the grid; one semi-implicit step adds two
 forward and one inverse FFT and a multiplication by the stored propagator
-$(I+\Delta tB)^{-1}$, which is inverted initially and when the timestep changes.
+$(I+\Delta tB)^{-1}$, which is inverted when a step size is first used; the
+two most recent step sizes stay cached, so an adaptive step and its half do
+not rebuild it.
 Grid geometry,
 walls and `V_ext` are validated when first seen and reused while the same
 tensors are passed unchanged. Non-tensor containers such as lists and arrays

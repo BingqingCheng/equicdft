@@ -35,11 +35,17 @@ def _positive_scalar(value, name):
 _GEOMETRY_KEYS = ("grid_size", "grid_positions", "grid_spacing", "excluded_mask", "V_ext", "beta", "temperature")
 
 
+class DensityError(ValueError):
+    """A density is non-finite, non-positive, or nonzero in an excluded voxel."""
+
+
 def _fingerprint(value):
     """Cache tensors and immutable scalars; rebuild for other input types."""
     if torch.is_tensor(value):
         return ("tensor", id(value), value._version)
     if value is None or isinstance(value, (bool, int, float, str)):
+        return ("value", value)
+    if isinstance(value, tuple) and all(isinstance(item, (bool, int, float, str)) for item in value):
         return ("value", value)
     # Lists/arrays (including containers holding them) have no version counter.
     return ("uncached", object())
@@ -118,9 +124,9 @@ class _Grid:
         accessible = rho.masked_fill(self.excluded[:, None], 1.0) if self.has_excluded else rho
         low, high = (value.item() for value in torch.aminmax(accessible))
         if not (0.0 < low and high < math.inf):  # a NaN fails both comparisons
-            raise ValueError("Accessible densities must be finite and positive; reduce the timestep.")
+            raise DensityError("Accessible densities must be finite and positive; reduce the timestep.")
         if self.has_excluded and torch.any(rho[self.excluded] != 0):
-            raise ValueError("Excluded voxels must have exactly zero density.")
+            raise DensityError("Excluded voxels must have exactly zero density.")
 
     def external(self):
         """Return the validated external potential, zero when none was given."""
@@ -232,13 +238,25 @@ class EulerIntegrator:
             raise ValueError("The model free energy must be finite.")
         return result.detach()
 
-    def step(self, data):
-        """Return one trial density; invalid steps raise instead of clipping."""
-        grid = self._grid_for(data)
-        rho = grid.rho.detach() + self.dt * self._rhs(data, grid)
+    def _advance(self, grid, rate, dt):
+        rho = grid.rho.detach() + dt * rate
         grid.check_density(rho)
         self._last_output = (rho, rho._version)
         return rho
+
+    def advance(self, data, rate, dt=None):
+        """Apply a rate from ``rhs(data)`` over ``dt`` (default ``self.dt``).
+
+        The model is not evaluated again, so a step can be retried with a
+        smaller ``dt`` from the same rate; invalid results raise as in ``step``.
+        """
+        dt = self.dt if dt is None else _positive_scalar(dt, "dt")
+        return self._advance(self._grid_for(data), rate, dt)
+
+    def step(self, data):
+        """Return one trial density; invalid steps raise instead of clipping."""
+        grid = self._grid_for(data)
+        return self._advance(grid, self._rhs(data, grid), self.dt)
 
     def relaxation_rates(self, data, reference_density=None):
         """Return the linear relaxation rate of every Fourier mode.
@@ -360,13 +378,12 @@ class SemiImplicitIntegrator(EulerIntegrator):
         self.reference_density = reference_density
         self.reference_curvature = reference_curvature
         self._operator = None
-        self._propagator = None
-        self._propagator_dt = None
+        self._propagators = {}   # dt -> (I + dt B)^-1 for the two most recent step sizes
         self._signature = None
         self._reference = None
 
-    def step(self, data):
-        grid = self._grid_for(data)
+    def _prepare(self, data, grid):
+        """Build the reference operator on first use and guard its reuse."""
         if grid.has_excluded:
             raise ValueError("SemiImplicitIntegrator requires a fully accessible periodic grid.")
         signature = (grid.shape, tuple(grid.spacing.tolist()), grid.beta, grid.temperature,
@@ -380,16 +397,44 @@ class SemiImplicitIntegrator(EulerIntegrator):
             self._reference = reference
         elif signature != self._signature or not torch.allclose(reference, self._reference, rtol=1e-6, atol=0.):
             raise ValueError("Grid, reference density or temperature changed; construct a new semi-implicit integrator.")
-        if self._propagator_dt != self.dt:
-            identity = torch.eye(grid.rho.shape[-1], dtype=self._operator.dtype, device=self._operator.device)
-            self._propagator = torch.linalg.inv(identity + self.dt * self._operator)
-            self._propagator_dt = self.dt
+
+    def _propagator_for(self, dt):
+        """Return (I + dt B)^-1, keeping the two most recent step sizes.
+
+        A fixed-step run reuses one propagator; step doubling alternates
+        between a step and its half without rebuilding either.
+        """
+        propagator = self._propagators.get(dt)
+        if propagator is None:
+            if self._operator.shape[-1] == 1:
+                propagator = 1 / (1 + dt * self._operator)
+            else:
+                identity = torch.eye(self._operator.shape[-1], dtype=self._operator.dtype, device=self._operator.device)
+                propagator = torch.linalg.inv(identity + dt * self._operator)
+            if len(self._propagators) >= 2:
+                del self._propagators[next(iter(self._propagators))]
+            self._propagators[dt] = propagator
+        return propagator
+
+    def _advance(self, grid, rate, dt):
+        propagator = self._propagator_for(dt)
         rho_hat = torch.fft.fftn(grid.dense(grid.rho.detach()), dim=(0, 1, 2))
-        rate_hat = torch.fft.fftn(grid.dense(self._rhs(data, grid)), dim=(0, 1, 2))
+        rate_hat = torch.fft.fftn(grid.dense(rate), dim=(0, 1, 2))
         # (I + dt B) rho' = rho + dt [R + B rho]  is  rho' = rho + dt (I + dt B)^-1 R.
-        updated = rho_hat + self.dt * (self._propagator @ rate_hat.unsqueeze(-1)).squeeze(-1)
+        updated = rho_hat + dt * (propagator @ rate_hat.unsqueeze(-1)).squeeze(-1)
         updated[0, 0, 0] = rho_hat[0, 0, 0]
         rho = grid.flat(torch.fft.ifftn(updated, dim=(0, 1, 2)).real)
         grid.check_density(rho)
         self._last_output = (rho, rho._version)
         return rho
+
+    def advance(self, data, rate, dt=None):
+        dt = self.dt if dt is None else _positive_scalar(dt, "dt")
+        grid = self._grid_for(data)
+        self._prepare(data, grid)
+        return self._advance(grid, rate, dt)
+
+    def step(self, data):
+        grid = self._grid_for(data)
+        self._prepare(data, grid)
+        return self._advance(grid, self._rhs(data, grid), self.dt)
