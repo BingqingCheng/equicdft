@@ -175,6 +175,58 @@ Pass `field=` to either trajectory driver. The field returns the **complete**
 species-resolved `V_ext`, replacing rather than adding to `data['V_ext']`.
 Omit it to keep the existing static-field behavior.
 
+For a conducting electrode, ramp its field with the liquid potential:
+
+```python
+field = RampedField.from_electric_field(
+    V_wall, data["grid_center"], charges, duration=20.0,
+    final_field=[0, 0, E_z],
+)
+trajectory = AdaptiveDynamics(integrator, control, field=field).run(data, t_end=100.)
+```
+
+Here `E_z` is the final field in model energy per charge per length. The model
+must already contain `MetalWall`. Its geometry and charge constraints stay
+fixed; electrode charges equilibrate at each density/field evaluation. This
+assumes instantaneous electronic response, not finite-rate electrode dynamics.
+The applied electrode field is stored in each state as `metal_external_field`;
+it overrides the wall's constructor field without changing its buffers or
+geometry cache. Custom fields can return a dictionary with `V_ext` and
+`metal_external_field` instead of a potential tensor.
+They must return the same keys throughout a trajectory. The helper constructs
+`V_ext,i = V_wall,i - q_i E dot r` and the matching electrode field; it accepts
+an optional `initial_field`, and `metal=False` selects a liquid-only ramp.
+It does not clip the potential. For manually supplied potentials, keeping the
+liquid/electrode signs, units and time dependence consistent is the caller's job.
+The model and data must use the same fixed temperature and beta convention.
+
+A uniform field represented by a periodic liquid potential has a branch cut.
+Place that cut across excluded/frozen no-flux faces, not an active transport
+connection. MetalWall separately keeps the electrode on its compact periodic
+branch. A periodic field without such blocked transport is a different driven
+problem, not the scalar-potential setup implemented here.
+
+Both drivers include liquid work and electrode work
+`-beta * p_metal dot dE` in `beta_work`, on the same periodic coordinate branch
+as the charge solve. Both drivers reuse detached endpoint dipoles from
+existing model evaluations: `-beta * (p_start + p_end) dot dE / 2`.
+The independent full-step work estimate still uses an electrode evaluation,
+because that density has no model output. Fixed-step evolution completes each
+smooth step's work at the next model evaluation, just like its free energy;
+the final state and failed-run records are settled before returning.
+Field jumps and uncached custom models retain the midpoint calculation. For linear induced charges
+the midpoint equals the endpoint trapezoid
+and gives the exact energy change for a field jump at fixed density. Rejected
+steps do not retain trial fields or accumulate work. Trajectories include the
+actual electrode field for restart and diagnostics.
+These identities assume fixed geometry, charge constraints and temperature.
+
+For semi-implicit evolution with zero-density `excluded_mask` voxels, supply
+`reference_curvature` from the homogeneous **liquid** model before adding the
+metal. The excluded/frozen no-flux solve uses the shared restricted operator;
+the nonlinear density rate still includes the full electrode response. Do not
+infer a homogeneous Fourier stabilizer from an inhomogeneous electrode Hessian.
+
 ```python
 from equicdft.evolution import RampedField
 
@@ -340,8 +392,8 @@ positive finite `integrator.dt` rebuilds only the propagator on the next step,
 not the reference operator. A later field
 with a different grid, temperature or reference density is rejected, and a
 new integrator is also needed after changing model parameters or the
-mobility. This initial semi-implicit method requires a
-fully accessible periodic grid; nonempty `excluded_mask` is rejected.
+mobility. Excluded voxels require an explicitly supplied homogeneous liquid
+`reference_curvature`; the restricted no-flux solve then keeps them empty.
 The implicit part relaxes a stiffness constraint but does not guarantee
 positivity or energy decrease at arbitrary timesteps.
 

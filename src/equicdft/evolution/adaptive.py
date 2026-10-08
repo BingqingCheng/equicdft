@@ -32,7 +32,7 @@ from ..geometry.grid import grid_spacing_tensor
 
 from .dynamics import _metadata
 from .integrator import ConvergenceError, DensityError, SemiImplicitIntegrator, _Grid, _positive_scalar, _with_mask
-from .field import _at_time, _breakpoints, _time, _work
+from .field import _FieldEvaluator, _breakpoints, _time, _work, _same_fields
 
 _SAFETY = 0.9        # fraction of the step the error estimate would allow
 _MAX_SHRINK = 0.1    # smallest factor applied after an accuracy rejection
@@ -144,6 +144,7 @@ class AdaptiveDynamics:
         self.control = control
         _breakpoints(field)
         self.field = field
+        self._field_at = _FieldEvaluator(field)
         self.mask = mask
         self.last_work = None
 
@@ -163,7 +164,8 @@ class AdaptiveDynamics:
         max_steps = _positive_count(max_steps, "max_steps")
         integrator, control = self.integrator, self.control
         data = _with_mask(data, self.mask, self.integrator.mask)
-        state = _at_time(self.field, start_time, dict(data, rho=data["rho"].detach().clone()))
+        self._field_at = _FieldEvaluator(self.field)
+        state = self._field_at(start_time, dict(data, rho=data["rho"].detach().clone()))
         initial_state = state
         grid = _Grid(state)
         accessible = ~grid.excluded
@@ -174,6 +176,8 @@ class AdaptiveDynamics:
         work = state["rho"].new_zeros(())
         if self.field is not None:
             records.update(V_ext=[], beta_work=[])
+        if "metal_external_field" in state:
+            records["metal_external_field"] = []
         counts = {"accepted": 0, "rejected_positivity": 0, "rejected_solve": 0, "rejected_accuracy": 0,
                   "rejected_energy": 0, "model_evaluations": 0}
 
@@ -186,6 +190,8 @@ class AdaptiveDynamics:
             if self.field is not None:
                 records["V_ext"].append(state["V_ext"].cpu().clone())
                 records["beta_work"].append(work.cpu().clone())
+            if "metal_external_field" in records:
+                records["metal_external_field"].append(state["metal_external_field"].cpu().clone())
 
         def assemble(completed):
             scalars = ("time", "dt", "error")
@@ -202,6 +208,7 @@ class AdaptiveDynamics:
         rate = integrator.rhs(state)
         counts["model_evaluations"] += 1
         energy = integrator.last_beta_A
+        dipole = integrator.last_metal_dipole
         time = start_time
         dt = min(max(integrator.dt, control.dt_min), cap)
         record(time, math.nan, math.nan, energy)
@@ -217,27 +224,31 @@ class AdaptiveDynamics:
                 dt = min(bound, next_stop - time)
                 endpoint = next_stop if dt == next_stop - time else time + dt
                 # Check the right-limit field before accepting a trial.
-                right = _at_time(self.field, endpoint, state)
+                right = self._field_at(endpoint, state)
                 while True:
                     try:
                         trial, new_rate, new_energy, error = self._trial(
-                            state, rate, dt, accessible, energy, counts, time=time, endpoint=endpoint)
+                            state, rate, dt, accessible, energy, counts, time=time, endpoint=endpoint,
+                            start_dipole=dipole)
                         break
                     except _Rejected as rejection:
                         counts[rejection.count] += 1
                         dt = self._retry(dt, rejection)
                         endpoint = time + dt
-                        right = _at_time(self.field, endpoint, state)
+                        right = self._field_at(endpoint, state)
                 new_work = work
                 if self.field is not None:
                     right = dict(right, rho=trial["rho"])
-                    new_work = work + self.last_work + _work(trial, right)
-                    if not torch.equal(trial["V_ext"], right["V_ext"]):
+                    left_dipole = integrator.last_metal_dipole
+                    if not _same_fields(trial, right):
                         new_rate = integrator.rhs(right)
                         new_energy = integrator.last_beta_A
                         counts["model_evaluations"] += 1
+                    new_work = work + self.last_work + _work(trial, right, integrator.model,
+                        start_dipole=left_dipole, end_dipole=integrator.last_metal_dipole)
                     trial = right
                 rate, energy, work = new_rate, new_energy, new_work
+                dipole = integrator.last_metal_dipole
                 state = trial
                 time = endpoint
                 counts["accepted"] += 1
@@ -256,7 +267,8 @@ class AdaptiveDynamics:
             record(time, math.nan, math.nan, energy)
         return assemble(completed=time >= t_end)
 
-    def _trial(self, state, rate, dt, accessible, energy, counts, time=0.0, endpoint=None):
+    def _trial(self, state, rate, dt, accessible, energy, counts, time=0.0, endpoint=None,
+               start_dipole=None):
         """Try one step as a full step and two half steps from the stored rate.
 
         Returns the half-step state, its rate and free energy, and the error
@@ -275,11 +287,13 @@ class AdaptiveDynamics:
             midpoint = dict(state, rho=integrator.advance(state, rate, half))
         except (DensityError, ConvergenceError) as failure:
             raise _rejection(failure, control) from None
-        midpoint = _at_time(self.field, time + half, midpoint)
+        midpoint = self._field_at(time + half, midpoint)
         midpoint_rate = integrator.rhs(midpoint)
         counts["model_evaluations"] += 1
         midpoint_energy = float(integrator.last_beta_A)
-        work_first = float(_work(state, midpoint)) if self.field is not None else 0.0
+        midpoint_dipole = integrator.last_metal_dipole
+        work_first = float(_work(state, midpoint, integrator.model,
+            start_dipole=start_dipole, end_dipole=midpoint_dipole)) if self.field is not None else 0.0
         energy_limit += work_first
         if midpoint_energy > energy_limit:
             raise _Rejected("rejected_energy", "free energy", control.shrink)
@@ -295,18 +309,19 @@ class AdaptiveDynamics:
         error = float((torch.maximum((full - rho).abs(), defect) / rho)[accessible].max())
         if error > control.error_tolerance:
             raise _Rejected("rejected_accuracy", "accuracy", self._factor(error))
-        trial = _at_time(self.field, endpoint, trial, left=True)
-        work_second = float(_work(midpoint, trial)) if self.field is not None else 0.0
+        trial = self._field_at(endpoint, trial, left=True)
+        trial_rate = integrator.rhs(trial)
+        counts["model_evaluations"] += 1
+        work_second = float(_work(midpoint, trial, integrator.model,
+            start_dipole=midpoint_dipole, end_dipole=integrator.last_metal_dipole)) if self.field is not None else 0.0
         energy_limit += work_second
         if self.field is not None:
-            full_work = _work(state, dict(trial, rho=full))
+            full_work = _work(state, dict(trial, rho=full), integrator.model)
             # Dimensionless work error per particle, using the density error tolerance.
             volume = grid_spacing_tensor(state["grid_spacing"], dtype=state["rho"].dtype,
                                          device=state["rho"].device).prod()
             particles = float(volume * state["rho"].sum())
             error = max(error, abs(float(full_work) - work_first - work_second) / max(1.0, particles))
-        trial_rate = integrator.rhs(trial)
-        counts["model_evaluations"] += 1
         defect += (half * trial_rate - (rho - midpoint["rho"])).abs()
         error = max(error, float((defect / rho)[accessible].max()))
         if error > control.error_tolerance:

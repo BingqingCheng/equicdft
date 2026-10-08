@@ -825,9 +825,9 @@ class GridCACEModel(nn.Module, Configurable):
         The default ignores fitting selections in every energy contribution.
         """
 
-        if METAL_DATA_KEYS & data.keys():
+        if (METAL_DATA_KEYS - {"metal_external_field"}) & data.keys():
             raise ValueError(
-                "Set electrode geometry, constraints, and field on MetalWall, not in data"
+                "Set electrode geometry and constraints on MetalWall, not in data"
             )
 
         use_voxel_mask = boolean(use_voxel_mask, "use_voxel_mask")

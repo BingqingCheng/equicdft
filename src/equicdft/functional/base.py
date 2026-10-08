@@ -85,6 +85,9 @@ class ReadoutContext:
         energy centers, never descriptor inputs or long-range source fields.
     local_density_index, grid_positions, grid_center, excluded_mask
         Grid geometry passed through from the batch when available.
+    metal_external_field
+        Optional applied electrode-field override, [3] or [..., 3], in
+        energy per charge per length. Does not alter the wall's stored field.
     msa_reference_region_mask, msa_reference_composition
         Optional MSA-only reference region and neutral composition. They do
         not exclude voxels from the model or solver.
@@ -110,6 +113,7 @@ class ReadoutContext:
     grid_positions: Optional[torch.Tensor] = None
     grid_center: Optional[torch.Tensor] = None
     excluded_mask: Optional[torch.Tensor] = None
+    metal_external_field: Optional[torch.Tensor] = None
     local_energy_mask: Optional[torch.Tensor] = None
     msa_reference_region_mask: Optional[torch.Tensor] = None
     msa_reference_composition: Optional[torch.Tensor] = None
@@ -224,6 +228,7 @@ class ReadoutContext:
             grid_positions=data.get("grid_positions"),
             grid_center=data.get("grid_center"),
             excluded_mask=data.get("excluded_mask"),
+            metal_external_field=data.get("metal_external_field"),
             msa_reference_region_mask=data.get("msa_reference_region_mask"),
             msa_reference_composition=data.get("msa_reference_composition"),
         )

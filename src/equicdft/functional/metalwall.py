@@ -166,9 +166,9 @@ class MetalWall(EnergyReadout, Configurable):
         arguments["liquid_coulomb"] = build(arguments["liquid_coulomb"])
         return cls(**arguments)
 
-    def _apply(self, fn):
+    def _apply(self, fn, *args, **kwargs):
         self._cache_key = self._cache = None
-        return super()._apply(fn)
+        return super()._apply(fn, *args, **kwargs)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -269,11 +269,15 @@ class MetalWall(EnergyReadout, Configurable):
                 raise ValueError("dipole_density must be zero at excluded grid points")
 
         n_fields = math.prod(leading) if leading else 1
-        if self.external_field.shape not in ((3,), (*leading, 3)):
+        external = (self.external_field if context.metal_external_field is None
+                    else _field_vector(context.metal_external_field, "metal_external_field"))
+        if external.shape not in ((3,), (*leading, 3)):
             raise ValueError(
                 "external_field must be [3] or match rho batch shape"
             )
-        external = self.external_field.to(rho).expand(
+        if torch.any(external != 0).item() and self.metal_group_ids.numel() != 1:
+            raise ValueError("a nonzero external_field requires exactly one electrode group")
+        external = external.to(rho).expand(
             *leading, 3,
         ).reshape(n_fields, 3)
         scale = (
@@ -417,6 +421,26 @@ class MetalWall(EnergyReadout, Configurable):
 
     def energy(self, context: ReadoutContext):
         return self.energy_and_outputs(context)[0]
+
+    def external_field_work(self, context: ReadoutContext, field_change):
+        """Beta work -beta p_metal dot dE, evaluated at the supplied midpoint.
+
+        The relaxed charge is linear in liquid density and field. Evaluating
+        at their arithmetic midpoint therefore equals the endpoint trapezoid
+        and is exact for a field change at fixed density. Geometry is unchanged.
+        """
+        metal = self.energy_and_outputs(context)[1]
+        dipole = self.field_dipole(metal["metal_site_q"])
+        return -context.require("beta") * (dipole * field_change.to(dipole)).sum(-1)
+
+    def field_dipole(self, site_charges):
+        """Dipole conjugate to the field, using this geometry's compact branch.
+
+        Reuse charges from a model evaluation; this performs no electrode solve.
+        """
+        if self._cache is None:
+            raise ValueError("Evaluate MetalWall before requesting its field dipole.")
+        return (site_charges[..., :, None] * self._cache.field_coordinates).sum(-2)
 
     def forward(self, context: ReadoutContext):
         """Return electrode outputs for direct diagnostic evaluation."""

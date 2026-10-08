@@ -82,6 +82,14 @@ Constructor arguments:
 | `external_field` | Applied field acting on electrode charges, in model energy per charge per length; default zero |
 | `tolerance` | Charge and equipotential residual tolerance; default `1e-6` |
 
+For a time-dependent applied field, `data["metal_external_field"]` overrides
+the constructor's field for that evaluation only. It uses the same units and
+accepts `[3]` or the density batch shape followed by `[3]`. The model is not
+mutated, and the geometry factorization is reused. `RampedField` in the
+evolution API can update this field together with the liquid potential and
+account for work on the induced charges. The sites remain in instantaneous
+electrostatic equilibrium throughout that evolution.
+
 Electrode coordinates and liquid `grid_center` use the same physical coordinate
 system. Electrode sites need not coincide with liquid grid points. A separate
 `excluded_mask` marks grid points at which liquid density and any polarization
@@ -93,6 +101,14 @@ the largest site-free gap along each field direction and unwraps all electrode
 sites onto the remaining contiguous branch. No field origin is supplied by the
 caller. With zero field, multiple independently constrained groups remain
 supported.
+
+The field coordinates are displacements from the compact branch center.
+For a neutral group this origin is immaterial. For a fixed nonzero group
+charge Q, translating the field coordinates by c changes the energy by
+`-Q E dot c` and the external work by `-Q delta_E dot c`; relaxed charges,
+liquid evolution and work-corrected dissipation are unchanged. Keep this
+convention fixed when comparing absolute energies or source work for charged
+groups. No coordinate convention is changed by enabling a time-dependent field.
 
 ## Electrostatic coupling
 

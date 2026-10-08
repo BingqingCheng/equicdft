@@ -7,6 +7,7 @@ import torch
 
 from ..geometry.grid import common_grid_size, _flat_grid_positions, grid_spacing_tensor
 from .mobility import ConstantMobility, _validate_matrix
+from .field import _metal_context, _metal_dipole
 
 
 @contextmanager
@@ -223,6 +224,7 @@ class EulerIntegrator:
         self.mask = mask
         self.dt = dt
         self.last_beta_A = None
+        self.last_metal_dipole = None
         self._grid = None
         self._last_output = None
 
@@ -249,12 +251,18 @@ class EulerIntegrator:
         if getattr(self.model, "requires_dipole_density", False) or "dipole_density" in data:
             raise ValueError("Evolution currently supports species densities, not dipole density.")
         state = dict(data, rho=data["rho"].detach().clone())
+        self.last_metal_dipole = None
+        if "metal_external_field" in data:
+            _metal_context(self.model, data)
         with _evaluation(self.model), torch.enable_grad():
-            return self.model(
+            output = self.model(
                 state, compute_c1=derivatives, compute_c2=False, compute_ideal=True,
                 compute_local_mu=False, compute_polarization_derivative=False,
                 use_voxel_mask=False,
             )
+        if "metal_external_field" in data:
+            self.last_metal_dipole = _metal_dipole(self.model, output)
+        return output
 
     def _mobility_matrices(self, data, grid):
         """Return per-voxel matrices, or one shared matrix for a uniform mobility."""
@@ -514,8 +522,9 @@ class SemiImplicitIntegrator(EulerIntegrator):
     physical curvature is not removed from the evolution. Without a frozen
     mask the solve is diagonal in Fourier space. With a mask, a matrix-free
     solve uses the same curvature and shared blocked-face fluxes, with the
-    periodic propagator as its preconditioner. Nonempty excluded_mask remains
-    unsupported by this integrator.
+    periodic propagator as its preconditioner. With excluded voxels, supply
+    ``reference_curvature`` from a separate homogeneous liquid calculation;
+    an electrode/wall geometry is not a homogeneous Hessian reference.
     """
 
     def __init__(self, model, mobility, dt, reference_density=None, reference_curvature=None, *, mask=None):
@@ -529,8 +538,9 @@ class SemiImplicitIntegrator(EulerIntegrator):
 
     def _prepare(self, data, grid):
         """Build the reference operator on first use and guard its reuse."""
-        if grid.has_excluded:
-            raise ValueError("SemiImplicitIntegrator requires a fully accessible periodic grid.")
+        if grid.has_excluded and self.reference_curvature is None:
+            raise ValueError("SemiImplicitIntegrator requires a fully accessible periodic grid "
+                             "or an explicit homogeneous reference_curvature for excluded voxels.")
         signature = (grid.shape, tuple(grid.spacing.tolist()), grid.beta, grid.temperature,
                      grid.rho.shape[-1], grid.rho.dtype, grid.rho.device)
         reference = _reference_density(grid, self.reference_density)
@@ -563,7 +573,7 @@ class SemiImplicitIntegrator(EulerIntegrator):
 
     def _advance(self, grid, rate, dt):
         propagator = self._propagator_for(dt)
-        if grid.has_frozen:
+        if grid.has_frozen or grid.has_excluded:
             # Solve the same IMEX increment with blocked faces, not a periodic
             # solve followed by clipping (which leaks mass into frozen voxels).
             # Restrict the periodic preconditioner to conservative free-region
@@ -587,7 +597,7 @@ class SemiImplicitIntegrator(EulerIntegrator):
                 return grid.project_free_increment(grid.flat(smoothed))
 
             increment = _gmres(action, dt * rate, precondition)
-            rho = grid.restore_frozen(grid.rho.detach() + increment)
+            rho = torch.where(grid.free[:, None], grid.rho.detach() + increment, grid.rho.detach())
             grid.check_density(rho)
             self._last_output = (rho, rho._version)
             return rho
