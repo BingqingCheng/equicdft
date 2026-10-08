@@ -1,88 +1,151 @@
-"""Run deterministic density trajectories without retaining autograd graphs."""
+"""Run density trajectories without retaining autograd graphs."""
 
 from numbers import Integral
 from pathlib import Path
 
 import torch
 
-from .integrator import _Grid
-from .mobility import ConstantMobility
+from .integrator import _Grid, _with_mask
+from .mobility import ConstantMobility, DensityMobility
+from .field import _at_time, _breakpoints, _time, _work
 
 
 def _metadata(integrator, data, **extra):
     """Describe a run: integrator, mobility, geometry and the caller's extras."""
     metadata = {
-        "dt": integrator.dt, "method": type(integrator).__name__, "deterministic": True,
+        "dt": integrator.dt, "method": type(integrator).__name__,
+        "deterministic": not getattr(integrator, "stochastic", False),
         "mobility": {"class": type(integrator.mobility).__name__},
     }
     metadata.update(extra)
-    for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "temperature", "beta", "V_ext"):
+    if getattr(integrator, "stochastic", False):
+        metadata.update(seed=integrator.seed, noise="unfiltered conserved face flux",
+                        stochastic_convention="Ito", rng_device=str(data["rho"].device),
+                        rho_min=integrator.rho_min,
+                        density_floor_correction=("species-wise headroom mass restore"
+                                                  if integrator.rho_min is not None else None))
+    for key in ("grid_size", "grid_spacing", "grid_positions", "grid_center", "excluded_mask", "mask", "temperature", "beta", "V_ext"):
         if key in data:
             metadata[key] = torch.as_tensor(data[key]).detach().cpu().clone()
     if isinstance(integrator.mobility, ConstantMobility):
         metadata["mobility"]["value"] = integrator.mobility.value.detach().cpu().clone()
+    elif isinstance(integrator.mobility, DensityMobility):
+        metadata["mobility"]["diffusivity"] = integrator.mobility.diffusivity.detach().cpu().clone()
     return metadata
 
 
 class Dynamics:
     """Advance a density field and record compact CPU snapshots and diagnostics."""
 
-    def __init__(self, integrator):
+    def __init__(self, integrator, field=None, *, mask=None):
         self.integrator = integrator
+        _breakpoints(field)
+        self.field = field
+        self.mask = mask
 
-    def run(self, data, n_steps, save_every=1):
+    def run(self, data, n_steps, save_every=1, *, start_time=0.0):
         """Record the initial state, sampling intervals, and the final state.
 
         If a step is rejected, the frames recorded so far plus the last valid
         state are attached to the raised error as ``error.trajectory`` (with
         ``metadata["completed"] = False``), so a long run is not lost.
+        Times are absolute. Declared field breakpoints split nominal steps;
+        save_every still counts nominal steps. beta_work starts at zero here.
         """
         if isinstance(n_steps, bool) or not isinstance(n_steps, Integral) or n_steps < 0:
             raise ValueError("n_steps must be a nonnegative integer.")
         if isinstance(save_every, bool) or not isinstance(save_every, Integral) or save_every <= 0:
             raise ValueError("save_every must be a positive integer.")
-        state = dict(data, rho=data["rho"].detach().clone())
+        start_time = _time(start_time)
+        points = _breakpoints(self.field)
+        data = _with_mask(data, self.mask, self.integrator.mask)
+        state = _at_time(self.field, start_time, dict(data, rho=data["rho"].detach().clone()))
+        initial_state = state
         grid = _Grid(state)
         records = {key: [] for key in ("time", "rho", "beta_A", "particle_numbers", "min_density")}
-        progress = {"done": 0, "recorded": 0, "pending": None}
+        work = state["rho"].new_zeros(())
+        if self.field is not None:
+            records.update(V_ext=[], beta_work=[])
+        if getattr(self.integrator, "stochastic", False):
+            records["rng_state"] = []
+        floor_totals = {}
+        if getattr(self.integrator, "rho_min", None) is not None:
+            for key in ("floor_clamped_voxels", "floor_added_particles",
+                        "floor_l1_particles", "floor_max_density_change"):
+                dtype = torch.long if key == "floor_clamped_voxels" else grid.rho.dtype
+                floor_totals[key] = torch.zeros(grid.rho.shape[1], device=grid.rho.device, dtype=dtype)
+                records[key] = []
+        progress = {"done": 0, "time": start_time, "recorded": start_time, "pending": False}
         dt = self.integrator.dt
 
-        def record(step):
+        def record():
             # The free energy of this state comes free with the next step's
             # derivative pass (integrator.last_beta_A); fill it in then.
             rho = state["rho"].detach()
-            values = (step * dt, rho.cpu().clone(), None,
+            values = (progress["time"], rho.cpu().clone(), None,
                       (grid.volume * rho.sum(0)).cpu(), rho[~grid.excluded].min().cpu())
             for key, value in zip(records, values):
                 records[key].append(value)
-            progress["recorded"] = progress["pending"] = step
+            if "rng_state" in records:
+                records["rng_state"].append(self.integrator.get_rng_state(state))
+            for key, total in floor_totals.items():
+                records[key].append(total.detach().cpu().clone())
+            if self.field is not None:
+                records["V_ext"].append(state["V_ext"].cpu().clone())
+                records["beta_work"].append(work.cpu().clone())
+            progress["recorded"] = progress["time"]
+            progress["pending"] = True
 
         def settle(energy):
             records["beta_A"][-1] = energy.detach().cpu()
-            progress["pending"] = None
+            progress["pending"] = False
 
         def assemble(completed):
             result = {key: torch.stack(values) for key, values in records.items() if key != "time"}
             result["time"] = torch.tensor(records["time"], dtype=torch.float64)
-            result["metadata"] = _metadata(self.integrator, data, n_steps=n_steps, save_every=save_every,
+            result["metadata"] = _metadata(self.integrator, initial_state, n_steps=n_steps, save_every=save_every,
+                                           start_time=start_time, dt=dt,
                                            completed=completed, steps_completed=progress["done"])
+            if self.field is not None:
+                result["metadata"]["field"] = self.field.metadata()
             return result
 
-        record(0)
+        record()
         try:
             for step in range(1, n_steps + 1):
                 if self.integrator.dt != dt:
                     raise ValueError("dt changed during Dynamics.run; use AdaptiveDynamics for variable steps.")
-                state["rho"] = self.integrator.step(state)
-                if progress["pending"] == step - 1:
-                    settle(self.integrator.last_beta_A)
+                target = start_time + step * dt
+                if target <= progress["time"]:
+                    raise ValueError("dt is too small to advance the absolute simulation time.")
+                endpoints = [t for t in points if progress["time"] < t < target] + [target]
+                for end in endpoints:
+                    # Validate both limits before consuming a stochastic draw.
+                    left = _at_time(self.field, end, state, left=True)
+                    right = _at_time(self.field, end, state) if end in points else left
+                    self.integrator.dt = (end - progress["time"] if len(endpoints) > 1 else dt)
+                    rho = self.integrator.step(state)
+                    if progress["pending"]:
+                        settle(self.integrator.last_beta_A)
+                    for key, total in floor_totals.items():
+                        value = self.integrator.last_floor_correction[key]
+                        floor_totals[key] = (torch.maximum(total, value)
+                                             if key == "floor_max_density_change" else total + value)
+                    if self.field is not None:
+                        left, right = dict(left, rho=rho), dict(right, rho=rho)
+                        work = work + _work(state, left) + _work(left, right)
+                        state = right
+                    else:
+                        state = dict(state, rho=rho)
+                    progress["time"] = end
+                self.integrator.dt = dt
                 progress["done"] = step
                 if step % save_every == 0 or step == n_steps:
-                    record(step)
+                    record()
         except ValueError as error:
-            if progress["recorded"] != progress["done"]:
-                record(progress["done"])
-            if progress["pending"] is not None:
+            if progress["recorded"] != progress["time"]:
+                record()
+            if progress["pending"]:
                 try:
                     settle(self.integrator.beta_A(state))
                 except ValueError:
@@ -91,7 +154,9 @@ class Dynamics:
                     settle(state["rho"].new_tensor(float("nan")))
             error.trajectory = assemble(completed=False)
             raise
-        if progress["pending"] is not None:
+        finally:
+            self.integrator.dt = dt
+        if progress["pending"]:
             settle(self.integrator.beta_A(state))
         return assemble(completed=True)
 

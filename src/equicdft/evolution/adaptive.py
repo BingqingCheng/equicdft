@@ -18,8 +18,8 @@ tolerance. The rate at the accepted state is needed to start the next step
 anyway, and the free energies from that pass and from the midpoint pass must
 not rise beyond the configured allowances. An accepted step therefore costs
 two model evaluations; a rejected step costs none or one when a density turns
-non-positive, one or two when the free energy rises or the error estimate
-exceeds the tolerance.
+non-positive or a masked implicit solve does not converge, one or two when
+the free energy rises or the error estimate exceeds the tolerance.
 """
 
 from dataclasses import dataclass
@@ -28,8 +28,11 @@ import numbers
 
 import torch
 
+from ..geometry.grid import grid_spacing_tensor
+
 from .dynamics import _metadata
-from .integrator import DensityError, SemiImplicitIntegrator, _Grid, _positive_scalar
+from .integrator import ConvergenceError, DensityError, SemiImplicitIntegrator, _Grid, _positive_scalar, _with_mask
+from .field import _at_time, _breakpoints, _time, _work
 
 _SAFETY = 0.9        # fraction of the step the error estimate would allow
 _MAX_SHRINK = 0.1    # smallest factor applied after an accuracy rejection
@@ -58,7 +61,7 @@ class StepControl:
     accepted step (with the proposal floored at ``dt_min`` before applying
     the independent bounds) and by at least one tenth after a rejected one; ``shrink``
     is the factor after a rejection that carries no estimate (positivity,
-    free energy). ``energy_increase`` is the absolute increase of ``beta A``
+    free energy, an unconverged masked implicit solve). ``energy_increase`` is the absolute increase of ``beta A``
     tolerated across a step or half step, in units of ``k_B T`` and
     independent of the zero of the free energy; the default rejects every
     increase beyond roundoff. ``energy_roundoff`` is the roundoff allowance
@@ -103,33 +106,48 @@ class _Rejected(Exception):
         self.factor = factor
 
 
+def _rejection(failure, control):
+    """A non-positive density or an unconverged implicit solve rejects the step by ``shrink``."""
+    if isinstance(failure, ConvergenceError):
+        return _Rejected("rejected_solve", "implicit solve", control.shrink)
+    return _Rejected("rejected_positivity", "positivity", control.shrink)
+
+
 def _explicit_limit(integrator, state, grid):
     """Linear explicit-stability bound of the field; walls are dropped for the estimate.
 
     The bound is evaluated for the periodic homogeneous reference at the mean
-    accessible density. Blocking faces only removes couplings from the
-    discrete Laplacian, which cannot raise its largest eigenvalue, so for a
-    uniform mobility the periodic bound is the conservative one; the energy
+    density of the free voxels (the integrator's default reference; frozen
+    voxels are kept out of it). Blocking faces only removes couplings from
+    the discrete Laplacian, which cannot raise its largest eigenvalue, so for
+    a uniform mobility the periodic bound is the conservative one; the energy
     and positivity checks remain the safeguard against the nonlinear response
     near the walls.
     """
     if not grid.has_excluded:
         return integrator.stability_limit(state)
+    pool = grid.free if bool(grid.free.any()) else ~grid.excluded
     periodic = {key: value for key, value in state.items() if key != "excluded_mask"}
-    periodic["rho"] = state["rho"][~grid.excluded].mean(0).expand_as(state["rho"]).clone()
+    periodic["rho"] = state["rho"][pool].mean(0).expand_as(state["rho"]).clone()
     return integrator.stability_limit(periodic)
 
 
 class AdaptiveDynamics:
     """Advance a density field to ``t_end`` with error-controlled steps."""
 
-    def __init__(self, integrator, control):
+    def __init__(self, integrator, control, field=None, *, mask=None):
+        if getattr(integrator, "stochastic", False):
+            raise ValueError("AdaptiveDynamics is deterministic-only; use fixed-step Dynamics for noise.")
         if not isinstance(control, StepControl):
             raise TypeError("control must be a StepControl.")
         self.integrator = integrator
         self.control = control
+        _breakpoints(field)
+        self.field = field
+        self.mask = mask
+        self.last_work = None
 
-    def run(self, data, t_end, save_every=1, max_steps=1000000):
+    def run(self, data, t_end, save_every=1, max_steps=1000000, *, start_time=0.0):
         """Record the initial state, every ``save_every`` accepted steps, and the final state.
 
         Besides the ``Dynamics`` fields the result carries ``dt`` and the
@@ -137,18 +155,27 @@ class AdaptiveDynamics:
         rejections and model evaluations, and the step cap ``dt_cap``.
         """
         t_end = _positive_scalar(t_end, "t_end")
+        start_time = _time(start_time)
+        if t_end <= start_time:
+            raise ValueError("t_end must exceed start_time (both are absolute times).")
+        points = _breakpoints(self.field)
         save_every = _positive_count(save_every, "save_every")
         max_steps = _positive_count(max_steps, "max_steps")
         integrator, control = self.integrator, self.control
-        state = dict(data, rho=data["rho"].detach().clone())
+        data = _with_mask(data, self.mask, self.integrator.mask)
+        state = _at_time(self.field, start_time, dict(data, rho=data["rho"].detach().clone()))
+        initial_state = state
         grid = _Grid(state)
         accessible = ~grid.excluded
         cap = control.dt_max
         if not isinstance(integrator, SemiImplicitIntegrator):
             cap = min(cap, control.stability_safety * _explicit_limit(integrator, state, grid))
         records = {key: [] for key in ("time", "dt", "error", "rho", "beta_A", "particle_numbers", "min_density")}
-        counts = {"accepted": 0, "rejected_positivity": 0, "rejected_accuracy": 0, "rejected_energy": 0,
-                  "model_evaluations": 0}
+        work = state["rho"].new_zeros(())
+        if self.field is not None:
+            records.update(V_ext=[], beta_work=[])
+        counts = {"accepted": 0, "rejected_positivity": 0, "rejected_solve": 0, "rejected_accuracy": 0,
+                  "rejected_energy": 0, "model_evaluations": 0}
 
         def record(time, dt, error, energy):
             rho = state["rho"].detach()
@@ -156,20 +183,26 @@ class AdaptiveDynamics:
                       (grid.volume * rho.sum(0)).cpu(), rho[accessible].min().cpu())
             for key, value in zip(records, values):
                 records[key].append(value)
+            if self.field is not None:
+                records["V_ext"].append(state["V_ext"].cpu().clone())
+                records["beta_work"].append(work.cpu().clone())
 
         def assemble(completed):
             scalars = ("time", "dt", "error")
             result = {key: torch.stack(values) for key, values in records.items() if key not in scalars}
             for key in scalars:
                 result[key] = torch.tensor(records[key], dtype=torch.float64)
-            result["metadata"] = _metadata(integrator, data, completed=completed, t_end=t_end, save_every=save_every,
+            result["metadata"] = _metadata(integrator, initial_state, completed=completed, t_end=t_end, save_every=save_every,
+                                           start_time=start_time,
                                            dt_cap=cap, control=control.__dict__, **counts)
+            if self.field is not None:
+                result["metadata"]["field"] = self.field.metadata()
             return result
 
         rate = integrator.rhs(state)
         counts["model_evaluations"] += 1
         energy = integrator.last_beta_A
-        time = 0.0
+        time = start_time
         dt = min(max(integrator.dt, control.dt_min), cap)
         record(time, math.nan, math.nan, energy)
         try:
@@ -180,16 +213,33 @@ class AdaptiveDynamics:
                     raise ValueError(
                         "The step bounds require dt = {:.3g} below dt_min = {:.3g} at t = {:.6g}; "
                         "the last accepted state is attached as error.trajectory.".format(bound, control.dt_min, time))
-                dt = min(bound, t_end - time)
+                next_stop = next((t for t in points if time < t <= t_end), t_end)
+                dt = min(bound, next_stop - time)
+                endpoint = next_stop if dt == next_stop - time else time + dt
+                # Check the right-limit field before accepting a trial.
+                right = _at_time(self.field, endpoint, state)
                 while True:
                     try:
-                        trial, rate, energy, error = self._trial(state, rate, dt, accessible, energy, counts)
+                        trial, new_rate, new_energy, error = self._trial(
+                            state, rate, dt, accessible, energy, counts, time=time, endpoint=endpoint)
                         break
                     except _Rejected as rejection:
                         counts[rejection.count] += 1
                         dt = self._retry(dt, rejection)
+                        endpoint = time + dt
+                        right = _at_time(self.field, endpoint, state)
+                new_work = work
+                if self.field is not None:
+                    right = dict(right, rho=trial["rho"])
+                    new_work = work + self.last_work + _work(trial, right)
+                    if not torch.equal(trial["V_ext"], right["V_ext"]):
+                        new_rate = integrator.rhs(right)
+                        new_energy = integrator.last_beta_A
+                        counts["model_evaluations"] += 1
+                    trial = right
+                rate, energy, work = new_rate, new_energy, new_work
                 state = trial
-                time += dt
+                time = endpoint
                 counts["accepted"] += 1
                 if counts["accepted"] % save_every == 0 or time >= t_end:
                     record(time, dt, error, energy)
@@ -206,12 +256,12 @@ class AdaptiveDynamics:
             record(time, math.nan, math.nan, energy)
         return assemble(completed=time >= t_end)
 
-    def _trial(self, state, rate, dt, accessible, energy, counts):
+    def _trial(self, state, rate, dt, accessible, energy, counts, time=0.0, endpoint=None):
         """Try one step as a full step and two half steps from the stored rate.
 
         Returns the half-step state, its rate and free energy, and the error
         estimate; raises ``_Rejected`` when a density turns non-positive, the
-        free energy rises beyond the allowances at the midpoint or the end, or
+        work-corrected energy rises beyond allowances at the midpoint or end, or
         the estimate exceeds the tolerance. Checks that need only the midpoint
         evaluation run before the second one.
         """
@@ -219,14 +269,18 @@ class AdaptiveDynamics:
         allowance = control.energy_increase + control.energy_roundoff * abs(float(energy))
         energy_limit = float(energy) + allowance
         half = dt / 2
+        endpoint = time + dt if endpoint is None else endpoint
         try:
             full = integrator.advance(state, rate, dt)
             midpoint = dict(state, rho=integrator.advance(state, rate, half))
-        except DensityError:
-            raise _Rejected("rejected_positivity", "positivity", control.shrink) from None
+        except (DensityError, ConvergenceError) as failure:
+            raise _rejection(failure, control) from None
+        midpoint = _at_time(self.field, time + half, midpoint)
         midpoint_rate = integrator.rhs(midpoint)
         counts["model_evaluations"] += 1
         midpoint_energy = float(integrator.last_beta_A)
+        work_first = float(_work(state, midpoint)) if self.field is not None else 0.0
+        energy_limit += work_first
         if midpoint_energy > energy_limit:
             raise _Rejected("rejected_energy", "free energy", control.shrink)
         # Check the second half against its own start, as well as the whole step.
@@ -234,13 +288,23 @@ class AdaptiveDynamics:
         energy_limit = min(energy_limit, midpoint_energy + midpoint_allowance)
         try:
             trial = dict(state, rho=integrator.advance(midpoint, midpoint_rate, half))
-        except DensityError:
-            raise _Rejected("rejected_positivity", "positivity", control.shrink) from None
+        except (DensityError, ConvergenceError) as failure:
+            raise _rejection(failure, control) from None
         rho = trial["rho"]
         defect = (half * midpoint_rate - (midpoint["rho"] - state["rho"])).abs()
         error = float((torch.maximum((full - rho).abs(), defect) / rho)[accessible].max())
         if error > control.error_tolerance:
             raise _Rejected("rejected_accuracy", "accuracy", self._factor(error))
+        trial = _at_time(self.field, endpoint, trial, left=True)
+        work_second = float(_work(midpoint, trial)) if self.field is not None else 0.0
+        energy_limit += work_second
+        if self.field is not None:
+            full_work = _work(state, dict(trial, rho=full))
+            # Dimensionless work error per particle, using the density error tolerance.
+            volume = grid_spacing_tensor(state["grid_spacing"], dtype=state["rho"].dtype,
+                                         device=state["rho"].device).prod()
+            particles = float(volume * state["rho"].sum())
+            error = max(error, abs(float(full_work) - work_first - work_second) / max(1.0, particles))
         trial_rate = integrator.rhs(trial)
         counts["model_evaluations"] += 1
         defect += (half * trial_rate - (rho - midpoint["rho"])).abs()
@@ -249,6 +313,7 @@ class AdaptiveDynamics:
             raise _Rejected("rejected_accuracy", "accuracy", self._factor(error))
         if float(integrator.last_beta_A) > energy_limit:
             raise _Rejected("rejected_energy", "free energy", control.shrink)
+        self.last_work = state["rho"].new_tensor(work_first + work_second)
         return trial, trial_rate, integrator.last_beta_A, error
 
     def _factor(self, error):

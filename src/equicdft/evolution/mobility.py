@@ -137,6 +137,40 @@ class ConstantMobility(Mobility):
         return _shared_matrix(value, rho)
 
 
+class DensityMobility(Mobility):
+    """Independent species mobilities M_a = beta * D_a * rho_a.
+
+    ``diffusivity`` is a nonnegative scalar or one value per species, in
+    length squared per time. Thermal energy comes from ``data['beta']``.
+    With arithmetic face averaging this linear law has zero discrete Ito
+    thermal drift. It can be used in deterministic or stochastic evolution.
+    """
+
+    validated = True
+
+    def __init__(self, diffusivity):
+        super().__init__()
+        value = _as_float(diffusivity).detach().clone()
+        if value.ndim > 1 or not value.numel():
+            raise ValueError("diffusivity must be a scalar or species vector.")
+        _validate_diagonal(value)
+        self.register_buffer("diffusivity", value)
+
+    def forward(self, data):
+        rho = _density(data)
+        diffusion = _as_float(self.diffusivity, device=rho.device, dtype=rho.dtype)
+        if diffusion.ndim and diffusion.shape != (rho.shape[-1],):
+            raise ValueError("diffusivity must have one value per species.")
+        _validate_diagonal(diffusion)
+        beta = _as_float(data["beta"], device=rho.device, dtype=rho.dtype)
+        if beta.numel() != 1 or not bool(beta > 0):
+            raise ValueError("beta must be a finite positive scalar.")
+        values = rho * diffusion * beta.reshape(())
+        if not torch.isfinite(values).all() or torch.any(rho < 0):
+            raise ValueError("Density mobility requires finite nonnegative density and mobility.")
+        return torch.diag_embed(values)
+
+
 class LocalMobility(Mobility):
     """Evaluate ``function(rho, temperature)`` on the live density field.
 

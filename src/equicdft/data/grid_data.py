@@ -52,6 +52,7 @@ default_data_key = {
     "dipole_density": "dipole_density",
     "dipole_density_std": "dipole_density_std",
     "excluded_mask": "excluded_mask",
+    "mask": "mask",
 }
 
 
@@ -179,6 +180,7 @@ class GridData(dict):
         dipole_density              [n_grid, n_types, 3] (optional, polar vector)
         dipole_density_std          [n_grid, n_types, 3] (optional, P units)
         excluded_mask               [n_grid] bool; true grid points are excluded
+        mask                        [n_grid] bool; true voxels are frozen in evolution
         local_density_index         [n_grid, n_neighbors] (optional)
         local_density_positions     [n_neighbors, 3]
 
@@ -370,6 +372,7 @@ class GridData(dict):
             "T",
             "n_types",
             "excluded_mask",
+            "mask",
             "rho",
             "rho_std",
             "dipole_density",
@@ -413,6 +416,7 @@ class GridData(dict):
                 boltzmann_constant=boltzmann_constant,
                 thermal_wavelength=thermal_wavelength,
                 excluded_mask=values.get("excluded_mask"),
+                mask=values.get("mask"),
                 rho=values.get("rho"),
                 rho_std=values.get("rho_std"),
                 dipole_density=values.get("dipole_density"),

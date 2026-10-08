@@ -138,11 +138,12 @@ def process_atoms(
     rho_std = _ordered_optional_field(
         atoms, data_key["rho_std"], order, "rho_std"
     )
-    excluded_mask = _ordered_optional_excluded_mask(
+    excluded_mask = _ordered_optional_mask(
         atoms,
         data_key["excluded_mask"],
         order,
     )
+    mask = _ordered_optional_mask(atoms, data_key["mask"], order, name="mask")
     V_ext = _ordered_optional_field(
         atoms,
         data_key["V_ext"],
@@ -215,8 +216,9 @@ def process_atoms(
                 _normalize_excluded_mask(excluded_mask, n_grid),
             )
             fields_to_coarsen.append(dipole_density.reshape(n_grid, -1))
-        if excluded_mask is not None:
-            fields_to_coarsen.append(excluded_mask[:, None].astype(float))
+        for optional_mask in (excluded_mask, mask):
+            if optional_mask is not None:
+                fields_to_coarsen.append(optional_mask[:, None].astype(float))
         if grid_center is not None:
             fields_to_coarsen.append(grid_center)
         fields, grid_positions, grid_spacing = coarsen_grid(
@@ -237,22 +239,18 @@ def process_atoms(
                 :, field_start : field_start + 3 * n_types
             ].reshape(-1, n_types, 3)
             field_start += 3 * n_types
-        if excluded_mask is not None:
-            coarse_excluded_fraction = fields[:, field_start]
-            uniform_exclusion = np.isclose(
-                coarse_excluded_fraction,
-                0.0,
-            ) | np.isclose(
-                coarse_excluded_fraction,
-                1.0,
-            )
-            if not np.all(uniform_exclusion):
-                raise ValueError(
-                    "coarsening would create partially accessible grid "
-                    "points; supply excluded_mask on the target grid"
-                )
-            excluded_mask = np.isclose(coarse_excluded_fraction, 1.0)
-            field_start += 1
+        coarse_masks = []
+        for name, optional_mask in (("excluded_mask", excluded_mask), ("mask", mask)):
+            if optional_mask is not None:
+                fraction = fields[:, field_start]
+                if not np.all(np.isclose(fraction, 0.) | np.isclose(fraction, 1.)):
+                    adjective = "accessible" if name == "excluded_mask" else "frozen"
+                    raise ValueError("coarsening would create partially {} grid points; "
+                                     "supply {} on the target grid".format(adjective, name))
+                optional_mask = np.isclose(fraction, 1.)
+                field_start += 1
+            coarse_masks.append(optional_mask)
+        excluded_mask, mask = coarse_masks
         if grid_center is not None:
             grid_center = fields[:, field_start : field_start + 3]
         grid_size = grid_positions.max(axis=0) + 1
@@ -284,6 +282,7 @@ def process_atoms(
         dipole_density_std=dipole_density_std,
         mu=_get_source_value(atoms, data_key["mu"]),
         excluded_mask=excluded_mask,
+        mask=mask,
         geometry_cache=geometry_cache,
         include_thermal_wavelength=V_ext is not None,
         include_local_density_index=include_local_density_index,
@@ -310,6 +309,7 @@ def build_grid_data(
     dipole_density: Optional[Any] = None,
     rho_std: Optional[Any] = None,
     dipole_density_std: Optional[Any] = None,
+    mask: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical tensor dictionary from normalized grid fields."""
 
@@ -413,6 +413,8 @@ def build_grid_data(
         ),
         "local_density_positions": local_density_positions,
     }
+    if mask is not None:
+        data["mask"] = torch.tensor(_normalize_voxel_mask(mask, n_grid, "mask"), dtype=torch.bool)
     if grid_center is not None:
         centers = torch.as_tensor(grid_center)
         if centers.shape != (n_grid, 3):
@@ -581,17 +583,20 @@ def _ordered_optional_field(
     return field
 
 
-def _ordered_optional_excluded_mask(
+def _ordered_optional_mask(
     atoms: Atoms,
     source_key: str,
     order: np.ndarray,
+    name: str = "excluded_mask",
 ) -> Optional[np.ndarray]:
-    """Return an optional Boolean exclusion mask in canonical grid order."""
+    """Return an optional voxel mask in canonical grid order."""
 
     value = _get_source_value(atoms, source_key)
     if value is None:
         return None
-    return _normalize_excluded_mask(np.asarray(value)[order], len(order))
+    if name == "excluded_mask":
+        return _normalize_excluded_mask(np.asarray(value)[order], len(order))
+    return _normalize_voxel_mask(np.asarray(value)[order], len(order), name)
 
 
 def _normalize_grid_field(
@@ -623,35 +628,40 @@ def _normalize_excluded_mask(
 ) -> np.ndarray:
     """Return a Boolean exclusion mask with one value per grid point."""
 
+    mask = _normalize_voxel_mask(value, n_grid, "excluded_mask")
+    if np.all(mask):
+        raise ValueError("excluded_mask must leave at least one accessible grid point")
+    return mask
+
+
+def _normalize_voxel_mask(value: Optional[Any], n_grid: int, name: str) -> np.ndarray:
+    """Shared Boolean/binary input normalization for per-voxel masks."""
+
     if value is None:
         return np.zeros(n_grid, dtype=bool)
-    excluded_mask = np.asarray(value)
-    if excluded_mask.ndim == 2 and excluded_mask.shape[1] == 1:
-        excluded_mask = excluded_mask[:, 0]
-    if excluded_mask.shape != (n_grid,):
-        raise ValueError("excluded_mask must have shape [n_grid]")
-    if excluded_mask.dtype != np.bool_:
+    mask = np.asarray(value)
+    if mask.ndim == 2 and mask.shape[1] == 1:
+        mask = mask[:, 0]
+    if mask.shape != (n_grid,):
+        raise ValueError("{} must have shape [n_grid]".format(name))
+    if mask.dtype != np.bool_:
         try:
-            numeric_mask = np.asarray(excluded_mask, dtype=float)
+            numeric_mask = np.asarray(mask, dtype=float)
         except (TypeError, ValueError):
             raise ValueError(
-                "excluded_mask values must be Boolean or binary"
+                "{} values must be Boolean or binary".format(name)
             )
         if (
             not np.all(np.isfinite(numeric_mask))
             or not np.all((numeric_mask == 0.0) | (numeric_mask == 1.0))
         ):
             raise ValueError(
-                "excluded_mask values must be Boolean or binary"
+                "{} values must be Boolean or binary".format(name)
             )
-        excluded_mask = numeric_mask.astype(bool)
+        mask = numeric_mask.astype(bool)
     else:
-        excluded_mask = excluded_mask.astype(bool, copy=False)
-    if np.all(excluded_mask):
-        raise ValueError(
-            "excluded_mask must leave at least one accessible grid point"
-        )
-    return excluded_mask
+        mask = mask.astype(bool, copy=False)
+    return mask
 
 
 def _normalize_dipole_density(

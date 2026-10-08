@@ -1,8 +1,8 @@
 # Density evolution
 
 `equicdft.evolution` advances conserved species densities using an equilibrium
-functional and a separate mobility. The initial implementation is deterministic,
-at a fixed uniform temperature, on periodic regular grids.
+functional and a separate mobility. Deterministic and stochastic
+dynamics run at a fixed uniform temperature on periodic regular grids.
 
 ```python
 from equicdft.evolution import (
@@ -67,6 +67,13 @@ mobility of the density mode, not a tagged-particle diffusion coefficient;
 using its small-$k$ value as a local constant is the modelling step discussed
 below.
 
+`DensityMobility(diffusivity)` supplies the diagonal Einstein law
+`M_a = beta * diffusivity_a * rho_a`. Supply a nonnegative diffusivity scalar
+or one value per species, in length squared per time. It uses `data['beta']`
+for inverse thermal energy, so no separate Boltzmann constant is needed.
+It works with both deterministic and stochastic integrators. Diffusivity is a
+user-supplied dynamical parameter, not automatically measured self-diffusion.
+
 `LocalMobility(function)` calls `function(rho, temperature)` to evaluate a
 mobility from the current species-density vector at each voxel and the fixed
 temperature. The function may return diagonal values with the same shape as
@@ -95,6 +102,7 @@ Both integrators expose `step(data)`, which returns the new density tensor,
 without evaluating the model again. `integrator.dt` may be reassigned
 between steps; `Dynamics.run` takes a fixed step and rejects a change made
 during a run, while `AdaptiveDynamics` below varies the step itself.
+The driver may split a nominal fixed step at a declared field breakpoint.
 The equilibrium model returns a dimensionless chemical-potential derivative,
 so the driving field is
 
@@ -107,6 +115,142 @@ $$
 The model already applies voxel-volume normalization to its derivative; do
 not divide it by the voxel volume again. `V_ext` uses the model data's energy
 units, and `beta` supplies $1/(k_BT)$.
+
+## Freezing voxel densities
+
+Use a Boolean `mask` with one entry per voxel, in the same row order as `rho`.
+`True` freezes **all species** in that voxel at their supplied values:
+
+```python
+mask = data["grid_center"][:, 0] < 2.0
+integrator = EulerIntegrator(model, mobility, dt=0.01, mask=mask)
+trajectory = Dynamics(integrator).run(data, n_steps=100)
+```
+
+The same `mask=` argument works with `SemiImplicitIntegrator`,
+`StochasticEulerIntegrator`, `Dynamics`, and `AdaptiveDynamics`. Alternatively,
+put it in `data["mask"]`. A driver's explicit mask overrides the data mask;
+the data mask overrides an integrator's default. No caller-owned data is changed.
+`GridData.from_dict` and `GridData.from_xyz` also read an optional `mask` field
+(Boolean or binary 0/1); EXTXYZ property names can be mapped with
+`data_key={"mask": "frozen"}`. Coarsening rejects blocks mixing frozen and free
+voxels rather than silently changing the boundary.
+
+Frozen voxels are no-flux boundaries: deterministic and random face fluxes
+are blocked on both sides, preserving particle numbers in the remaining
+connected regions. Their densities still enter the free-energy functional
+and can affect neighboring chemical potentials. They are **not reservoirs**.
+They need not be zero: unlike `excluded_mask`, they keep their original
+positive densities (a frozen voxel without a finite positive density is
+rejected when the mask is first seen; an empty voxel belongs in
+`excluded_mask`). All-frozen masks are allowed. Trajectory metadata stores
+the resolved mask, which must be reused when restarting. The homogeneous
+reference of the semi-implicit stabilizer and of `stability_limit` is the
+mean over free voxels, so a frozen slab at a different density does not
+shift it; `min_density` still scans every non-excluded voxel, frozen ones
+included.
+
+Mask validation, topology and flux blocking are shared by the integrators.
+Masked semi-implicit stepping solves the restricted IMEX system
+$(I+\Delta tB_{\rm masked})\,\delta\boldsymbol\rho=\Delta t\,\mathcal R$ with
+restarted GMRES, right-preconditioned by the periodic propagator
+$(I+\Delta tB)^{-1}$ restricted to free rows and projected to zero species
+sums within each connected free region. This keeps region particle numbers
+at roundoff and frozen values bitwise unchanged, rather than resetting cells
+after an unconstrained FFT update. The relative residual tolerance is
+$\max(10^{-12},32\epsilon_{\rm dtype})$, where $\epsilon_{\rm dtype}$ is machine
+precision. Each normal iteration uses four FFTs plus the face stencils;
+the iteration count depends on the mask, curvature and timestep. The
+preconditioner helps stiff slab cases but does not guarantee convergence
+for arbitrary masks. A solve that still fails raises
+`ConvergenceError` (a `ValueError`); `AdaptiveDynamics` treats it as a
+rejection and shrinks the step. Unmasked/empty-mask runs retain the original
+FFT fast path. Optional stochastic density-floor repair touches only free
+voxels and preserves the species numbers of each connected free region,
+whether excluded or frozen voxels separate the regions.
+
+## Time-dependent external fields
+
+Pass `field=` to either trajectory driver. The field returns the **complete**
+species-resolved `V_ext`, replacing rather than adding to `data['V_ext']`.
+Omit it to keep the existing static-field behavior.
+
+```python
+from equicdft.evolution import RampedField
+
+field = RampedField(V_initial, V_final, duration=10.0)
+trajectory = Dynamics(integrator, field=field).run(
+    data, n_steps=1000, save_every=10, start_time=0.0,
+)
+# The same field works with deterministic adaptive evolution:
+# AdaptiveDynamics(integrator, control, field=field).run(data, t_end=10.0)
+```
+
+`RampedField` holds `initial` before `start_time` (default zero), interpolates
+linearly over `duration`, then holds `final`. Inputs have shape
+`[n_grid, n_species]` and use energy units, not beta-scaled potentials.
+They are copied at construction and converted to the density's device/dtype
+on evaluation.
+
+For another prescribed protocol, subclass `ExternalField`:
+
+```python
+import math
+from equicdft.evolution import ExternalField
+
+class OscillatingField(ExternalField):
+    def __init__(self, amplitude, omega):
+        self.amplitude = amplitude.detach().clone()
+        self.omega = omega
+
+    def __call__(self, time, data):
+        return self.amplitude.to(data['rho']) * math.sin(self.omega * time)
+```
+
+Custom fields must return a
+finite tensor matching `rho`'s shape, row order, dtype and device. Evaluation
+must not mutate data or internal state, depend on the evolving density, or
+draw random numbers: adaptive trials can repeat or revisit a time. This is a
+prescribed-field interface, not a feedback controller. Override `metadata()`
+to record custom parameters, and retain the protocol source with scientific runs.
+
+For sudden switches, declare a strictly increasing `breakpoints` sequence of
+absolute times. The field must be right-continuous at each switch. Both drivers
+land on those times, evolve up to the left limit, then change the field at
+fixed density. Fixed-step runs split nominal steps internally, keeping the
+nominal output cadence and restoring `integrator.dt`; stochastic substeps
+draw independent increments at their actual durations. Adaptive steps use
+the field at the start, midpoint and endpoint, without carrying a rejected
+trial's field into the accepted state. Choose a timestep or `dt_max` that
+resolves smooth oscillations; error estimation cannot detect an arbitrarily
+undersampled protocol.
+
+The energy of a driven system need not decrease. Adaptive acceptance instead
+checks the change in `beta_A` minus external work, across each half step and
+the full step. Smooth-protocol work is estimated by
+
+$$
+\beta\Delta W=\beta\Delta V\sum_{g,a}
+\frac{\rho^{\rm start}_{a,g}+\rho^{\rm end}_{a,g}}2
+\left(V^{\rm end}_{a,g}-V^{\rm start}_{a,g}\right).
+$$
+
+The full-step versus two-half-step work difference, divided by
+`max(1, total_particle_number)`, also contributes to `error` and is bounded by
+`error_tolerance`. Work at a field jump is exactly
+`beta * voxel_volume * sum(rho * delta_V)`, with no density update.
+Stochastic runs record work but never impose energy-descent acceptance.
+
+Driven trajectories additionally save `V_ext` and cumulative `beta_work` at
+each recorded frame, plus field metadata. Work starts at zero for each run.
+For a restart, restore the density (and stochastic RNG state), reuse the same
+protocol and pass the saved absolute time as `start_time`; adaptive `t_end`
+is an absolute endpoint too. Add the previous final work when joining records.
+An adaptive restart may choose different subsequent steps; stochastic restart
+reproducibility requires the same backend and subsequent step/substep schedule.
+These protocols do not update metal-module parameters, temperature or geometry.
+
+## Model evaluation and spatial discretization
 
 The integrators call the model as `GridCACEModel.forward` is called:
 `model(data, compute_c1=..., compute_c2=False, compute_ideal=True,
@@ -177,7 +321,8 @@ $H_{\beta,+}$. The full model response remains in $\mathcal R$, so this does
 not remove physically unstable directions from the evolution.
 
 `reference_density` optionally supplies a positive species vector; otherwise
-the first field's species means are used. A smaller reference strengthens the
+the first field's species means over free voxels are used (excluded voxels
+hold zeros and frozen voxels may hold anything). A smaller reference strengthens the
 stabilizer (the ideal curvature grows as $1/\rho$), which buys robustness at
 low densities at the price of extra first-order damping error: the step is
 reduced by $(I+\Delta tB)^{-1}$, so a stronger $B$ slows the computed
@@ -199,6 +344,108 @@ mobility. This initial semi-implicit method requires a
 fully accessible periodic grid; nonempty `excluded_mask` is rejected.
 The implicit part relaxes a stiffness constraint but does not guarantee
 positivity or energy decrease at arbitrary timesteps.
+
+## Stochastic dynamics
+
+Use a separate integrator to include thermal fluctuations; deterministic calls
+above are unchanged:
+
+```python
+from equicdft.evolution import StochasticEulerIntegrator, DensityMobility
+
+integrator = StochasticEulerIntegrator(model, ConstantMobility(0.1), dt=1e-4, seed=42)
+trajectory = Dynamics(integrator).run(data, n_steps=1000, save_every=10)
+# Alternatively: mobility=DensityMobility(diffusivity=0.1)
+```
+
+The value and timestep are illustrative, not a calibrated physical choice.
+This fixed-step Euler--Maruyama method supports constant scalar, diagonal or
+full symmetric positive-semidefinite species mobility, and `DensityMobility`.
+It uses the same model
+derivative, external potential and shared faces as deterministic Euler. Each
+face receives one integrated random flux
+
+$$
+\Delta J_f^R=\sqrt{\frac{2\Delta t}{\beta\Delta V}}\,B_fz_f,
+\qquad B_fB_f^{\mathsf T}=M_f,\qquad z_f\sim\mathcal N(0,I),
+$$
+
+where delta V is the voxel volume. Its discrete divergence is added to the
+deterministic density increment. Independent face draws conserve every species
+by cancellation, including at periodic boundaries. Excluded voxels block both
+fluxes. Matrix square roots preserve cross-species covariance and null modes;
+no diagonal jitter is added. Thermal energy is read from `1/data['beta']`,
+not a separate noise temperature. There is no spatial filter or adjustable
+noise scale. `rhs` remains the deterministic drift; use `step`, not `advance`,
+for stochastic updates. General `LocalMobility` is not supported yet because
+its discrete thermal drift must be specified consistently.
+
+For `DensityMobility`, both drift and noise use the arithmetic face value
+`M_{a,f} = beta D_a (rho_{a,L} + rho_{a,R})/2`, evaluated at the current state
+(Ito). No extra thermal drift is needed for this specific discretization:
+writing `G` for the face gradient, the density-space mobility is
+`K = G^T M_face G / (beta delta V)`. The Ito correction would be
+`sum_j partial K_ij / partial rho_j`. At each face its two endpoint
+derivatives are equal, `partial_L M_face = partial_R M_face = beta D_a/2`,
+while the two gradient coefficients have opposite signs, so they cancel.
+This also holds with fixed blocked faces and independent species with different
+diffusivities. It does not justify omitting thermal drift for arbitrary
+nonlinear mobility. The shared-face covariance matches this same `K`.
+
+Energy increases are physical and are recorded, not rejected. By default a
+nonpositive or nonfinite trial stops with the last valid trajectory and RNG
+checkpoint. An optional minimum-density guard is enabled explicitly:
+
+```python
+integrator = StochasticEulerIntegrator(model, mobility, dt=1e-5,
+                                      seed=42, rho_min=1e-4)
+```
+
+After the drift and noise update, accessible densities below `rho_min` are
+floored. The added mass is removed in proportion to each voxel's density above
+the floor, separately for each species. Excluded voxels remain zero; species
+without floor hits are unchanged. Initial accessible densities must already
+meet the floor. Nonfinite trials still stop. No new random numbers are drawn
+for the correction.
+
+This is an explicit numerical regularization: species particle numbers are
+preserved, but the original noise statistics and equilibrium distribution need
+not be. With the guard enabled, saved trajectories include cumulative per-species
+`floor_clamped_voxels` (hits summed over all steps), `floor_added_particles`
+(mass added by flooring before removal), `floor_l1_particles` (absolute mass
+redistributed), and `floor_max_density_change` (largest single-cell correction
+so far). These totals start at zero for each `Dynamics.run`, including restarts.
+`rho_min` and the correction rule are recorded in metadata. Floor/timestep
+sensitivity and stationary fluctuation statistics require separate validation.
+
+Do not repeatedly
+redraw failed steps or select successful seeds: this biases the process.
+`AdaptiveDynamics` refuses stochastic integrators; deterministic step-doubling
+and energy-descent gates are not a stochastic controller.
+
+Every saved frame includes `rng_state`. To resume on the same backend/device:
+
+```python
+state = dict(data, rho=trajectory['rho'][-1].to(data['rho']))
+integrator.set_rng_state(state, trajectory['rng_state'][-1])
+continued = Dynamics(integrator).run(state, n_steps=1000, save_every=10)
+```
+
+Use the same model, mobility, geometry and timestep, and offset the returned
+time axis when joining trajectories. Cross-device bitwise reproducibility is
+not promised. Rewinding the RNG after a failed trial preserves the checkpoint;
+it is not an adaptive Brownian-bridge algorithm or permission to retry until
+a trajectory succeeds.
+
+Validate the stationary covariance and correlation times as dt decreases:
+Euler--Maruyama has finite-step sampling bias. For a stable homogeneous
+quadratic functional, volume-normalized modes approach
+`C(k,0) = inverse(H_beta(k))/V` for nonzero k. The relaxation uses the same
+finite-difference `q_h^2` as deterministic Euler. Fine grids with far below
+one particle per voxel may make Gaussian fluctuating density inappropriate;
+a learned mean-density functional is not automatically the coarse-grained
+free energy for stochastic trajectories. Agreement with MD and nucleation
+rates requires separate scientific validation of this field interpretation.
 
 ## Adaptive timesteps
 
@@ -244,7 +491,7 @@ by the same factor but at least by one tenth; after a rejection for
 positivity or free energy by `shrink`. An accepted step's next proposal is
 floored at `dt_min` before the independent stability and relative-change
 bounds are applied; this does not override either bound or allow a rejected
-step at `dt_min`. The free energy must not rise across either half step or
+step at `dt_min`. For a static field, the free energy must not rise across either half step or
 the whole step by more than
 `energy_increase` + `energy_roundoff` $\cdot|\beta A|$: the first is an
 absolute tolerance in $k_BT$, independent of the zero of the free energy
@@ -255,14 +502,19 @@ $10^{-5}$). Set `energy_roundoff=0` for acceptance decisions that are exactly
 independent of the zero of the free energy. A step that would have to fall
 below `dt_min` to satisfy the bounds, or that is still rejected at `dt_min`,
 stops the run with the last accepted state attached as `error.trajectory`;
-only the final step is shortened freely to land exactly on `t_end`.
+the final step and steps landing on field breakpoints may be shortened to
+land exactly on their endpoint. Driven-field acceptance subtracts external
+work as described above.
 
 The model evaluation at the accepted state starts the next step, so an
-accepted step costs two model evaluations, twice the fixed-step cost; a step
-rejected for positivity costs none or one, for accuracy or free energy one or
-two. The result has the `Dynamics` fields plus `dt` and the error estimate
-`error` per frame, the counts of accepted steps, rejections by cause and
-model evaluations, and the step cap `dt_cap` in the metadata.
+accepted step normally costs two model evaluations, twice the fixed-step cost;
+a field jump also refreshes the endpoint derivative. A step
+rejected for positivity or for an unconverged masked implicit solve costs
+none or one, for accuracy or free energy one or two. The result has the
+`Dynamics` fields plus `dt` and the error estimate `error` per frame, the
+counts of accepted steps, rejections by cause (`rejected_positivity`,
+`rejected_solve`, `rejected_accuracy`, `rejected_energy`) and model
+evaluations, and the step cap `dt_cap` in the metadata.
 
 ```python
 control = StepControl(dt_min=1e-4, dt_max=50.0, max_relative_change=0.05, error_tolerance=1e-3)
@@ -325,9 +577,10 @@ forward and one inverse FFT and a multiplication by the stored propagator
 $(I+\Delta tB)^{-1}$, which is inverted when a step size is first used; the
 two most recent step sizes stay cached, so an adaptive step and its half do
 not rebuild it.
-Grid geometry,
-walls and `V_ext` are validated when first seen and reused while the same
-tensors are passed unchanged. Non-tensor containers such as lists and arrays
+Grid geometry and walls are validated when first seen and reused while the same
+tensors are passed unchanged. `V_ext` is validated separately on each call,
+so a changed potential does not rebuild geometry or reuse a stale field.
+Non-tensor containers such as lists and arrays
 are revalidated on each call. A density returned by `step` is not re-checked
 unless modified in place or the geometry changes, and a `ConstantMobility`
 is applied as one shared matrix rather than one matrix per voxel. The model evaluation therefore

@@ -32,7 +32,13 @@ def _positive_scalar(value, name):
     return result
 
 
-_GEOMETRY_KEYS = ("grid_size", "grid_positions", "grid_spacing", "excluded_mask", "V_ext", "beta", "temperature")
+_GEOMETRY_KEYS = ("grid_size", "grid_positions", "grid_spacing", "excluded_mask", "mask", "beta", "temperature")
+
+
+def _with_mask(data, mask=None, default=None):
+    """Resolve one voxel mask: driver argument, data, then integrator default."""
+    mask = data.get("mask", default) if mask is None else mask
+    return data if mask is None else dict(data, mask=mask)
 
 
 class DensityError(ValueError):
@@ -54,7 +60,7 @@ def _fingerprint(value):
 class _Grid:
     """One complete regular grid, retaining the input row order.
 
-    The static geometry (shape, row order, spacing, walls, external potential)
+    The static geometry (shape, row order, spacing, walls)
     is validated once and reused while the same data tensors are passed in
     unchanged; ``cached`` is the previous grid of the same integrator. Density
     checks are skipped only for unchanged outputs under unchanged geometry.
@@ -74,6 +80,12 @@ class _Grid:
         else:
             self.geometry = self._build(data)
         self.__dict__.update(self.geometry)
+        potential = data.get("V_ext")
+        self.potential = None
+        if potential is not None:
+            self.potential = torch.as_tensor(potential, dtype=self.rho.dtype, device=self.rho.device)
+            if self.potential.shape != self.rho.shape or not torch.isfinite(self.potential).all():
+                raise ValueError("V_ext must be finite and have the same shape as rho.")
         if not trusted or not reused:
             self.check_density(self.rho)
 
@@ -92,22 +104,29 @@ class _Grid:
             raise ValueError("excluded_mask must be a boolean [n_grid] tensor.")
         if excluded.all():
             raise ValueError("At least one voxel must be accessible.")
-        potential = data.get("V_ext")
-        if potential is not None:
-            potential = torch.as_tensor(potential, dtype=rho.dtype, device=rho.device)
-            if potential.shape != rho.shape or not torch.isfinite(potential).all():
-                raise ValueError("V_ext must be finite and have the same shape as rho.")
+        frozen = torch.as_tensor(
+            data.get("mask", torch.zeros(rho.shape[0], dtype=torch.bool)), device=rho.device,
+        )
+        if frozen.dtype != torch.bool or frozen.shape != rho.shape[:1]:
+            raise ValueError("mask must be a boolean [n_grid] tensor; True freezes all species.")
+        held = rho[frozen & ~excluded]
+        if held.numel() and not bool(torch.all(torch.isfinite(held) & (held > 0))):
+            raise ValueError("Frozen voxels keep finite positive densities; use excluded_mask for empty voxels.")
+        inactive = excluded | frozen
         geometry = {
             "shape": shape, "indices": indices, "canonical": canonical,
             "spacing": spacing, "volume": spacing.prod(),
             "beta": _positive_scalar(data["beta"], "beta"),
             "temperature": _positive_scalar(data["temperature"], "temperature"),
             "excluded": excluded, "has_excluded": bool(excluded.any()),
-            "potential": potential, "blocked": None,
+            "frozen": frozen, "has_frozen": bool(frozen.any()),
+            "free": ~inactive, "has_blocked": bool(inactive.any()),
+            "blocked": None,
+            "_regions": None,
         }
-        if geometry["has_excluded"]:
+        if geometry["has_blocked"]:
             self.__dict__.update(geometry)
-            dense = self.dense(excluded)
+            dense = self.dense(inactive)
             geometry["blocked"] = [(dense | torch.roll(dense, -1, axis))[..., None] for axis in range(3)]
         return geometry
 
@@ -132,18 +151,76 @@ class _Grid:
         """Return the validated external potential, zero when none was given."""
         return torch.zeros_like(self.rho) if self.potential is None else self.potential
 
+    def divergence(self, flux, axis):
+        """Shared conservative face update, including excluded and frozen voxels."""
+        if self.has_blocked:
+            flux = flux.masked_fill(self.blocked[axis], 0)
+        return -(flux - torch.roll(flux, 1, axis)) / self.spacing[axis]
+
+    def restore_frozen(self, rho):
+        """Keep original frozen values bitwise, without mass redistribution."""
+        return torch.where(self.frozen[:, None], self.rho.detach(), rho) if self.has_frozen else rho
+
+    def free_regions(self):
+        """Connected free regions (no blocked face between members), for the density-floor repair.
+
+        Excluded and frozen voxels both split the grid; a region's species
+        numbers are conserved by every flux, so a repair must act per region.
+        """
+        if self._regions is None:
+            if not self.has_blocked:
+                self._regions = [torch.nonzero(self.free).flatten()]
+            else:
+                # Static topology: label on CPU once, retaining arbitrary input row order.
+                free = self.dense(self.free).cpu().reshape(-1).tolist()
+                nx, ny, nz = self.shape
+                regions = []
+                for start, active in enumerate(free):
+                    if not active:
+                        continue
+                    free[start] = False
+                    stack, cells = [start], []
+                    while stack:
+                        cell = stack.pop()
+                        cells.append(cell)
+                        x, rem = divmod(cell, ny * nz)
+                        y, z = divmod(rem, nz)
+                        neighbours = [((x+d) % nx)*ny*nz+y*nz+z for d in (-1, 1)]
+                        neighbours += [x*ny*nz+((y+d) % ny)*nz+z for d in (-1, 1)]
+                        neighbours += [x*ny*nz+y*nz+(z+d) % nz for d in (-1, 1)]
+                        for neighbour in neighbours:
+                            if free[neighbour]:
+                                free[neighbour] = False
+                                stack.append(neighbour)
+                    selected = torch.zeros(math.prod(self.shape), dtype=torch.bool, device=self.rho.device)
+                    selected[cells] = True
+                    rows = self.flat(selected.reshape(self.shape))
+                    regions.append(torch.nonzero(rows).flatten())
+                self._regions = regions
+            self.geometry["_regions"] = self._regions
+        return self._regions
+
+    def project_free_increment(self, increment):
+        """Restrict a correction to free cells, conserving each region's species sums."""
+        result = increment.masked_fill(~self.free[:, None], 0)
+        for rows in self.free_regions():
+            result[rows] -= result[rows].mean(0)
+        return result
+
 
 class EulerIntegrator:
     """Explicit first-order step for j = -M grad(mu), with shared face fluxes.
 
     ``model`` returns the full intrinsic beta-free-energy derivative. Mobility
     is physical, so its coefficient against grad(beta*mu) is ``M / beta``.
-    Excluded voxels have zero density and block every adjoining face.
+    Excluded voxels have zero density and block every adjoining face. Frozen
+    ``mask`` voxels also block faces but retain their supplied densities.
     """
 
-    def __init__(self, model, mobility, dt):
+    def __init__(self, model, mobility, dt, *, mask=None):
         self.model = model
         self.mobility = mobility
+        self.mask = mask
         self.dt = dt
         self.last_beta_A = None
         self._grid = None
@@ -165,7 +242,7 @@ class EulerIntegrator:
         """
         output, version = self._last_output if self._last_output is not None else (None, None)
         trusted = data["rho"] is output and output._version == version
-        self._grid = _Grid(data, self._grid, trusted=trusted)
+        self._grid = _Grid(_with_mask(data, default=self.mask), self._grid, trusted=trusted)
         return self._grid
 
     def _model_output(self, data, derivatives):
@@ -216,9 +293,7 @@ class EulerIntegrator:
             else:
                 face_mobility = (matrices + torch.roll(matrices, -1, axis)) / 2
                 flux = -(face_mobility @ gradient.unsqueeze(-1)).squeeze(-1) / grid.beta
-            if grid.has_excluded:
-                flux = flux.masked_fill(grid.blocked[axis], 0)
-            rate -= (flux - torch.roll(flux, 1, axis)) / spacing
+            rate += grid.divergence(flux, axis)
         return grid.flat(rate).detach()
 
     def rhs(self, data):
@@ -239,7 +314,7 @@ class EulerIntegrator:
         return result.detach()
 
     def _advance(self, grid, rate, dt):
-        rho = grid.rho.detach() + dt * rate
+        rho = grid.restore_frozen(grid.rho.detach() + dt * rate)
         grid.check_density(rho)
         self._last_output = (rho, rho._version)
         return rho
@@ -264,8 +339,9 @@ class EulerIntegrator:
         The rates are the eigenvalues of the homogeneous reference operator
         ``k_B T q_h^2 M_ref H_+(k)`` (the semi-implicit stabilizer), shaped
         ``grid_size + (n_species,)``; ``1 / rates[rates > 0].min()`` is the
-        slowest linear relaxation time. The reference is the field's species
-        means unless ``reference_density`` is given.
+        slowest linear relaxation time. The reference is the species means
+        over free voxels unless ``reference_density`` is given; frozen voxels
+        only block faces, which cannot raise the largest rate.
         """
         grid = self._grid_for(data)
         if grid.has_excluded:
@@ -284,10 +360,18 @@ class EulerIntegrator:
 
 
 def _reference_density(grid, reference_density):
-    """Return the validated homogeneous reference species vector."""
+    """Return the validated homogeneous reference species vector.
+
+    The default is the mean over free voxels: excluded voxels hold zeros and
+    frozen voxels may hold any density, and neither evolves.
+    """
     rho = grid.rho
-    reference = (rho.mean(0) if reference_density is None else
-                 torch.as_tensor(reference_density, dtype=rho.dtype, device=rho.device))
+    if reference_density is None:
+        # An all-frozen field has nothing to stabilize; any positive reference serves.
+        pool = grid.free if bool(grid.free.any()) else ~grid.excluded
+        reference = rho[pool].mean(0)
+    else:
+        reference = torch.as_tensor(reference_density, dtype=rho.dtype, device=rho.device)
     if reference.shape != (rho.shape[-1],) or not torch.isfinite(reference).all() or torch.any(reference <= 0):
         raise ValueError("reference_density must be a finite positive species vector.")
     return reference.detach()
@@ -319,7 +403,7 @@ def _reference_curvature(model, data, grid):
     return torch.fft.fftn(jacobian, dim=(0, 1, 2)).conj()
 
 
-def _reference_operator(model, mobility, data, grid, reference, reference_curvature=None):
+def _reference_operator(model, mobility, data, grid, reference, reference_curvature=None, *, parts=False):
     """Return ``k_B T q_h^2 M_ref H_+(k)`` for every mode, shape ``grid_size + (p, p)``."""
     n_species = grid.rho.shape[-1]
     reference_data = dict(data, rho=reference.expand_as(grid.rho).clone())
@@ -361,7 +445,65 @@ def _reference_operator(model, mobility, data, grid, reference, reference_curvat
         shape = [1, 1, 1]
         shape[axis] = size
         q2 += component.reshape(shape)
-    return q2[..., None, None] * (matrices[0].to(positive.dtype) @ positive) / grid.beta
+    operator = q2[..., None, None] * (matrices[0].to(positive.dtype) @ positive) / grid.beta
+    return (operator, positive, matrices[0]) if parts else operator
+
+
+_SOLVE_TOLERANCE = 1e-12   # float64 target; lower precision uses a roundoff floor
+_SOLVE_RESTART = 40
+_SOLVE_CYCLES = 5
+
+
+class ConvergenceError(ValueError):
+    """An implicit solve did not reach its tolerance; a smaller step usually will."""
+
+
+def _gmres(action, rhs, precondition):
+    """Right-preconditioned restarted GMRES with double reorthogonalization.
+
+    Solves ``action(x) = rhs`` through ``x = precondition(y)``. The masked
+    IMEX operator need not be symmetric for coupled species, so CG is
+    unsuitable. The least-squares residual decides when a candidate is
+    formed and its true residual checked, so an iteration applies the
+    operator once. The preconditioner preserves zero increments on frozen
+    rows and zero species sums in each connected free region.
+    """
+    solution = torch.zeros_like(rhs)
+    norm = torch.linalg.vector_norm(rhs)
+    if norm == 0:
+        return solution
+    limit = max(_SOLVE_TOLERANCE, 32 * torch.finfo(rhs.dtype).eps) * norm
+    for _ in range(_SOLVE_CYCLES):
+        residual = rhs - action(solution)
+        length = torch.linalg.vector_norm(residual)
+        if length <= limit:
+            return solution
+        basis = [residual / length]
+        hessenberg = rhs.new_zeros((_SOLVE_RESTART + 1, _SOLVE_RESTART))
+        target = rhs.new_zeros(_SOLVE_RESTART + 1)
+        target[0] = length
+        for j in range(_SOLVE_RESTART):
+            vector = action(precondition(basis[j]))
+            # Reorthogonalize to retain accuracy for stiff/non-normal mixtures.
+            for _ in range(2):
+                for i, direction in enumerate(basis):
+                    coefficient = (direction * vector).sum()
+                    hessenberg[i, j] += coefficient
+                    vector = vector - coefficient * direction
+            next_length = torch.linalg.vector_norm(vector)
+            hessenberg[j + 1, j] = next_length
+            weights = torch.linalg.lstsq(hessenberg[:j + 2, :j + 1], target[:j + 2, None]).solution[:, 0]
+            estimate = torch.linalg.vector_norm(target[:j + 2] - hessenberg[:j + 2, :j + 1] @ weights)
+            exhausted = next_length <= torch.finfo(rhs.dtype).tiny or j == _SOLVE_RESTART - 1
+            if estimate <= limit or exhausted:
+                candidate = solution + precondition(sum(weight * direction for weight, direction in zip(weights, basis)))
+                if torch.linalg.vector_norm(rhs - action(candidate)) <= limit:
+                    return candidate
+                if exhausted:
+                    solution = candidate
+                    break
+            basis.append(vector / next_length)
+    raise ConvergenceError("Masked implicit solve did not converge; reduce the timestep.")
 
 
 class SemiImplicitIntegrator(EulerIntegrator):
@@ -369,12 +511,15 @@ class SemiImplicitIntegrator(EulerIntegrator):
 
     The full nonlinear response stays explicit. Only the positive part of the
     reference beta-free-energy curvature enters the implicit operator; negative
-    physical curvature is not removed from the evolution. This FFT step requires
-    a fully accessible periodic grid, unlike Euler's blocked-face update.
+    physical curvature is not removed from the evolution. Without a frozen
+    mask the solve is diagonal in Fourier space. With a mask, a matrix-free
+    solve uses the same curvature and shared blocked-face fluxes, with the
+    periodic propagator as its preconditioner. Nonempty excluded_mask remains
+    unsupported by this integrator.
     """
 
-    def __init__(self, model, mobility, dt, reference_density=None, reference_curvature=None):
-        super().__init__(model, mobility, dt)
+    def __init__(self, model, mobility, dt, reference_density=None, reference_curvature=None, *, mask=None):
+        super().__init__(model, mobility, dt, mask=mask)
         self.reference_density = reference_density
         self.reference_curvature = reference_curvature
         self._operator = None
@@ -390,8 +535,8 @@ class SemiImplicitIntegrator(EulerIntegrator):
                      grid.rho.shape[-1], grid.rho.dtype, grid.rho.device)
         reference = _reference_density(grid, self.reference_density)
         if self._operator is None:
-            self._operator = _reference_operator(
-                self.model, self.mobility, data, grid, reference, self.reference_curvature,
+            self._operator, self._curvature, self._reference_mobility = _reference_operator(
+                self.model, self.mobility, data, grid, reference, self.reference_curvature, parts=True,
             )
             self._signature = signature
             self._reference = reference
@@ -418,6 +563,34 @@ class SemiImplicitIntegrator(EulerIntegrator):
 
     def _advance(self, grid, rate, dt):
         propagator = self._propagator_for(dt)
+        if grid.has_frozen:
+            # Solve the same IMEX increment with blocked faces, not a periodic
+            # solve followed by clipping (which leaks mass into frozen voxels).
+            # Restrict the periodic preconditioner to conservative free-region
+            # increments: zeroing frozen rows alone would leak region mass.
+
+            def action(increment):
+                modes = torch.fft.fftn(grid.dense(increment), dim=(0, 1, 2))
+                potential = torch.fft.ifftn(
+                    (self._curvature @ modes.unsqueeze(-1)).squeeze(-1), dim=(0, 1, 2),
+                ).real
+                response = torch.zeros_like(potential)
+                for axis, spacing in enumerate(grid.spacing):
+                    gradient = (torch.roll(potential, -1, axis) - potential) / spacing
+                    flux = -(gradient @ self._reference_mobility.T) / grid.beta
+                    response += grid.divergence(flux, axis)
+                return increment - dt * grid.flat(response)
+
+            def precondition(vector):
+                modes = torch.fft.fftn(grid.dense(vector), dim=(0, 1, 2))
+                smoothed = torch.fft.ifftn((propagator @ modes.unsqueeze(-1)).squeeze(-1), dim=(0, 1, 2)).real
+                return grid.project_free_increment(grid.flat(smoothed))
+
+            increment = _gmres(action, dt * rate, precondition)
+            rho = grid.restore_frozen(grid.rho.detach() + increment)
+            grid.check_density(rho)
+            self._last_output = (rho, rho._version)
+            return rho
         rho_hat = torch.fft.fftn(grid.dense(grid.rho.detach()), dim=(0, 1, 2))
         rate_hat = torch.fft.fftn(grid.dense(rate), dim=(0, 1, 2))
         # (I + dt B) rho' = rho + dt [R + B rho]  is  rho' = rho + dt (I + dt B)^-1 R.

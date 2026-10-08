@@ -85,9 +85,10 @@ class TestAdaptiveDynamics(unittest.TestCase):
     @staticmethod
     def cost_bounds(metadata):
         """Model evaluations: one to start, two per accepted step, at most two per rejection."""
-        accepted, accuracy, energy, positivity = (metadata[key] for key in
-                                                  ("accepted", "rejected_accuracy", "rejected_energy", "rejected_positivity"))
-        return 1 + 2 * accepted, 1 + 2 * (accepted + accuracy + energy) + positivity
+        accepted, accuracy, energy, positivity, solve = (metadata[key] for key in
+                                                         ("accepted", "rejected_accuracy", "rejected_energy",
+                                                          "rejected_positivity", "rejected_solve"))
+        return 1 + 2 * accepted, 1 + 2 * (accepted + accuracy + energy) + positivity + solve
 
     def test_control_validation(self):
         StepControl(dt_min=1e-3, dt_max=1.)
@@ -219,7 +220,7 @@ class TestAdaptiveDynamics(unittest.TestCase):
             runs.append(AdaptiveDynamics(weak, control).run(self.data, t_end=.5))
         reference, shifted = runs
         self.assertGreater(reference["metadata"]["rejected_energy"], 0)
-        for key in ("accepted", "rejected_energy", "rejected_accuracy", "rejected_positivity", "model_evaluations"):
+        for key in ("accepted", "rejected_energy", "rejected_accuracy", "rejected_positivity", "rejected_solve", "model_evaluations"):
             self.assertEqual(shifted["metadata"][key], reference["metadata"][key], key)
         torch.testing.assert_close(shifted["rho"], reference["rho"], rtol=0, atol=1e-12)
         torch.testing.assert_close(shifted["beta_A"] - 1e4, reference["beta_A"], rtol=0, atol=1e-8)
