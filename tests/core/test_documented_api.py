@@ -55,6 +55,7 @@ DOCUMENTED_METHODS = {
     "evaluate": GridSolver.evaluate,
     "fit": Trainer.fit,
     "fit_streams": Trainer.fit_streams,
+    "from_quadratic": equicdft.PairwiseReadout.from_quadratic,
 }
 
 

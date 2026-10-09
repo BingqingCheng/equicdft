@@ -24,6 +24,15 @@ target.
 - A passing software regression is not evidence that an experimental feature
   improves a scientific benchmark.
 
+## Density-dependent pairwise readout
+
+`PairwiseReadout(density_channels=M)` adds nonlinear local endpoint-density
+features while retaining symmetric finite-range FFT convolutions;
+`density_temperature=True` lets those features depend on temperature, and
+`PairwiseReadout.from_quadratic` starts the form from a trained quadratic
+readout. Omitting the option preserves the existing quadratic form and saved
+models. See [the pairwise functional definition and compatibility rules](pairwise.md).
+
 ## Density-channel transforms
 
 `CartesianAFeatures` can transform physical density components pointwise
