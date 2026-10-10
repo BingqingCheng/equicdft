@@ -416,6 +416,8 @@ class ReciprocalFeatures(nn.Module, Configurable):
             if (charges.shape != (self.n_types,)
                     or not torch.isfinite(charges).all().item()):
                 raise ValueError("charges must contain one finite value per type")
+        if not direct_polarization and dipole_density is None and charges is None:
+            return self._density_features(rho, grid_size, grid_spacing)
         nx, ny, nz = common_grid_size(grid_size, rho.shape[:-2])
         if nx * ny * nz != rho.shape[-2]:
             raise ValueError("grid_size product does not match rho n_grid")
@@ -468,6 +470,29 @@ class ReciprocalFeatures(nn.Module, Configurable):
             features = torch.cat((features, divergence_features), dim=-2)
         return features
 
+    def _density_features(self, fields, grid_size, grid_spacing):
+        """Scalar pair spectra, allowing nonlinear source-channel counts.
+
+        Remove the source mean after any local density transformation. The
+        scalar kernels also set k=0 to zero, independently of FFT roundoff.
+        """
+
+        nx, ny, nz = common_grid_size(grid_size, fields.shape[:-2])
+        if nx * ny * nz != fields.shape[-2]:
+            raise ValueError("grid_size product does not match rho n_grid")
+        spacing = self._spacing(grid_spacing, fields)
+        volume_element = voxel_volume(spacing)
+        field_grid = fields.reshape(
+            *fields.shape[:-2], nx, ny, nz, fields.shape[-1],
+        )
+        source = self._field_fft(field_grid, (-4, -3, -2), volume_element)
+        kernels = self._kernel_values(
+            (nx, ny, nz), spacing, fields.device, fields.dtype,
+        ).flatten(start_dim=1)
+        return self._pair_features(
+            source.unsqueeze(-1), kernels, volume_element * float(nx * ny * nz),
+        )
+
     def density_weight(self, rho: torch.Tensor) -> torch.Tensor:
         """Return ``(rho_ref / sqrt(rho^2 + rho_floor^2))^gamma`` per voxel and type."""
 
@@ -478,11 +503,11 @@ class ReciprocalFeatures(nn.Module, Configurable):
         return (reference / regularized) ** self.density_exponent
 
     def _pair_features(self, fourier_source, kernels, volume):
-        """Contract ``[..., nx, ny, nz, n_types, n_vector]`` pair spectra."""
+        """Contract ``[..., nx, ny, nz, n_channels, n_vector]`` pair spectra."""
 
         fourier_source = fourier_source.flatten(start_dim=-5, end_dim=-3)
         pair_features = []
-        for first, second in symmetric_component_pairs(self.n_types):
+        for first, second in symmetric_component_pairs(fourier_source.shape[-2]):
             cross_power = torch.real(
                 torch.conj(fourier_source[..., first, :])
                 * fourier_source[..., second, :]

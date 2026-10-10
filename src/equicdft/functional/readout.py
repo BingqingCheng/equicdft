@@ -11,6 +11,7 @@ from .._validation import (
     positive_integer,
 )
 from ._pairs import symmetric_component_pairs
+from ._density import density_fields
 from .._config import (
     Configurable,
     build_optional,
@@ -398,8 +399,9 @@ class LongRangeReadout(EnergyReadout, Configurable):
 
     The readout predicts one coefficient for every fixed reciprocal kernel and
     unique species pair. Its output energy is a linear contraction with the
-    reciprocal features, preserving their quadratic field dependence and
-    extensive scaling. Coefficients are signed, not positivity constrained.
+    reciprocal features, preserving extensive scaling. Coefficients are
+    signed, not positivity constrained. With ``density_channels``, a local
+    density transformation makes the energy nonquadratic in physical rho.
 
     Parameters
     ----------
@@ -410,8 +412,9 @@ class LongRangeReadout(EnergyReadout, Configurable):
     n_types
         Number of physical density components. Inferred from ``features`` when
         omitted, or defaults to one without a feature module. Explicit counts
-        must match the feature module. The state vector contains
-        normalized temperature followed by one mean density per component.
+        must match the feature module. Normally the state vector contains
+        normalized temperature followed by one mean density per component;
+        with ``density_channels`` it contains only normalized temperature.
     hidden_sizes
         Width of each state-network hidden layer. An empty sequence gives a
         linear state dependence.
@@ -468,6 +471,22 @@ class LongRangeReadout(EnergyReadout, Configurable):
         turns a known linear response, such as a dielectric kernel fitted
         to polarization structure factors, into a fixed reference.
         Unavailable in the charge-factorized and fixed-amplitude modes.
+    density_channels
+        Optional number M of nonlinear local density sources for scalar
+        Gaussian features. Uses ``f_a = sum_i rho_i A_ia(rho / mean_density)``
+        before the FFT. Kernel coefficients then depend only on normalized
+        temperature, with M*(M+1)/2 symmetric pairs per kernel. The transformed
+        source mean and k=0 kernel are removed; every homogeneous density has
+        zero Gaussian energy. Requires Gaussian density ``features`` and no
+        fixed charges. ``None`` preserves the existing quadratic branch,
+        global state dependence, parameter shapes and saved configuration.
+    density_hidden_sizes
+        Hidden widths of the local density MLP. The normalization is the
+        fixed model ``mean_density``, not the current field average.
+    density_temperature
+        Also supply normalized temperature to the local density MLP. Requires
+        ``density_channels``. Physical rho multiplies the MLP output, so
+        transformed fields vanish in vacuum without clipping or division.
     """
 
     @property
@@ -491,6 +510,9 @@ class LongRangeReadout(EnergyReadout, Configurable):
         include_polarization: bool = False,
         coefficient_scale: Optional[Union[float, Sequence[float]]] = None,
         initial_coefficients: Optional[Sequence[float]] = None,
+        density_channels: Optional[int] = None,
+        density_hidden_sizes: Sequence[int] = (16, 16),
+        density_temperature: bool = False,
     ) -> None:
         super().__init__()
 
@@ -518,7 +540,27 @@ class LongRangeReadout(EnergyReadout, Configurable):
         self.n_types = positive_integer(n_types, "n_types")
         type_pairs = symmetric_component_pairs(self.n_types)
         self.n_type_pairs = len(type_pairs)
-        self.n_state_features = 1 + self.n_types
+        self.density_channels = optional_positive_integer(
+            density_channels, "density_channels",
+        )
+        self.n_kernel_channels = self.density_channels or self.n_types
+        self.n_kernel_pairs = len(symmetric_component_pairs(self.n_kernel_channels))
+        self.density_hidden_sizes = validate_hidden_sizes(density_hidden_sizes)
+        self.density_temperature = boolean(
+            density_temperature, "density_temperature",
+        )
+        if self.density_temperature and self.density_channels is None:
+            raise ValueError("density_temperature requires density_channels")
+        if self.density_channels is not None and (
+            features is None or features.kernel != "gaussian"
+            or features.requires_dipole_density or charges is not None
+        ):
+            raise ValueError(
+                "density_channels requires scalar Gaussian features without charges"
+            )
+        self.n_state_features = (
+            1 if self.density_channels is not None else 1 + self.n_types
+        )
         self.hidden_sizes = validate_hidden_sizes(hidden_sizes)
         self.zero_init = boolean(zero_init, "zero_init")
 
@@ -602,15 +644,15 @@ class LongRangeReadout(EnergyReadout, Configurable):
             ).detach().clone()
             if initial_tensor.numel() == self.n_kernels:
                 initial_tensor = initial_tensor.reshape(self.n_kernels, 1).expand(
-                    self.n_kernels, self.n_type_pairs,
+                    self.n_kernels, self.n_kernel_pairs,
                 ).clone()
             if (
-                initial_tensor.shape != (self.n_kernels, self.n_type_pairs)
+                initial_tensor.shape != (self.n_kernels, self.n_kernel_pairs)
                 or not torch.all(torch.isfinite(initial_tensor)).item()
             ):
                 raise ValueError(
                     "initial_coefficients must contain one finite value per kernel "
-                    "channel or one per kernel channel and type pair"
+                    "channel or one per kernel channel and source pair"
                 )
         # Non-persistent: both live in the config, and checkpoints written
         # before they existed keep loading strictly.
@@ -621,7 +663,7 @@ class LongRangeReadout(EnergyReadout, Configurable):
             self.mlp = None
         else:
             output_width = (
-                self.n_kernels * self.n_type_pairs
+                self.n_kernels * self.n_kernel_pairs
                 if charges is None
                 else 1
             )
@@ -631,11 +673,16 @@ class LongRangeReadout(EnergyReadout, Configurable):
                 output_width,
                 zero_init=self.zero_init,
             )
+        self.density_mlp = None if self.density_channels is None else build_mlp(
+            input_size=self.n_types + int(self.density_temperature),
+            hidden_sizes=self.density_hidden_sizes,
+            output_size=self.n_types * self.density_channels,
+        )
 
     def to_config(self) -> Dict[str, Any]:
         """Return the constructor arguments describing this readout."""
 
-        return make_config(
+        config = make_config(
             self,
             n_kernels=self.n_kernels,
             n_types=self.n_types,
@@ -648,6 +695,14 @@ class LongRangeReadout(EnergyReadout, Configurable):
             coefficient_scale=optional_buffer_value(self.coefficient_scale),
             initial_coefficients=optional_buffer_value(self.initial_coefficients),
         )
+        if self.density_channels is not None:
+            config.update(
+                density_channels=self.density_channels,
+                density_hidden_sizes=list(self.density_hidden_sizes),
+            )
+            if self.density_temperature:
+                config["density_temperature"] = True
+        return config
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "LongRangeReadout":
@@ -658,18 +713,17 @@ class LongRangeReadout(EnergyReadout, Configurable):
         return cls(**arguments)
 
     def coefficients(self, state_features: torch.Tensor) -> torch.Tensor:
-        """Return coefficients shaped ``[..., n_kernels, n_type_pairs]``."""
+        """Return coefficients shaped ``[..., n_kernels, n_kernel_pairs]``."""
 
         if state_features.shape[-1] != self.n_state_features:
             raise ValueError(
-                "state_features must end with normalized temperature and "
-                "one mean density per type"
+                "state_features must have width {}".format(self.n_state_features)
             )
         if self.charges is None:
             coefficients = self.mlp(state_features).reshape(
                 *state_features.shape[:-1],
                 self.n_kernels,
-                self.n_type_pairs,
+                self.n_kernel_pairs,
             )
             if self.coefficient_scale is not None:
                 coefficients = coefficients * self.coefficient_scale.to(
@@ -753,6 +807,8 @@ class LongRangeReadout(EnergyReadout, Configurable):
         dependence, so the model's density scale is not needed at all.
         """
 
+        if self.density_channels is not None:
+            return context.normalized_temperature[..., None]
         if self.coulomb_amplitude is None:
             return context.state_features()
         return context.rho.new_zeros(
@@ -794,7 +850,7 @@ class LongRangeReadout(EnergyReadout, Configurable):
     ) -> torch.Tensor:
         """Return one reduced long-range contribution per field."""
 
-        expected_trailing_shape = (self.n_kernels, self.n_type_pairs)
+        expected_trailing_shape = (self.n_kernels, self.n_kernel_pairs)
         if reciprocal_features.shape[-2:] != expected_trailing_shape:
             raise ValueError(
                 "reciprocal_features must end with shape {}".format(
@@ -811,6 +867,14 @@ class LongRangeReadout(EnergyReadout, Configurable):
             dim=(-2, -1),
         )
 
+    def density_fields(self, context: ReadoutContext) -> torch.Tensor:
+        """Return physical rho, or local nonlinear sources for Gaussian kernels."""
+
+        return density_fields(
+            context, self.n_types, self.density_mlp, self.density_channels,
+            self.density_temperature,
+        )
+
     def energy(self, context: ReadoutContext) -> torch.Tensor:
         """Return the reciprocal-space contribution for a complete field."""
 
@@ -823,12 +887,18 @@ class LongRangeReadout(EnergyReadout, Configurable):
             source_options["dipole_density"] = context.require("dipole_density")
         if self.include_polarization:
             source_options["charges"] = self.charges
-        reciprocal_features = self.features(
-            rho=context.rho,
-            grid_size=context.require("grid_size"),
-            grid_spacing=context.require("grid_spacing"),
-            **source_options,
-        )
+        if self.density_channels is not None:
+            reciprocal_features = self.features._density_features(
+                self.density_fields(context), context.require("grid_size"),
+                context.require("grid_spacing"),
+            )
+        else:
+            reciprocal_features = self.features(
+                rho=context.rho,
+                grid_size=context.require("grid_size"),
+                grid_spacing=context.require("grid_spacing"),
+                **source_options,
+            )
         energy = self(reciprocal_features, self._state_input(context))
         if energy.shape != context.rho.shape[:-2]:
             raise ValueError(

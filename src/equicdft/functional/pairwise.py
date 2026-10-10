@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Sequence
 import torch
 
 from .._validation import boolean, optional_positive_integer, positive_integer
+from ._density import density_fields
 from ._pairs import symmetric_component_pairs
 from .._config import Configurable, make_config, register
 from ..geometry.grid import common_grid_size
@@ -335,22 +336,10 @@ class PairwiseReadout(EnergyReadout, Configurable):
         the quadratic case the result is ``context.rho`` itself, not a copy.
         """
 
-        rho = context.rho
-        if rho.shape[-1] != self.n_types:
-            raise ValueError(
-                "rho must have shape [..., n_grid, n_types] with the "
-                "configured n_types"
-            )
-        if self.density_mlp is None:
-            return rho
-        inputs = (
-            context.pointwise_state() if self.density_temperature
-            else context.normalized_rho()
+        return density_fields(
+            context, self.n_types, self.density_mlp, self.density_channels,
+            self.density_temperature,
         )
-        coefficients = self.density_mlp(inputs).reshape(
-            *rho.shape, self.density_channels,
-        )
-        return torch.sum(rho[..., None] * coefficients, dim=-2)
 
     def shell_kernel_values(
         self,

@@ -336,6 +336,50 @@ adopting FFT for a new dtype, device, grid, or model family. Performance also
 depends on grid size and runtime: benchmark the complete workload rather than
 assuming the large-grid speedup transfers to a small model.
 
+## Local density-dependent Gaussian readouts
+
+Gaussian reciprocal kernels can convolve nonlinear local density fields,
+using the same endpoint transformation as `PairwiseReadout`:
+
+```python
+gaussian = LongRangeReadout(
+    features=ReciprocalFeatures(
+        radial_exponents=(0.25, 0.5, 1.0, 2.0),
+        kernel="gaussian", n_types=n_species,
+    ),
+    density_channels=4,
+    density_hidden_sizes=(16, 16),
+    density_temperature=False,
+)
+```
+
+At each voxel the density MLP constructs
+`f_a = sum_i rho_i A_ia(rho / mean_density)`. It reads all local species;
+`mean_density` is the containing model's fixed normalization. Setting
+`density_temperature=True` also supplies `T / mean_T` to this MLP. Physical
+rho multiplies the learned mapping, so every source vanishes in vacuum.
+
+The coefficient MLP reads only `T / mean_T` and returns a symmetric matrix
+per Gaussian kernel in the transformed channels. For `M=density_channels`,
+there are `M*(M+1)/2` unique pairs per kernel, regardless of the physical
+species count. The energy is the usual continuum-normalized spectral
+quadratic form in **f**, not in physical rho. All density derivatives include
+derivatives of the local mapping.
+
+The spatial mean is removed **after** transforming rho to f, and the scalar
+Gaussian kernel still has `k=0` exactly zero. Thus this branch contributes no
+homogeneous free energy or homogeneous-mode curvature, but its finite-k
+response can depend on density. Gaussian same-voxel coupling is unchanged;
+it does not adopt the finite-range pairwise readout's excluded self offset.
+Signed coefficients do not guarantee positive curvature.
+
+The option is restricted to scalar Gaussian density kernels: it does not
+transform fixed physical charges or direct polarization. With
+`density_channels=None` (the default), existing global-state dependence,
+parameter shapes and saved configurations are unchanged. `zero_init=True`
+zeros the coefficient head only, so the added branch initially contributes
+zero energy and density derivatives while remaining trainable.
+
 ## Charge-factorized reciprocal readouts
 
 `LongRangeReadout` can constrain pair coefficients to a known charge-product
