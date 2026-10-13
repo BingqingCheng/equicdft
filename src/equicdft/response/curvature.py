@@ -793,10 +793,18 @@ def _polarization_excess_energy_difference(
     )
 
 
-def _energy_only_model(model, batch):
+def _energy_only_model(model, batch, *, bulk_second_variation=False):
     """Evaluate energy without optional response derivatives."""
 
     kwargs = {"compute_c1": False}
+    if bulk_second_variation:
+        # A subclass may override forward with the old signature. Only the
+        # known implementation (including inherited, unmodified forwards)
+        # receives the optional shortcut; generic/custom models keep their
+        # exact existing evaluation path.
+        from ..model import GridCACEModel
+        if getattr(model.forward, "__func__", None) is GridCACEModel.forward:
+            kwargs["bulk_second_variation"] = True
     if hasattr(model, "voxel_weights"):
         kwargs["use_voxel_mask"] = False
     if hasattr(model, "compute_local_mu"):

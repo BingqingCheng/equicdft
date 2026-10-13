@@ -83,6 +83,10 @@ class ReadoutContext:
     local_energy_mask
         Optional Boolean selection shaped like rho. Selects ideal/LDA/CACE
         energy centers, never descriptor inputs or long-range source fields.
+    bulk_second_variation
+        Internal per-call unpolarized energy surrogate for bulk Hessians.
+        Preserves second variations and parameter gradients, not fourth-order
+        field derivatives. Never used by finite-P fields or stability probes.
     local_density_index, grid_positions, grid_center, excluded_mask
         Grid geometry passed through from the batch when available.
     metal_external_field
@@ -117,6 +121,8 @@ class ReadoutContext:
     local_energy_mask: Optional[torch.Tensor] = None
     msa_reference_region_mask: Optional[torch.Tensor] = None
     msa_reference_composition: Optional[torch.Tensor] = None
+    # Per-call second-order surrogate, never a configuration/model setting.
+    bulk_second_variation: bool = False
     _cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, init=False, repr=False,
     )

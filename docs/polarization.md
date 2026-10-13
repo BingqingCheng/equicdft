@@ -767,6 +767,13 @@ $\rho$, a density–polarization coupling at finite $\mathbf P$ (at fixed
 $\mathbf P$ a denser voxel is less aligned). Above $u=1-\sqrt{\epsilon}$ the
 weights are held at that alignment.
 
+The inverse Langevin function retains its twelve Newton refinement steps for
+the value, but differentiates the defining equation implicitly,
+`dx/du = 1/L'(x)`, instead of retaining the Newton-iteration graph. Its
+higher-order reverse derivatives and forward/batched automatic-differentiation
+transforms are supported. This changes evaluation cost, not the functional,
+the root values, the alignment clamp or the fitted parameters.
+
 ```python
 ReciprocalFeatures(
     radial_exponents=(1.0, 2.5, 8.0), kernel="gaussian", n_types=1,

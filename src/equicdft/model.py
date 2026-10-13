@@ -935,12 +935,18 @@ class GridCACEModel(nn.Module, Configurable):
         compute_ideal: Optional[bool] = None,
         compute_local_mu: Optional[bool] = None,
         use_voxel_mask: bool = False,
+        bulk_second_variation: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Return the full intrinsic free energy and requested responses.
 
         ``use_voxel_mask=True`` selects ideal/LDA/CACE energy centers using
         positive :meth:`voxel_weights`. Descriptor inputs and LR remain full.
         The default ignores fitting selections in every energy contribution.
+
+        ``bulk_second_variation=True`` is a response-evaluation shortcut at
+        exactly zero polarization. It preserves the excess energy's second
+        variation and parameter gradients, not higher field derivatives.
+        It must not be used for polarized fields or finite stability probes.
         """
 
         if (METAL_DATA_KEYS - {"metal_external_field"}) & data.keys():
@@ -949,6 +955,12 @@ class GridCACEModel(nn.Module, Configurable):
             )
 
         use_voxel_mask = boolean(use_voxel_mask, "use_voxel_mask")
+        bulk_second_variation = boolean(bulk_second_variation, "bulk_second_variation")
+        if bulk_second_variation and (
+            "dipole_density" not in data
+            or torch.any(data["dipole_density"] != 0).item()
+        ):
+            raise ValueError("bulk_second_variation requires exactly zero polarization")
         compute_local_mu = optional_boolean(compute_local_mu, "compute_local_mu")
         if compute_local_mu is None:
             compute_local_mu = self.compute_local_mu
@@ -1032,6 +1044,7 @@ class GridCACEModel(nn.Module, Configurable):
                 ),
                 dipole_magnitude=getattr(self.ideal, "dipole_magnitude", None),
             )
+            context.bulk_second_variation = bulk_second_variation
             if "beta" in data:
                 self._check_unit_contract(data["beta"], context.beta)
             rho = context.rho

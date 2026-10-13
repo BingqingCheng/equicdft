@@ -492,6 +492,8 @@ class ReciprocalFeatures(nn.Module, Configurable):
         grid_spacing: torch.Tensor,
         dipole_density: Optional[torch.Tensor] = None,
         charges: Optional[torch.Tensor] = None,
+        *,
+        bulk_second_variation: bool = False,
     ) -> torch.Tensor:
         """Return features with shape ``[..., n_kernels, n_type_pairs]``.
 
@@ -513,6 +515,11 @@ class ReciprocalFeatures(nn.Module, Configurable):
         The real spectral divergence zeros each even-axis Nyquist derivative
         component, preserving Hermitian symmetry. The radial kernel retains
         the ordinary FFT wavevectors, including Nyquist frequencies.
+
+        ``bulk_second_variation`` replaces alignment/fading by their exact
+        second-order energy surrogate at zero polarization, preserving
+        density scaling and parameter gradients. It is not a finite-P or
+        higher-order field-derivative approximation to use outside bulk response.
         """
 
         if rho.ndim < 2 or rho.shape[-1] != self.n_types:
@@ -522,6 +529,11 @@ class ReciprocalFeatures(nn.Module, Configurable):
             )
         direct_polarization = self.requires_dipole_density
         self._validate_polarization(rho, dipole_density, charges)
+        bulk_second_variation = boolean(bulk_second_variation, "bulk_second_variation")
+        if bulk_second_variation and dipole_density is not None and torch.any(
+            dipole_density != 0
+        ).item():
+            raise ValueError("bulk_second_variation requires exactly zero polarization")
         if charges is not None:
             charges = torch.as_tensor(
                 charges, dtype=rho.dtype, device=rho.device,
@@ -543,9 +555,18 @@ class ReciprocalFeatures(nn.Module, Configurable):
         if dipole_density is not None:
             if direct_polarization and (
                     self.density_exponent > 0.0 or self._alignment_dependent):
-                weight = self.density_weight(rho) * self.alignment_weight(
-                    rho, dipole_density,
-                )
+                if bulk_second_variation:
+                    # Q = w(rho) P + O(P^3), so its quadratic pair energy
+                    # differs only at O(P^4). Retain an explicit zero gradient
+                    # for the learned fading parameter (not None), including
+                    # in bulk-only optimizer updates.
+                    alignment_weight = torch.ones_like(rho)
+                    parameter = self._parameters.get("saturation_parameter")
+                    if parameter is not None:
+                        alignment_weight = alignment_weight + 0.0 * parameter.to(rho)
+                else:
+                    alignment_weight = self.alignment_weight(rho, dipole_density)
+                weight = self.density_weight(rho) * alignment_weight
                 dipole_density = dipole_density * weight[..., None]
             p_grid = dipole_density.reshape(
                 *leading_shape, nx, ny, nz, self.n_types, 3,

@@ -887,6 +887,9 @@ class LongRangeReadout(EnergyReadout, Configurable):
             source_options["dipole_density"] = context.require("dipole_density")
         if self.include_polarization:
             source_options["charges"] = self.charges
+        if (context.bulk_second_variation and type(self.features) is ReciprocalFeatures
+                and getattr(self.features.forward, "__func__", None) is ReciprocalFeatures.forward):
+            source_options["bulk_second_variation"] = True
         if self.density_channels is not None:
             reciprocal_features = self.features._density_features(
                 self.density_fields(context), context.require("grid_size"),

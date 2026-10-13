@@ -142,6 +142,7 @@ def bulk_response_symbol(
     wavevector_indices: torch.Tensor,
     *,
     create_graph: Optional[bool] = None,
+    use_fast_path: bool = True,
 ) -> torch.Tensor:
     r"""Return the ideal-normalized Hessian symbol ``K(k)`` of a bulk state.
 
@@ -165,9 +166,15 @@ def bulk_response_symbol(
     entropy of fixed dipoles) is the identity in these coordinates at zero
     polarization. ``create_graph`` (default: whether gradients are enabled)
     keeps the result differentiable with respect to the model parameters.
+    ``use_fast_path=False`` disables exact unpolarized second-variation
+    shortcuts for reference comparisons. Supported models skip nonlinear
+    reciprocal transformations whose energy starts at fourth order in P;
+    ordinary finite-P evaluations and finite-difference probes are unaffected.
     """
 
     rho, polarization = _validated_bulk_state(batch)
+    if not isinstance(use_fast_path, bool):
+        raise TypeError("use_fast_path must be Boolean")
     n_fields, n_grid, n_types = rho.shape
     if (
         not torch.is_tensor(wavevector_indices)
@@ -195,7 +202,9 @@ def bulk_response_symbol(
             density = rho[field:field + 1].detach().clone().requires_grad_(True)
             dipoles = polarization[field:field + 1].detach().clone().requires_grad_(True)
             single["rho"], single["dipole_density"] = density, dipoles
-            energy = _energy_only_model(model, single)["beta_F_exc"].sum()
+            energy = _energy_only_model(
+                model, single, bulk_second_variation=use_fast_path,
+            )["beta_F_exc"].sum()
             # An excess that does not depend on rho or P (ideal-only or
             # density-only models) contributes exact zeros, not an error.
             first_rho, first_pol = (

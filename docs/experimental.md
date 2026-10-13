@@ -1249,6 +1249,18 @@ Brillouin zone, as `reduce_bulk_symbol` takes the lattice indices as given;
 bulk response constrains the homogeneous unpolarized state only, and
 polarized and dense states still need the stability probes.
 
+For the unpolarized Hessian, `bulk_response_symbol` uses an exact
+second-variation shortcut for built-in reciprocal polarization features:
+alignment scaling and Gaussian fading are replaced by one, while density
+scaling and learned coefficients remain in the graph. Their source is
+`Q = w(rho) P + O(P^3)`, so the omitted energy starts at fourth order in P.
+The symbol and its parameter gradients, including an explicit zero gradient
+for the fading exponent, are unchanged. `use_fast_path=False` provides the
+full evaluation for regression comparisons. This per-call path has no
+configuration or checkpoint state, rejects nonzero polarization, and is
+never used by finite-P field losses or finite stability probes. Custom model
+forwards and custom reciprocal-feature subclasses retain the generic path.
+
 ## Joint field and response training
 
 `TrainingStream` keeps different datasets, losses, metrics, and model-forward

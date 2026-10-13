@@ -68,15 +68,54 @@ def log_sinhc(x):
     return torch.where(x.abs() < 0.1, series, regular)
 
 
+class _InverseLangevin(torch.autograd.Function):
+    """Solve the scalar inverse, differentiating its defining equation.
+
+    The root value uses the same twelve Newton steps as the original
+    implementation.  Saving the *output*, rather than a detached Newton
+    intermediate, keeps implicit derivatives differentiable for Hessians and
+    their parameter gradients without retaining the iteration graph.
+    """
+
+    @staticmethod
+    def forward(p):
+        if not torch.isfinite(p).all() or torch.any(p.abs() >= 1):
+            raise ValueError("inverse Langevin requires finite |p| < 1")
+        # Refine the rational estimate; do not replace the inverse with it.
+        x = p * (3 - p.square()) / (1 - p.square())
+        for _ in range(12):
+            x = x - (langevin(x) - p) / _langevin_prime(x)
+        return x
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(output)
+        ctx.save_for_forward(output)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (x,) = ctx.saved_tensors
+        return gradient / _langevin_prime(x)
+
+    @staticmethod
+    def jvp(ctx, tangent):
+        (x,) = ctx.saved_tensors
+        return tangent / _langevin_prime(x)
+
+    @staticmethod
+    def vmap(info, in_dims, p):
+        # The inverse is elementwise.  Applying it to the full explicit batch
+        # also leaves the domain check outside vmap's data-dependent branching.
+        return _InverseLangevin.apply(p), in_dims[0]
+
+
 def inverse_langevin(p):
-    """Differentiable inverse on -1 < p < 1; Newton solves the actual L."""
-    if not torch.isfinite(p).all() or torch.any(p.abs() >= 1):
-        raise ValueError("inverse Langevin requires finite |p| < 1")
-    # A rational initial estimate, refined rather than used as an approximation.
-    x = p * (3 - p.square()) / (1 - p.square())
-    for _ in range(12):
-        x = x - (langevin(x) - p) / _langevin_prime(x)
-    return x
+    """Differentiable inverse on -1 < p < 1; Newton solves the actual L.
+
+    Derivatives follow ``dx/dp = 1/L'(x)`` implicitly, including higher-order
+    reverse derivatives and ``torch.func`` forward/batched transforms.
+    """
+    return _InverseLangevin.apply(p)
 
 
 def dipole_alignment(vector):
