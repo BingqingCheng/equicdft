@@ -346,3 +346,13 @@ are saved in the model file.
 number, so a schedule that introduces a regularizer gradually needs no custom
 loop. With `record_initial_validation=True` the epoch-zero pass evaluates
 those callables at zero.
+
+## Input fields of a batch
+
+Besides `rho`, `dipole_density`, `V_ext`, `E_ext` and the geometry, a batch
+may carry `rho_std` and `dipole_density_std` (per-voxel sampling errors, used
+by the [case weights](#per-case-loss-weights-from-signal-and-noise)) and
+`laplacian_phi_ext`, the Laplacian of the applied electrostatic potential at
+the voxel centres, required by a model with `second_moment` set (see the
+[model guide](model.md#quadrupole-trace-coupling-to-the-applied-potential)).
+Unknown keys pass through the loaders untouched.

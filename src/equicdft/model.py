@@ -220,6 +220,41 @@ def _resolve_n_types(
     return n_types
 
 
+# Batch key of the Laplacian of the applied electrostatic potential, and the
+# private key under which a batch resolved by ``resolve_external_potential``
+# keeps the number-only potential. The marker is private on purpose: public
+# names such as the products' ``V_ext_number`` column must never switch the
+# coupling off when a loader happens to carry them.
+LAPLACIAN_KEY = "laplacian_phi_ext"
+EXTERNAL_NUMBER_KEY = "_V_ext_number"
+
+
+def _second_moment_tensor(value, n_types):
+    """Validate the per-species quadrupole trace; ``None`` keeps it off."""
+
+    if value is None:
+        return None
+    raw = torch.as_tensor(value)
+    if raw.is_complex() or raw.dtype == torch.bool:
+        raise ValueError("second_moment must be real")
+    tensor = raw.to(torch.get_default_dtype()).detach().clone().reshape(-1)
+    if tensor.numel() == 1:
+        tensor = tensor.repeat(n_types)
+    if tensor.shape != (n_types,):
+        raise ValueError("second_moment must be a scalar or one value per type")
+    if not torch.isfinite(tensor).all():
+        raise ValueError("second_moment must be finite")
+    return tensor
+
+
+def _second_moment_config(value):
+    if value is None:
+        return None
+    if value.numel() == 1:
+        return scalar_value(value)
+    return [float(item) for item in value.detach().cpu().tolist()]
+
+
 @register
 class GridCACEModel(nn.Module, Configurable):
     """Combine free-energy readouts and differentiate their scalar sum.
@@ -306,6 +341,22 @@ class GridCACEModel(nn.Module, Configurable):
     explicit weights are supplied. See :meth:`voxel_weights`.
     These are fitting diagnostics, not extra intrinsic energy terms; V_ext
     and a full ideal reference are required only when requesting them.
+
+    ``second_moment`` switches on the quadrupole-trace coupling of a
+    molecular species to the external electrostatic potential. For a rigid
+    molecule with charges ``q_a`` at displacements ``d_a`` from the site the
+    density is binned on, the orientation-independent part of its energy in
+    ``phi_ext`` beyond the dipole term is ``(Tr M / 6) laplacian(phi_ext)``
+    with ``Tr M = sum_a q_a |d_a|^2`` (SPC/E about the oxygen: 0.8476 e A^2).
+    The value is one trace per species in ``e * length^2`` (potential units
+    per ``e`` times length squared give the energy units of ``V_ext``). With
+    it set, every use of the external number potential, the chemical-potential
+    diagnostic here and the solver objectives, adds ``second_moment / 6``
+    times ``data["laplacian_phi_ext"]`` (``[..., n_grid, 1]`` or ``[...,
+    n_grid, n_types]``, the Laplacian of the applied potential at the voxel
+    centres) to ``V_ext``; see :meth:`external_potential`. The learned
+    functional and the second variation are unchanged, since the term is
+    linear in the density.
     """
 
     def __init__(
@@ -335,6 +386,7 @@ class GridCACEModel(nn.Module, Configurable):
         polarization_scale: Optional[Union[float, torch.Tensor]] = None,
         alignment_scale: Optional[Union[float, torch.Tensor]] = None,
         alignment_density_floor: Optional[Union[float, torch.Tensor]] = None,
+        second_moment: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
     ) -> None:
         super().__init__()
 
@@ -493,6 +545,12 @@ class GridCACEModel(nn.Module, Configurable):
             "boltzmann_constant",
             boltzmann_constant_tensor,
         )
+        # Fixed physics, recorded in the configuration rather than the state.
+        self.register_buffer(
+            "second_moment",
+            _second_moment_tensor(second_moment, self._n_types),
+            persistent=False,
+        )
         # The ideal reference validated its own constants in its constructor.
         # A default one built from this model's ``thermal_wavelength`` is
         # widened to one value per component, which is the shape model files
@@ -552,6 +610,9 @@ class GridCACEModel(nn.Module, Configurable):
             alignment_density_floor=(
                 None if self.alignment_density_floor is None
                 else scalar_value(self.alignment_density_floor)
+            ),
+            second_moment=_second_moment_config(
+                self._buffers.get("second_moment")
             ),
         )
 
@@ -779,10 +840,67 @@ class GridCACEModel(nn.Module, Configurable):
             weights = weights.masked_fill(~active[..., None], 0.)
         return weights
 
+    def external_potential(self, data: Mapping[str, Any]) -> torch.Tensor:
+        """Return the external number potential the functional couples to.
+
+        This is ``data["V_ext"]`` plus, when ``second_moment`` is set, the
+        quadrupole-trace term ``second_moment / 6 * data["laplacian_phi_ext"]``.
+        A batch resolved by :meth:`resolve_external_potential` (marked by the
+        private ``_V_ext_number`` entry it adds) is returned as it is, so the
+        term is never added twice; any public key, including a product's
+        ``V_ext_number`` column, leaves the coupling on.
+        """
+
+        potential = data["V_ext"]
+        moment = self._buffers.get("second_moment") if hasattr(self, "_buffers") else None
+        if moment is None or EXTERNAL_NUMBER_KEY in data:
+            return potential
+        if LAPLACIAN_KEY not in data:
+            raise ValueError(
+                "second_moment coupling requires data['{}'], the Laplacian of the "
+                "applied electrostatic potential at the voxel centres (zero for a "
+                "uniform field)".format(LAPLACIAN_KEY)
+            )
+        laplacian = data[LAPLACIAN_KEY]
+        if not torch.is_tensor(potential) or not potential.is_floating_point():
+            raise ValueError("V_ext must be a floating tensor")
+        if (not torch.is_tensor(laplacian) or not laplacian.is_floating_point()
+                or laplacian.ndim != potential.ndim
+                or laplacian.shape[:-1] != potential.shape[:-1]
+                or laplacian.shape[-1] not in (1, potential.shape[-1])):
+            raise ValueError(
+                "{} must be floating with V_ext's field/grid shape and one or "
+                "n_types trailing values".format(LAPLACIAN_KEY)
+            )
+        laplacian = laplacian.to(potential)
+        if not torch.isfinite(laplacian).all():
+            raise ValueError(LAPLACIAN_KEY + " must be finite")
+        return potential + (moment.to(potential) / 6.0) * laplacian
+
+    def resolve_external_potential(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return ``data`` with ``V_ext`` replaced by :meth:`external_potential`.
+
+        The number-only potential is kept under the private ``_V_ext_number``
+        entry, which also marks the batch as resolved; a batch that already
+        carries it, or a model without ``second_moment``, is returned
+        unchanged. Solvers call this once on their inputs so the objective,
+        the residuals and the recorded ``V_ext`` all include the
+        quadrupole-trace term.
+        """
+
+        moment = self._buffers.get("second_moment") if hasattr(self, "_buffers") else None
+        if moment is None or "V_ext" not in data or EXTERNAL_NUMBER_KEY in data:
+            return data
+        effective = self.external_potential(data)
+        resolved = dict(data)
+        resolved[EXTERNAL_NUMBER_KEY] = data["V_ext"]
+        resolved["V_ext"] = effective
+        return resolved
+
     def _chemical_potential_outputs(self, data, outputs, beta):
         """Add beta mu = delta(beta F)/delta rho + beta V and its spatial mean."""
         rho = data["rho"]
-        potential = data["V_ext"]
+        potential = self.external_potential(data)
         if (not torch.is_tensor(potential) or potential.shape != rho.shape
                 or not potential.is_floating_point()):
             raise ValueError("V_ext must be floating with rho's shape")

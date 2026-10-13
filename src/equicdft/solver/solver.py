@@ -557,4 +557,8 @@ class GridSolver:
         )
 
     def _move_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return move_batch(data, self.device, self._geometry_cache)
+        moved = move_batch(data, self.device, self._geometry_cache)
+        # A model with a quadrupole-trace coupling folds it into V_ext once,
+        # so every objective, residual and recorded potential includes it.
+        resolve = getattr(self.model, "resolve_external_potential", None)
+        return moved if resolve is None else resolve(moved)

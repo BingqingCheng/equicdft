@@ -223,3 +223,44 @@ require a package version that knows `CACEBranch`.
 The joint branch also contains pure-density invariants. This decomposition
 does **not** enforce `F_joint(rho, 0) = 0` and is not a unique separation of
 physical contributions; only the total energy and its derivatives are fitted.
+
+## Quadrupole-trace coupling to the applied potential
+
+A point-dipole model couples its molecules to an applied electrostatic
+potential through `-P . E_ext` only. A real rigid molecule carries its
+charges at finite displacements `d_a` from the site the density is binned
+on, and the orientation-independent part of its energy beyond the dipole
+term is
+
+    (Tr M / 6) laplacian(phi_ext),   Tr M = sum_a q_a |d_a|^2,
+
+the trace of the second charge moment (SPC/E about the oxygen: 0.8476 e A^2).
+It depends on where the molecule is, not on how it points, so it is a number
+potential: `V_ext,total = V_ext + (Tr M / 6) laplacian(phi_ext)`. For the
+potentials used in MD training sets (Gaussians of width 1.5-3 A, sinusoids)
+this term is 5-20 % of the dipole coupling and dominates the density response
+of strongly charge-coupled cases; it is also the Bethe-potential physics of a
+water interface.
+
+`GridCACEModel(second_moment=...)` switches it on, with one trace per species
+in `e * length^2`. The batch must then carry `laplacian_phi_ext`, the
+Laplacian of the applied potential at the voxel centres with shape
+`[..., n_grid, 1]` or `[..., n_grid, n_types]` (zero for a uniform field).
+`model.external_potential(data)` returns the effective potential; it feeds
+the chemical-potential diagnostic `beta_mu_local`, and `GridSolver`
+resolves it once on its inputs (`model.resolve_external_potential`, which
+keeps the number-only potential under the private `_V_ext_number` entry
+that also marks the batch as resolved), so objectives, residuals and the
+recorded `V_ext` all include the term. No public batch key switches the
+coupling off; a loader may carry the products' `V_ext_number` column. The learned
+functional and its second variation are unchanged: the term is linear in the
+density. Store the analytic Laplacian in the data products; for band-limited
+potentials `equicdft.geometry.spectral.spectral_laplacian` differentiates a
+sampled potential exactly, but a Gaussian narrower than the grid spacing is
+not band-limited and should be differentiated analytically.
+
+With the coupling on, the bulk-response targets for the learned part are the
+responses to the dipole and traceless-quadrupole couplings only: compute them
+from the site charge density with the trace part removed,
+`rho_q(k) + (k^2 Tr M / 6) n(k)`, rather than from the full charge density.
+Without it, use the full site-charge cross spectra; see `docs/polarization.md`.
