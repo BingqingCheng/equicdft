@@ -705,6 +705,81 @@ ReciprocalFeatures(
 The default `density_exponent=0` keeps the density-independent kernel and
 every existing model.
 
+#### Alignment dependence of the cooperative excess
+
+The bulk linear response fixes the kernel at $\mathbf P=0$: a transverse
+excess of about $-0.7$ ideal units ($g_K\approx3.6$) and a longitudinal one
+growing with $k$. A kernel quadratic in $\mathbf P$ keeps that excess at
+every alignment, while the exact Langevin ideal term supplies the
+single-dipole saturation. The uniform-field SPC/E cases (v10, tin-foil
+boundaries, so a uniform polarization costs no Coulomb energy) measure the
+excess directly: with $u$ the alignment reached under $E_{\mathrm{ext}}$,
+
+$$
+A_{\mathrm{eff}}(u)=\frac{\beta mE_{\mathrm{ext}}-L^{-1}(u)}{3u}
+$$
+
+is the effective $k=0$ excess per unit of the ideal stiffness. It is
+$-0.73$ at $u\le0.2$ (the Kirkwood value), $-0.78$ at $u=0.31$, $-0.82$ at
+$0.44$, $-0.90$ at $0.58$ and $-1.15$ at $0.78$: the cooperative softening
+grows with alignment rather than fading, and up to $u\approx0.5$ it grows
+exactly like the ideal secant $L^{-1}(u)/(3u)$, i.e. the orientational free
+energy of the liquid is $(1-1/g_K)$ times smaller than the ideal one at every
+alignment, the Kirkwood "super-dipole" picture. Beyond $u\approx0.5$ the
+ratio to that picture falls (0.95 at $0.58$, 0.81 at $0.78$). A quadratic
+kernel reproduces none of this: at $u=0.78$ it supplies $-0.72$ where the
+data need $-1.15$, which is why fits under-respond to strong uniform fields.
+
+`alignment_scaling="ideal"` applies the kernels to
+
+$$
+\mathbf Q_a=c(u_a)\left(\frac{\rho_{\mathrm{ref},a}}{\tilde\rho_a}\right)^{\gamma}\mathbf P_a,
+\qquad u_a=\frac{|\mathbf P_a|}{m_a\tilde\rho_a},
+\qquad c(u)^2=\frac{2f_{\mathrm{id}}(u)}{3u^2},
+$$
+
+with $f_{\mathrm{id}}(u)=uL^{-1}(u)-\ln[\sinh L^{-1}(u)/L^{-1}(u)]$ the
+Langevin free energy per molecule, so $c\to1$ at $u\to0$ and the kernel
+energy at $k=0$ is $A\,\rho f_{\mathrm{id}}(u)$ instead of
+$\tfrac12AK_{\mathrm{ideal}}P^2$: the kernel's contribution to the
+polarization derivative is $A\,L^{-1}(u)/m$, $A$ times the ideal's, at every
+alignment, in both the longitudinal and the transverse direction. This is
+parameter-free and matches the uniform-field data to $u\approx0.5$.
+`saturation="gaussian"` multiplies $\mathbf Q$ by $s(u)$,
+$s(u)^2=e^{-au^2}$, with one learned exponent $a=\mathrm{softplus}(\theta)>0$
+per `ReciprocalFeatures` (`saturation_initial` sets its start; $\theta$ is
+fitted state in the state dict) for the fading beyond $u\approx0.5$; on its
+own, with the quadratic kernel, it only weakens the excess with alignment,
+the opposite of what the data show. Both options depend on $u^2$ only, so the
+second variation at $\mathbf P=0$, and with it S(k), $g_K$ and the transverse
+floor at the unpolarized state, is unchanged; only polarized states pin
+them. At a uniform alignment $u$ with weight $w(u)=c(u)s(u)$ a vector
+coefficient contributes
+
+$$
+K_T^{\mathrm{kernel}}=A(k)\,w^2+A(0)\,u\,w\,w',\qquad
+K_L^{\mathrm{kernel}}=A(k)\,(w+uw')^2+A(0)\left(2u\,w\,w'+u^2w\,w''\right),
+$$
+
+which for the Gaussian factor alone gives $A e^{-au^2}(1-au^2)$ and
+$Ae^{-au^2}(1-5au^2+2a^2u^4)$ at $k\to0$. Through $u$ the features depend on
+$\rho$, a density–polarization coupling at finite $\mathbf P$ (at fixed
+$\mathbf P$ a denser voxel is less aligned). Above $u=1-\sqrt{\epsilon}$ the
+weights are held at that alignment.
+
+```python
+ReciprocalFeatures(
+    radial_exponents=(1.0, 2.5, 8.0), kernel="gaussian", n_types=1,
+    variable="dipole_density", include_divergence=True,
+    density_exponent=0.5, reference_density=rho_ref, density_floor=1.0e-3,
+    alignment_scaling="ideal", saturation="gaussian", saturation_initial=0.3,
+    dipole_magnitude=m,
+)
+```
+
+Both default to off, which keeps the quadratic kernel and every existing
+model.
+
 ### Density-only use of the same API
 
 This independent helper accepts the same physical Gaussian widths and species

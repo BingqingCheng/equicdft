@@ -146,6 +146,22 @@ class _CoulombEvaluation(NamedTuple):
         return potential[0]
 
 
+def _ideal_alignment_weight_squared(square: torch.Tensor) -> torch.Tensor:
+    """Return ``2 f_id(u) / (3 u^2)`` from ``u^2``, the Langevin free energy per molecule
+    relative to its quadratic part; one at ``u = 0``, held fixed above ``1 - sqrt(eps)``."""
+
+    from .polarization_ideal import inverse_langevin, log_sinhc
+
+    limit = (1.0 - math.sqrt(torch.finfo(square.dtype).eps)) ** 2
+    clamped = square.clamp(max=limit)
+    series = 1 + 0.3 * clamped + 99 / 525 * clamped ** 2 + 1539 / 10500 * clamped ** 3
+    safe = clamped.clamp_min(1e-6)
+    u = safe.sqrt()
+    x = inverse_langevin(u)
+    exact = 2 * (x * u - log_sinhc(x)) / (3 * safe)
+    return torch.where(clamped < 1e-6, series, exact)
+
+
 @register
 class ReciprocalFeatures(nn.Module, Configurable):
     r"""Contract scalar or vector Fourier fields against fixed radial kernels.
@@ -237,7 +253,39 @@ class ReciprocalFeatures(nn.Module, Configurable):
         Nonnegative ``rho_floor`` regularizing ``rho~`` in dilute voxels
         (``Q`` vanishes there with ``P``; the floor only keeps the weight and
         its derivative finite). Required to be positive when
-        ``density_exponent > 0``.
+        ``density_exponent > 0`` or ``saturation`` is set.
+    alignment_scaling
+        Direct polarization only. ``None`` (default) keeps the kernels
+        quadratic in ``P``. ``"ideal"`` lets the cooperative excess grow with
+        the local alignment like the orientational ideal free energy: the
+        kernels act on ``Q_a = c(u_a) (rho_ref/rho~_a)^gamma P_a`` with
+        ``u_a = |P_a| / (m_a rho~_a)`` and ``c(u)^2 = 2 f_id(u) / (3 u^2)``,
+        ``f_id(u) = u L^-1(u) - ln[sinh(L^-1(u)) / L^-1(u)]`` the Langevin
+        free energy per molecule (``c -> 1`` as ``u -> 0``). At ``k = 0`` a
+        coefficient ``A`` then contributes ``A`` times the ideal orientational
+        Hessian at every alignment, i.e. the orientational free energy is
+        ``(1 + A)`` times the ideal one (``1 / g_K`` for water), which is what
+        the uniform-field SPC/E responses show up to ``u ~ 0.5``. The second
+        variation at ``P = 0`` (S(k), g_K) is unchanged.
+    saturation
+        Direct polarization only. ``"gaussian"`` multiplies ``Q`` by
+        ``s(u)``, ``s(u)^2 = exp(-a u^2)``, with a learned exponent
+        ``a = softplus(saturation_parameter) > 0``: a fading of the excess
+        with alignment, on its own or on top of ``alignment_scaling``. The
+        second variation at ``P = 0`` is unchanged for any ``a``; at a
+        uniform alignment ``u`` and ``k -> 0`` a vector coefficient ``A``
+        alone contributes the transverse stiffness
+        ``A exp(-a u^2)(1 - a u^2)`` and the longitudinal one
+        ``A exp(-a u^2)(1 - 5 a u^2 + 2 a^2 u^4)``. Both options make the
+        features depend on ``rho`` through ``u`` (a density-polarization
+        coupling at finite ``P``); with ``u`` above ``1 - sqrt(eps)`` the
+        weights are held at that alignment.
+    saturation_initial
+        Initial value of the exponent ``a`` (positive). The quadratic kernel
+        is recovered as ``a -> 0``.
+    dipole_magnitude
+        Molecular dipole ``m_a`` defining the alignment, one value or one per
+        type. Required with ``alignment_scaling`` or ``saturation``.
     """
 
     _KERNELS = (
@@ -258,6 +306,10 @@ class ReciprocalFeatures(nn.Module, Configurable):
         density_exponent: float = 0.0,
         reference_density: Optional[Union[float, Sequence[float]]] = None,
         density_floor: float = 0.0,
+        alignment_scaling: Optional[str] = None,
+        saturation: Optional[str] = None,
+        saturation_initial: float = 1.0,
+        dipole_magnitude: Optional[Union[float, Sequence[float]]] = None,
     ) -> None:
         super().__init__()
 
@@ -349,6 +401,53 @@ class ReciprocalFeatures(nn.Module, Configurable):
         # dict so existing checkpoints load unchanged.
         self.register_buffer("reference_density", reference, persistent=False)
 
+        if saturation is not None and saturation != "gaussian":
+            raise ValueError("saturation must be None or 'gaussian'")
+        if alignment_scaling is not None and alignment_scaling != "ideal":
+            raise ValueError("alignment_scaling must be None or 'ideal'")
+        moment = None
+        if saturation is not None or alignment_scaling is not None:
+            if variable != "dipole_density":
+                raise ValueError(
+                    "alignment_scaling and saturation require direct polarization features"
+                )
+            if density_floor <= 0.0:
+                raise ValueError(
+                    "alignment_scaling and saturation require a positive density_floor"
+                )
+            if dipole_magnitude is None:
+                raise ValueError("alignment_scaling and saturation require dipole_magnitude")
+            moment = torch.as_tensor(
+                dipole_magnitude, dtype=torch.get_default_dtype(),
+            ).detach().clone().reshape(-1)
+            if moment.numel() == 1:
+                moment = moment.repeat(n_types)
+            if moment.numel() != n_types or not bool(
+                torch.isfinite(moment).all() and (moment > 0).all()
+            ):
+                raise ValueError(
+                    "dipole_magnitude must contain one positive value or one per type"
+                )
+        elif dipole_magnitude is not None:
+            raise ValueError("dipole_magnitude requires alignment_scaling or saturation")
+        if saturation is not None:
+            saturation_initial = finite_scalar(saturation_initial, "saturation_initial")
+            if saturation_initial <= 0.0:
+                raise ValueError("saturation_initial must be positive")
+        self.alignment_scaling = alignment_scaling
+        self.saturation = saturation
+        self.saturation_initial = float(saturation_initial) if saturation else None
+        self.register_buffer("dipole_magnitude", moment, persistent=False)
+        if saturation is not None:
+            # a = softplus(parameter) stays positive; the raw value is the
+            # fitted state and lives in the state dict.
+            self.saturation_parameter = nn.Parameter(torch.tensor(
+                math.log(math.expm1(saturation_initial)),
+                dtype=torch.get_default_dtype(),
+            ))
+        else:
+            self.saturation_parameter = None
+
     @property
     def requires_dipole_density(self) -> bool:
         return self.variable == "dipole_density"
@@ -370,7 +469,21 @@ class ReciprocalFeatures(nn.Module, Configurable):
                 else self.reference_density
             ),
             density_floor=self.density_floor,
+            # getattr: objects pickled before these options existed carry none.
+            alignment_scaling=getattr(self, "alignment_scaling", None),
+            saturation=getattr(self, "saturation", None),
+            saturation_initial=getattr(self, "saturation_initial", None),
+            dipole_magnitude=self._buffers.get("dipole_magnitude"),
         )
+
+    @property
+    def saturation_exponent(self) -> Optional[torch.Tensor]:
+        """Return the current exponent ``a`` (``None`` without saturation)."""
+
+        parameter = self._parameters.get("saturation_parameter")
+        if parameter is None:
+            return None
+        return torch.nn.functional.softplus(parameter)
 
     def forward(
         self,
@@ -428,8 +541,12 @@ class ReciprocalFeatures(nn.Module, Configurable):
         volume = volume_element * float(nx * ny * nz)
         polarization_hat = None
         if dipole_density is not None:
-            if direct_polarization and self.density_exponent > 0.0:
-                dipole_density = dipole_density * self.density_weight(rho)[..., None]
+            if direct_polarization and (
+                    self.density_exponent > 0.0 or self._alignment_dependent):
+                weight = self.density_weight(rho) * self.alignment_weight(
+                    rho, dipole_density,
+                )
+                dipole_density = dipole_density * weight[..., None]
             p_grid = dipole_density.reshape(
                 *leading_shape, nx, ny, nz, self.n_types, 3,
             )
@@ -501,6 +618,37 @@ class ReciprocalFeatures(nn.Module, Configurable):
         reference = self.reference_density.to(rho)
         regularized = torch.sqrt(rho.square() + self.density_floor ** 2)
         return (reference / regularized) ** self.density_exponent
+
+    @property
+    def _alignment_dependent(self) -> bool:
+        return (getattr(self, "alignment_scaling", None) is not None
+                or getattr(self, "saturation", None) is not None)
+
+    def alignment_weight(
+        self,
+        rho: torch.Tensor,
+        dipole_density: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``c(u) s(u)`` per voxel and type (ones without the options).
+
+        ``c(u)^2 = 2 f_id(u) / (3 u^2)`` for ``alignment_scaling="ideal"`` and
+        ``s(u)^2 = exp(-a u^2)`` for ``saturation="gaussian"``; both are
+        functions of ``u^2`` and equal one at ``P = 0``.
+        """
+
+        if not self._alignment_dependent:
+            return torch.ones_like(rho)
+        regularized = torch.sqrt(rho.square() + self.density_floor ** 2)
+        moment = self.dipole_magnitude.to(rho)
+        square = dipole_density.square().sum(dim=-1) / (moment * regularized).square()
+        weight_squared = torch.ones_like(square)
+        if getattr(self, "alignment_scaling", None) == "ideal":
+            weight_squared = weight_squared * _ideal_alignment_weight_squared(square)
+        if getattr(self, "saturation", None) is not None:
+            weight_squared = weight_squared * torch.exp(
+                -self.saturation_exponent.to(rho) * square
+            )
+        return weight_squared.sqrt()
 
     def _pair_features(self, fourier_source, kernels, volume):
         """Contract ``[..., nx, ny, nz, n_channels, n_vector]`` pair spectra."""
