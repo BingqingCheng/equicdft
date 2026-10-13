@@ -1214,16 +1214,40 @@ bulk_response = BulkResponseLoss(
     zero_wavevector_key="response_gk",                     # [field, n, n] (optional)
     zero_wavevector_sem_key="response_gk_sem",
     relative_floor=0.02,
+    window="ngp",  # point-particle reference spectra, nearest-grid-point training fields
     weight=1.0,  # relative to the data loss; tune per campaign
 )
 ```
 
-The reference should be computed from simulation frames binned exactly as
-the training fields are: a voxel functional reproduces the spectra of
-voxel-averaged fields, including the assignment window and aliasing, not the
-point-particle spectra. Without that, use only wavevectors well below the
-grid's Nyquist limit. Bulk response constrains the homogeneous unpolarized
-state only; polarized and dense states still need the stability probes.
+The training fields are point particles binned to the voxels (nearest grid
+point), and the model is driven by potentials sampled at the voxel centres.
+The linear response of such a binned field to a smooth perturbation at
+$\mathbf k$ is the point-particle response times the assignment window
+
+$$
+W(\mathbf k) = \prod_i \frac{\sin(k_i h_i/2)}{k_i h_i/2}
+= \prod_i \mathrm{sinc}\!\left(\frac{\pi n_i}{N_i}\right),
+$$
+
+the same factor on every channel ($W(0) = 1$; $2/\pi$ on an axis at the
+Nyquist index). This is the response, not the fluctuation spectrum of the
+binned field, which also contains the folded (aliased) high-$k$ structure and
+is not what a grid functional reproduces. With `window="ngp"` the loss
+multiplies each member's symbol by $W(\mathbf k_m)$ (divides its spectrum by
+$W$) before the bin average, so simulation spectra of the point particles are
+used as they are; because the factor is applied per member, bins may mix
+lattice vectors with different $W$ (`equicdft.response.bulk.ngp_window`
+evaluates it). On a 2 Å grid $W$ is 0.994 at $k = 0.2$ Å⁻¹, 0.914 at
+0.73 Å⁻¹ and 0.637 at the axis Nyquist. The binned fields respond with
+$W S$, so a model fitted to the unwindowed point spectrum $S$ is softer than
+its own training fields by $1/W - 1$ (0.6 %, 9 % and 57 % at those
+wavevectors), and the window asks the model for a curvature $1/W$ times the
+point value instead. Do not also multiply the delivered reference by $W$;
+doing that in place of the option is exact only when all members of a bin
+share one $W$ (a cubic orbit). Keep the compared wavevectors inside the first
+Brillouin zone, as `reduce_bulk_symbol` takes the lattice indices as given;
+bulk response constrains the homogeneous unpolarized state only, and
+polarized and dense states still need the stability probes.
 
 ## Joint field and response training
 

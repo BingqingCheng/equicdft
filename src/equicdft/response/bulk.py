@@ -32,8 +32,77 @@ __all__ = [
     "reduce_bulk_symbol",
     "spectra_to_curvature",
     "curvature_to_spectra",
+    "ngp_window",
     "BulkResponseLoss",
 ]
+
+_WINDOWS = ("ngp",)
+
+
+def ngp_window(
+    wavevector_indices: torch.Tensor,
+    grid_size: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Nearest-grid-point assignment window ``W(k)`` of lattice vectors.
+
+    Binning point particles to the voxels of a grid with spacing ``h``
+    multiplies every Fourier component by ``W(k) = prod_i sinc(k_i h_i / 2)``
+    (``sinc(x) = sin(x) / x``), so the linear response of a binned field to a
+    smooth perturbation is ``W(k)`` times the point-particle response. For a
+    lattice vector ``k_i = 2 pi n_i / (N_i h_i)`` the spacing cancels and
+    ``W = prod_i sinc(pi n_i / N_i)``. ``wavevector_indices`` is an integer
+    ``[..., 3]`` tensor and ``grid_size`` (finite positive integers, three per
+    grid) broadcasts against it; the result is real with the leading shape.
+    ``W(0) = 1``, ``W = 2 / pi`` on an axis at the Nyquist index ``N_i / 2``,
+    and ``W > 0`` inside the first Brillouin zone; an index beyond it is an
+    alias of a smaller vector and raises, because the frame of
+    :func:`reduce_bulk_symbol` also takes the indices as given. ``mask``
+    (boolean, the leading shape) marks real members: padding entries are not
+    checked and return ``W = 0``.
+    """
+
+    if (
+        not torch.is_tensor(wavevector_indices)
+        or wavevector_indices.dtype.is_floating_point
+        or wavevector_indices.dtype == torch.bool
+        or wavevector_indices.ndim < 1
+        or wavevector_indices.shape[-1] != 3
+    ):
+        raise ValueError("wavevector_indices must be an integer [..., 3] tensor")
+    device = wavevector_indices.device
+    size = torch.as_tensor(grid_size, device=device)
+    if size.dtype == torch.bool or size.is_complex() or size.ndim < 1 or size.shape[-1] != 3:
+        raise ValueError("grid_size must hold three extents in its last axis")
+    size = size.to(torch.get_default_dtype())
+    if (
+        not torch.all(torch.isfinite(size)).item()
+        or torch.any(size < 1).item()
+        or torch.any(size != size.round()).item()
+    ):
+        raise ValueError("grid_size must be finite positive integers")
+    try:
+        size = size.expand(wavevector_indices.shape)
+    except RuntimeError as error:
+        raise ValueError(
+            "grid_size of shape {} does not broadcast against wavevector_indices of shape {}".format(
+                tuple(torch.as_tensor(grid_size).shape), tuple(wavevector_indices.shape),
+            )
+        ) from error
+    if mask is None:
+        mask = torch.ones(wavevector_indices.shape[:-1], dtype=torch.bool, device=device)
+    else:
+        mask = torch.as_tensor(mask, device=device)
+        if mask.dtype != torch.bool or mask.shape != wavevector_indices.shape[:-1]:
+            raise ValueError("mask must be a boolean tensor with the leading shape of wavevector_indices")
+    fraction = wavevector_indices.to(size) / size                               # n_i / N_i = k_i h_i / (2 pi)
+    if torch.any(mask & (fraction.abs() > 0.5).any(dim=-1)).item():
+        raise ValueError(
+            "wavevector indices must lie inside the first Brillouin zone (|n_i| <= N_i / 2); "
+            "reduce aliases to the centred representative"
+        )
+    window = torch.sinc(fraction).prod(dim=-1)                                   # torch.sinc(x) = sin(pi x)/(pi x)
+    return torch.where(mask, window, torch.zeros_like(window))
 
 
 def _moment(model, n_types, reference):
@@ -426,6 +495,20 @@ class BulkResponseLoss(LossTerm):
     ``K_{LL}``, ``K_{TT}`` and ``Im K_{rho L}``; for ``n`` species the upper
     triangles of the three symmetric blocks and the full cross block.
 
+    ``window="ngp"`` compares point-particle spectra with a model of binned
+    fields. The response of a field binned to the voxels (nearest grid point)
+    to a smooth perturbation is the point response times the assignment
+    window ``W(k)`` (:func:`ngp_window`), the same factor on every channel, so
+    each member's symbol is multiplied by ``W(k_m)`` (its spectrum divided by
+    ``W(k_m)``) before the bin average, and the reference keeps its
+    point-particle values: do not also scale the reference. The factor is
+    exact per member, so bins may mix lattice vectors with different ``W``;
+    the zero wavevector has ``W = 1``. Without the option a model fitted to
+    point spectra is softer than its own training fields by ``1 / W - 1``.
+    ``window=None`` (default) compares the model's spectra as they are. The
+    result reports the applied ``window`` per member (one without the option,
+    zero on padding).
+
     Like :class:`FourierResponseLoss`, ``loss_fn`` (default smooth L1) is applied
     to prediction and target divided by a per-element scale. The scale is the
     reference SEM propagated linearly to each curvature element, combined in
@@ -460,6 +543,7 @@ class BulkResponseLoss(LossTerm):
         zero_wavevector_weight: float = 1.0,
         relative_floor: float = 0.02,
         bin_average: str = "covariance",
+        window: Optional[str] = None,
         loss_fn: Optional[nn.Module] = None,
         weight: float = 1.0,
         name: str = "bulk_response",
@@ -491,6 +575,11 @@ class BulkResponseLoss(LossTerm):
         if bin_average not in ("covariance", "curvature"):
             raise ValueError("bin_average must be 'covariance' or 'curvature'")
         self.bin_average = bin_average
+        if window is not None:
+            window = nonempty_string(window, "window")
+            if window not in _WINDOWS:
+                raise ValueError("window must be None or one of {}".format(", ".join(repr(w) for w in _WINDOWS)))
+        self.window = window
 
     def evaluate(
         self,
@@ -537,9 +626,22 @@ class BulkResponseLoss(LossTerm):
         symbol = bulk_response_symbol(model, batch, flat_indices)
         lengths = batch["grid_size"].to(rho) * batch["grid_spacing"].to(rho)
         vector_symbol = symbol[:, : n_bins * n_members]
-        reduced = reduce_bulk_symbol(
-            vector_symbol, flat_indices[:, : n_bins * n_members], lengths,
-        )
+        member_indices = flat_indices[:, : n_bins * n_members]
+        window = torch.where(mask, torch.ones_like(mask, dtype=rho.dtype), torch.zeros_like(mask, dtype=rho.dtype))
+        if self.window == "ngp":
+            # The binned model responds with W(k) times the point response:
+            # scale each member's curvature by W (its spectrum by 1 / W)
+            # so the point reference is compared without change. W is a
+            # positive scalar per member, so definiteness and the relative
+            # anisotropy are unaffected. Only real members are checked
+            # against the zone and scaled; padding keeps its placeholder
+            # symbol and is dropped by the mask as before.
+            flat_mask = mask.reshape(n_fields, -1)
+            window = ngp_window(member_indices, batch["grid_size"][:, None, :], flat_mask).to(rho)
+            factor = torch.where(flat_mask, window, torch.ones_like(window))
+            vector_symbol = vector_symbol * factor[..., None, None].to(vector_symbol.dtype)
+            window = window.reshape(mask.shape)
+        reduced = reduce_bulk_symbol(vector_symbol, member_indices, lengths)
         counts = mask.sum(dim=-1).to(rho)                                    # [field, bin]
         valid_bin = counts > 0
         averaged, unstable = _bin_average(
@@ -565,6 +667,7 @@ class BulkResponseLoss(LossTerm):
                 mask.reshape(n_fields, -1), reduced["anisotropy"], torch.zeros_like(reduced["anisotropy"]),
             ).amax(dim=-1),
             "unstable_bins": unstable & valid_bin,
+            "window": window,
         }
         if include_zero:
             zero_symbol = symbol[:, -1, n_types:, n_types:].real.reshape(n_fields, n_types, 3, n_types, 3)

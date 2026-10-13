@@ -14,7 +14,7 @@ from equicdft import (
 )
 from equicdft.geometry.stencil import get_neighbor_indices
 from equicdft.response.bulk import (
-    bulk_response_symbol, curvature_to_spectra, reduce_bulk_symbol, spectra_to_curvature,
+    bulk_response_symbol, curvature_to_spectra, ngp_window, reduce_bulk_symbol, spectra_to_curvature,
 )
 from equicdft.response.curvature import _energy_only_model
 
@@ -330,6 +330,137 @@ class TestBulkResponse(unittest.TestCase):
                 self.assertLess(result["loss"].item(), 1e-12)
         with self.assertRaisesRegex(ValueError, "bin_average"):
             BulkResponseLoss(bin_average="mean")
+
+    def test_ngp_window_values(self):
+        size = torch.tensor([GRID, GRID, 2 * GRID])
+        indices = torch.tensor([[0, 0, 0], [1, 0, 0], [0, 0, 1], [GRID // 2, 0, 0], [2, 1, -3], [-1, 2, 5]])
+        expected = torch.tensor([
+            math.prod(math.sin(math.pi * n / N) / (math.pi * n / N) if n else 1.0 for n, N in zip(row, size.tolist()))
+            for row in indices.tolist()
+        ])
+        torch.testing.assert_close(ngp_window(indices, size), expected)
+        self.assertAlmostEqual(ngp_window(indices, size)[3].item(), 2 / math.pi, places=14)
+        # k_i h_i / 2 = pi n_i / N_i: the spacing cancels, so the explicit sinc form agrees.
+        spacing = torch.tensor([1.5, 2.0, 0.7])
+        k = 2 * math.pi * indices.double() / (size.double() * spacing)
+        explicit = torch.sinc(k * spacing / (2 * math.pi)).prod(-1)
+        torch.testing.assert_close(ngp_window(indices, size), explicit)
+        # Broadcasting over fields, and the zone check.
+        batched = ngp_window(indices[None].expand(2, -1, -1), size[None, None, :].expand(2, 1, 3))
+        self.assertEqual(batched.shape, (2, 6))
+        torch.testing.assert_close(ngp_window(indices, size.double()), expected)
+        with self.assertRaisesRegex(ValueError, "Brillouin"):
+            ngp_window(torch.tensor([[GRID // 2 + 1, 0, 0]]), size)
+        # Padding is exempt from the zone check when masked, and reports W = 0.
+        padded = torch.cat((indices, torch.tensor([[-7, 99, 0]])))
+        mask = torch.tensor([True] * 6 + [False])
+        with self.assertRaisesRegex(ValueError, "Brillouin"):
+            ngp_window(padded, size)
+        masked = ngp_window(padded, size, mask)
+        torch.testing.assert_close(masked[:6], expected)
+        self.assertEqual(masked[6].item(), 0.0)
+        with self.assertRaisesRegex(ValueError, "mask"):
+            ngp_window(padded, size, mask[:6])
+        with self.assertRaisesRegex(ValueError, "mask"):
+            ngp_window(padded, size, mask.double())
+        # Invalid indices and grid sizes.
+        with self.assertRaisesRegex(ValueError, "integer"):
+            ngp_window(indices.double(), size)
+        with self.assertRaisesRegex(ValueError, "integer"):
+            ngp_window(indices.bool(), size)
+        with self.assertRaisesRegex(ValueError, r"\[\.\.\., 3\]"):
+            ngp_window(indices[:, :2], size)
+        for bad in (torch.tensor([GRID, 0, GRID]), torch.tensor([GRID, -GRID, GRID]), torch.tensor([GRID, 6.5, GRID]),
+                    torch.tensor([GRID, float("nan"), GRID]), torch.tensor([GRID, float("inf"), GRID])):
+            with self.assertRaisesRegex(ValueError, "grid_size"):
+                ngp_window(indices, bad)
+        with self.assertRaisesRegex(ValueError, "grid_size"):
+            ngp_window(indices, torch.tensor([GRID, GRID]))
+        with self.assertRaisesRegex(ValueError, "broadcast"):
+            ngp_window(indices, size[None, :].expand(2, 3))
+
+    def test_window_makes_point_references_exact_for_any_bin(self):
+        # The model's own spectra are the binned-field responses. The point
+        # reference consistent with them is S_point(k) = S_model(k) / W(k) per
+        # member, bin-averaged as a simulation averages a shell. With
+        # window="ngp" the loss is zero for a single orbit (one W) and for a
+        # bin mixing orbits with different W; without it the point reference
+        # is wrong, and the shortcut of scaling the reference by the bin-mean
+        # W is exact only for the single orbit.
+        model, data = cace_model(), bulk()
+        lengths = torch.full((1, 3), GRID * SPACING)
+        size = torch.tensor([[GRID] * 3])
+
+        def point_reference(members):
+            indices = torch.tensor([members])                                  # [1, m, 3]
+            symbol = bulk_response_symbol(model, data, indices, create_graph=False)
+            blocks = reduce_bulk_symbol(symbol, indices, lengths)
+            spectra = curvature_to_spectra({k: v for k, v in blocks.items() if k != "anisotropy"})
+            window = ngp_window(indices, size)                                 # [1, m]
+            return (spectra / window[..., None, None, None]).mean(1, keepdim=True), window
+
+        def batch(members, reference):
+            return dict(
+                data, response_wavevector_indices=torch.tensor([[members]]),
+                response_member_mask=torch.ones(1, 1, len(members), dtype=torch.bool),
+                response_spectra=reference,
+            )
+
+        orbit = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+        mixed = [[1, 0, 0], [2, 1, 0], [0, 1, 2]]
+        for name, members in (("orbit", orbit), ("mixed", mixed)):
+            reference, window = point_reference(members)
+            exact = batch(members, reference)
+            shortcut = batch(members, reference * window.mean())
+            with self.subTest(bin=name):
+                windowed = BulkResponseLoss(window="ngp").evaluate(model(exact), exact, model=model)
+                self.assertLess(windowed["loss"].item(), 1e-16)
+                self.assertFalse(bool(windowed["unstable_bins"].any()))
+                torch.testing.assert_close(windowed["window"][0, 0], window[0])
+                plain = BulkResponseLoss().evaluate(model(exact), exact, model=model)
+                self.assertGreater(plain["loss"].item(), 1e-3)
+                torch.testing.assert_close(plain["window"], torch.ones(1, 1, len(members)))
+                quick = BulkResponseLoss().evaluate(model(shortcut), shortcut, model=model)
+                if name == "orbit":
+                    self.assertLess(quick["loss"].item(), 1e-16)
+                else:
+                    self.assertGreater(quick["loss"].item(), 1e-6)
+        # Curvature averaging sees the same per-member factor.
+        reference, _ = point_reference(orbit)
+        exact = batch(orbit, reference)
+        result = BulkResponseLoss(window="ngp", bin_average="curvature").evaluate(model(exact), exact, model=model)
+        self.assertLess(result["loss"].item(), 1e-16)
+        # Padding is windowed per member and never checked against the zone,
+        # whatever index it carries: zeros or an out-of-zone sentinel.
+        for sentinel in ([0, 0, 0], [99, -99, 0]):
+            padded = batch(mixed + [sentinel], point_reference(mixed)[0])
+            padded["response_member_mask"][0, 0, -1] = False
+            result = BulkResponseLoss(window="ngp").evaluate(model(padded), padded, model=model)
+            self.assertLess(result["loss"].item(), 1e-16)
+            self.assertEqual(result["window"][0, 0, -1].item(), 0.0)
+            torch.testing.assert_close(result["window"][0, 0, :-1], point_reference(mixed)[1][0])
+        with self.assertRaisesRegex(ValueError, "Brillouin"):
+            aliased = batch([[GRID // 2 + 1, 0, 0]], reference)
+            BulkResponseLoss(window="ngp").evaluate(model(aliased), aliased, model=model)
+        with self.assertRaisesRegex(ValueError, "window"):
+            BulkResponseLoss(window="hann")
+
+    def test_window_leaves_the_zero_wavevector_term_unchanged(self):
+        model = LocalCoupled(a=0.3, b=-0.2, lam=0.1)
+        data = self.batch_with_targets(model, bulk())
+        data.update(response_gk=torch.tensor([[[3.0]]]), response_gk_sem=torch.tensor([[[0.1]]]))
+        results = [
+            BulkResponseLoss(window=window, zero_wavevector_key="response_gk",
+                             zero_wavevector_sem_key="response_gk_sem").evaluate(model(data), data, model=model)
+            for window in (None, "ngp")
+        ]
+        torch.testing.assert_close(results[0]["zero_prediction"], results[1]["zero_prediction"])
+        torch.testing.assert_close(results[0]["zero_target"], results[1]["zero_target"])
+        # The members are (1,0,0)-type and others: the finite-k predictions do move.
+        self.assertGreater((results[0]["prediction"] - results[1]["prediction"]).abs().max().item(), 1e-3)
+        expected = ngp_window(data["response_wavevector_indices"], torch.tensor([[[GRID] * 3]]))
+        torch.testing.assert_close(results[1]["window"], expected)
+        torch.testing.assert_close(results[1]["prediction"][..., 0], results[0]["prediction"][..., 0] * expected[..., 0])
 
     def test_unstable_bins_are_reported(self):
         unstable = LocalCoupled(a=-3.0, b=0.0, lam=0.0)
