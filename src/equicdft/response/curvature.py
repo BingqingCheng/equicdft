@@ -257,11 +257,18 @@ def polarization_fourier_curvature(
     perturbations_per_forward: Optional[int] = None,
     wavevector_phases: Optional[torch.Tensor] = None,
     density_power: float = 0.0,
+    alignment_reference: str = "quadratic",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Return excess plus quadratic-alignment ideal curvature per field.
+    r"""Return excess plus a declared ideal polarization curvature per field.
 
-    The moment comes from model.ideal; exact orientational entropy is not
-    evaluated, so probes may cross its local physical domain boundary.
+    ``alignment_reference="quadratic"`` preserves the weak-alignment ideal
+    reference. ``"exact"`` uses the analytic Langevin ideal Hessian at the
+    base state, with the same saturation cap as the coupled probe. The
+    denominator remains the weak-alignment ideal metric in either mode, so
+    the requested floor and weight retain their units. Exact ideal entropy
+    is never evaluated at displaced states: probes may cross its physical
+    domain boundary without changing their amplitude or the excess energies.
+    The moment comes exclusively from ``model.ideal``.
 
     The selected basis displacement applies one shared Cartesian alignment
     change to every species, scaled locally by ``m_a*rho_a``. The result has
@@ -287,6 +294,8 @@ def polarization_fourier_curvature(
     wave's polarization; it is exact for layers normal to the wavevector.
     """
 
+    if alignment_reference not in ("exact", "quadratic"):
+        raise ValueError("alignment_reference must be 'exact' or 'quadratic'")
     if "dipole_density" not in batch:
         raise KeyError("batch is missing 'dipole_density'")
     polarization = batch["dipole_density"]
@@ -376,7 +385,19 @@ def polarization_fourier_curvature(
             dim=-1,
         )
     )
-    total_second = ideal_second + excess_second
+    reference_second = ideal_second
+    if alignment_reference == "exact":
+        along_coefficient, across_coefficient, unit_polarization, _ = _orientational_hessian(
+            rho, polarization, moment, exact=True,
+        )
+        delta = used_amplitude[..., None, None, None] * directions
+        along = (delta * unit_polarization[:, None]).sum(dim=-1)
+        across = delta - along[..., None] * unit_polarization[:, None]
+        reference_second = volume[:, None] * (
+            along_coefficient[:, None] * along.square()
+            + across_coefficient[:, None] * across.square().sum(dim=-1)
+        ).sum(dim=(-2, -1))
+    total_second = reference_second + excess_second
     ideal_denominator = ideal_second.detach()
     ideal_scale = torch.clamp(
         torch.amax(torch.abs(ideal_denominator), dim=1, keepdim=True),

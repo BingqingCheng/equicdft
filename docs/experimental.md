@@ -945,6 +945,33 @@ sampling bound locally. The exact ideal functional and equilibrium solver
 retain their physical-domain checks; only this stochastic regularizer omits
 the constraint.
 
+To use the full ideal stiffness at finite polarization, opt in with
+`FourierStabilityLoss(variable="dipole_density", alignment_reference="exact", ...)`.
+The default remains `"quadratic"` for existing polarization runs. Exact mode
+replaces only the numerator's ideal term with the analytic base-state
+Langevin Hessian. Writing $u_a=|\mathbf P_a|/(m_a\rho_a)$,
+$x_a=L^{-1}(u_a)$, $L(x)=\coth x-1/x$, its second variation is
+
+$$
+\Delta_P^2 F_{\rm id}
+=\Delta V\sum_{a,\mathbf r}\frac{1}{m_a^2\rho_a}
+\left[\frac{|\delta\mathbf P_{a,\parallel}|^2}{L'(x_a)}
++\frac{x_a}{u_a}|\delta\mathbf P_{a,\perp}|^2\right],
+$$
+
+where parallel/perpendicular refer to the **base polarization**, not the
+wavevector; both coefficients tend to 3 at zero alignment. Zero-density
+species contribute zero. The denominator remains $\Delta_P^2 F_{\rm id,0}$,
+so floors and weights keep their original weak-ideal units, while an aligned
+ideal gas generally has curvature greater than one. No extra excess-energy
+evaluations or random draws are introduced. The base-state ideal coefficients
+are held at $u=1-\sqrt{\mathrm{eps}}$ at and beyond saturation, as for coupled
+probes. This continuation keeps reference fields at the sampling bound usable;
+it does not change the physical ideal functional or solver domain. The exact
+ideal is not evaluated at displaced states, and amplitudes and masks are not
+clipped. This remains a finite-excess-difference, projected stability
+regularizer, not a complete Hessian or accuracy guarantee.
+
 The zero-wavevector polarization probe is meaningful because total
 polarization is not conserved. It is included by default; its cosine is the
 constant wave and its identically zero sine partner is discarded. It remains

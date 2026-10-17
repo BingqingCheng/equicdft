@@ -83,8 +83,9 @@ class FourierStabilityLoss(LossTerm):
     ``delta_P_a = epsilon * m_a * rho_a * wave * u``,
 
     where ``m_a`` comes exclusively from ``model.ideal``, which must be a
-    ``FixedDipoleIdeal``. The added ideal term is the quadratic weak-alignment
-    reference, not the exact finite-polarization entropy. Thus
+    ``FixedDipoleIdeal``. By default the added ideal term is the quadratic
+    weak-alignment reference. ``alignment_reference="exact"`` instead adds
+    the analytic full Langevin ideal Hessian at the base state. Thus
     ``epsilon`` is a dimensionless change in local alignment fraction.
     The same ``u`` is used for all wavevectors and phases of one field.
     The selected direction is normalized by the isotropic small-alignment
@@ -216,16 +217,21 @@ class FourierStabilityLoss(LossTerm):
 
         Coupled: both channels of every species are weighted the same way.
     alignment_reference
-        Coupled only. The reference enters as its analytic Hessian at the
+        Polarization or coupled probes only. The exact reference enters as its analytic Hessian at the
         base state, one regime per voxel for every probe row, so it is convex
-        and an ideal gas is never penalized. ``"exact"`` (default) uses the
+        and a nonnegative-curvature ideal gas is never penalized at a zero floor. ``"exact"`` uses the
         Langevin orientational entropy of :class:`~equicdft.FixedDipoleIdeal`,
         with its coefficients held at their value at alignment
         ``1 - sqrt(eps)`` beyond it (continuous, never weaker near
         saturation);
         ``"quadratic"`` uses the weak-alignment form ``3|P|^2/(2 m^2 rho)``
         everywhere, which underestimates the stiffness of strongly aligned
-        states and so flags stable polarized bulk.
+        states and so can flag stable polarized bulk. The default is
+        ``"exact"`` for coupled probes and ``"quadratic"`` for polarization
+        probes, preserving existing runs. Both retain the weak-alignment
+        ideal metric as denominator; exact-reference curvature need not be
+        one for an aligned ideal gas. Neither mode changes probe amplitudes,
+        wavevectors, random draws, or the excess finite differences.
     """
 
     def __init__(
@@ -285,9 +291,12 @@ class FourierStabilityLoss(LossTerm):
             raise ValueError("polarization_direction='parallel' applies to variable='coupled'")
         self.polarization_direction = polarization_direction
         if alignment_reference is None:
-            alignment_reference = "exact" if variable == "coupled" else None
-        elif variable != "coupled":
-            raise ValueError("alignment_reference applies to variable='coupled'")
+            alignment_reference = (
+                "exact" if variable == "coupled" else
+                "quadratic" if variable == "dipole_density" else None
+            )
+        elif variable == "rho":
+            raise ValueError("alignment_reference applies to variable='dipole_density' or 'coupled'")
         elif alignment_reference not in ("exact", "quadratic"):
             raise ValueError("alignment_reference must be 'exact' or 'quadratic'")
         self.alignment_reference = alignment_reference
@@ -482,8 +491,9 @@ class FourierStabilityLoss(LossTerm):
             return "translational_ideal_gas_plus_{}_alignment".format(
                 "langevin" if self.alignment_reference == "exact" else "quadratic"
             )
-        return ("quadratic_alignment" if self.variable == "dipole_density"
-                else "translational_ideal_gas")
+        if self.variable == "dipole_density":
+            return "langevin_alignment" if self.alignment_reference == "exact" else "quadratic_alignment"
+        return "translational_ideal_gas"
 
     def extra_repr(self) -> str:
         return "variable={!r}, ideal_reference={!r}, polarization_direction={!r}, probe_density_power={!r}".format(
@@ -650,6 +660,7 @@ class FourierStabilityLoss(LossTerm):
             "polarization_directions": directions,
             "perturbations_per_forward": self.response.perturbations_per_forward,
             "density_power": self.probe_density_power,
+            "alignment_reference": self.alignment_reference or "quadratic",
         }
         if self.wavevector_treatment == "independent":
             _, amplitude = self._sample_wavevector_probe(

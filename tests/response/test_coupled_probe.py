@@ -346,7 +346,7 @@ class TestCoupledProbe(unittest.TestCase):
         quadratic = FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="coupled", alignment_reference="quadratic")
         self.assertEqual(quadratic.ideal_reference, "translational_ideal_gas_plus_quadratic_alignment")
         with self.assertRaisesRegex(ValueError, "alignment_reference"):
-            FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="dipole_density", alignment_reference="exact")
+            FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="rho", alignment_reference="exact")
         with self.assertRaisesRegex(ValueError, "alignment_reference"):
             FourierStabilityLoss(wavevector_indices=((1, 0, 0),), variable="coupled", alignment_reference="langevin")
         self.assertIn("variable='coupled'", repr(term))
