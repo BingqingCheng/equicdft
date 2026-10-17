@@ -113,6 +113,8 @@ class PairwiseReadout(EnergyReadout, Configurable):
     ``cutoff_grid * h``.
     """
 
+    reads_smoothed_fields = True
+
     def __init__(
         self,
         cutoff_grid: int,

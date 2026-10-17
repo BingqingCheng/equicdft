@@ -264,3 +264,126 @@ responses to the dipole and traceless-quadrupole couplings only: compute them
 from the site charge density with the trace part removed,
 `rho_q(k) + (k^2 Tr M / 6) n(k)`, rather than from the full charge density.
 Without it, use the full site-charge cross spectra; see `docs/polarization.md`.
+
+## Averaged inputs for the learned terms
+
+`GridCACEModel(learned_input_smoothing=sigma)` evaluates every learned local
+readout on periodic averages of the fields instead of the voxel fields
+themselves:
+
+    beta F_exc[rho, P] = F_learned[G * rho, G * P] + F_fixed[rho, P].
+
+`G` is the nonnegative nearest-neighbour kernel of
+`equicdft.geometry.spectral.nonnegative_average`, with second moment
+`sigma^2` along every axis; `sigma` is in the length unit of `grid_spacing`.
+The learned readouts are `CACEBranch` pipelines, readouts of the shared
+features (`LocalReadout`, `GGAReadout`), `LDAReadout`, `PairwiseReadout` and a
+`LongRangeReadout` with learned `density_channels` sources; each declares
+`reads_smoothed_fields`, and a readout that consumes the local features
+always reads them. They see the averaged fields everywhere, including the
+density that weights their per-particle energies, so their whole
+contribution is a functional of `G * rho` and `G * P`. Averaging only the
+descriptors would not do: with the voxel density as the prefactor, a term of
+the form `2 a'(G * rho) T(k)` survives in the curvature, with the amplitude
+`T` rather than `T^2`.
+
+The ideal reference, the external coupling (including the quadrupole-trace
+term), `LongRangeReadout` on the physical fields (Coulomb, Gaussian and
+dielectric kernels, fixed references), `BulkReadout`, FMT, MSA and
+metal-wall terms keep the voxel fields, and so do the fitting selection
+(`voxel_weights`, `use_voxel_mask`) and the chemical-potential diagnostic.
+Every derivative (`c1`, the `c2` row, the polarization derivative) is taken
+with respect to the voxel fields; the average is its own adjoint, so the
+learned part of `c1` is `G * c1_learned` evaluated at the averaged fields.
+Solvers, losses, bulk-response targets and feature standardization need no
+change, because they all evaluate the model.
+
+At a homogeneous state, the learned second variation is multiplied by
+`T(k)^2`, where `T` is the kernel's transfer function. At a nonuniform state,
+the learned Hessian is `G^T H_learned[G x] G`, where `x` collects the voxel
+density and polarization fields; Fourier modes can mix. Averaging removes
+exact null modes and attenuates other learned contributions, but does not
+guarantee stability or prevent excessive stiffness of the total functional.
+For example, at `sigma = h / sqrt(6)` the corner is removed, while the
+learned curvature retains `4/9` at an axis Nyquist mode and `1/9` at a [110]
+edge. Full-grid and relevant nonuniform-state stability checks remain needed.
+
+### The kernel
+
+One step of second moment `s^2` replaces every value by `1 - 2 sum_i a_i`
+times itself plus `a_i = s^2 / (2 h_i^2)` times each of its two neighbours
+along axis `i`; its transfer function is
+
+    t(k) = 1 - 2 s^2 sum_i sin^2(k_i h_i / 2) / h_i^2.
+
+No step is wider than `s_max = h / sqrt(6)` (on a cubic grid; `(2 sum_i
+h_i^-2)^(-1/2)` in general), where `t` vanishes at the cube corner and the
+centre weight is one half. A `sigma` up to `s_max` is one step; a wider one
+is whole steps of `s_max` and a remainder, the second moments adding up to
+`sigma^2`. `T`, the product of the step transfers, lies in [0, 1], equals
+`exp(-sigma^2 |k|^2 / 2)` to second order in `k`, decreases continuously
+with `sigma` at every wavevector and is zero at the cube corner for every
+`sigma >= s_max`. The weights reach one voxel per step and are exact zeros
+beyond.
+
+The weights are nonnegative by design, because the alignment inputs assume
+admissible fields. A nonnegative average keeps a nonnegative density
+nonnegative and keeps `|G P| <= G |P| <= m G rho` wherever `|P| <= m rho`
+holds voxel by voxel, so an alignment formed from the averaged fields stays
+within the range of the voxel alignments it averages. A positive Fourier
+multiplier does not guarantee this. The zone-restricted Gaussian
+`exp(-sigma^2 |k|^2 / 2)` has negative real-space weights, and the alignment
+`u = rho P / (m (rho^2 + floor^2))` amplifies the cancellation: across a
+slab of 0.09 and 0.001 A^-3 with alignment 0.8 in opposite directions on a
+2 A grid, `sigma = 0.6` A leaves 1.05e-4 A^-3 at the second dilute voxel
+with nearly twice its polarization, alignment 14.4. The density floor
+prevents a division by zero there, not an alignment above one, and raising
+it would change valid low-density inputs as well. The Gaussian residual
+smoothing of `TensorLoss(residual_smoothing=...)` is unaffected: a residual
+weighting needs only a positive multiplier, an input average needs positive
+weights.
+
+Positivity limits the suppression at the zone boundary. Every nonnegative
+kernel with second moment `sigma^2` has `T >= 1 - 2 sigma^2 / h^2` at an
+axis Nyquist mode, `T >= 1 - 4 sigma^2 / h^2` at a [110] edge mode and
+`T >= 1 - 6 sigma^2 / h^2` at the cube corner, and one step attains all
+three. `sigma = h / sqrt(6)` (0.82 A on a 2 A grid) is therefore the natural
+choice: the learned curvature keeps 0.85 of its value at |k| = 0.5 A^-1
+along an axis, 0.58 at 1.0, 0.44 at the axis Nyquist and 0.11 at the [110]
+edge, and none at the cube corner. Beyond second order the transfer is
+anisotropic: at |k| = 1.0 A^-1 the factor is 0.58 along an axis and 0.49
+along [111]. A wider `sigma` suppresses the zone boundary further at the
+cost of the low-`k` response; `sigma = h / sqrt(12)` (0.58 A for 2 A) is the
+second moment of the voxel itself.
+
+Choose the fixed terms accordingly: the voxel scale must keep positive
+curvature without the learned part. `IdealGas` and `FixedDipoleIdeal` have it
+in every mode. A reference whose curvature vanishes in some mode, such as one
+combined ideal for several site densities (no curvature in the composition
+mode), leaves that mode flat at the zone boundary unless a fixed term, for
+example an intramolecular reference, supplies it. With site charges the
+Coulomb damping is part of the same choice: `exp(-alpha k^2)` with
+`alpha = sigma_q^2` is the Coulomb energy of Gaussian-averaged charges, and a
+damping much stronger than the charge structure of the reference system
+forces the learned terms to restore the missing stiffness at the wavevectors
+they can still reach.
+
+The density and every polarization component are averaged together, six
+shifted additions per step. The data must carry `grid_size`; rows may follow
+any complete order given by `grid_positions`.
+
+With polarization, every Cartesian component of `P` is averaged by the same
+kernel, which has the symmetry of the grid, so the cubic equivariance of the
+features is unchanged. Alignment inputs are formed from the averaged fields,
+`u = (G rho)(G P) / (m ((G rho)^2 + floor^2))`, not by averaging `u`, so at a
+homogeneous state the density, cross and polarization blocks of the learned
+curvature all scale by `T(k)^2`. The fixed-dipole ideal keeps the Langevin
+curvature of the voxel fields in every polarization mode. The slab above is
+a regression in `tests/model/test_learned_input_smoothing.py`: the learned readouts see
+densities within the input range and alignments of at most 0.8, and the
+derivatives at the interface match finite differences of the energy.
+
+The option is part of the configuration and has no state entry; `None`, the
+default, evaluates every readout on the voxel fields exactly as before.
+Changing it on a fitted model changes the functional the parameters were
+fitted for.

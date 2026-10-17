@@ -84,6 +84,8 @@ class LDAReadout(EnergyReadout, Configurable):
         model-owned scale.
     """
 
+    reads_smoothed_fields = True
+
     def __init__(
         self,
         n_types: int = 1,
@@ -217,6 +219,7 @@ class GGAReadout(EnergyReadout, Configurable):
     """
 
     requires_local_features = True
+    reads_smoothed_fields = True
 
     def __init__(
         self,

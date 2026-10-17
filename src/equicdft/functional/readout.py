@@ -99,6 +99,7 @@ class LocalReadout(EnergyReadout, Configurable):
     """
 
     requires_local_features = True
+    reads_smoothed_fields = True
 
     def __init__(
         self,
@@ -496,6 +497,17 @@ class LongRangeReadout(EnergyReadout, Configurable):
             self.include_polarization
             or (features is not None and features.requires_dipole_density)
         )
+
+    @property
+    def reads_smoothed_fields(self) -> bool:
+        """Whether this readout's sources are a learned local function of rho.
+
+        Learned ``density_channels`` sources read the model's learned-input
+        fields; kernels on the physical fields (Coulomb, Gaussian, dielectric,
+        fixed references) always read the voxel fields.
+        """
+
+        return getattr(self, "density_channels", None) is not None
 
     def __init__(
         self,

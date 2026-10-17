@@ -1,6 +1,7 @@
 """Collected grid density-functional model."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from numbers import Integral
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
@@ -28,6 +29,7 @@ from .geometry.grid import (
     require_matching_grid_spacing,
     voxel_volume as compute_voxel_volume,
 )
+from .geometry.spectral import nonnegative_average
 from .derivatives import compute_grid_derivative
 from .functional.base import EnergyReadout, ReadoutContext
 from .functional.cace import CACEBranch
@@ -189,6 +191,16 @@ def _validate_readout_graph(readouts: Sequence[EnergyReadout]) -> None:
 
     for item in readouts:
         item.validate_readout_graph(readouts)
+
+
+def _reads_smoothed_fields(item: EnergyReadout) -> bool:
+    """Whether a top-level readout is evaluated on the learned-input fields.
+
+    Readouts that consume the local feature vector always are: the features
+    themselves are computed from those fields.
+    """
+
+    return bool(item.reads_smoothed_fields or item.requires_local_features)
 
 
 def _resolve_n_types(
@@ -357,6 +369,28 @@ class GridCACEModel(nn.Module, Configurable):
     centres) to ``V_ext``; see :meth:`external_potential`. The learned
     functional and the second variation are unchanged, since the term is
     linear in the density.
+
+    ``learned_input_smoothing`` is a width ``sigma`` in the length unit of
+    ``grid_spacing``. With it, every learned local readout (CACE branches and
+    shared-feature readouts, LDA, GGA, pairwise, and long-range readouts with
+    learned ``density_channels`` sources) is evaluated on the averages
+    ``G * rho`` and ``G * dipole_density``, density prefactors included,
+    where ``G`` is the nonnegative nearest-neighbour kernel of
+    :func:`equicdft.geometry.spectral.nonnegative_average` with second moment
+    ``sigma^2``. Their excess is ``F[G * rho, G * P]``, so at a homogeneous
+    state their curvature is multiplied by ``T(k)^2`` (``T`` the kernel's
+    transfer function, zero at the cube corner once ``sigma >= h / sqrt(6)``).
+    At a nonuniform state the learned Hessian is ``G.T H[G * fields] G``;
+    Fourier modes can mix. Averaging attenuates non-null modes but does not
+    guarantee stability of the total functional. The nonnegative weights keep
+    averaged densities nonnegative and averaged
+    fields within ``|P| <= m rho`` when the voxel fields are, so alignment
+    inputs, formed from the averaged fields, stay in their physical range.
+    The ideal reference, the external coupling, long-range kernels on the
+    physical fields, bulk, FMT, MSA and metal-wall readouts, the fitting
+    selection and the diagnostics keep the voxel fields; all derivatives are
+    with respect to the voxel fields. ``None`` (the default) evaluates every
+    readout on the voxel fields.
     """
 
     def __init__(
@@ -387,6 +421,7 @@ class GridCACEModel(nn.Module, Configurable):
         alignment_scale: Optional[Union[float, torch.Tensor]] = None,
         alignment_density_floor: Optional[Union[float, torch.Tensor]] = None,
         second_moment: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
+        learned_input_smoothing: Optional[float] = None,
     ) -> None:
         super().__init__()
 
@@ -416,6 +451,16 @@ class GridCACEModel(nn.Module, Configurable):
         _check_cutoff_and_feature_requirements(a_features, readouts)
         _validate_readout_graph(readouts)
         n_types = _resolve_n_types(a_features, readouts, n_types)
+        if learned_input_smoothing is not None:
+            learned_input_smoothing = positive_scalar(
+                learned_input_smoothing, "learned_input_smoothing",
+            )
+            if not any(_reads_smoothed_fields(item) for item in readouts):
+                raise ValueError(
+                    "learned_input_smoothing requires a learned local readout "
+                    "(CACE, LDA, GGA, pairwise or learned density channels); "
+                    "the other terms always use the voxel fields"
+                )
         polarization_scale = (None if polarization_scale is None else
                               positive_scalar_tensor(polarization_scale, "polarization_scale"))
         needs_polarization_scale = (
@@ -551,6 +596,8 @@ class GridCACEModel(nn.Module, Configurable):
             _second_moment_tensor(second_moment, self._n_types),
             persistent=False,
         )
+        # A length in grid_spacing units, recorded in the configuration.
+        self.learned_input_smoothing = learned_input_smoothing
         # The ideal reference validated its own constants in its constructor.
         # A default one built from this model's ``thermal_wavelength`` is
         # widened to one value per component, which is the shape model files
@@ -614,6 +661,8 @@ class GridCACEModel(nn.Module, Configurable):
             second_moment=_second_moment_config(
                 self._buffers.get("second_moment")
             ),
+            # Whole-object pickles from before the option lack the attribute.
+            learned_input_smoothing=getattr(self, "learned_input_smoothing", None),
         )
 
     @classmethod
@@ -897,6 +946,44 @@ class GridCACEModel(nn.Module, Configurable):
         resolved["V_ext"] = effective
         return resolved
 
+    def _learned_inputs(self, data, context):
+        """Return the data and context that the learned readouts evaluate.
+
+        Without ``learned_input_smoothing`` these are the physical ``data``
+        and ``context`` themselves. With it, ``rho`` and ``dipole_density``
+        are replaced by their nonnegative periodic averages, which stay
+        connected to the physical fields for every functional derivative.
+        Geometry, the unit contract and the energy-centre selection are
+        shared.
+        """
+
+        sigma = getattr(self, "learned_input_smoothing", None)
+        if sigma is None:
+            return data, context
+        grid_size = context.grid_size
+        if grid_size is None:
+            raise ValueError("learned_input_smoothing requires grid_size in the data")
+        rho, dipole = context.rho, context.dipole_density
+        fields = rho
+        if dipole is not None:
+            if not torch.is_tensor(dipole) or dipole.shape != (*rho.shape, 3):
+                raise ValueError("dipole_density must have shape [..., n_grid, n_types, 3]")
+            # Each Cartesian component is averaged with the same kernel, which
+            # has the grid's symmetry; one pass serves the density and every
+            # component, and the same nonnegative weights for both keep
+            # |G P| <= m G rho wherever |P| <= m rho.
+            fields = torch.cat((rho, dipole.flatten(-2)), dim=-1)
+        averaged = nonnegative_average(
+            fields, grid_size, context.grid_spacing, sigma,
+            grid_positions=data.get("grid_positions"),
+        )
+        rho = averaged[..., :rho.shape[-1]]
+        learned = dict(data, rho=rho)
+        if dipole is not None:
+            dipole = averaged[..., rho.shape[-1]:].unflatten(-1, dipole.shape[-2:])
+            learned["dipole_density"] = dipole
+        return learned, replace(context, rho=rho, dipole_density=dipole)
+
     def _chemical_potential_outputs(self, data, outputs, beta):
         """Add beta mu = delta(beta F)/delta rho + beta V and its spatial mean."""
         rho = data["rho"]
@@ -1052,23 +1139,31 @@ class GridCACEModel(nn.Module, Configurable):
             context.local_energy_mask = weights > 0 if weights is not None else None
             normalized_temperature = context.normalized_temperature
             volume_element = context.voxel_volume
+            # Learned readouts read these; without smoothing they are the
+            # physical data and context themselves.
+            learned_data, learned_context = self._learned_inputs(data, context)
             if any(item.requires_local_features for item in self.readout):
-                context.invariants = self._local_invariant_features(data)
+                learned_context.invariants = self._local_invariant_features(
+                    learned_data,
+                )
                 if (
                     self.a_features.separate_center
                     and not self.a_features.include_polarization
                 ):
                     # Polarized features already carry their center slots
                     # inside the invariant block.
-                    context.center_density = (
-                        self.a_features.transform_density(rho)
-                        / context.require("mean_density")
+                    learned_context.center_density = (
+                        self.a_features.transform_density(learned_context.rho)
+                        / learned_context.require("mean_density")
                     )
 
             readout_energies = []
             readout_outputs = {}
             for item in self.readout:
-                energy, extra_outputs = item.energy_and_outputs(context)
+                item_context = (
+                    learned_context if _reads_smoothed_fields(item) else context
+                )
+                energy, extra_outputs = item.energy_and_outputs(item_context)
                 if energy.shape != rho.shape[:-2]:
                     raise ValueError(
                         "every readout must return one scalar energy per field"

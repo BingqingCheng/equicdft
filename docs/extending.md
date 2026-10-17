@@ -98,6 +98,7 @@ Class attributes tell the model what to prepare and what to check:
 | `requires_local_features` | you call `context.local_features()`; the model then evaluates the invariant features, and `a_features`/`b_features` become mandatory |
 | `requires_local_density_index` | you gather explicit periodic neighborhoods, so the data must carry a neighbor list |
 | `requires_dipole_density` | you read the polarization field |
+| `reads_smoothed_fields` | you are a learned function of the local fields: a model with `learned_input_smoothing` hands you a context whose `rho` and `dipole_density` are nonnegative averages of the voxel fields (implied by `requires_local_features`); leave `False` for physical or reference terms that must see the voxel fields |
 | `requires_polarization_scale` | you normalize polarization, so the model must own a `polarization_scale` |
 | `requires_alignment_scale` | you use the molecular-alignment inputs, so the model must own `alignment_scale`, `alignment_density_floor` and an ideal with a `dipole_magnitude` |
 | `cutoff_grid` | your stencil radius in grid steps, or `None` |

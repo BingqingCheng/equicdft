@@ -99,6 +99,22 @@ only while calculating the rotation-invariant population standard deviation,
 and feed the uncentered field to the model. Because the statistic depends on
 $\rho_0$, record both values with the fitted model.
 
+With `GridCACEModel(learned_input_smoothing=sigma)` the learned readouts read
+nonnegative averages of $\rho$ and $\mathbf P$ (each Cartesian component with
+the same kernel), and $\mathbf u_\epsilon$ is formed from the averaged
+fields, so at a homogeneous state every block of the learned curvature is
+multiplied by $T(k)^2$, while the fixed-dipole ideal and the Coulomb term keep
+the voxel fields. At a nonuniform state the learned Hessian is
+$G^T H_{\rm learned}[Gx] G$, with possible Fourier mode mixing. Averaging
+does not guarantee stability of the total functional.
+Nonnegative weights keep $|\bar{\mathbf P}| \le m\bar\rho$ wherever
+$|\mathbf P| \le m\rho$, so $\mathbf u_\epsilon$ stays within the range of
+the voxel alignments; a filter with negative weights can push it far above
+one at a dense/dilute interface. See
+[`model.md`](model.md#averaged-inputs-for-the-learned-terms). The
+`polarization_scale` and `alignment_scale` statistics are then best measured
+on the averaged fields, which are what the readouts see.
+
 The selector is available independently on `CartesianAFeatures` and
 `LDAReadout`. This complete helper builds an alignment-only excess model:
 

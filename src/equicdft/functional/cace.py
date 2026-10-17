@@ -27,6 +27,7 @@ class CACEBranch(EnergyReadout, Configurable):
     # A branch is built on the model's stencil, so every branch and any
     # top-level A features must agree on one cutoff_grid.
     shares_grid_stencil = True
+    reads_smoothed_fields = True
 
     def __init__(self, a_features, b_features, readout, *, message_layers=None):
         super().__init__()

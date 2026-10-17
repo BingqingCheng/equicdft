@@ -364,6 +364,12 @@ class EnergyReadout(nn.Module):
         ``cutoff_grid`` that must agree with the feature module.
     ``requires_dipole_density``
         The readout depends on the independent polarization field.
+    ``reads_smoothed_fields``
+        The readout is a learned function of the local fields. A model with
+        ``learned_input_smoothing`` evaluates it, and every readout that
+        consumes the local features, on the nonnegative averages of ``rho``
+        and ``dipole_density`` in place of the voxel fields; ideal, external,
+        Coulomb and other fixed or reference terms keep the voxel fields.
     ``n_types``
         Number of physical density components the readout is built for, or
         ``None`` for readouts that accept any component count.
@@ -377,6 +383,7 @@ class EnergyReadout(nn.Module):
     requires_local_features = False
     requires_local_density_index = False
     requires_dipole_density = False
+    reads_smoothed_fields = False
     # Learned readouts request normalization independently of physical P.
     requires_polarization_scale = False
     requires_alignment_scale = False
