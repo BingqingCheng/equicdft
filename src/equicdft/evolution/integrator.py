@@ -216,9 +216,24 @@ class EulerIntegrator:
     is physical, so its coefficient against grad(beta*mu) is ``M / beta``.
     Excluded voxels have zero density and block every adjoining face. Frozen
     ``mask`` voxels also block faces but retain their supplied densities.
+
+    ``face_average='arithmetic'`` preserves the original averaging of voxel
+    mobility matrices. The deterministic-only ``'harmonic-density'`` option
+    evaluates a local mobility at the componentwise harmonic mean density
+    of each face's endpoints. It avoids assigning a dense neighbor's local
+    mobility to a nearly empty voxel. Each face matrix remains symmetric PSD,
+    so the semidiscrete scheme conserves species numbers and dissipates the
+    supplied free energy. It is a different, consistent spatial quadrature,
+    not a density floor or an unconditional positivity guarantee. Use a
+    positivity-controlled timestep. Constant mobility is unchanged.
     """
 
-    def __init__(self, model, mobility, dt, *, mask=None):
+    def __init__(self, model, mobility, dt, *, mask=None, face_average="arithmetic"):
+        if face_average not in ("arithmetic", "harmonic-density"):
+            raise ValueError("face_average must be 'arithmetic' or 'harmonic-density'.")
+        if face_average != "arithmetic" and getattr(self, "stochastic", False):
+            raise ValueError("Harmonic-density faces require a separate stochastic drift derivation.")
+        self.face_average = face_average
         self.model = model
         self.mobility = mobility
         self.mask = mask
@@ -294,15 +309,35 @@ class EulerIntegrator:
         u = grid.dense(derivative + grid.beta * external)
         matrices, uniform = self._mobility_matrices(data, grid)
         rate = torch.zeros_like(u)
+        fluxes = [] if getattr(self, "preserve_face_fluxes", False) else None
         for axis, spacing in enumerate(grid.spacing):
             gradient = (torch.roll(u, -1, axis) - u) / spacing
             if uniform:
                 flux = -(gradient @ matrices.transpose(-1, -2)) / grid.beta
             else:
-                face_mobility = (matrices + torch.roll(matrices, -1, axis)) / 2
+                if self.face_average == "harmonic-density":
+                    dense = grid.dense(grid.rho)
+                    other = torch.roll(dense, -1, axis)
+                    low, high = torch.minimum(dense, other), torch.maximum(dense, other)
+                    # 2ab/(a+b), without reciprocal/product overflow or underflow.
+                    # Excluded/excluded faces are zero and are blocked below.
+                    high = torch.where(high > 0, high, torch.ones_like(high))
+                    face_rho = low * (2 / (1 + low / high))
+                    face_mobility, _ = self._mobility_matrices(dict(data, rho=grid.flat(face_rho)), grid)
+                else:
+                    face_mobility = (matrices + torch.roll(matrices, -1, axis)) / 2
                 flux = -(face_mobility @ gradient.unsqueeze(-1)).squeeze(-1) / grid.beta
+            if fluxes is not None:
+                fluxes.append(flux.masked_fill(grid.blocked[axis], 0) if grid.has_blocked else flux)
             rate += grid.divergence(flux, axis)
-        return grid.flat(rate).detach()
+        result = grid.flat(rate).detach()
+        if fluxes is not None:
+            # Adaptive retries reuse the start rate after midpoint RHS calls.
+            result._face_fluxes = tuple(flux.detach() for flux in fluxes)
+            result._face_state = (id(data["rho"]), data["rho"]._version, grid.signature,
+                                  _fingerprint(grid.potential))
+            result._face_rate_version = result._version
+        return result
 
     def rhs(self, data):
         """Return drho/dt without altering data or retaining an autograd graph."""
@@ -527,8 +562,9 @@ class SemiImplicitIntegrator(EulerIntegrator):
     an electrode/wall geometry is not a homogeneous Hessian reference.
     """
 
-    def __init__(self, model, mobility, dt, reference_density=None, reference_curvature=None, *, mask=None):
-        super().__init__(model, mobility, dt, mask=mask)
+    def __init__(self, model, mobility, dt, reference_density=None, reference_curvature=None, *, mask=None,
+                 face_average="arithmetic"):
+        super().__init__(model, mobility, dt, mask=mask, face_average=face_average)
         self.reference_density = reference_density
         self.reference_curvature = reference_curvature
         self._operator = None
@@ -571,7 +607,8 @@ class SemiImplicitIntegrator(EulerIntegrator):
             self._propagators[dt] = propagator
         return propagator
 
-    def _advance(self, grid, rate, dt):
+    def _implicit_increment(self, grid, rate, dt):
+        """Solve the unconstrained conservative increment before density checks."""
         propagator = self._propagator_for(dt)
         if grid.has_frozen or grid.has_excluded:
             # Solve the same IMEX increment with blocked faces, not a periodic
@@ -596,11 +633,20 @@ class SemiImplicitIntegrator(EulerIntegrator):
                 smoothed = torch.fft.ifftn((propagator @ modes.unsqueeze(-1)).squeeze(-1), dim=(0, 1, 2)).real
                 return grid.project_free_increment(grid.flat(smoothed))
 
-            increment = _gmres(action, dt * rate, precondition)
+            return _gmres(action, dt * rate, precondition)
+        rate_hat = torch.fft.fftn(grid.dense(rate), dim=(0, 1, 2))
+        increment_hat = dt * (propagator @ rate_hat.unsqueeze(-1)).squeeze(-1)
+        increment_hat[0, 0, 0] = 0
+        return grid.flat(torch.fft.ifftn(increment_hat, dim=(0, 1, 2)).real)
+
+    def _advance(self, grid, rate, dt):
+        if grid.has_frozen or grid.has_excluded:
+            increment = self._implicit_increment(grid, rate, dt)
             rho = torch.where(grid.free[:, None], grid.rho.detach() + increment, grid.rho.detach())
             grid.check_density(rho)
             self._last_output = (rho, rho._version)
             return rho
+        propagator = self._propagator_for(dt)
         rho_hat = torch.fft.fftn(grid.dense(grid.rho.detach()), dim=(0, 1, 2))
         rate_hat = torch.fft.fftn(grid.dense(rate), dim=(0, 1, 2))
         # (I + dt B) rho' = rho + dt [R + B rho]  is  rho' = rho + dt (I + dt B)^-1 R.

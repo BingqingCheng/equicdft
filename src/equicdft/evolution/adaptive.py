@@ -71,6 +71,14 @@ class StepControl:
     need about ``1e-5``. ``stability_safety`` multiplies the linear
     explicit-stability bound that caps the step of an explicit integrator;
     the semi-implicit step has no such cap.
+
+    ``density_absolute_tolerance`` adds an absolute density-error allowance:
+    |local error| <= error_tolerance * rho + density_absolute_tolerance.
+    Its default zero preserves purely relative control. The same mixed scale
+    is used for the preliminary change bound; with a nonzero absolute term
+    that bound alone no longer proves positivity. Integrator density checks
+    remain mandatory; FluxLimitedEulerIntegrator bounds outgoing transfers.
+    The error scale never changes the density and is not a density floor.
     """
 
     dt_min: float
@@ -82,6 +90,7 @@ class StepControl:
     energy_increase: float = 0.0
     energy_roundoff: float = 1e-12
     stability_safety: float = 0.9
+    density_absolute_tolerance: float = 0.0
 
     def __post_init__(self):
         for name in ("dt_min", "dt_max", "max_relative_change", "error_tolerance", "growth", "shrink", "stability_safety"):
@@ -90,7 +99,7 @@ class StepControl:
             raise ValueError("dt_min must not exceed dt_max.")
         if not self.growth >= 1 or not 0 < self.shrink < 1:
             raise ValueError("growth must be >= 1 and 0 < shrink < 1.")
-        for name in ("energy_increase", "energy_roundoff"):
+        for name in ("energy_increase", "energy_roundoff", "density_absolute_tolerance"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, numbers.Real) or not 0 <= value < math.inf:
                 raise ValueError("{} must be finite and nonnegative.".format(name))
@@ -169,6 +178,7 @@ class AdaptiveDynamics:
         initial_state = state
         grid = _Grid(state)
         accessible = ~grid.excluded
+        active = grid.free
         cap = control.dt_max
         if not isinstance(integrator, SemiImplicitIntegrator):
             cap = min(cap, control.stability_safety * _explicit_limit(integrator, state, grid))
@@ -214,7 +224,8 @@ class AdaptiveDynamics:
         record(time, math.nan, math.nan, energy)
         try:
             while time < t_end and counts["accepted"] < max_steps:
-                change = float((rate.abs() / state["rho"])[accessible].max())
+                controlled_rate = self._control_rate(state, rate, min(dt, cap))
+                change = float((controlled_rate.abs() / self._density_scale(state["rho"])).masked_fill(~active[:, None], 0).max())
                 bound = min(dt, cap, control.max_relative_change / change) if change > 0 else min(dt, cap)
                 if bound < control.dt_min:
                     raise ValueError(
@@ -228,7 +239,7 @@ class AdaptiveDynamics:
                 while True:
                     try:
                         trial, new_rate, new_energy, error = self._trial(
-                            state, rate, dt, accessible, energy, counts, time=time, endpoint=endpoint,
+                            state, rate, dt, active, energy, counts, time=time, endpoint=endpoint,
                             start_dipole=dipole)
                         break
                     except _Rejected as rejection:
@@ -240,13 +251,18 @@ class AdaptiveDynamics:
                 if self.field is not None:
                     right = dict(right, rho=trial["rho"])
                     left_dipole = integrator.last_metal_dipole
-                    if not _same_fields(trial, right):
+                    field_changed = not _same_fields(trial, right)
+                    if field_changed:
                         new_rate = integrator.rhs(right)
                         new_energy = integrator.last_beta_A
                         counts["model_evaluations"] += 1
                     new_work = work + self.last_work + _work(trial, right, integrator.model,
                         start_dipole=left_dipole, end_dipole=integrator.last_metal_dipole)
-                    trial = right
+                    # Equal endpoint fields can be distinct cloned tensors.
+                    # Keep the state that owns the reused rate/face fluxes;
+                    # only a real field jump requires adopting the right state.
+                    if field_changed:
+                        trial = right
                 rate, energy, work = new_rate, new_energy, new_work
                 dipole = integrator.last_metal_dipole
                 state = trial
@@ -305,8 +321,9 @@ class AdaptiveDynamics:
         except (DensityError, ConvergenceError) as failure:
             raise _rejection(failure, control) from None
         rho = trial["rho"]
-        defect = (half * midpoint_rate - (midpoint["rho"] - state["rho"])).abs()
-        error = float((torch.maximum((full - rho).abs(), defect) / rho)[accessible].max())
+        defect = (half * self._control_rate(midpoint, midpoint_rate, half)
+                  - (midpoint["rho"] - state["rho"])).abs()
+        error = float((torch.maximum((full - rho).abs(), defect) / self._density_scale(rho)).masked_fill(~accessible[:, None], 0).max())
         if error > control.error_tolerance:
             raise _Rejected("rejected_accuracy", "accuracy", self._factor(error))
         trial = self._field_at(endpoint, trial, left=True)
@@ -322,14 +339,24 @@ class AdaptiveDynamics:
                                          device=state["rho"].device).prod()
             particles = float(volume * state["rho"].sum())
             error = max(error, abs(float(full_work) - work_first - work_second) / max(1.0, particles))
-        defect += (half * trial_rate - (rho - midpoint["rho"])).abs()
-        error = max(error, float((defect / rho)[accessible].max()))
+        defect += (half * self._control_rate(trial, trial_rate, half)
+                   - (rho - midpoint["rho"])).abs()
+        error = max(error, float((defect / self._density_scale(rho)).masked_fill(~accessible[:, None], 0).max()))
         if error > control.error_tolerance:
             raise _Rejected("rejected_accuracy", "accuracy", self._factor(error))
         if float(integrator.last_beta_A) > energy_limit:
             raise _Rejected("rejected_energy", "free energy", control.shrink)
         self.last_work = state["rho"].new_tensor(work_first + work_second)
         return trial, trial_rate, integrator.last_beta_A, error
+
+    def _control_rate(self, state, rate, dt):
+        method = getattr(self.integrator, "control_rate", None)
+        return rate if method is None else method(state, rate, dt)
+
+    def _density_scale(self, rho):
+        # error <= rtol means |density error| <= rtol*rho + atol.
+        # This only scales errors; it never replaces the physical density.
+        return rho + self.control.density_absolute_tolerance / self.control.error_tolerance
 
     def _factor(self, error):
         return max(_MAX_SHRINK, _SAFETY * math.sqrt(self.control.error_tolerance / error))

@@ -1,5 +1,22 @@
 # Density evolution
 
+## Conservative floor-aware semi-implicit steps
+
+`FluxLimitedSemiImplicitIntegrator` combines `SemiImplicitIntegrator` with
+the donor-budget mechanism of `FluxLimitedEulerIntegrator`. Supply an explicit
+`density_floor` in input-density units; excluded zeros and frozen densities
+are unchanged. Initialization must separately meet that floor conservatively.
+The unconstrained IMEX increment defines corrected face fluxes; common-species
+face factors limit outgoing transfers before applying their divergence.
+There is no post-step clipping or particle redistribution across blocked faces.
+Inactive limiting recovers the original semi-implicit result to solve accuracy.
+Active limiting need not preserve implicit stability or energy descent, so use
+adaptive energy/defect checks and temporal refinement. The defect uses the
+floor-constrained explicit endpoint rate, not the implicitly smoothed rate.
+For excluded domains supply a separate homogeneous-liquid reference curvature.
+This method has no explicit-Euler timestep cap, but not every larger step is
+accurate or acceptable. It supports general species matrices and is deterministic.
+
 `equicdft.evolution` advances conserved species densities using an equilibrium
 functional and a separate mobility. Deterministic and stochastic
 dynamics run at a fixed uniform temperature on periodic regular grids.
@@ -25,7 +42,76 @@ modules in evaluation mode, then restore their original mode flags.
 The evolving fields are species number densities; polarization evolution is
 not included.
 
+### Strong density depletion
+
+For deterministic evolution with a local density-dependent mobility,
+`EulerIntegrator(..., face_average="harmonic-density")` evaluates the mobility
+at the componentwise harmonic mean of the two densities bordering each face.
+The default `"arithmetic"` still averages the two voxel mobility matrices;
+constant mobilities are identical under either choice. The new option does
+not floor, freeze or remove low-density voxels. It is a spatial quadrature
+choice, with second-order consistency for smooth positive densities; sharply
+varying profiles still need spatial-convergence checks.
+
+Both choices use one shared flux per face, conserving every species. A
+symmetric positive-semidefinite face matrix gives non-positive instantaneous
+free-energy change at fixed external potential. Time integration must still
+enforce positivity and energy acceptance. `AdaptiveDynamics` retains its
+relative-rate, error and work-corrected-energy checks without modification.
+Direct Euler updates avoid subtracting Fourier reconstruction roundoff from
+densities far below machine precision relative to the bulk. The homogeneous
+Fourier stabilizer is not positivity preserving in such inhomogeneous fields.
+
+`SemiImplicitIntegrator` also accepts the face option, but this does not remove
+that limitation. The option is not available through
+`StochasticEulerIntegrator`: its noise and thermal drift are derived for
+arithmetic faces and cannot be reused unchanged. Trajectory metadata records
+`face_average`. No existing default is changed.
+
+For extreme depletion or composition imbalance, use
+`FluxLimitedEulerIntegrator(..., face_average="harmonic-density")` with an
+explicitly chosen `StepControl(density_absolute_tolerance=...)`. The latter
+changes the error test to `abs(error) <= error_tolerance*rho + absolute_tolerance`.
+Its default is zero, and it never changes the physical density. A positive
+absolute tolerance should be refined together with the relative tolerance.
+
+The flux-limited integrator budgets each voxel's outgoing transfers, retaining
+at least `1-outflow_fraction` of its initial density in that step (default
+outflow_fraction0.9). The donor budget also retains the smallest normal
+floating-point value (`torch.finfo(dtype).tiny`) to prevent repeated depletion
+from underflowing to zero. This does not raise densities: an input below that
+machine-scale value cannot donate until replenished. It scales each entire
+species flux vector by a common
+nonnegative face factor. Thus each species remains conservative and the
+face's instantaneous dissipation sign is preserved even with cross coupling.
+Finite-step energy is still checked by the driver. The limiter is inactive
+for sufficiently small steps at fixed densities above the machine reserve; it neither clips
+densities nor redistributes particles globally. `advance` requires the
+unmodified rate tensor returned by `rhs` for that same state, including the
+external field. Stored face fluxes belong to each rate, so adaptive retries
+can safely reuse start-state rates after midpoint evaluations.
+
 ## Mobility
+
+### Optional deterministic density floor
+
+`FluxLimitedEulerIntegrator(..., density_floor=...)` uses a nonnegative donor
+reserve in the input density units. The default zero retains the machine-scale
+reserve and the original adaptive controller. A positive floor is an explicit
+numerical regularization: each donor can export only a fraction of its excess
+above that floor. It never clips the result or creates particles. Inputs below
+the floor are not automatically raised; applications must specify a separate
+conservative initialization if they require all accessible densities above it.
+Excluded zeros and frozen values remain untouched by integration.
+
+With a positive floor, adaptive change and defect tests use the integrator's
+actual constrained finite-step rate. Full-versus-two-half-step error and
+work-corrected energy checks remain active. `dt_min` remains a failure threshold,
+not permission to force a step that fails these checks. Test sensitivity to
+both the floor and temporal tolerances before adopting this regularization.
+It is not available as a stochastic-noise prescription.
+
+### Mobility convention
 
 The supplied mobility is the physical coefficient in
 

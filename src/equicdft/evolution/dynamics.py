@@ -15,9 +15,14 @@ def _metadata(integrator, data, **extra):
     metadata = {
         "dt": integrator.dt, "method": type(integrator).__name__,
         "deterministic": not getattr(integrator, "stochastic", False),
+        "face_average": integrator.face_average,
         "mobility": {"class": type(integrator.mobility).__name__},
     }
     metadata.update(extra)
+    if hasattr(integrator, "outflow_fraction"):
+        metadata["outflow_fraction"] = integrator.outflow_fraction
+        metadata["density_floor"] = integrator.density_floor
+        metadata["last_limiter"] = integrator.last_limiter
     if getattr(integrator, "stochastic", False):
         metadata.update(seed=integrator.seed, noise="unfiltered conserved face flux",
                         stochastic_convention="Ito", rng_device=str(data["rho"].device),
