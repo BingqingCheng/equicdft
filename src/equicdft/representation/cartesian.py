@@ -1,5 +1,7 @@
 """Cartesian moment features for density fields on fixed integer grids."""
 
+import copy
+import math
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -8,8 +10,10 @@ from torch import nn
 from .._validation import (
     boolean,
     nonnegative_integer,
+    nonnegative_scalar,
     optional_positive_integer,
     positive_integer,
+    positive_scalar,
 )
 from .._config import Configurable, make_config, register, scalar_value
 from .._polarization import (
@@ -51,6 +55,45 @@ def _make_powers(max_power: int) -> torch.Tensor:
                 z_power = remaining_power - y_power
                 powers.append((x_power, y_power, z_power))
     return torch.tensor(powers, dtype=torch.long)
+
+
+def _normalization_reference_config(reference):
+    """Validate a JSON-compatible original stencil record, without fitted state."""
+    if reference is None:
+        return None
+    if not isinstance(reference, Mapping):
+        raise TypeError("normalization_reference must be a mapping or None")
+    required = {"grid_spacing", "offsets", "neighbor_mask", "cutoff_grid",
+                "stencil_radius", "monomial_scale", "coordinate_scaling", "spacing_ratio"}
+    if set(reference) != required:
+        raise ValueError("normalization_reference must contain exactly {}".format(sorted(required)))
+    cutoff = nonnegative_integer(reference["cutoff_grid"], "reference cutoff_grid")
+    radius = nonnegative_scalar(reference["stencil_radius"], "reference stencil_radius")
+    if radius > cutoff:
+        raise ValueError("reference stencil_radius cannot exceed cutoff_grid")
+    offsets = torch.as_tensor(reference["offsets"])
+    expected = torch.from_numpy(make_stencil(cutoff))
+    if (offsets.dtype == torch.bool or offsets.is_complex()
+            or offsets.shape != expected.shape or not torch.equal(offsets, expected.to(offsets))):
+        raise ValueError("reference offsets must be the canonical integer stencil")
+    mask = torch.as_tensor(reference["neighbor_mask"])
+    if mask.dtype != torch.bool or mask.shape != expected.shape[:1]:
+        raise ValueError("reference neighbor_mask must contain one Boolean per offset")
+    squared = expected.square().sum(dim=-1)
+    expected_mask = (squared > 0) & (squared <= radius ** 2 + 1e-12 * max(1., radius ** 2))
+    if not torch.equal(mask, expected_mask) or not mask.any().item():
+        raise ValueError("reference mask must be a nonempty spherical, center-excluded stencil")
+    scaling = reference["coordinate_scaling"]
+    if scaling not in ("none", "cutoff"):
+        raise ValueError("reference coordinate_scaling must be 'none' or 'cutoff'")
+    return dict(
+        grid_spacing=positive_scalar(reference["grid_spacing"], "reference grid_spacing"),
+        offsets=expected.tolist(), neighbor_mask=mask.tolist(), cutoff_grid=cutoff,
+        stencil_radius=radius,
+        monomial_scale=positive_scalar(reference["monomial_scale"], "reference monomial_scale"),
+        coordinate_scaling=scaling,
+        spacing_ratio=positive_scalar(reference["spacing_ratio"], "reference spacing_ratio"),
+    )
 
 
 @register
@@ -174,6 +217,22 @@ class CartesianAFeatures(nn.Module, Configurable):
         ``"gather"`` retains explicit periodic neighborhoods. ``"fft"``
         evaluates the same circular stencil contraction in reciprocal space
         without materializing ``[..., G, J, C]``.
+    stencil_radius
+        Optional active spherical radius in grid steps, no larger than
+        ``cutoff_grid``. Regridding uses this to preserve a physical cutoff
+        that falls between integer shells. The default is ``cutoff_grid``.
+    monomial_scale
+        Positive multiplier on the Cartesian coordinates after the selected
+        ``coordinate_scaling``. Regridding uses it to preserve moment units.
+    center_normalization
+        ``"strict"`` retains ordinary center exclusion. The exploratory
+        ``"reference"`` policy compensates each primitive Gaussian channel
+        relative to ``normalization_reference`` before convolution. Its
+        scalar center weight may be negative; it is not a positive kernel.
+    normalization_reference
+        Original stencil geometry recorded by :meth:`GridCACEModel.regrid`.
+        It contains no frozen exponents or correction factors. The current
+        exponents determine both reference and target normalizations.
     include_polarization
         If True, require electric dipole density ``[..., G, n_types, 3]``.
         Use the same spatial basis and species transform for rho and each
@@ -222,6 +281,10 @@ class CartesianAFeatures(nn.Module, Configurable):
         convolution_backend: str = "gather",
         include_polarization: bool = False,
         polarization_input: str = "raw",
+        stencil_radius: Optional[float] = None,
+        monomial_scale: float = 1.0,
+        center_normalization: str = "strict",
+        normalization_reference: Optional[Mapping[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -230,6 +293,17 @@ class CartesianAFeatures(nn.Module, Configurable):
             polarization_input,
             include_polarization=self.include_polarization,
         )
+        if center_normalization not in ("strict", "reference"):
+            raise ValueError("center_normalization must be 'strict' or 'reference'")
+        radius = float(cutoff_grid) if stencil_radius is None else nonnegative_scalar(
+            stencil_radius, "stencil_radius",
+        )
+        if radius > cutoff_grid:
+            raise ValueError("stencil_radius cannot exceed cutoff_grid")
+        monomial_scale = positive_scalar(monomial_scale, "monomial_scale")
+        reference = _normalization_reference_config(normalization_reference)
+        if center_normalization == "reference" and reference is None:
+            raise ValueError("reference center normalization requires normalization_reference")
 
         if not isinstance(radial_basis, str):
             raise TypeError(
@@ -371,6 +445,8 @@ class CartesianAFeatures(nn.Module, Configurable):
         monomial_positions = positions
         if coordinate_scaling == "cutoff" and int(cutoff_grid) > 0:
             monomial_positions = positions / float(cutoff_grid)
+        if monomial_scale != 1.0:
+            monomial_positions = monomial_positions * monomial_scale
         monomial_values = torch.ones(
             (positions.shape[0], powers.shape[0]),
             dtype=torch.get_default_dtype(),
@@ -384,6 +460,10 @@ class CartesianAFeatures(nn.Module, Configurable):
         neighbor_mask = ~center_mask if separate_center else torch.ones_like(
             center_mask
         )
+        if radius != cutoff_grid:
+            neighbor_mask = neighbor_mask & (
+                squared_distances <= radius ** 2 + 1e-12 * max(1., radius ** 2)
+            )
 
         if radial_basis == "bessel":
             radial_function_count = int(n_radial_functions)
@@ -485,6 +565,40 @@ class CartesianAFeatures(nn.Module, Configurable):
         self.register_buffer("mean_density", mean_density_tensor)
         # This deterministic constructor product is not fitted state.
         self.register_buffer("neighbor_mask", neighbor_mask, persistent=False)
+        self.stencil_radius = radius
+        self.monomial_scale = monomial_scale
+        self.center_normalization = center_normalization
+        self.normalization_reference = reference
+        if reference is not None:
+            ratio = reference["spacing_ratio"]
+            expected_scale = reference["monomial_scale"] * ratio
+            if coordinate_scaling == "cutoff":
+                expected_scale *= self.cutoff_grid / reference["cutoff_grid"]
+            if (reference["coordinate_scaling"] != coordinate_scaling
+                    or not math.isclose(radius, reference["stencil_radius"] / ratio, rel_tol=1e-12)
+                    or not math.isclose(monomial_scale, expected_scale, rel_tol=1e-12)):
+                raise ValueError("normalization_reference conflicts with current radius or monomial units")
+        self.register_buffer(
+            "normalization_reference_squared_distances",
+            None if reference is None else torch.as_tensor(
+                reference["offsets"], dtype=mean_density_tensor.dtype,
+            ).square().sum(dim=-1), persistent=False,
+        )
+        self.register_buffer(
+            "normalization_reference_neighbor_mask",
+            None if reference is None else torch.tensor(reference["neighbor_mask"], dtype=torch.bool),
+            persistent=False,
+        )
+        self._normalization_reference_is_native = reference is not None and (
+            reference["spacing_ratio"] == 1.0
+            and reference["coordinate_scaling"] == coordinate_scaling
+            and reference["monomial_scale"] == monomial_scale
+            and reference["stencil_radius"] == radius
+            and reference["offsets"] == local_density_positions.tolist()
+            and reference["neighbor_mask"] == neighbor_mask.tolist()
+        )
+        if center_normalization == "reference":
+            self._validate_reference_normalization()
 
     def to_config(self) -> Dict[str, Any]:
         """Return the constructor arguments describing this module.
@@ -501,7 +615,7 @@ class CartesianAFeatures(nn.Module, Configurable):
         gaussian = self.radial_basis == "gaussian"
         bessel = self.radial_basis == "bessel"
         density_transform = self.density_transform
-        return make_config(
+        config = make_config(
             self,
             max_power=self.max_power,
             mean_density=scalar_value(self.mean_density),
@@ -534,6 +648,50 @@ class CartesianAFeatures(nn.Module, Configurable):
             convolution_backend=self.convolution_backend,
             include_polarization=self.include_polarization,
             polarization_input=self.polarization_input,
+        )
+        # Keep the exact legacy configuration/state structure for default
+        # models. New geometry is structural config, not mandatory state keys.
+        radius = getattr(self, "stencil_radius", float(self.cutoff_grid))
+        scale = getattr(self, "monomial_scale", 1.0)
+        if radius != self.cutoff_grid:
+            config["stencil_radius"] = radius
+        if scale != 1.0:
+            config["monomial_scale"] = scale
+        policy = getattr(self, "center_normalization", "strict")
+        if policy != "strict":
+            config["center_normalization"] = policy
+        reference = getattr(self, "normalization_reference", None)
+        if reference is not None:
+            config["normalization_reference"] = copy.deepcopy(reference)
+        return config
+
+    def _validate_reference_normalization(self):
+        """Fail closed for kernels outside the tested primitive Gaussian rule."""
+        if self.radial_basis not in ("none", "gaussian") or self.radial_transform is not None:
+            raise ValueError("reference normalization supports only untransformed Gaussian/none primitives")
+        if self.include_polarization or not self.separate_center:
+            raise ValueError("reference normalization requires scalar separate_center features")
+        if self.trainable_radial_centers or torch.any(self.radial_centers != 0).item():
+            raise ValueError("reference normalization requires fixed zero-centered Gaussians")
+        if not self.neighbor_mask.any().item():
+            raise ValueError("reference normalization requires active noncentral neighbors")
+
+    def _primitive_stencil_basis(self, radial_exponents, radial_centers):
+        """One primitive path for base and independent Gaussian messages."""
+        arguments = {}
+        if getattr(self, "center_normalization", "strict") == "reference":
+            if torch.any(radial_centers != 0).item():
+                raise ValueError("reference normalization requires zero-centered Gaussian overrides")
+        if (getattr(self, "center_normalization", "strict") == "reference"
+                and not self._normalization_reference_is_native):
+            arguments = dict(
+                reference_squared_distances=self.normalization_reference_squared_distances,
+                reference_neighbor_mask=self.normalization_reference_neighbor_mask,
+                spacing_ratio=self.normalization_reference["spacing_ratio"],
+            )
+        return _cartesian_stencil_basis(
+            self.squared_distances, self.monomial_values, radial_exponents,
+            radial_centers, self.stencil_neighbor_mask(), **arguments,
         )
 
     @property
@@ -596,24 +754,12 @@ class CartesianAFeatures(nn.Module, Configurable):
                 raise ValueError(
                     "radial_centers shape must match radial_exponents shape"
                 )
-            return _cartesian_stencil_basis(
-                self.squared_distances,
-                self.monomial_values,
-                radial_exponents,
-                radial_centers,
-                self.stencil_neighbor_mask(),
-            )
+            return self._primitive_stencil_basis(radial_exponents, radial_centers)
 
         if self.radial_basis == "bessel":
             basis = self.fixed_bessel_stencil_basis
         else:
-            basis = _cartesian_stencil_basis(
-                self.squared_distances,
-                self.monomial_values,
-                self.radial_exponents,
-                self.radial_centers,
-                self.stencil_neighbor_mask(),
-            )
+            basis = self._primitive_stencil_basis(self.radial_exponents, self.radial_centers)
 
         if self.radial_transform is not None:
             basis = self.radial_transform(basis, self.powers)

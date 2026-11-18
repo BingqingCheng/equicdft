@@ -13,6 +13,9 @@ density/polarization solve are in [`polarization.md`](polarization.md).
 Equilibrium solving is in [`solving.md`](solving.md); running a fit is in
 [`training.md`](training.md).
 
+Explicit scalar-model resolution transfer and the opt-in reference-center
+normalization policy are documented in [`regridding.md`](regridding.md).
+
 ## Choosing the ideal reference
 
 Choose `ideal=IdealGas(...)` for a scalar density or

@@ -550,6 +550,14 @@ class GridCACEModel(nn.Module, Configurable):
             grid_spacing,
             dtype=torch.get_default_dtype(),
         )
+        reference = getattr(a_features, "normalization_reference", None)
+        if reference is not None:
+            expected_spacing = reference["grid_spacing"] * reference["spacing_ratio"]
+            if not torch.allclose(
+                spacing, torch.full_like(spacing, expected_spacing),
+                rtol=8 * torch.finfo(spacing.dtype).eps, atol=0,
+            ):
+                raise ValueError("normalization_reference does not match model grid_spacing")
         if has_polarization and not torch.allclose(
             spacing, spacing[0].expand_as(spacing)
         ):
@@ -616,6 +624,29 @@ class GridCACEModel(nn.Module, Configurable):
                 value = getattr(self.ideal, name, None)
                 if value is not None and value.numel() not in (1, self.n_types):
                     raise ValueError(name + " must be scalar or one value per type")
+
+    def regrid(
+        self,
+        grid_spacing: Union[float, Sequence[float], torch.Tensor],
+        *,
+        center_normalization: str = "strict",
+        convolution_backend: Optional[str] = None,
+    ) -> "GridCACEModel":
+        """Return an independent scalar model for another isotropic grid.
+
+        Physical local cutoff, Gaussian widths and monomial units are kept.
+        Strict center exclusion is the default; ``center_normalization=
+        'reference'`` explicitly opts into the exploratory signed correction.
+        See :func:`equicdft.regrid.regrid_model` for scope and limitations.
+        Input fields are not resampled, and this model is never mutated.
+        """
+        from .regrid import regrid_model
+
+        return regrid_model(
+            self, grid_spacing,
+            center_normalization=center_normalization,
+            convolution_backend=convolution_backend,
+        )
 
     def to_config(self) -> Dict[str, Any]:
         """Return the nested constructor arguments describing this model.

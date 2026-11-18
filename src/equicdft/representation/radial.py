@@ -121,8 +121,40 @@ def _cartesian_stencil_basis(
     radial_exponents: torch.Tensor,
     radial_centers: torch.Tensor,
     neighbor_mask: torch.Tensor,
+    *,
+    reference_squared_distances: Optional[torch.Tensor] = None,
+    reference_neighbor_mask: Optional[torch.Tensor] = None,
+    spacing_ratio: float = 1.0,
 ) -> torch.Tensor:
     """Return normalized radial-Cartesian values with shape ``[J, N, K]``."""
+
+    if reference_squared_distances is not None:
+        # Only zero-centered primitive Gaussian/none channels enter here.
+        # Keep the legacy construction untouched when the option is disabled
+        # or when CartesianAFeatures detects the exact reference geometry.
+        logits = -squared_distances[neighbor_mask, None] * radial_exponents[None, :]
+        reference_exponents = radial_exponents / spacing_ratio ** 2
+        reference_logits = (
+            -reference_squared_distances[reference_neighbor_mask, None]
+            * reference_exponents[None, :]
+        )
+        log_mass = torch.logsumexp(logits, dim=0)
+        reference_log_mass = torch.logsumexp(reference_logits, dim=0)
+        # log(1-p0) without subtracting nearly equal floating-point numbers.
+        log_fraction = log_mass - torch.logaddexp(torch.zeros_like(log_mass), log_mass)
+        reference_log_fraction = reference_log_mass - torch.logaddexp(
+            torch.zeros_like(reference_log_mass), reference_log_mass,
+        )
+        gamma = torch.exp(log_fraction - reference_log_fraction)
+        if not (torch.isfinite(gamma) & (gamma > 0)).all().item():
+            raise ValueError("Reference center normalization is not representable for these Gaussian widths")
+        weights = logits.new_zeros((squared_distances.numel(), radial_exponents.numel()))
+        weights[neighbor_mask] = torch.exp(logits - log_mass[None, :]) * gamma[None, :]
+        # The center has only its constant monomial. Multiplying by the
+        # monomial table below inserts the scalar term before convolution,
+        # so it uses exactly the same (possibly smoothed) density carrier.
+        weights[squared_distances == 0] = 1.0 - gamma
+        return weights[:, :, None] * monomial_values[:, None, :]
 
     radial_values = gaussian_radial_values(
         squared_distances,
