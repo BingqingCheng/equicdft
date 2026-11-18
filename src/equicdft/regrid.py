@@ -49,15 +49,7 @@ def _validate_kernel(owner, label):
 
 
 def _validate_source_geometry(features):
-    """Reject unrecorded geometry edits instead of guessing their units.
-
-    A historical float32 model may have been cast to float64 after its
-    monomials were constructed. Rebuilding directly in float64 then differs
-    by the original float32 coordinate/power rounding. The relative bound is
-    eight rounding units per Cartesian degree (and at least float32
-    precision); exact zero entries have no absolute allowance. This is a
-    conversion-precision guard, not permission for a different physical scale.
-    """
+    """Reject unrecorded geometry edits; allow historical float32 rounding."""
     anchor = features.mean_density
     with default_dtype(anchor.dtype):
         configured = CartesianAFeatures.from_config(features.to_config())
@@ -66,6 +58,8 @@ def _validate_source_geometry(features):
         if not torch.equal(getattr(features, name), getattr(configured, name)):
             raise ValueError("a_features " + name + " differs from its configuration; "
                              "unrecorded geometry edits cannot be regridded")
+    # A model cast to double can retain moments originally built in float32.
+    # Allow eight rounding units per degree, but no absolute error at zeros.
     epsilon = max(torch.finfo(anchor.dtype).eps, torch.finfo(torch.float32).eps)
     tolerance = 8 * max(1, features.max_power) * epsilon
     if (features.monomial_values.shape != configured.monomial_values.shape
@@ -98,11 +92,8 @@ def _validate_model(model):
         if "stencil_basis" in message.__dict__:
             raise ValueError("regrid does not accept a runtime-replaced message kernel")
         _validate_kernel(message, "message_layers[{}]".format(index))
-    radius = float(getattr(features, "stencil_radius", features.cutoff_grid))
-    expected = ((features.squared_distances <= radius * radius + 1e-12 * max(1., radius * radius))
-                & (features.squared_distances != 0))
-    if not torch.equal(features.neighbor_mask, expected):
-        raise ValueError("a_features mask differs from its configured stencil_radius")
+    # Reconstruction validates reference units/radius and checks the stored
+    # geometry, including its spherical center-excluded mask, in one place.
     _validate_source_geometry(features)
 
 
@@ -114,18 +105,6 @@ def _reference_geometry(features, current_spacing):
         expected_spacing = float(reference["grid_spacing"]) * ratio
         if not math.isclose(expected_spacing, current_spacing, rel_tol=1e-12, abs_tol=0):
             raise ValueError("normalization reference does not match the model grid spacing")
-        if reference["coordinate_scaling"] != features.coordinate_scaling:
-            raise ValueError("normalization reference has different Cartesian coordinate units")
-        expected_radius = float(reference["stencil_radius"]) / ratio
-        radius = float(getattr(features, "stencil_radius", features.cutoff_grid))
-        if not math.isclose(expected_radius, radius, rel_tol=1e-12, abs_tol=1e-12):
-            raise ValueError("normalization reference has a different physical cutoff")
-        expected_scale = float(reference["monomial_scale"]) * ratio
-        if features.coordinate_scaling == "cutoff":
-            expected_scale *= features.cutoff_grid / int(reference["cutoff_grid"])
-        if not math.isclose(expected_scale, float(getattr(features, "monomial_scale", 1.0)),
-                            rel_tol=1e-12, abs_tol=0):
-            raise ValueError("normalization reference has different monomial units")
         return reference
     return dict(
         grid_spacing=current_spacing,
@@ -145,35 +124,21 @@ def _rebuild_features(features, config, spacing_ratio):
     with default_dtype(anchor.dtype):
         rebuilt = CartesianAFeatures.from_config(config)
     rebuilt = rebuilt.to(device=anchor.device, dtype=anchor.dtype)
-    old_state, new_state = features.state_dict(), rebuilt.state_dict()
-    geometry = {"local_density_positions", "squared_distances", "powers",
-                "monomial_values", "center_mask", "neighbor_mask"}
-    preserve_geometry = (
-        torch.equal(features.local_density_positions, rebuilt.local_density_positions)
-        and torch.equal(features.squared_distances, rebuilt.squared_distances)
-        and torch.equal(features.monomial_values, rebuilt.monomial_values)
-        and torch.equal(features.neighbor_mask, rebuilt.neighbor_mask)
-    )
-    unexpected = set(old_state) - set(new_state) - geometry
-    if unexpected:
-        raise ValueError("unrecognized feature state in regrid: " + ", ".join(sorted(unexpected)))
-    for name in new_state:
-        if name in geometry and not preserve_geometry:
-            continue
-        if name not in old_state:
-            if name in geometry:
-                continue
-            raise ValueError("missing fitted feature state in regrid: " + name)
-        if old_state[name].shape != new_state[name].shape:
-            raise ValueError("regrid changed fitted feature shape: " + name)
-        value = old_state[name].detach().clone()
-        if spacing_ratio != 1.0:
-            if name == "log_radial_exponents":
-                value += 2.0 * math.log(spacing_ratio)
-            elif name == "fixed_radial_exponents":
-                value *= spacing_ratio ** 2
-        new_state[name] = value
-    rebuilt.load_state_dict(new_state, strict=True)
+    state = features.state_dict()
+    geometry = ("local_density_positions", "squared_distances", "powers", "monomial_values")
+    if not all(torch.equal(getattr(features, name), getattr(rebuilt, name))
+               for name in (*geometry, "neighbor_mask")):
+        for name in geometry:
+            state[name] = getattr(rebuilt, name)
+    # Only the local exponent's grid-unit representation changes. Assign new
+    # tensors: state_dict values can share storage with the source model.
+    if spacing_ratio != 1.0:
+        if "log_radial_exponents" in state:
+            state["log_radial_exponents"] = state["log_radial_exponents"] + 2.0 * math.log(spacing_ratio)
+        else:
+            state["fixed_radial_exponents"] = state["fixed_radial_exponents"] * spacing_ratio ** 2
+    # Strict loading already checks all fitted-state keys and tensor shapes.
+    rebuilt.load_state_dict(state, strict=True)
     old_parameters = dict(features.named_parameters())
     for name, parameter in rebuilt.named_parameters():
         parameter.requires_grad_(old_parameters[name].requires_grad)

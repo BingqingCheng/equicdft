@@ -313,6 +313,11 @@ outputs = model(field)
 print(outputs["beta_F_exc"], outputs["c1"])
 ```
 
+For evaluation at another resolution, see the short
+[grid-transfer example](examples/grid_transfer/README.md). It uses
+`model.regrid(...)` and a density field already sampled on the target grid;
+no interpolation or equilibrium solve is performed.
+
 `save_model` and `load_model` use a versioned file (currently
 `MODEL_FORMAT_VERSION`, 5) that stores the model's structure
 (`model.to_config()`, a plain JSON-compatible dictionary) next to its fitted

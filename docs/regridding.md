@@ -28,6 +28,27 @@ parameters, device/dtype, training mode and parameter `requires_grad` flags.
 Only local radial exponents change their numerical grid-unit representation.
 Long-range reciprocal radial parameters are not rescaled.
 
+## Minimal evaluation script
+
+[`examples/grid_transfer/evaluate.py`](../examples/grid_transfer/evaluate.py)
+loads one versioned model and evaluates the first EXTXYZ density field:
+
+```sh
+python examples/grid_transfer/evaluate.py model.pt fine.extxyz \
+    --spacing 0.125 --center-normalization reference --output fine-evaluation.pt
+```
+
+The field must already have the requested spacing and contain temperature
+(`T`) and density (`density`) metadata in the usual `GridData` format.
+The loader checks grid/component compatibility. No density interpolation,
+particle-number adjustment, gauge fit or equilibrium solve is performed.
+FFT avoids constructing the explicit voxel-neighbor table. Add
+`--device cuda` for larger fields on a GPU; do not use a large fine grid on
+a memory-limited laptop. The output contains `beta_F_exc`, `c1` with shape
+`[n_grid, n_types]`, and grid/input metadata; existing files are not overwritten.
+The default is `--center-normalization strict`; the command above explicitly
+selects the exploratory reference-normalization policy described below.
+
 ## What reference normalization means
 
 For primitive Gaussian channel `n`, let `p0_n(h)` be the central normalized

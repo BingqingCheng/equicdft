@@ -356,6 +356,15 @@ class TestModelRegrid(unittest.TestCase):
                                    torch.ones((1, 1)), rtol=1e-13, atol=1e-13)
         self.assertTrue(torch.isfinite(fine(_data(fine))["c1"]).all().item())
 
+    def test_fixed_gaussian_exponents_are_rescaled_without_modifying_source(self):
+        native = _model(feature_options={"trainable_radial_exponents": False})
+        before = native.a_features.fixed_radial_exponents.clone()
+        fine = native.regrid(0.25, center_normalization="reference")
+        torch.testing.assert_close(fine.a_features.fixed_radial_exponents, before * 0.25,
+                                   rtol=0, atol=0)
+        self.assertTrue(torch.equal(native.a_features.fixed_radial_exponents, before))
+        self.assertTrue(torch.isfinite(fine(_data(fine))["c1"]).all().item())
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
     def test_reference_geometry_follows_cuda_device_and_dtype(self):
         cpu = _model().regrid(0.25, center_normalization="reference")
