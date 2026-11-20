@@ -28,6 +28,22 @@ Longer documents live in `docs/`:
 - [`migration.md`](docs/migration.md) — what changed for existing models and
   data files
 
+## Lennard--Jones reference study
+
+The reference study considers a one-component Lennard--Jones fluid, truncated
+and shifted at $r_c=2.5\sigma$. The functional is learned from three-dimensional
+equilibrium density fields and tested on bulk thermodynamics, liquid--vapor
+interfaces, solvent-mediated colloid interactions, and adsorption in a gyroid
+pore.
+
+- Paper: Bingqing Cheng, [Equivariant learning of a transferable
+  three-dimensional classical density functional](https://arxiv.org/abs/2608.13506).
+- [LJ data repository](https://github.com/BingqingCheng/equicdft-lj-data):
+  trained models, training/validation/test fields, and figure data and scripts.
+  The [revised-paper release, `lj-paper-v2`](https://github.com/BingqingCheng/equicdft-lj-data/releases/tag/lj-paper-v2)
+  contains the radial C4 model and paired-grid reference data; the original
+  release is preserved separately.
+
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local
