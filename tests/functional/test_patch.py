@@ -1,6 +1,7 @@
 """Raw-patch ordering, scalar derivatives, and model integration."""
 
 import copy
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,8 @@ def context(data, **overrides):
         voxel_volume=torch.tensor(0.125, dtype=torch.float64),
         mean_density=torch.tensor(0.5, dtype=torch.float64),
         local_density_index=data["local_density_index"],
+        grid_size=data["grid_size"],
+        grid_positions=data["grid_positions"],
     )
     arguments.update(overrides)
     return ReadoutContext(**arguments)
@@ -62,6 +65,110 @@ class TestDensityPatchReadout(unittest.TestCase):
         self.assertTrue(np.array_equal(offsets[0], [0, 0, 0]))
         self.assertEqual(np.sum(np.all(offsets == 0, axis=-1)), 1)
         self.assertTrue(np.all(np.sum(offsets ** 2, axis=-1) <= 16))
+
+    def test_one_domain_flag_with_the_same_model_and_data_api(self):
+        data = field()
+        for domain, neighbors in (("sphere", 7), ("cube", 27)):
+            with self.subTest(domain=domain):
+                readout = DensityPatchReadout(cutoff_grid=1, domain=domain)
+                model = patch_model(readout=[readout]).eval()
+                outputs = model(copy.deepcopy(data), compute_c2=True)
+                self.assertEqual(readout.n_neighbors, neighbors)
+                self.assertEqual(readout.to_config()["domain"], domain)
+                for key in ("beta_F_exc", "c1", "c2"):
+                    self.assertTrue(torch.isfinite(outputs[key]).all())
+
+    def test_cube_patch_width_order_and_periodic_values(self):
+        wide = DensityPatchReadout(domain="cube")
+        self.assertEqual(wide.n_neighbors, 729)
+        self.assertEqual(wide.n_features, 730)
+        self.assertEqual(sum(p.numel() for p in wide.parameters()), 23937)
+        self.assertFalse(wide.requires_local_density_index)
+        data = field(n_types=2)
+        readout = DensityPatchReadout(2, cutoff_grid=1, domain="cube", hidden_sizes=()).double()
+        offsets = np.asarray(list(itertools.product(range(-1, 2), repeat=3)))
+        self.assertEqual(np.sum(np.all(offsets == 0, axis=-1)), 1)
+        coordinates = data["grid_positions"].numpy()
+        index = np.ravel_multi_index(((coordinates[:, None]+offsets) % 3).reshape(-1, 3).T, (3, 3, 3)).reshape(27, 27)
+        captured = []
+        hook = readout.mlp.register_forward_pre_hook(lambda _, inputs: captured.append(inputs[0]))
+        readout.energy(context(data, local_density_index=None))
+        hook.remove()
+        expected = torch.cat(((data["rho"][torch.as_tensor(index)]/.5).flatten(-2),
+                              torch.full((27, 1), 1.2, dtype=torch.float64)), dim=-1)
+        torch.testing.assert_close(captured[0], expected)
+        self.assertNotIn("_cube_index", readout.state_dict())
+
+    def test_cube_batched_and_shuffled_rows(self):
+        data = field(n_types=2)
+        readout = DensityPatchReadout(2, cutoff_grid=1, domain="cube").double()
+        expected = readout.energy(context(data))
+        permutation = torch.randperm(27)
+        shuffled = context(data, rho=data["rho"][permutation],
+                           grid_positions=data["grid_positions"][permutation])
+        torch.testing.assert_close(readout.energy(shuffled), expected)
+        rho = torch.stack((data["rho"], data["rho"][permutation]))
+        positions = torch.stack((data["grid_positions"], data["grid_positions"][permutation]))
+        batch = context(data, rho=rho, grid_positions=positions,
+                        normalized_temperature=torch.full((2,), 1.2, dtype=torch.float64))
+        torch.testing.assert_close(readout.energy(batch), expected.expand(2))
+
+    def test_cube_quadratic_c1_and_c2_include_all_overlaps(self):
+        data = field()
+        readout = DensityPatchReadout(cutoff_grid=1, domain="cube", hidden_sizes=()).double()
+        weights = torch.arange(1, 28, dtype=torch.float64)/27
+        with torch.no_grad():
+            readout.mlp[0].weight.copy_(torch.cat((weights, weights.new_tensor([.3])))[None])
+            readout.mlp[0].bias.fill_(.2)
+        offsets = np.asarray(list(itertools.product(range(-1, 2), repeat=3)))
+        positions = data["grid_positions"].numpy()
+        neighbors = (positions[:, None]+offsets) % 3
+        index = torch.from_numpy(np.ravel_multi_index(neighbors.reshape(-1, 3).T, (3, 3, 3)).reshape(27, 27))
+        matrix = torch.zeros(27, 27, dtype=torch.float64).scatter_add_(1, index, weights.expand(27, -1))
+        rho = data["rho"][:, 0]
+        result = patch_model(readout=[readout]).eval()(data, compute_c2=True, c2_reference=(5, 0))
+        torch.testing.assert_close(result["beta_F_exc"], .125*(rho*(matrix@rho/.5+.56)).sum())
+        torch.testing.assert_close(result["c1"][:, 0], -(matrix+matrix.T)@rho/.5-.56)
+        torch.testing.assert_close(result["c2"][:, 0], -(matrix+matrix.T)[5]/(.5*.125))
+
+    def test_cube_nonlinear_derivatives_and_loss_gradients(self):
+        model = patch_model(readout=[DensityPatchReadout(cutoff_grid=1, domain="cube", hidden_sizes=(4,))],
+                            compute_local_mu=True).eval()
+        data = field()
+        result = model(copy.deepcopy(data), compute_c2=True, c2_reference=(4, 0))
+        shifted = []
+        for sign in (-1, 1):
+            sample = copy.deepcopy(data)
+            sample["rho"][13, 0] += sign*1e-5
+            shifted.append(model(sample))
+        torch.testing.assert_close(result["c1"][13, 0],
+            -(shifted[1]["beta_F_exc"]-shifted[0]["beta_F_exc"])/(2e-5*.125), rtol=1e-7, atol=1e-8)
+        torch.testing.assert_close(result["c2"][13, 0],
+            (shifted[1]["c1"][4, 0]-shifted[0]["c1"][4, 0])/(2e-5*.125), rtol=1e-7, atol=1e-8)
+        term = TensorLoss(name="mu", prediction_key="beta_mu_local", target_key="beta_mu_average", weights_key="voxel_weights")
+        model.train()
+        result = model(copy.deepcopy(data))
+        term(result, data).backward()
+        self.assertTrue(torch.isfinite(model.readout[0].mlp[0].weight.grad).all())
+        self.assertGreater(model.readout[0].mlp[0].weight.grad.abs().sum().item(), 0)
+
+    def test_cube_serialization_and_old_sphere_configuration(self):
+        model = patch_model(readout=[DensityPatchReadout(cutoff_grid=1, domain="cube")]).eval()
+        data = field()
+        expected = model(copy.deepcopy(data))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"cube.pt"
+            save_model(model, path)
+            restored = load_model(path)
+        self.assertEqual(restored.readout[0].domain, "cube")
+        self.assertEqual(restored.cutoff_grid, 1)
+        self.assertEqual(restored.readout[0]._cube_index.numel(), 0)
+        actual = restored(data)
+        for key in ("beta_F_exc", "c1"):
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+        config = DensityPatchReadout(cutoff_grid=1).to_config()
+        config.pop("domain")
+        self.assertEqual(DensityPatchReadout.from_config(config).domain, "sphere")
 
     def test_raw_input_order_normalization_and_integral(self):
         data = field(n_types=2)
@@ -247,7 +354,7 @@ class TestDensityPatchReadout(unittest.TestCase):
         self.assertEqual(readout.n_features, 2)
 
     def test_invalid_inputs_fail_clearly(self):
-        for arguments in ({"cutoff_grid": -1}, {"n_types": 0}, {"hidden_sizes": (0,)}):
+        for arguments in ({"cutoff_grid": -1}, {"n_types": 0}, {"hidden_sizes": (0,)}, {"domain": "ball"}):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 DensityPatchReadout(**arguments)
         data = field()
@@ -265,12 +372,13 @@ class TestDensityPatchReadout(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_cuda_model_and_derivatives(self):
-        model = patch_model().cuda().eval()
-        data = {key: value.cuda() for key, value in field().items()}
-        outputs = model(data, compute_c2=True)
-        for key in ("beta_F_exc", "c1", "c2"):
-            self.assertEqual(outputs[key].device.type, "cuda")
-            self.assertTrue(torch.isfinite(outputs[key]).all())
+        for domain in ("sphere", "cube"):
+            model = patch_model(readout=[DensityPatchReadout(cutoff_grid=1, domain=domain)]).cuda().eval()
+            data = {key: value.cuda() for key, value in field().items()}
+            outputs = model(data, compute_c2=True)
+            for key in ("beta_F_exc", "c1", "c2"):
+                self.assertEqual(outputs[key].device.type, "cuda")
+                self.assertTrue(torch.isfinite(outputs[key]).all())
 
 
 if __name__ == "__main__":

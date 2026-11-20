@@ -34,8 +34,9 @@ for integration is physical number density, not the normalized network input.
 ```python
 from equicdft import DensityPatchReadout, GridCACEModel, GridData
 
+domain = "sphere"  # Change only this to "cube" for a cubic patch.
 model = GridCACEModel(
-    readout=[DensityPatchReadout(cutoff_grid=4, hidden_sizes=(32, 16))],
+    readout=[DensityPatchReadout(cutoff_grid=4, domain=domain, hidden_sizes=(32, 16))],
     grid_spacing=0.5,
     mean_density=0.4,       # replace with the training-data density scale
     mean_temperature=1.2,  # replace with the training-data temperature scale
@@ -48,7 +49,10 @@ model = GridCACEModel(
 frames = GridData.from_xyz("train.extxyz", grid_info=model.grid_info)
 ```
 
-Leave `include_local_density_index=True` (the data loader default). Patches gather
+The same `GridData.from_xyz` call works for both domains with its default
+`include_local_density_index=True`: sphere uses that table, while cube ignores
+it and constructs its own geometry. Setting it to `False` is an optional
+memory optimization for cube, not a second domain selector. Patches gather
 from live rho, not detached precomputed density arrays; all overlapping environments
 therefore contribute to c1 and c2. The usual model conversions remain
 `c1 = -(1/DeltaV) d(beta F_exc)/d rho` and
@@ -64,6 +68,30 @@ not part of this implementation. For a future comparison, the requested control 
 raw-patch-only versus the complete production LDA+CACE model, not CACE-only.
 Gathered patches occupy `[..., n_grid, n_neighbors, n_types]`; memory therefore
 grows with patch size and batch size rather than a compressed descriptor width.
+
+## Domain selector
+
+`DensityPatchReadout(domain="cube", cutoff_grid=4)` instead reads every integer
+offset in `[-4,4]^3`: 729 densities plus temperature, 23,937 parameters for the
+same `(32,16)` hidden widths. The default remains `domain="sphere"`, preserving
+old configurations and spherical weights. Cube offsets are lexicographic,
+with z varying fastest, and include the center exactly once. A cube at this
+cutoff keeps the sphere's axial reach but extends to `sqrt(3)*cutoff_grid` at
+its corners; it is not a matched-radius or matched-parameter comparison.
+
+Cube geometry is built from `grid_size` and `grid_positions`; a spherical
+`local_density_index` is neither needed nor reinterpreted. The periodic index
+table is cached for the current shape/device, supports shuffled rows, and is
+not serialized as fitted state. Live density gathering and the scalar/c1/c2
+conventions are unchanged. Cube inputs can use
+`GridData.from_xyz(..., include_local_density_index=False)` to avoid storing
+an unused spherical table. No rotational symmetrization, extra LDA or grid
+resolution-transfer rule is added by this flag.
+
+Choose the domain when constructing a model. It is saved in the readout's
+configuration. Changing the domain changes the input width, so do not mutate
+`readout.domain` on an already trained model or reuse spherical weights for
+a cubic network.
 
 ## Software validation
 
@@ -119,3 +147,20 @@ remote main (`26cbe8f`) with only this vanilla patch: **149 passed, one CUDA ski
 no failures**. The historical local error-message mismatch above is not present
 on that target base. This also verifies that the readout does not depend on the
 unrelated, uncommitted working-tree changes.
+
+### Cubic domain API publication check, 19 November 2026
+
+The optional `domain="sphere"` / `domain="cube"` selector is published as a
+focused extension to remote main `800c56d`. The sphere remains the default;
+old versioned sphere configurations and parameter shapes are preserved. No
+energy, derivative-normalization, dataset, trainer or solver convention changes.
+The only affected files are the patch readout, its tests and this document.
+
+The combined command above now runs **156 tests: 155 passed, one CUDA skip**
+on the isolated remote-main base, including the retained LJ forward and fixed-N
+solve regressions. Tests cover the single-flag common model/data API, cube
+ordering and periodic wrapping, shuffled/batched fields, analytic and numerical
+c1/c2, loss backpropagation and serialization. The same cubic implementation
+also passed prior L40S GPU pilots, including training/restart and finite
+energy/c1/c2/local-mu reload checks. No running HPC campaign is modified by
+this publication, and no model-quality conclusion follows from the unit tests.
