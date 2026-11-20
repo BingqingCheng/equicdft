@@ -10,6 +10,7 @@ from .functional.ideal import IdealGas, IdealReference
 from .functional.metalwall import MetalWall
 from .functional.msa import MSAReferenceReadout
 from .functional.pairwise import PairwiseReadout
+from .functional.patch import DensityPatchReadout
 from .functional.polarization_ideal import FixedDipoleIdeal
 from .functional.readout import BulkReadout, LocalReadout, LongRangeReadout
 from .functional.reciprocal import ReciprocalFeatures
@@ -77,6 +78,7 @@ __all__ = [
     "MSAReferenceReadout",
     "NoiseOptions",
     "PairwiseReadout",
+    "DensityPatchReadout",
     "FixedDipoleIdeal",
     "FMTReadout",
     "ReciprocalFeatures",
