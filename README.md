@@ -44,6 +44,11 @@ pore.
   contains the radial C4 model and paired-grid reference data; the original
   release is preserved separately.
 
+The fitted model and one held-out density field are bundled in
+[`examples/lj_paper_v2`](examples/lj_paper_v2/README.md). Run
+`python examples/lj_paper_v2/evaluate.py` for a small CPU inference example;
+no training or data download is needed.
+
 ## Method in one page
 
 For grid-cell volume $\Delta V$, density $\rho_g$, and a learned local

@@ -1,0 +1,82 @@
+{
+  "status": "frozen revised-paper reference; system-specific",
+  "reference_fit": "fit-beta-p3nu2-rbf1normtrain-c4",
+  "source": {
+    "repository": "https://github.com/BingqingCheng/equicdft-lj-data",
+    "commit": "15fedd81b05846fc3134dfae93eaf5b3c3ac0524",
+    "release": "lj-paper-v2",
+    "path": "releases/lj-paper-v2/model/model.pt",
+    "sha256": "6edbebb18192ca7f6a311a88c3236d61c3c5d285c739b9f533b4dc1b6e7137ca",
+    "training_code_commit": "8832a1b41d28f6da839ecf4cde12fd128edea08d",
+    "run_config": {
+      "seed": 1,
+      "epoch_budget": 200,
+      "completed_epochs": 200,
+      "best_epoch": 200,
+      "best_valid_loss": 0.009091212322626567,
+      "batch_size": 2,
+      "cutoff_grid": 4,
+      "max_power": 3,
+      "max_product_order": 2,
+      "free_energy_mode": "beta",
+      "rho_min": 0.001,
+      "radial_basis": "gaussian",
+      "radial_exponents": [
+        0.125
+      ],
+      "trainable_radial_exponents": true,
+      "coordinate_scaling": "none",
+      "separate_center": true,
+      "use_lda": true,
+      "long_range_kernel": null,
+      "mean_density": 0.4056662858721711,
+      "mean_temperature": 1.076966085499136,
+      "training_target": "spatially constant local chemical potential",
+      "train_frames": 11219,
+      "valid_frames": 1255,
+      "test_frames": 2055,
+      "split_manifest": "/global/scratch/users/bingqingcheng/equicdft_nvt_morecomprehensive/split_manifest.json",
+      "code_commit": "8832a1b",
+      "device": "cuda"
+    }
+  },
+  "export": {
+    "code_commit": "f4204196fc7cd56179084354a1c102ba23055611",
+    "operation": "load_converted_model(source) in float32, then .double(), then save_model; no refitting",
+    "format_version": 5,
+    "dtype": "float64",
+    "torch_version": "2.8.0",
+    "source_unchanged": true,
+    "native_field_max_abs_difference": {
+      "beta_F_exc": 0.0,
+      "c1": 0.0
+    }
+  },
+  "field": {
+    "source": "releases/lj-paper-v2/evaluation/nvt_T1p5_general_frame120.extxyz",
+    "temperature": 1.5,
+    "particle_number": 208,
+    "box_sigma": [
+      8,
+      8,
+      8
+    ],
+    "spacing_sigma": 0.5,
+    "shape": [
+      16,
+      16,
+      16
+    ],
+    "selection": "one held-out regression field; not an aggregate accuracy test"
+  },
+  "artifacts": {
+    "model.pt": {
+      "sha256": "df6d64beecd3afd29412af12887279179e830fa2203b24cf7d6d7ddbc6b95c8a",
+      "bytes": 93964
+    },
+    "field.extxyz": {
+      "sha256": "e3bcf4e390db14e9a6606f89c8be291f583a74c1beecb43fb1809f8faa095b9a",
+      "bytes": 237214
+    }
+  }
+}
